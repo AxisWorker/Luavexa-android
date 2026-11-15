@@ -188,7 +188,12 @@ fn system_property(name: &str) -> String {
 /// `android_main`: the editor in this activity, until it is destroyed.
 pub fn run(app: AndroidApp) {
     logcat::install();
-    log::info!("rustudio {} starting (Android API {})", env!("CARGO_PKG_VERSION"), AndroidApp::sdk_version());
+    log::info!(
+        "rustudio {} starting (Android API {}; {})",
+        env!("CARGO_PKG_VERSION"),
+        AndroidApp::sdk_version(),
+        crate::perf_log::build()
+    );
     let _ = APP.set(app.clone());
     export_env();
     log::info!(
@@ -274,22 +279,13 @@ pub mod touch {
     /// laptop's worth of editor.
     pub const FIT_POINTS: f32 = 1100.0;
     pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.8..=1.6;
-    /// The 3D view's first-run render scale: about half the pixels (phone
-    /// GPUs at their screens' full resolution fell well under 60 Hz).
-    const DEFAULT_RENDER_SCALE: f32 = 0.7;
 
+    /// (The 3D view's first-run render scale, MSAA, shadows and passes are
+    /// the Low quality preset's: src/quality.rs, app.rs `Editor::quality`.)
     pub fn setup(app: &mut crate::app::RustudioApp, ctx: &egui::Context) {
         let saved = crate::layout_store::load();
         // (the window's size isn't known until the first frame: auto_zoom)
         app.ed.auto_zoom = saved.as_ref().and_then(|l| l.zoom).is_none();
-        if saved.as_ref().and_then(|l| l.render_scale).is_none() && std::env::var_os("RUSTUDIO_RENDER_SCALE").is_none() {
-            app.ed.render_scale = DEFAULT_RENDER_SCALE;
-        }
-        // Studio's SSAO costs five passes over the view for a subtle
-        // darkening in corners a phone's screen barely shows.
-        if saved.as_ref().and_then(|l| l.ssao).is_none() && std::env::var_os("RUSTUDIO_SSAO").is_none() {
-            app.ed.ssao = false;
-        }
         ctx.options_mut(|o| {
             // A finger lands less precisely than a pointer: a press that
             // drifts this far is still a tap.

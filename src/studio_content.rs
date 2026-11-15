@@ -87,14 +87,34 @@ pub fn spawn_background_install_if_missing() {
     }
     let _ = std::thread::Builder::new().name("studio-content".into()).spawn(|| {
         post(false, "No Roblox Studio install found: downloading Studio's built-in content (default character, player scripts, fonts, textures, sounds; about 60 MB) from Roblox's CDN…".into());
-        match install(&|_| {}) {
-            Ok(v) => post(false, format!(
-                "Studio content {v} installed in {}. Play now uses Roblox's default character and player scripts; restart rustudio to use Studio's fonts everywhere.",
-                install_dir().display()
-            )),
-            Err(e) => post(true, format!(
-                "Couldn't download Studio's built-in content: {e}. Run `rustudio --install-studio-content` to retry, or point RUSTUDIO_STUDIO_DIR at a Studio install."
-            )),
+        // The packages as they come, so a slow connection is seen to get
+        // somewhere (the retired textures are a hundred small fetches: one
+        // line for all of them).
+        let step = |s: &str| {
+            if s.starts_with("downloading ") || (s.starts_with("fetching ") && !s.starts_with("fetching legacy ")) {
+                post(false, format!("Studio content: {s}…"));
+            }
+        };
+        // A connection that drops gets a few more tries here (the download
+        // goes on where it stopped), and again at the next start.
+        const TRIES: u32 = 3;
+        for attempt in 1..=TRIES {
+            match install(&step) {
+                Ok(v) => {
+                    post(false, format!(
+                        "Studio content {v} installed in {}. Play now uses Roblox's default character and player scripts; restart rustudio to use Studio's fonts everywhere.",
+                        install_dir().display()
+                    ));
+                    break;
+                }
+                Err(e) if attempt < TRIES => {
+                    post(false, format!("Studio content: {e}; trying again in 20 s"));
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+                }
+                Err(e) => post(true, format!(
+                    "Couldn't download Studio's built-in content: {e}. It continues where it stopped at the next start; `rustudio --install-studio-content` retries now, or point RUSTUDIO_STUDIO_DIR at a Studio install."
+                )),
+            }
         }
     });
 }
@@ -187,12 +207,26 @@ pub fn install(progress: &dyn Fn(&str)) -> Result<String, String> {
     }
     let parent = dest.parent().ok_or("bad install dir")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let partial = parent.join(format!(".studio-partial-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&partial);
+    // The download goes on where an earlier run stopped (a phone's app is
+    // killed when it leaves the screen for a while; a flaky connection): the
+    // unpacked packages stay in one partial folder, each marked when whole,
+    // until the whole content is there. Another Studio version starts over.
+    let partial = parent.join(".studio-partial");
+    let stamp = format!("{version} {CONTENT_REVISION}");
+    if !std::fs::read_to_string(partial.join(".version")).is_ok_and(|s| s.trim() == stamp) {
+        let _ = std::fs::remove_dir_all(&partial);
+    }
+    std::fs::create_dir_all(&partial).map_err(|e| e.to_string())?;
+    std::fs::write(partial.join(".version"), format!("{stamp}\n")).map_err(|e| e.to_string())?;
 
     let result = (|| -> Result<(), String> {
-        for (pkg, sub) in PACKAGES {
-            progress(&format!("downloading {pkg}"));
+        let total = PACKAGES.len();
+        for (n, (pkg, sub)) in PACKAGES.iter().enumerate() {
+            let done = partial.join(format!(".done-{pkg}"));
+            if done.is_file() {
+                continue;
+            }
+            progress(&format!("downloading {pkg} ({}/{total})", n + 1));
             let url = format!("{CDN}/{version}-{pkg}");
             let bytes = get(&agent, &url, None)?;
             let zip = Zip::parse(&bytes).map_err(|e| format!("{pkg}: {e}"))?;
@@ -203,15 +237,20 @@ pub fn install(progress: &dyn Fn(&str)) -> Result<String, String> {
                 let data = zip.read(&bytes, e).map_err(|err| format!("{pkg} {}: {err}", e.name))?;
                 write_file(&partial.join(sub), &e.name, &data)?;
             }
+            std::fs::write(&done, "").map_err(|e| e.to_string())?;
         }
         // Studio resolves retired rbxasset paths through LegacyContentTable,
         // not another deployment zip. Materialize its missing textures too so
         // a downloaded content tree is usable by file-based consumers.
-        for line in include_str!("../assets/legacy-content.tsv").lines() {
-            let Some((path, id)) = line.split_once('\t') else { continue };
-            if !path.starts_with("textures/") || partial.join("content").join(path).is_file() {
-                continue;
-            }
+        let legacy: Vec<(&str, &str)> = include_str!("../assets/legacy-content.tsv")
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter(|(path, _)| path.starts_with("textures/") && !partial.join("content").join(path).is_file())
+            .collect();
+        if !legacy.is_empty() {
+            progress(&format!("fetching {} retired textures one by one", legacy.len()));
+        }
+        for (path, id) in legacy {
             let id: u64 = id.trim().parse().map_err(|e| format!("legacy texture {path}: {e}"))?;
             progress(&format!("fetching legacy {path}"));
             match crate::assets::remote_cached(id) {
@@ -222,16 +261,25 @@ pub fn install(progress: &dyn Fn(&str)) -> Result<String, String> {
             }
         }
         for (pkg, file) in SINGLE_FILES {
+            if partial.join(file).is_file() {
+                continue;
+            }
             progress(&format!("fetching {file} from {pkg}"));
             let url = format!("{CDN}/{version}-{pkg}");
             let data = fetch_one(&agent, &url, file)?;
             write_file(&partial, file, &data)?;
         }
-        std::fs::write(partial.join(MARKER), format!("{version} {CONTENT_REVISION}\n")).map_err(|e| e.to_string())
+        std::fs::write(partial.join(MARKER), format!("{stamp}\n")).map_err(|e| e.to_string())
     })();
-    if let Err(e) = result {
-        let _ = std::fs::remove_dir_all(&partial);
-        return Err(e);
+    // (An error leaves the partial folder for the next attempt.)
+    result?;
+    if let Ok(rd) = std::fs::read_dir(&partial) {
+        for e in rd.flatten() {
+            let n = e.file_name();
+            if n == ".version" || n.to_string_lossy().starts_with(".done-") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
     }
     let _ = std::fs::remove_dir_all(&dest);
     std::fs::rename(&partial, &dest).map_err(|e| format!("{}: {e}", dest.display()))?;

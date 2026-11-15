@@ -12,6 +12,18 @@ use std::time::{Duration, Instant};
 
 const PERIOD: Duration = Duration::from_secs(5);
 
+/// The build this is: a debug APK / binary runs the editor at opt-level 1
+/// with debug assertions and overflow checks in every crate, several times
+/// slower than a release build (and a phone shows it first).
+pub fn build() -> String {
+    format!(
+        "{} build, {} {}",
+        if cfg!(debug_assertions) { "debug" } else { "release" },
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+    )
+}
+
 /// logcat on Android (the `log` crate is an Android dependency), stderr
 /// elsewhere.
 fn say(line: String) {
@@ -41,19 +53,6 @@ pub struct PerfLog {
 pub fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| cfg!(target_os = "android") || std::env::var_os("RUSTUDIO_PERF_LOG").is_some())
-}
-
-/// An on/off switch from the environment, read once: `RUSTUDIO_<X>=0`
-/// (or false/off/no) is off, anything else on, unset is `default`. The
-/// caller keeps the cell:
-/// `static S: OnceLock<bool> = OnceLock::new(); env_switch(&S, "RUSTUDIO_X", true)`.
-/// (On a device: `adb shell setprop debug.rustudio.env "RUSTUDIO_X=0"`,
-/// src/android/mod.rs `export_env`.)
-pub fn env_switch(cell: &'static std::sync::OnceLock<bool>, name: &str, default: bool) -> bool {
-    *cell.get_or_init(|| match std::env::var(name) {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
-        Err(_) => default,
-    })
 }
 
 impl PerfLog {
@@ -98,7 +97,7 @@ impl PerfLog {
         if !self.said_device {
             self.said_device = true;
             if let Some(d) = device() {
-                say(format!("perf: {d}"));
+                say(format!("perf: {d}; {}", build()));
             }
         }
         let n = self.intervals.len();

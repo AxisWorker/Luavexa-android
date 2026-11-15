@@ -522,6 +522,8 @@ fn sun_visibility_at(world: vec3<f32>, n: vec3<f32>, receiver: vec3<f32>) -> f32
 
 /// The cascades alone (sun_shadow.rs): the first whose sphere holds the
 /// point, else the last; its EVSM moments at the point. −1 outside its tile.
+/// Only the first SUN_CASCADES (render.rs shader_source, from the quality
+/// settings) are drawn: past the last of those the voxel sun takes over.
 fn sun_shadow_map(world: vec3<f32>) -> f32 {
     let d0 = world - g.sun_sphere[0].xyz;
     let d1 = world - g.sun_sphere[1].xyz;
@@ -533,6 +535,9 @@ fn sun_shadow_map(world: vec3<f32>) -> f32 {
         i = 1;
     } else if (dot(d2, d2) < g.sun_sphere[2].w) {
         i = 2;
+    }
+    if (i >= SUN_CASCADES) {
+        return -1.0;
     }
     let p = g.sun_casc[i] * vec4<f32>(world, 1.0);
     if (any(p.xy <= vec2<f32>(0.0)) || any(p.xy >= vec2<f32>(1.0))) {
@@ -2573,7 +2578,10 @@ fn fs_ssao_apply(in: PostOut) -> @location(0) vec4<f32> {
     let p = clamp(vec2<i32>(in.pos.xy), vec2<i32>(0), dims);
     var raw = textureLoad(ssao_depth_ms, p, 0);
     if (all(textureDimensions(ssao_in) == vec2<u32>(full))) {
-        for (var sample = 1; sample < 4; sample++) {
+        // (MSAA_SAMPLES: render.rs shader_source; 1 without multisampling,
+        // when the depth is a plain texture_depth_2d and the third
+        // argument is its only mip level)
+        for (var sample = 1; sample < MSAA_SAMPLES; sample++) {
             raw = min(raw, textureLoad(ssao_depth_ms, p, sample));
         }
     }
@@ -2631,6 +2639,6 @@ fn fs_ssao_apply(in: PostOut) -> @location(0) vec4<f32> {
 fn fs_glass_depth(in: PostOut) -> @location(0) f32 {
     let pixel = vec2<i32>(in.pos.xy);
     var z = 0.0;
-    for (var i = 0; i < 4; i++) { z = max(z, textureLoad(ssao_depth_ms, pixel, i)); }
+    for (var i = 0; i < MSAA_SAMPLES; i++) { z = max(z, textureLoad(ssao_depth_ms, pixel, i)); }
     return z;
 }

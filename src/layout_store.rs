@@ -96,6 +96,9 @@ pub struct Layout {
     /// Where each panel sat last in the main window.
     pub homes: HashMap<String, Home>,
     pub zoom: Option<f32>,
+    /// The 3D view's quality preset (View > Quality; quality.rs names).
+    #[serde(default)]
+    pub quality: Option<String>,
     /// The 3D view's render scale (View > Render Scale).
     #[serde(default)]
     pub render_scale: Option<f32>,
@@ -221,6 +224,13 @@ impl Layout {
     pub fn apply(&self, ed: &mut Editor) {
         if let Some(z) = self.zoom.and_then(finite) {
             ed.ui.zoom = z.clamp(0.5, 3.0);
+        }
+        // (the preset first: it sets the render scale and AO, which the
+        // saved values of their own then override)
+        if let Some(q) = self.quality.as_deref().and_then(crate::quality::Quality::parse) {
+            if std::env::var_os("RUSTUDIO_QUALITY").is_none() {
+                ed.set_quality(q);
+            }
         }
         if let Some(r) = self.render_scale.and_then(finite) {
             ed.render_scale = r.clamp(0.25, 1.0);
@@ -398,6 +408,7 @@ impl Saver {
             popped: saved_popped(panels),
             homes: panels.homes.clone(),
             zoom: Some(ed.ui.zoom),
+            quality: Some(ed.quality.name().to_string()),
             render_scale: Some(ed.render_scale),
             ssao: Some(ed.ssao),
             ribbon_tab: Some(format!("{:?}", ed.ui.tab)),

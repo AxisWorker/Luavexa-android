@@ -1644,6 +1644,14 @@
    "source": "Android: the cascades' tiles, atlas and depth map at half the texels across, a quarter of the shadow fill and blur work (a phone GPU has a tenth of a desktop card's bandwidth); RUSTUDIO_SHADOW_SCALE overrides"
   },
   {
+   "name": "render scale at Low quality",
+   "group": "performance",
+   "value": 0.7,
+   "unit": "fraction",
+   "estimated": true,
+   "source": "the Low quality preset (quality.rs; a phone's start): the 3D view at about half the panel's pixels, drawn scaled up; the first phone measurements fell well under 60 Hz at full resolution"
+  },
+  {
    "name": "shadow extent",
    "group": "lighting",
    "value": 128,

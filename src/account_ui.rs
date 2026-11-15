@@ -846,7 +846,9 @@ impl Editor {
                         .margin(egui::vec2(8.0, 6.0))
                         .desired_width(f32::INFINITY),
                 );
-                if a.adding && a.cookie_input.is_empty() && !field.has_focus() && a.add_error.is_none() {
+                // (not back from a loss: a soft keyboard the user hid
+                // releases the focus — android/keyboard.rs)
+                if a.adding && a.cookie_input.is_empty() && !field.has_focus() && !field.lost_focus() && a.add_error.is_none() {
                     field.request_focus();
                 }
                 ui.add_space(6.0);

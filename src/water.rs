@@ -40,7 +40,11 @@ pub const FRAMES: u32 = 25;
 const SIZE: u32 = 256;
 
 pub struct WaterPass {
-    pub pipeline: wgpu::RenderPipeline,
+    /// The pipeline's layout (globals, textures, this pass's group); the
+    /// renderer makes the pipeline itself on first use (render.rs
+    /// `Pipe::Water`: vs_water / fs_water of the viewport shader, the
+    /// scene's colour format and sample count).
+    pub layout: wgpu::PipelineLayout,
     pub bgl: wgpu::BindGroupLayout,
     pub buf: wgpu::Buffer,
     normals: wgpu::TextureView,
@@ -49,15 +53,11 @@ pub struct WaterPass {
 }
 
 impl WaterPass {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        shader: &wgpu::ShaderModule,
         globals: &wgpu::BindGroupLayout,
         textures: &wgpu::BindGroupLayout,
-        buffers: &[Option<wgpu::VertexBufferLayout>],
-        hdr: wgpu::TextureFormat,
         samples: u32,
     ) -> Self {
         let frag = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
@@ -109,41 +109,6 @@ impl WaterPass {
             bind_group_layouts: &[Some(globals), Some(textures), Some(&bgl)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("water"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: shader,
-                entry_point: Some("vs_water"),
-                compilation_options: Default::default(),
-                buffers,
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Greater),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: samples,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: shader,
-                entry_point: Some("fs_water"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: hdr,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("water"),
             size: std::mem::size_of::<WaterRaw>() as u64,
@@ -163,7 +128,7 @@ impl WaterPass {
             ..Default::default()
         });
         WaterPass {
-            pipeline,
+            layout,
             bgl,
             buf,
             normals,

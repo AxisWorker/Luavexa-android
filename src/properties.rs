@@ -501,7 +501,13 @@ impl Editor {
         // Sits over the edit box so egui's own click handling never runs.
         p.ui.interact(resp.rect, eid.with("mouse"), egui::Sense::CLICK | egui::Sense::DRAG).on_hover_cursor(egui::CursorIcon::Text);
         self.props.edit_layout = Some((key.to_string(), out.galley.clone(), out.galley_pos, resp.rect));
-        resp.request_focus();
+        // Asked only while lacking, and not back from a loss (which ends
+        // the edit below): egui counts a request as an IME interruption,
+        // which hides and shows a soft keyboard again, and a keyboard the
+        // user hid releases the focus (android/keyboard.rs).
+        if !resp.has_focus() && !resp.lost_focus() {
+            resp.request_focus();
+        }
         let (enter, esc) = p.ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
         if esc {
             self.props.editing = None;

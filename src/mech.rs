@@ -655,6 +655,7 @@ pub const SHADOW_SOFTNESS_BLUR: [f32; 2] = [1.71, 0.05]; // the blur's reach in 
 pub const SUN_SHADOW_ATLAS: [u32; 2] = [3200, 2048]; // rustudio's atlas for the four tiles (Studio shares a 4096 × 7680 one with the local lights)
 pub const SUN_CASCADE_ORIGINS: [[u32; 2]; 4] = [[2816, 1024], [2048, 1024], [2048, 0], [0, 0]]; // each tile's corner in that atlas
 pub const SUN_SHADOW_TEXEL_SCALE_PHONE: f32 = 0.5; // Android: the cascades' tiles, atlas and depth map at this fraction of the texels across (a quarter of the shadow fill and blur work; RUSTUDIO_SHADOW_SCALE overrides) (estimated; a phone GPU has a tenth of a desktop card's bandwidth)
+pub const RENDER_SCALE_LOW: f32 = 0.7; // the Low quality preset's 3D view render scale (quality.rs): about half the pixels of the panel; the first phone measurements fell well under 60 Hz at full resolution (estimated)
 pub const SUN_DIST: f32 = 580.0; // Globals.sunDist: the sun's map hands off to the voxel sun from here, over 1 / HYBRID_LERP_SLOPE studs
 pub const LIGHT_INNER: f32 = 0.71; // light record m1 = Range × 1000 + this: full brightness to this × Range (all lights read)
 

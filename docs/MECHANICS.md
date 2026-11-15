@@ -253,6 +253,7 @@ by id.
 | Pinch zoom | a pinch that doubles the distance between two fingers zooms like 4 wheel notches (`PINCH_NOTCHES_PER_DOUBLING`), toward the point between the fingers; in Play it is the game's wheel input | estimated (Roblox's touch camera zooms about that far for that pinch) |
 | Movement stick | in Play a finger landing in the bottom-left 35% × 50% of the view is the stick; its knob moves up to 56 pt from where the finger landed, nothing within 10 pt, and a direction counts past ~22° off the other axis (eight directions, W/A/S/D held) | estimated (Roblox's dynamic thumbstick appears under the finger the same way) |
 | Jump button | a 72 pt square 28 pt from the bottom-right corner holds Space | estimated (Roblox's is 70 × 70) |
+| Low quality preset | a phone's first run (View > Quality; src/quality.rs): the 3D view at 0.7 of the panel's pixels (`RENDER_SCALE_LOW`), no MSAA, the scene in Rg11b10Ufloat, one sun shadow cascade at half texel scale (`SUN_SHADOW_TEXEL_SCALE_PHONE`), no local light shadows, SSAO, bloom, depth of field, clouds or scene environment probe; Medium 2× MSAA, two cascades at 0.75, bloom 3 levels, clouds and the probe; High (a computer's first run) everything, as Studio's defaults | estimated (Roblox's mobile quality levels 1–10 thin out the same passes; the measurements are in docs/ANDROID.md) |
 
 ## New objects and the starter place
 

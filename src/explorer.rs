@@ -499,7 +499,11 @@ impl Editor {
             let clicked_out = ui.input(|i| {
                 i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !edit_rect.contains(p))
             });
-            if !clicked_out {
+            // (while lacking only, and not back from a loss, which ends the
+            // rename below: a request interrupts the IME, which hides and
+            // shows a soft keyboard again, and a keyboard the user hid
+            // releases the focus — android/keyboard.rs)
+            if !clicked_out && !edit.has_focus() && !edit.lost_focus() {
                 edit.request_focus();
             }
             let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));

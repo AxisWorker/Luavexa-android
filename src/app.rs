@@ -349,6 +349,10 @@ pub struct Editor {
     /// (camera aspect from it; drawn scaled into the panel): self-test
     /// steps that compare with a Studio capture at Studio's view size.
     pub view_render_size: Option<[u32; 2]>,
+    /// The 3D view's quality preset (View > Quality; src/quality.rs: Low
+    /// on phones, High on desktops; RUSTUDIO_QUALITY). Render scale and
+    /// ambient occlusion below start from it and can be set apart.
+    pub quality: crate::quality::Quality,
     /// The 3D view rendered at this fraction of the panel's pixels and
     /// drawn scaled up (View > Render Scale; 1 on desktops, less on phones,
     /// whose screens have more pixels than their GPUs like at 60 Hz).
@@ -455,9 +459,10 @@ impl RustudioApp {
             );
         }
         let render_state = cc.wgpu_render_state.clone();
-        let renderer = render_state
-            .as_ref()
-            .map(|rs| Renderer::new(&rs.device, &rs.queue));
+        // (the renderer is made below, once the saved layout has said
+        // which quality preset it is for)
+        let renderer = None;
+        let preset = crate::quality::RenderSettings::platform_default();
         let mut ed = Editor {
             dialogs: crate::file_dialog::Dialogs::new(cc.egui_ctx.clone()),
             doc: Document::new_place(),
@@ -548,10 +553,11 @@ impl RustudioApp {
             game_cursor_hidden: false,
             cursor_log: Vec::new(),
             view_render_size: None,
-            render_scale: std::env::var("RUSTUDIO_RENDER_SCALE").ok().and_then(|v| v.parse().ok()).map_or(1.0, |v: f32| v.clamp(0.25, 1.0)),
+            quality: preset.quality,
+            render_scale: preset.render_scale,
             touch: Default::default(),
             auto_zoom: false,
-            ssao: std::env::var("RUSTUDIO_SSAO").map_or(true, |v| v != "0"),
+            ssao: preset.ssao,
             view_reuse: crate::viewport::ViewReuse::new(
                 std::env::var("RUSTUDIO_VIEW_REUSE").map_or(cfg!(target_os = "android"), |v| v != "0"),
             ),
@@ -575,7 +581,7 @@ impl RustudioApp {
         for line in crate::crash::unseen_reports() {
             ed.error(line);
         }
-        if ed.renderer.is_none() {
+        if ed.render_state.is_none() {
             ed.error("No wgpu renderer available; the 3D viewport is disabled.");
         }
         let open_none = open.is_none();
@@ -654,6 +660,13 @@ impl RustudioApp {
             }
             layout = Some(crate::layout_store::Saver::new(saved.as_ref()));
         }
+        let settings = ed.render_settings();
+        ed.renderer = ed.render_state.as_ref().map(|rs| {
+            if crate::perf_log::on() {
+                eprintln!("render settings: {}", settings.describe(settings.scene_format(&rs.device)));
+            }
+            Renderer::new(&rs.device, &rs.queue, Some(&rs.adapter.get_info()), settings.clone())
+        });
         // Comparison captures (src/control.rs) want the 3D view as big as the
         // other program's: the view alone, no Explorer / Properties / Output.
         #[cfg(unix)]
@@ -750,6 +763,25 @@ impl Editor {
 // ------------------------------------------------------------------ actions
 
 impl Editor {
+    /// The quality preset, the render scale and ambient occlusion as set
+    /// here (View menu, saved layout), then the run's `RUSTUDIO_*`
+    /// switches over them (a device run's comparison wins over the saved
+    /// choices).
+    pub fn render_settings(&self) -> crate::quality::RenderSettings {
+        let mut s = crate::quality::RenderSettings::preset(self.quality);
+        s.render_scale = self.render_scale;
+        s.ssao = self.ssao;
+        s.with_env().normalized()
+    }
+
+    /// Chooses a preset: its render scale and ambient occlusion too.
+    pub fn set_quality(&mut self, quality: crate::quality::Quality) {
+        self.quality = quality;
+        let s = crate::quality::RenderSettings::preset(quality).with_env();
+        self.render_scale = s.render_scale;
+        self.ssao = s.ssao;
+    }
+
     pub fn set_document(&mut self, doc: Document) {
         // Another document closes the open project (open_project sets it again).
         self.project = None;
@@ -2390,7 +2422,6 @@ impl eframe::App for RustudioApp {
             self.text_menu.end_frame(&ctx);
         }
         if crate::perf_log::on() {
-            let (render_scale, ssao) = (self.ed.render_scale, self.ed.ssao);
             let (renderer, render_state) = (&self.ed.renderer, &self.ed.render_state);
             let view_reuse = &mut self.ed.view_reuse;
             self.perf.frame(
@@ -2403,19 +2434,26 @@ impl eframe::App for RustudioApp {
                     let view = renderer.as_ref().and_then(|r| r.target_size()).unwrap_or([0, 0]);
                     let (drawn, reused) = view_reuse.take_counts();
                     format!(
-                        "window {}x{} px at {ppp:.2} px/pt, 3D view {}x{} px (scale {render_scale:.2}, AO {}, shadow maps x{:.2}), 3D frames drawn {drawn} / shown again {reused}",
+                        "window {}x{} px at {ppp:.2} px/pt, 3D view {}x{} px ({}), 3D frames drawn {drawn} / shown again {reused}",
                         (r.width() * ppp).round(),
                         (r.height() * ppp).round(),
                         view[0],
                         view[1],
-                        if ssao { "on" } else { "off" },
-                        crate::sun_shadow::texel_scale(),
+                        renderer.as_ref().map_or_else(|| "no renderer".to_string(), |r| r.describe()),
                     )
                 },
                 || {
                     let rs = render_state.as_ref()?;
                     let i = rs.adapter.get_info();
-                    Some(format!("GPU {} ({:?}, {} {}), {:?}", i.name, i.backend, i.driver, i.driver_info, i.device_type))
+                    Some(format!(
+                        "GPU {} ({:?}, {} {}), {:?}; frame latency {} (swapchain images less one)",
+                        i.name,
+                        i.backend,
+                        i.driver,
+                        i.driver_info,
+                        i.device_type,
+                        crate::frame_latency()
+                    ))
                 },
             );
         }

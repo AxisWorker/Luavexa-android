@@ -19,22 +19,26 @@ const PASS_STRIDE: u64 = 256;
 const ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// Texels across, as a fraction of Studio's sizes (`mech::SUN_CASCADE_TILES`,
-/// the atlas, the depth map): 1 on a computer; on a phone
+/// the atlas, the depth map): the quality settings' `shadow_scale`
+/// (quality.rs: 1 at High, 0.75 at Medium, on a phone's Low
 /// `mech::SUN_SHADOW_TEXEL_SCALE_PHONE`, a quarter of the shadow fill and
 /// blur work for cascades whose texels are still finer than the view's
-/// pixels. `RUSTUDIO_SHADOW_SCALE` (0.25 to 1) overrides. Read once, before
-/// the renderer is made; the blur stays the same width in studs
-/// (`Cascade::level` counts texels).
+/// pixels; `RUSTUDIO_SHADOW_SCALE` overrides). The blur stays the same
+/// width in studs (`Cascade::level` counts texels).
 pub fn texel_scale() -> f32 {
-    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *SCALE.get_or_init(|| {
-        let default = if cfg!(target_os = "android") { mech::SUN_SHADOW_TEXEL_SCALE_PHONE } else { 1.0 };
-        std::env::var("RUSTUDIO_SHADOW_SCALE")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .filter(|s| s.is_finite())
-            .map_or(default, |s| s.clamp(0.25, 1.0))
-    })
+    f32::from_bits(SCALE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The scale in force: 1 until the renderer sets it from the quality
+/// settings (`RenderSettings::shadow_scale`: the Low preset's is
+/// mech::SUN_SHADOW_TEXEL_SCALE_PHONE; RUSTUDIO_SHADOW_SCALE overrides).
+static SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f80_0000);
+
+/// Sets the scale (render.rs, before its shadow atlas is made or remade;
+/// the cascades planned afterwards take it).
+pub fn set_texel_scale(scale: f32) {
+    let scale = if scale.is_finite() { scale.clamp(0.25, 1.0) } else { 1.0 };
+    SCALE.store(scale.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `v` texels at [`texel_scale`], rounded down to a multiple of 16 (so
@@ -614,7 +618,7 @@ mod tests {
     #[test]
     fn at_full_scale_the_tiles_pack_studios_atlas() {
         if texel_scale() != 1.0 {
-            return; // RUSTUDIO_SHADOW_SCALE set for this run
+            return; // another test's renderer set a scale
         }
         assert_eq!(tiles(), mech::SUN_CASCADE_TILES);
         assert_eq!(origins(), mech::SUN_CASCADE_ORIGINS);

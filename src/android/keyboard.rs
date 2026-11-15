@@ -18,6 +18,18 @@
 //! last look, without waiting for the answer (it comes a frame or two
 //! later); at other times nothing runs. egui keeps the last safe-area
 //! inset it was given, so the inset is set every frame, zero included.
+//!
+//! The keyboard is shown and hidden by egui-winit alone, from egui's IME
+//! output: up while a text field has the focus. The user hiding it (Back,
+//! the keyboard's own hide key) is invisible to the app: the field keeps
+//! the focus and nothing would bring the keyboard back but another tap —
+//! or a `request_focus` of the field, which egui counts as an IME
+//! interruption (egui-winit hides and shows the keyboard again at once).
+//! So the editor's fields ask for the focus only while they lack it
+//! (properties.rs, explorer.rs), and when the keyboard goes down while a
+//! field the keyboard was up for keeps the focus for [`HIDDEN_FOR`], the
+//! field's focus is released here: the edit ends (its text kept) as the
+//! user meant, and a tap starts it again.
 
 use std::time::{Duration, Instant};
 
@@ -27,6 +39,10 @@ use super::jni::KeyboardAnswer;
 
 /// How often the height is read while it matters.
 const POLL: Duration = Duration::from_millis(100);
+/// The keyboard down this long while the field it was up for keeps the
+/// focus: the user hid it (longer than its slide out, and than the hide
+/// and show of a focus move between fields).
+const HIDDEN_FOR: Duration = Duration::from_millis(300);
 /// A question the main thread hasn't answered in this long is given up
 /// on (it is busy with a pause or a configuration change) and asked again.
 const GIVE_UP: Duration = Duration::from_secs(1);
@@ -40,6 +56,10 @@ pub struct Keyboard {
     asked: Option<(Instant, KeyboardAnswer)>,
     /// The keyboard's height in pixels (0: down).
     height_px: i32,
+    /// The text field the keyboard was last seen up for.
+    up_for: Option<egui::Id>,
+    /// Since when it has been down with that field still focused.
+    down_since: Option<Instant>,
 }
 
 /// The focused widget when it is a text field (egui keeps a
@@ -84,13 +104,43 @@ impl Keyboard {
             // The keyboard slides in after the focus (and out after it):
             // keep looking while it matters, input or none.
             ctx.request_repaint_after(POLL);
+            self.hidden_by_user(ctx, now);
         } else {
             self.polled = None;
             self.asked = None;
+            self.up_for = None;
+            self.down_since = None;
         }
         // Every frame, down (zero) or up: egui keeps the last inset given.
         let bottom = self.height(ctx);
         raw.safe_area_insets = Some(SafeAreaInsets(MarginF32 { left: 0.0, right: 0.0, top: 0.0, bottom }));
+    }
+
+    /// Releases a text field's focus once the keyboard has been down for
+    /// [`HIDDEN_FOR`] with the field the keyboard was up for still
+    /// focused (the module comment).
+    fn hidden_by_user(&mut self, ctx: &egui::Context, now: Instant) {
+        let focused = focused_text(ctx);
+        if self.height_px > 0 {
+            self.up_for = focused;
+            self.down_since = None;
+            return;
+        }
+        match focused {
+            Some(id) if self.up_for == Some(id) => {
+                let since = *self.down_since.get_or_insert(now);
+                if now.duration_since(since) >= HIDDEN_FOR {
+                    log::info!("soft keyboard hidden by the user: the text field's focus released");
+                    ctx.memory_mut(|m| m.surrender_focus(id));
+                    self.up_for = None;
+                    self.down_since = None;
+                }
+            }
+            _ => {
+                self.up_for = None;
+                self.down_since = None;
+            }
+        }
     }
 
     /// The keyboard's height in points (0 while it is down).

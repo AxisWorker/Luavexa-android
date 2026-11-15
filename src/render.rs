@@ -17,10 +17,14 @@ use wgpu::util::DeviceExt;
 
 use crate::math::Xform;
 
-/// The scene is lit in linear light into this target...
-const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// The scene is lit in linear light into a target of the quality
+/// settings' format (`Renderer::scene_format`: Rgba16Float, or the 32-bit
+/// Rg11b10Ufloat without HDR, quality.rs)...
 /// ...and the post pass writes display values (gamma 2.0) here.
 const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// Depth of field's targets keep the circle of confusion in alpha
+/// (shader.wgsl fs_dof_h / fs_dof_v), whatever the scene's format.
+const DOF_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// EVSM moments of the local light shadow maps (Studio's warps of 5.54 keep
 /// e^(2·5.54) under half float's 65504).
@@ -45,8 +49,10 @@ pub struct LightShadows {
 }
 
 impl LightShadows {
-    fn new(device: &wgpu::Device) -> Self {
-        let side = crate::mech::LSHADOW_ATLAS;
+    /// `enabled` false (quality settings `light_shadows`): a 1 × 1 atlas
+    /// that is bound but never drawn or read (no light gets a slot).
+    fn new(device: &wgpu::Device, enabled: bool) -> Self {
+        let side = if enabled { crate::mech::LSHADOW_ATLAS } else { 1 };
         let tex = |label: &str, format, usage| {
             device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -126,7 +132,12 @@ impl LightShadows {
         })
     }
 }
-const SAMPLES: u32 = 4;
+
+/// The depth-of-field near field's passes (shader.wgsl fs_near_*), in order.
+const NEAR_PASSES: usize = 11;
+const NEAR_ENTRIES: [&str; NEAR_PASSES] = ["fs_near_h", "fs_near_v", "fs_near_mask0", "fs_near_mask1", "fs_near_mask2", "fs_near_mask3", "fs_near_mask4", "fs_near_mask5", "fs_near_edge", "fs_near_bokeh", "fs_near_tent"];
+/// The bloom pyramid's levels at most (half resolution down to 1/64).
+pub const BLOOM_LEVELS: usize = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -486,7 +497,7 @@ mod gpu_tests {
         limits.max_sampled_textures_per_shader_stage = 24;
         limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() })).unwrap();
-        let mut renderer = Renderer::new(&device, &queue);
+        let mut renderer = Renderer::new(&device, &queue, None, crate::quality::RenderSettings::preset(crate::quality::Quality::High));
         let mut vox = crate::terrain::Voxels::empty();
         // Same FillBlock: x,z in [0,32), y in [-16,0), full Grass voxels.
         for x in 0..8 { for y in -4..0 { for z in 0..8 { vox.set([x,y,z],2,1.0); } } }
@@ -527,12 +538,18 @@ mod gpu_tests {
         let desc = wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() };
         let (device, queue) = pollster::block_on(adapter.request_device(&desc))
             .unwrap_or_else(|e| panic!("{} ({:?}) refused rustudio's limits: {e}", info.name, info.backend));
-        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let r = Renderer::new(&device, &queue);
-        drop(r);
-        let err = pollster::block_on(scope.pop());
-        assert!(err.is_none(), "{} ({:?}): {err:?}", info.name, info.backend);
-        eprintln!("renderer built on {} ({:?})", info.name, info.backend);
+        // Every preset: the multisampled shader and the plain one, the
+        // HDR scene format and (where the device has it) the 32-bit one.
+        for quality in crate::quality::Quality::ALL {
+            let settings = crate::quality::RenderSettings::preset(quality);
+            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let r = Renderer::new(&device, &queue, None, settings);
+            r.build_all_pipelines();
+            drop(r);
+            let err = pollster::block_on(scope.pop());
+            assert!(err.is_none(), "{} ({:?}) at {quality:?}: {err:?}", info.name, info.backend);
+            eprintln!("renderer built on {} ({:?}) at {quality:?}", info.name, info.backend);
+        }
     }
 }
 
@@ -875,9 +892,11 @@ struct Mesh {
 
 struct Target {
     size: [u32; 2],
-    msaa: wgpu::TextureView,
+    /// The multisampled scene, resolved into `hdr`; None without MSAA
+    /// (the passes draw into `hdr` directly).
+    msaa: Option<wgpu::TextureView>,
     depth: wgpu::TextureView,
-    /// The resolved scene in linear light.
+    /// The resolved scene in linear light (`Renderer::scene_format`).
     hdr: wgpu::Texture,
     hdr_view: wgpu::TextureView,
     /// The opaque scene's colour, copied for the water pass to look through.
@@ -887,27 +906,54 @@ struct Target {
     water_depth: wgpu::TextureView,
     glass_bg: wgpu::BindGroup,
     glass_depth: wgpu::TextureView,
+    /// The post pass's inputs: the scene, the bloom (or black) and the far
+    /// field (or black).
     hdr_bg: wgpu::BindGroup,
+    /// Group 2 of the post pass: the depth and the near field (or black).
     post_depth_bg: wgpu::BindGroup,
-    dof_bgs: [wgpu::BindGroup; 2],
-    near_bgs: Vec<wgpu::BindGroup>,
-    near_views: Vec<wgpu::TextureView>,
-    dof_views: [wgpu::TextureView; 2],
-    /// Linear bloom pyramid, from half resolution through 1/32 resolution.
-    bloom_view: wgpu::TextureView,
-    bloom_bright_capture: Option<wgpu::Texture>,
-    bloom_textures: Vec<wgpu::Texture>,
-    bloom_levels: Vec<wgpu::TextureView>,
-    bloom_down_bgs: Vec<wgpu::BindGroup>,
-    bloom_up_bgs: Vec<wgpu::BindGroup>,
-    /// SSAO at half resolution: the AO depth, then (occlusion, depth) ping-
-    /// ponged through the blurs; a bind group per pass (depth + its input).
-    ssao_depth_view: wgpu::TextureView,
-    ssao_views: [wgpu::TextureView; 2],
-    ssao_bgs: [wgpu::BindGroup; 4],
+    /// Group 2 with the depth alone (black input): the glass depth
+    /// snapshot, SSAO's depth down and the far field's CoC.
+    depth_bg: wgpu::BindGroup,
+    /// Depth of field's targets, when the settings have it.
+    dof: Option<DofTargets>,
+    /// The bloom pyramid, when the settings have it.
+    bloom: Option<BloomTargets>,
+    /// SSAO's half-resolution targets, when the settings have it.
+    ssao: Option<SsaoTargets>,
     /// The tone-mapped image egui shows.
     display: wgpu::Texture,
     display_view: wgpu::TextureView,
+}
+
+/// Depth of field: the far field (two full-resolution passes) and the
+/// near field (NEAR_PASSES quarter-resolution passes), DOF_FORMAT.
+struct DofTargets {
+    bgs: [wgpu::BindGroup; 2],
+    views: [wgpu::TextureView; 2],
+    near_bgs: Vec<wgpu::BindGroup>,
+    near_views: Vec<wgpu::TextureView>,
+}
+
+/// The linear bloom pyramid, from half resolution down a level each
+/// (`RenderSettings::bloom_levels` of them at most).
+struct BloomTargets {
+    /// Level 0 (half resolution): what the post pass adds.
+    view: wgpu::TextureView,
+    bright_capture: Option<wgpu::Texture>,
+    textures: Vec<wgpu::Texture>,
+    levels: Vec<wgpu::TextureView>,
+    down_bgs: Vec<wgpu::BindGroup>,
+    up_bgs: Vec<wgpu::BindGroup>,
+}
+
+/// SSAO at half resolution: the AO depth, then (occlusion, depth) ping-
+/// ponged through the blurs; a bind group per pass (depth + its input):
+/// occlusion (reads the AO depth), blur across (reads a; the apply too),
+/// blur down (reads b).
+struct SsaoTargets {
+    depth_view: wgpu::TextureView,
+    views: [wgpu::TextureView; 2],
+    bgs: [wgpu::BindGroup; 3],
 }
 
 /// GPU time of a drawn frame's sections, by timestamp queries (when the
@@ -1024,13 +1070,468 @@ impl GpuTimer {
     }
 }
 
+/// A render pipeline of the 3D view. Each is made on first use ([`Pipes`]),
+/// so starting takes the shader module alone and a frame compiles only
+/// what it draws; a thread warms the rest in the background.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pipe {
+    Sky,
+    Opaque,
+    OpaqueTwoSided,
+    DecalDepth,
+    Transparent,
+    TransparentCulled,
+    Glass,
+    GlassCulled,
+    Overlay,
+    Lines,
+    Water,
+    Terrain,
+    Shadow,
+    TerrainShadow,
+    TerrainShadowBack,
+    LightShadow,
+    GlassResolve,
+    SsaoDown,
+    SsaoMain,
+    SsaoBlurX,
+    SsaoBlurY,
+    SsaoApply,
+    BloomBright,
+    BloomDown,
+    BloomUp,
+    DofH,
+    DofV,
+    /// One of the near field's passes (NEAR_ENTRIES).
+    Near(usize),
+    Post,
+}
+
+impl Pipe {
+    const COUNT: usize = 28 + NEAR_PASSES;
+
+    fn index(self) -> usize {
+        match self {
+            Pipe::Sky => 0,
+            Pipe::Opaque => 1,
+            Pipe::OpaqueTwoSided => 2,
+            Pipe::DecalDepth => 3,
+            Pipe::Transparent => 4,
+            Pipe::TransparentCulled => 5,
+            Pipe::Glass => 6,
+            Pipe::GlassCulled => 7,
+            Pipe::Overlay => 8,
+            Pipe::Lines => 9,
+            Pipe::Water => 10,
+            Pipe::Terrain => 11,
+            Pipe::Shadow => 12,
+            Pipe::TerrainShadow => 13,
+            Pipe::TerrainShadowBack => 14,
+            Pipe::LightShadow => 15,
+            Pipe::GlassResolve => 16,
+            Pipe::SsaoDown => 17,
+            Pipe::SsaoMain => 18,
+            Pipe::SsaoBlurX => 19,
+            Pipe::SsaoBlurY => 20,
+            Pipe::SsaoApply => 21,
+            Pipe::BloomBright => 22,
+            Pipe::BloomDown => 23,
+            Pipe::BloomUp => 24,
+            Pipe::DofH => 25,
+            Pipe::DofV => 26,
+            Pipe::Post => 27,
+            Pipe::Near(i) => 28 + i.min(NEAR_PASSES - 1),
+        }
+    }
+
+    /// Every pipeline, the ones a first frame needs first (the warm-up
+    /// thread's order).
+    fn all() -> Vec<Pipe> {
+        let mut v = vec![
+            Pipe::Sky,
+            Pipe::Opaque,
+            Pipe::OpaqueTwoSided,
+            Pipe::Post,
+            Pipe::Lines,
+            Pipe::Shadow,
+            Pipe::Transparent,
+            Pipe::TransparentCulled,
+            Pipe::DecalDepth,
+            Pipe::Overlay,
+            Pipe::Terrain,
+            Pipe::TerrainShadow,
+            Pipe::Glass,
+            Pipe::GlassCulled,
+            Pipe::GlassResolve,
+            Pipe::Water,
+            Pipe::LightShadow,
+            Pipe::SsaoDown,
+            Pipe::SsaoMain,
+            Pipe::SsaoBlurX,
+            Pipe::SsaoBlurY,
+            Pipe::SsaoApply,
+            Pipe::BloomBright,
+            Pipe::BloomDown,
+            Pipe::BloomUp,
+            Pipe::DofH,
+            Pipe::DofV,
+        ];
+        v.extend((0..NEAR_PASSES).map(Pipe::Near));
+        v.push(Pipe::TerrainShadowBack);
+        v
+    }
+
+    /// Whether the settings can draw with this pipeline at all (the
+    /// warm-up skips the others; turned on later they compile on first use).
+    fn wanted(self, s: &crate::quality::RenderSettings) -> bool {
+        match self {
+            Pipe::Shadow | Pipe::TerrainShadow => s.sun_cascades > 0,
+            Pipe::TerrainShadowBack => false, // (a diagnostic: RUSTUDIO_CULL_BACK)
+            Pipe::LightShadow => s.light_shadows,
+            Pipe::SsaoDown | Pipe::SsaoMain | Pipe::SsaoBlurX | Pipe::SsaoBlurY | Pipe::SsaoApply => s.ssao,
+            Pipe::BloomBright | Pipe::BloomDown | Pipe::BloomUp => s.bloom_levels > 0,
+            Pipe::DofH | Pipe::DofV | Pipe::Near(_) => s.dof,
+            _ => true,
+        }
+    }
+}
+
+/// The driver's pipeline cache kept on disk (wgpu PIPELINE_CACHE, Vulkan):
+/// a second start finds its pipelines compiled.
+struct DiskCache {
+    cache: wgpu::PipelineCache,
+    path: std::path::PathBuf,
+}
+
+impl DiskCache {
+    fn open(device: &wgpu::Device, info: &wgpu::AdapterInfo) -> Option<Self> {
+        if !device.features().contains(wgpu::Features::PIPELINE_CACHE) || std::env::var_os("RUSTUDIO_NO_PIPELINE_CACHE").is_some() {
+            return None;
+        }
+        let key = wgpu::util::pipeline_cache_key(info)?;
+        let path = crate::paths::cache().join(format!("{key}.bin"));
+        let data = std::fs::read(&path).ok();
+        // SAFETY: the data is what this program wrote from `get_data` of
+        // a cache for the same adapter (the key); wgpu and the driver
+        // validate its header and fall back to an empty cache otherwise.
+        let cache = unsafe {
+            device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor { label: Some("rustudio pipelines"), data: data.as_deref(), fallback: true })
+        };
+        Some(Self { cache, path })
+    }
+
+    fn save(&self) {
+        let Some(data) = self.cache.get_data() else { return };
+        if std::fs::read(&self.path).is_ok_and(|old| old == data) {
+            return;
+        }
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = self.path.with_extension("tmp");
+        if std::fs::write(&tmp, &data).is_ok() {
+            let _ = std::fs::rename(&tmp, &self.path);
+        }
+    }
+}
+
+/// What every pipeline is made from: the shader module, the layouts, the
+/// scene's format and sample count (quality.rs).
+struct PipeFactory {
+    device: wgpu::Device,
+    shader: wgpu::ShaderModule,
+    disk: Option<DiskCache>,
+    samples: u32,
+    scene_format: wgpu::TextureFormat,
+    /// Globals + textures.
+    layout: wgpu::PipelineLayout,
+    /// + the glass scene snapshot (fs_part).
+    part_layout: wgpu::PipelineLayout,
+    water_layout: wgpu::PipelineLayout,
+    lshadow_layout: wgpu::PipelineLayout,
+    shadow_layout: wgpu::PipelineLayout,
+    terrain_layout: wgpu::PipelineLayout,
+    /// Globals + textures + the scene's depth (post, DoF).
+    post_layout: wgpu::PipelineLayout,
+    /// Globals + the scene's depth (SSAO, the glass depth snapshot).
+    ssao_layout: wgpu::PipelineLayout,
+}
+
+impl PipeFactory {
+    fn build(&self, p: Pipe) -> wgpu::RenderPipeline {
+        use wgpu::CompareFunction as C;
+        use wgpu::PrimitiveTopology as T;
+        let device = &self.device;
+        let shader = &self.shader;
+        let cache = self.disk.as_ref().map(|d| &d.cache);
+        let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 8 => Float32x2, 12 => Float32x4, 11 => Float32x4];
+        let vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &vertex_attrs,
+        };
+        let instance_attrs = wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 9 => Float32x4, 10 => Float32x4];
+        let instance_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<InstanceRaw>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &instance_attrs,
+        };
+        let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+        let line_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<LineVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &line_attrs,
+        };
+        let terrain_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Uint8x4, 3 => Uint8x4, 4 => Uint8x4, 5 => Float32x4];
+        let terrain_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<crate::terrain::TerrainVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &terrain_attrs,
+        };
+        let parts = [Some(vertex_layout.clone()), Some(instance_layout.clone())];
+        let ms = wgpu::MultisampleState { count: self.samples, mask: !0, alpha_to_coverage_enabled: false };
+        let depth = |write: bool, compare: wgpu::CompareFunction| {
+            Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(write),
+                depth_compare: Some(compare),
+                stencil: Default::default(),
+                bias: Default::default(),
+            })
+        };
+        // A scene pass's pipeline: multisampled into the scene's format.
+        let make = |label: &str,
+                    vs: &str,
+                    fs: &str,
+                    buffers: &[Option<wgpu::VertexBufferLayout>],
+                    topology: wgpu::PrimitiveTopology,
+                    cull: Option<wgpu::Face>,
+                    depth_write: bool,
+                    depth_compare: wgpu::CompareFunction,
+                    blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(if fs == "fs_part" || fs == "fs_decal_depth" { &self.part_layout } else { &self.layout }),
+                vertex: wgpu::VertexState { module: shader, entry_point: Some(vs), compilation_options: Default::default(), buffers },
+                primitive: wgpu::PrimitiveState { topology, cull_mode: cull, ..Default::default() },
+                depth_stencil: depth(depth_write, depth_compare),
+                multisample: ms,
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.scene_format,
+                        blend,
+                        write_mask: if fs == "fs_decal_depth" { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL },
+                    })],
+                }),
+                multiview_mask: None,
+                cache,
+            })
+        };
+        // A depth-only pass into a shadow map, both sides unless culled
+        // (`fs`: a fragment stage and its target's format, for moments).
+        let depth_only = |label: &str, layout: &wgpu::PipelineLayout, vs: &str, buffers: &[Option<wgpu::VertexBufferLayout>], cull: Option<wgpu::Face>, fs: Option<(&str, wgpu::TextureFormat)>| {
+            let targets = [Some(wgpu::ColorTargetState { format: fs.map_or(LSHADOW_FORMAT, |f| f.1), blend: None, write_mask: wgpu::ColorWrites::ALL })];
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState { module: shader, entry_point: Some(vs), compilation_options: Default::default(), buffers },
+                primitive: wgpu::PrimitiveState { topology: T::TriangleList, cull_mode: cull, ..Default::default() },
+                depth_stencil: depth(true, C::LessEqual),
+                multisample: Default::default(),
+                fragment: fs.map(|(entry, _)| wgpu::FragmentState { module: shader, entry_point: Some(entry), compilation_options: Default::default(), targets: &targets }),
+                multiview_mask: None,
+                cache,
+            })
+        };
+        // A full-screen pass (vs_post) into one target.
+        let fullscreen = |label: &str, layout: &wgpu::PipelineLayout, fs: &str, format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState { module: shader, entry_point: Some("vs_post"), compilation_options: Default::default(), buffers: &[] },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                multiview_mask: None,
+                cache,
+            })
+        };
+        let premul = Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+        match p {
+            Pipe::Sky => make("sky", "vs_sky", "fs_sky", &[], T::TriangleList, None, false, C::Always, None),
+            Pipe::Opaque => make("parts", "vs_part", "fs_part", &parts, T::TriangleList, Some(wgpu::Face::Back), true, C::Greater, None),
+            Pipe::OpaqueTwoSided => make("parts-two-sided", "vs_part", "fs_part", &parts, T::TriangleList, None, true, C::Greater, None),
+            // fs_part writes premultiplied colour (round 26): see-through
+            // Neon adds its glow with cover 0, everything else blends as before.
+            Pipe::DecalDepth => make("decal opaque texel depth", "vs_part", "fs_decal_depth", &parts, T::TriangleList, None, true, C::Greater, None),
+            Pipe::Transparent => make("parts-transparent", "vs_part", "fs_part", &parts, T::TriangleList, None, false, C::GreaterEqual, premul),
+            // See-through built-in shapes show their front faces only, as in
+            // Studio (round 19: from inside a translucent part it draws nothing).
+            Pipe::TransparentCulled => make("parts-transparent-culled", "vs_part", "fs_part", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::GreaterEqual, premul),
+            // GlassTransparentFS already composites the opaque scene. Replace
+            // RGB and preserve its energy-derived alpha; ordinary transparents
+            // remain premultiplied One / OneMinusSrcAlpha.
+            Pipe::Glass => make("glass-composite", "vs_part", "fs_part", &parts, T::TriangleList, None, false, C::Greater, None),
+            Pipe::GlassCulled => make("glass-composite-culled", "vs_part", "fs_part", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None),
+            // Hover highlight: the same geometry again, on top of itself.
+            Pipe::Overlay => make("parts-overlay", "vs_part", "fs_part", &parts, T::TriangleList, None, false, C::GreaterEqual, premul),
+            Pipe::Lines => make("lines", "vs_line", "fs_line", &[Some(line_layout)], T::LineList, None, false, C::GreaterEqual, Some(wgpu::BlendState::ALPHA_BLENDING)),
+            // Terrain water (water.rs): its own depth attachment, the scene's format.
+            Pipe::Water => device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("water"),
+                layout: Some(&self.water_layout),
+                vertex: wgpu::VertexState { module: shader, entry_point: Some("vs_water"), compilation_options: Default::default(), buffers: &parts },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: depth(true, C::Greater),
+                multisample: ms,
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_water"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format: self.scene_format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                multiview_mask: None,
+                cache,
+            }),
+            // Smooth terrain (round 21): its own vertices (terrain.rs
+            // TerrainVertex) and per-palette parameters in group 1.
+            Pipe::Terrain => device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("terrain"),
+                layout: Some(&self.terrain_layout),
+                vertex: wgpu::VertexState { module: shader, entry_point: Some("vs_terrain"), compilation_options: Default::default(), buffers: &[Some(terrain_vertex_layout.clone())] },
+                primitive: wgpu::PrimitiveState { topology: T::TriangleList, cull_mode: Some(wgpu::Face::Back), ..Default::default() },
+                depth_stencil: depth(true, C::Greater),
+                multisample: ms,
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_terrain"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format: self.scene_format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                multiview_mask: None,
+                cache,
+            }),
+            // A cascade of the sun's shadow: depth only, both sides (thin
+            // parts). No depth bias: the EVSM test's minimum variance is the bias.
+            Pipe::Shadow => depth_only("shadow", &self.shadow_layout, "vs_shadow", &parts, None, None),
+            Pipe::TerrainShadow => depth_only("terrain shadow", &self.shadow_layout, "vs_terrain_shadow", &[Some(terrain_vertex_layout.clone())], None, None),
+            Pipe::TerrainShadowBack => depth_only("terrain shadow", &self.shadow_layout, "vs_terrain_shadow", &[Some(terrain_vertex_layout.clone())], Some(wgpu::Face::Back), None),
+            // Local light shadow faces: EVSM moments + depth, both sides.
+            Pipe::LightShadow => depth_only("light shadow", &self.lshadow_layout, "vs_light_shadow", &parts, None, Some(("fs_light_shadow", LSHADOW_FORMAT))),
+            Pipe::GlassResolve => fullscreen("glass depth", &self.ssao_layout, "fs_glass_depth", wgpu::TextureFormat::R32Float, None),
+            Pipe::SsaoDown => fullscreen("ssao depth", &self.ssao_layout, "fs_ssao_down", wgpu::TextureFormat::R32Float, None),
+            Pipe::SsaoMain => fullscreen("ssao", &self.ssao_layout, "fs_ssao", wgpu::TextureFormat::Rg32Float, None),
+            Pipe::SsaoBlurX => fullscreen("ssao blur across", &self.ssao_layout, "fs_ssao_blur_x", wgpu::TextureFormat::Rg32Float, None),
+            Pipe::SsaoBlurY => fullscreen("ssao blur down", &self.ssao_layout, "fs_ssao_blur_y", wgpu::TextureFormat::Rg32Float, None),
+            // SSAOApply: the scene × the occlusion.
+            Pipe::SsaoApply => fullscreen(
+                "ssao apply",
+                &self.ssao_layout,
+                "fs_ssao_apply",
+                self.scene_format,
+                Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::Src, operation: wgpu::BlendOperation::Add },
+                    alpha: wgpu::BlendComponent::OVER,
+                }),
+            ),
+            Pipe::BloomBright => fullscreen("bloom bright", &self.layout, "fs_bloom_bright", self.scene_format, None),
+            Pipe::BloomDown => fullscreen("bloom pyramid down", &self.layout, "fs_bloom_down", self.scene_format, None),
+            Pipe::BloomUp => fullscreen(
+                "bloom pyramid up",
+                &self.layout,
+                "fs_bloom_up",
+                self.scene_format,
+                Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+                    alpha: wgpu::BlendComponent::REPLACE,
+                }),
+            ),
+            Pipe::DofH => fullscreen("dof prepare", &self.post_layout, "fs_dof_h", DOF_FORMAT, None),
+            Pipe::DofV => fullscreen("dof down", &self.layout, "fs_dof_v", DOF_FORMAT, None),
+            Pipe::Near(i) => fullscreen("dof near", &self.post_layout, NEAR_ENTRIES[i.min(NEAR_PASSES - 1)], DOF_FORMAT, None),
+            // Exposure, tone mapping, bloom and colour correction into the display texture.
+            Pipe::Post => fullscreen("post", &self.post_layout, "fs_post", DISPLAY_FORMAT, None),
+        }
+    }
+}
+
+/// The 3D view's pipelines, each made on first use (and by the warm-up
+/// thread `Renderer::new` starts, in `Pipe::all` order, so a scene opened
+/// a few seconds in finds most of them ready). Shared with that thread.
+pub struct Pipes {
+    factory: PipeFactory,
+    cells: [std::sync::OnceLock<wgpu::RenderPipeline>; Pipe::COUNT],
+    /// Set when the renderer moved on to another build (`rebuild`): the
+    /// warm-up thread stops at its next pipeline.
+    dropped: std::sync::atomic::AtomicBool,
+}
+
+impl Pipes {
+    fn new(factory: PipeFactory) -> Self {
+        Self { factory, cells: std::array::from_fn(|_| std::sync::OnceLock::new()), dropped: std::sync::atomic::AtomicBool::new(false) }
+    }
+
+    /// Tells a warm-up thread still making these to stop.
+    fn abandon(&self) {
+        self.dropped.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The pipeline, made now if it is not yet (another thread making it
+    /// already is waited for).
+    pub fn get(&self, p: Pipe) -> &wgpu::RenderPipeline {
+        self.cells[p.index()].get_or_init(|| {
+            let _b = crate::bench::scope("pipeline_build");
+            self.factory.build(p)
+        })
+    }
+
+    /// Makes every pipeline `settings` can use (all of them with None),
+    /// then writes the driver's cache to disk.
+    pub fn build_all(&self, settings: Option<&crate::quality::RenderSettings>) {
+        for p in Pipe::all() {
+            if self.dropped.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            if settings.is_none_or(|s| p.wanted(s)) {
+                self.get(p);
+            }
+        }
+        if let Some(d) = self.factory.disk.as_ref() {
+            d.save();
+        }
+    }
+
+    /// How many are made so far (the perf log).
+    pub fn ready(&self) -> usize {
+        self.cells.iter().filter(|c| c.get().is_some()).count()
+    }
+}
+
 pub struct Renderer {
+    /// The quality settings in force (quality.rs; `set_settings`).
+    settings: crate::quality::RenderSettings,
+    /// The settings the pipelines, layouts and atlases were built for
+    /// (`RenderSettings::build_key`): a change rebuilds them.
+    built_key: (u32, bool, u32, bool),
+    /// The scene's sample count and colour format, from the settings.
+    samples: u32,
+    scene_format: wgpu::TextureFormat,
+    /// The viewport shader's pipelines, made on first use.
+    pipes: std::sync::Arc<Pipes>,
     /// SurfaceGuis / BillboardGuis tested against the scene's depth (round 23).
     world_gui: Option<crate::world_gui::WorldGuiPass>,
     /// Terrain water (round 24, water.rs).
     water: crate::water::WaterPass,
     glass_layout: wgpu::BindGroupLayout,
-    glass_resolve: wgpu::RenderPipeline,
     material_epoch: Instant,
     /// Fog for the world GUI pass (gui_fog).
     gui_fog: ([f32; 4], [f32; 3]),
@@ -1040,45 +1541,18 @@ pub struct Renderer {
     gui_sun_params: [f32; 4],
     /// Local lights in lights_buf this frame (the effects read them).
     gui_n_lights: u32,
-    sky: wgpu::RenderPipeline,
-    opaque: wgpu::RenderPipeline,
-    transparent: wgpu::RenderPipeline,
-    decal_depth: wgpu::RenderPipeline,
-    transparent_culled: wgpu::RenderPipeline,
-    glass: wgpu::RenderPipeline,
-    glass_culled: wgpu::RenderPipeline,
-    opaque_two_sided: wgpu::RenderPipeline,
-    lines: wgpu::RenderPipeline,
-    post: wgpu::RenderPipeline,
     post_dof: bool,
     post_dof_near: bool,
-    dof_h: wgpu::RenderPipeline,
-    dof_v: wgpu::RenderPipeline,
-    near_pipelines: Vec<wgpu::RenderPipeline>,
-    /// Studio's SSAO passes (shader.wgsl "SSAO"): depth down, occlusion,
-    /// blur across, blur down, and the multiply into the HDR scene.
+    /// Group 2 of the post / SSAO pipelines: the scene's depth, an input
+    /// and the scene copy (shader.wgsl "SSAO").
     ssao_layout: wgpu::BindGroupLayout,
-    ssao_down: wgpu::RenderPipeline,
-    ssao_main: wgpu::RenderPipeline,
-    ssao_blur_x: wgpu::RenderPipeline,
-    ssao_blur_y: wgpu::RenderPipeline,
-    ssao_apply: wgpu::RenderPipeline,
-    /// Bloom: bright pass, blur across (two targets), blur down.
-    bloom_bright: wgpu::RenderPipeline,
-    bloom_down: wgpu::RenderPipeline,
-    bloom_up: wgpu::RenderPipeline,
     post_bloom_size: f32,
-    shadow: wgpu::RenderPipeline,
-    /// Local light shadow maps (Studio's Future path) and their pass.
+    /// Local light shadow maps (Studio's Future path).
     lshadow: LightShadows,
-    lshadow_pipe: wgpu::RenderPipeline,
     /// Bumped whenever the static instances change (light shadow cache key).
     static_gen: u64,
     /// Smooth terrain (round 21): per-chunk triangle buffers, drawn with
     /// Studio's terrain shading, and their per-palette parameters.
-    terrain: wgpu::RenderPipeline,
-    terrain_shadow: wgpu::RenderPipeline,
-    terrain_shadow_back: wgpu::RenderPipeline,
     terrain_params_buf: wgpu::Buffer,
     terrain_bg: wgpu::BindGroup,
     terrain_chunks: HashMap<[i32; 3], TerrainChunk>,
@@ -1130,7 +1604,6 @@ pub struct Renderer {
     sampler: wgpu::Sampler,
     /// Texture bind groups; index 0 is plain white.
     textures: Vec<wgpu::BindGroup>,
-    overlay: wgpu::RenderPipeline,
     /// Per-frame instances: moving and see-through parts, overlay.
     instance_buf: wgpu::Buffer,
     instance_cap: usize,
@@ -1161,21 +1634,22 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("rustudio viewport"),
-            source: wgpu::ShaderSource::Wgsl(shader_source().into()),
-        });
-        let uniform_entry = wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
+    /// `info`: the adapter, for the pipeline cache kept on disk (None: no
+    /// cache). The pipelines themselves are made on first use and by a
+    /// background thread; `build_all_pipelines` makes them all now.
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, info: Option<&wgpu::AdapterInfo>, settings: crate::quality::RenderSettings) -> Self {
+        let settings = settings.normalized();
+        let samples = settings.msaa;
+        let scene_format = settings.scene_format(device);
+        crate::sun_shadow::set_texel_scale(settings.shadow_scale);
+        let shader = {
+            let _b = crate::bench::scope("shader_module");
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("rustudio viewport"),
+                source: wgpu::ShaderSource::Wgsl(shader_source(&settings).into()),
+            })
         };
+        let uniform_entry = Self::uniform_entry();
         let frag = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -1447,11 +1921,11 @@ impl Renderer {
             anisotropy_clamp: crate::mech::TEXTURE_ANISOTROPY,
             ..Default::default()
         });
-        let lshadow = LightShadows::new(device);
+        let lshadow = LightShadows::new(device, settings.light_shadows);
         let sun = crate::sun_shadow::SunShadows::new(device, &shadow_view);
         // Studio's scene environment probe (env_probe.rs): binding 13 is its
         // current slot, 21 the slot it blends to.
-        let probe = env_probe_gpu::ProbeGpu::new(device, queue, SAMPLES, DEPTH_FORMAT, std::mem::size_of::<Globals>() as u64);
+        let probe = env_probe_gpu::ProbeGpu::new(device, queue, samples, scene_format, DEPTH_FORMAT, std::mem::size_of::<Globals>() as u64);
         let probe_globals_bg = Self::globals_group(
             device,
             &bgl,
@@ -1582,249 +2056,22 @@ impl Renderer {
             bind_group_layouts: &[Some(&bgl), Some(&tex_layout)],
             immediate_size: 0,
         });
-
         let part_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("parts with glass scene"),
             bind_group_layouts: &[Some(&bgl), Some(&tex_layout), Some(&glass_layout)],
             immediate_size: 0,
         });
-        let vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 8 => Float32x2, 12 => Float32x4, 11 => Float32x4],
-        };
-        let instance_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<InstanceRaw>() as u64,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 9 => Float32x4, 10 => Float32x4],
-        };
-        let line_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<LineVertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
-        };
-
-        let ms = wgpu::MultisampleState {
-            count: SAMPLES,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        };
-        let make = |label: &str,
-                    vs: &str,
-                    fs: &str,
-                    buffers: &[Option<wgpu::VertexBufferLayout>],
-                    topology: wgpu::PrimitiveTopology,
-                    cull: Option<wgpu::Face>,
-                    depth_write: bool,
-                    depth_compare: wgpu::CompareFunction,
-                    blend: Option<wgpu::BlendState>| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(if fs == "fs_part" || fs == "fs_decal_depth" { &part_layout } else { &layout }),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some(vs),
-                    compilation_options: Default::default(),
-                    buffers,
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology,
-                    cull_mode: cull,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(depth_write),
-                    depth_compare: Some(depth_compare),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: ms,
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: HDR_FORMAT,
-                        blend,
-                        write_mask: if fs == "fs_decal_depth" { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL },
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        use wgpu::CompareFunction as C;
-        use wgpu::PrimitiveTopology as T;
-        let sky = make(
-            "sky",
-            "vs_sky",
-            "fs_sky",
-            &[],
-            T::TriangleList,
-            None,
-            false,
-            C::Always,
-            None,
-        );
-        let opaque = make(
-            "parts",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            Some(wgpu::Face::Back),
-            true,
-            C::Greater,
-            None,
-        );
-        let opaque_two_sided = make(
-            "parts-two-sided",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            None,
-            true,
-            C::Greater,
-            None,
-        );
-        // fs_part writes premultiplied colour (round 26): see-through Neon
-        // adds its glow with cover 0, everything else blends as before.
-        let decal_depth = make("decal opaque texel depth", "vs_part", "fs_decal_depth",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList, None, true, C::Greater, None);
-        let transparent = make(
-            "parts-transparent",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            None,
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-        );
-        // See-through built-in shapes show their front faces only, as in
-        // Studio (round 19: from inside a translucent part it draws nothing).
-        let transparent_culled = make(
-            "parts-transparent-culled",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            Some(wgpu::Face::Back),
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-        );
-        // GlassTransparentFS already composites the opaque scene. Replace RGB
-        // and preserve its energy-derived alpha; ordinary transparents remain
-        // premultiplied One / OneMinusSrcAlpha.
-        let glass = make("glass-composite", "vs_part", "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList, None, false, C::Greater, None);
-        let glass_culled = make("glass-composite-culled", "vs_part", "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None);
-        let water = crate::water::WaterPass::new(
-            device,
-            queue,
-            &shader,
-            &bgl,
-            &tex_layout,
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            HDR_FORMAT,
-            SAMPLES,
-        );
-        // Hover highlight: the same geometry again, on top of itself.
-        let overlay = make(
-            "parts-overlay",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            None,
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-        );
-        // Local light shadow faces: EVSM moments + depth, both sides.
+        let water = crate::water::WaterPass::new(device, queue, &bgl, &tex_layout, samples);
         let lshadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("light shadow"),
             bind_group_layouts: &[Some(&shadow_bgl), Some(&lshadow.face_layout)],
             immediate_size: 0,
         });
-        let lshadow_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("light shadow"),
-            layout: Some(&lshadow_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_light_shadow"),
-                compilation_options: Default::default(),
-                buffers: &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_light_shadow"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: LSHADOW_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        // A cascade of the sun's shadow: depth only, both sides (thin
-        // parts). No depth bias: the EVSM test's minimum variance is the bias.
         let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadow"),
             bind_group_layouts: &[Some(&shadow_bgl), Some(&sun.pass_layout)],
             immediate_size: 0,
         });
-        let shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("shadow"),
-            layout: Some(&shadow_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_shadow"),
-                compilation_options: Default::default(),
-                buffers: &[Some(vertex_layout), Some(instance_layout)],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: None,
-            multiview_mask: None,
-            cache: None,
-        });
-        // Smooth terrain (round 21): its own vertices (terrain.rs
-        // TerrainVertex) and per-palette parameters in group 1.
         let terrain_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrain params"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -1852,319 +2099,37 @@ impl Renderer {
                 resource: terrain_params_buf.as_entire_binding(),
             }],
         });
-        let terrain_vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<crate::terrain::TerrainVertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Uint8x4, 3 => Uint8x4, 4 => Uint8x4, 5 => Float32x4],
-        };
         let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("terrain"),
             bind_group_layouts: &[Some(&bgl), Some(&terrain_bgl)],
             immediate_size: 0,
         });
-        let terrain = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terrain"),
-            layout: Some(&terrain_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_terrain"),
-                compilation_options: Default::default(),
-                buffers: &[Some(terrain_vertex_layout.clone())],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::Greater),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: ms,
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_terrain"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: HDR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let terrain_shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terrain shadow"),
-            layout: Some(&shadow_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_terrain_shadow"),
-                compilation_options: Default::default(),
-                buffers: &[Some(terrain_vertex_layout.clone())],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: None,
-            multiview_mask: None,
-            cache: None,
-        });
-        let terrain_shadow_back = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terrain shadow"),
-            layout: Some(&shadow_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_terrain_shadow"),
-                compilation_options: Default::default(),
-                buffers: &[Some(terrain_vertex_layout.clone())],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: None,
-            multiview_mask: None,
-            cache: None,
-        });
-        // Exposure, tone mapping, bloom and colour correction into the display texture.
-        let fullscreen = |label: &str, fs: &str, targets: usize| {
-            let t = Some(wgpu::ColorTargetState {
-                format: HDR_FORMAT,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_post"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &vec![t; targets],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-
-
-        let dof_v = fullscreen("dof down", "fs_dof_v", 1);
-        let bloom_bright = fullscreen("bloom bright", "fs_bloom_bright", 1);
-        let bloom_down = fullscreen("bloom pyramid down", "fs_bloom_down", 1);
-        let bloom_up_desc = wgpu::RenderPipelineDescriptor {
-            label: Some("bloom pyramid up"), layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_post"), compilation_options: Default::default(), buffers: &[] },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_bloom_up"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: Some(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent::REPLACE }), write_mask: wgpu::ColorWrites::ALL })] }),
-            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
-        };
-        let bloom_up = device.create_render_pipeline(&bloom_up_desc);
-        let ssao_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("ssao"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: true,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None,
-                },
-            ],
-        });
+        let ssao_layout = Self::depth_layout(device, samples);
         let post_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("post with depth"),
             bind_group_layouts: &[Some(&bgl), Some(&tex_layout), Some(&ssao_layout)],
             immediate_size: 0,
-        });
-        let post = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("post"),
-            layout: Some(&post_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_post"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_post"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: DISPLAY_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let near_fullscreen = |label: &str, fs: &str, targets: usize| {
-            let t = Some(wgpu::ColorTargetState {
-                format: HDR_FORMAT,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&post_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_post"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &vec![t; targets],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let near_pipelines = ["fs_near_h", "fs_near_v", "fs_near_mask0", "fs_near_mask1", "fs_near_mask2", "fs_near_mask3", "fs_near_mask4", "fs_near_mask5", "fs_near_edge", "fs_near_bokeh", "fs_near_tent"].iter().map(|fs| near_fullscreen("dof near", fs, 1)).collect();
-        let dof_h = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("dof prepare"),
-            layout: Some(&post_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_post"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_dof_h"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: HDR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
         });
         let ssao_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ssao"),
             bind_group_layouts: &[Some(&bgl), Some(&ssao_layout)],
             immediate_size: 0,
         });
-        let ssao_pipe = |label: &str, fs: &str, format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&ssao_pl),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_post"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let glass_resolve = ssao_pipe("glass depth", "fs_glass_depth", wgpu::TextureFormat::R32Float, None);
-        let ssao_down = ssao_pipe("ssao depth", "fs_ssao_down", wgpu::TextureFormat::R32Float, None);
-        let ssao_main = ssao_pipe("ssao", "fs_ssao", wgpu::TextureFormat::Rg32Float, None);
-        let ssao_blur_x = ssao_pipe("ssao blur across", "fs_ssao_blur_x", wgpu::TextureFormat::Rg32Float, None);
-        let ssao_blur_y = ssao_pipe("ssao blur down", "fs_ssao_blur_y", wgpu::TextureFormat::Rg32Float, None);
-        // SSAOApply: the scene × the occlusion.
-        let ssao_apply = ssao_pipe(
-            "ssao apply",
-            "fs_ssao_apply",
-            HDR_FORMAT,
-            Some(wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::Zero,
-                    dst_factor: wgpu::BlendFactor::Src,
-                    operation: wgpu::BlendOperation::Add,
-                },
-                alpha: wgpu::BlendComponent::OVER,
-            }),
-        );
-        let lines = make(
-            "lines",
-            "vs_line",
-            "fs_line",
-            &[Some(line_layout)],
-            T::LineList,
-            None,
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::ALPHA_BLENDING),
-        );
+        let pipes = std::sync::Arc::new(Pipes::new(PipeFactory {
+            device: device.clone(),
+            shader,
+            disk: info.and_then(|i| DiskCache::open(device, i)),
+            samples,
+            scene_format,
+            layout,
+            part_layout,
+            water_layout: water.layout.clone(),
+            lshadow_layout,
+            shadow_layout,
+            terrain_layout,
+            post_layout,
+            ssao_layout: ssao_pl,
+        }));
 
         let meshes = build_meshes()
             .into_iter()
@@ -2182,6 +2147,11 @@ impl Renderer {
         let instance_cap = 1024;
         let line_cap = 4096;
         let mut r = Renderer {
+            built_key: settings.build_key(),
+            settings,
+            samples,
+            scene_format,
+            pipes,
             gui_fog: ([0.0, 1e9, 0.0, 0.0], [0.0; 3]),
             gui_sun: Default::default(),
             gui_lightgrid: [0.0; 4],
@@ -2190,37 +2160,11 @@ impl Renderer {
             world_gui: None,
             water,
             glass_layout,
-            glass_resolve,
             material_epoch: Instant::now(),
-            sky,
-            opaque,
-            opaque_two_sided,
-            transparent_culled,
-            glass,
-            glass_culled,
-            transparent,
-            decal_depth,
-            lines,
-            post,
             post_dof: false,
             post_dof_near: false,
             ssao_layout,
-            ssao_down,
-            ssao_main,
-            dof_h,
-            dof_v,
-            near_pipelines,
-            ssao_blur_x,
-            ssao_blur_y,
-            ssao_apply,
-            bloom_bright,
-            bloom_down,
-            bloom_up,
             post_bloom_size: 24.0,
-            shadow,
-            terrain,
-            terrain_shadow,
-            terrain_shadow_back,
             terrain_params_buf,
             terrain_bg,
             terrain_chunks: HashMap::new(),
@@ -2229,7 +2173,6 @@ impl Renderer {
             globals_bg,
             shadow_globals_bg,
             lshadow,
-            lshadow_pipe,
             static_gen: 0,
             globals_layout: bgl,
             lights_buf,
@@ -2257,7 +2200,6 @@ impl Renderer {
             sampler,
             textures: Vec::new(),
             black_view,
-            overlay,
             instance_buf: Self::make_buf(
                 device,
                 "instances",
@@ -2291,7 +2233,171 @@ impl Renderer {
             gpu_timer: GpuTimer::new(device, queue),
         };
         r.add_texture(device, queue, 1, 1, &[255, 255, 255, 255]);
+        r.warm_pipelines();
         r
+    }
+
+    /// Binding 0 of the globals (and the shadow passes' globals-only group).
+    fn uniform_entry() -> wgpu::BindGroupLayoutEntry {
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }
+    }
+
+    /// Group 2 of the post and SSAO pipelines: the scene's depth (as drawn:
+    /// multisampled or not), a pass's input and the scene copy.
+    fn depth_layout(device: &wgpu::Device, samples: u32) -> wgpu::BindGroupLayout {
+        let tex = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::FRAGMENT, ty, count: None };
+        let float = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false };
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssao"),
+            entries: &[
+                tex(0, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: samples > 1 }),
+                tex(1, float),
+                tex(2, float),
+            ],
+        })
+    }
+
+    /// Starts the thread that makes the pipelines the settings can use,
+    /// most needed first (`Pipe::all`), so the first scene drawn finds
+    /// them ready instead of compiling them in its frame. Not in tests
+    /// (they build on the calling thread and check the errors there).
+    fn warm_pipelines(&self) {
+        if cfg!(test) || std::env::var_os("RUSTUDIO_NO_PIPELINE_WARMUP").is_some() {
+            return;
+        }
+        let pipes = std::sync::Arc::clone(&self.pipes);
+        let settings = self.settings.clone();
+        let _ = std::thread::Builder::new().name("rustudio-pipelines".into()).spawn(move || {
+            let t0 = Instant::now();
+            pipes.build_all(Some(&settings));
+            if crate::perf_log::on() {
+                eprintln!("pipelines: {} ready after {:.1} s", pipes.ready(), t0.elapsed().as_secs_f32());
+            }
+        });
+    }
+
+    /// Makes every pipeline now, on this thread (the tests: every
+    /// pipeline through the GPU's compiler with the errors caught there).
+    #[cfg(test)]
+    pub fn build_all_pipelines(&self) {
+        self.pipes.build_all(None);
+    }
+
+    /// The pipeline for a pass, made on first use.
+    fn pipe(&self, p: Pipe) -> &wgpu::RenderPipeline {
+        self.pipes.get(p)
+    }
+
+    /// Applies new quality settings. Pass switches (SSAO, bloom, DoF,
+    /// clouds, cascades, the probe) take effect in the next frame; the
+    /// targets are remade when what they hold changes; MSAA, the scene's
+    /// format, the shadow scale and the light shadow atlas
+    /// (`RenderSettings::build_key`) rebuild the pipelines, the shadow
+    /// atlases and the environment probe (its capture starts over).
+    pub fn set_settings(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, settings: &crate::quality::RenderSettings) {
+        let settings = settings.normalized();
+        if settings == self.settings {
+            return;
+        }
+        let targets_differ = settings.ssao != self.settings.ssao
+            || settings.dof != self.settings.dof
+            || (settings.bloom_levels > 0) != (self.settings.bloom_levels > 0)
+            || settings.bloom_levels.max(1) != self.settings.bloom_levels.max(1);
+        self.settings = settings;
+        self.generation = self.generation.wrapping_add(1);
+        if self.settings.build_key() != self.built_key {
+            self.rebuild(device, queue);
+            return;
+        }
+        if targets_differ {
+            self.target = None;
+        }
+        if !self.settings.clouds {
+            self.clouds = None;
+        }
+    }
+
+    /// Remakes what the build key covers (see `set_settings`), keeping the
+    /// meshes, textures, items, terrain and grids.
+    fn rebuild(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let settings = self.settings.clone();
+        let samples = settings.msaa;
+        let scene_format = settings.scene_format(device);
+        crate::sun_shadow::set_texel_scale(settings.shadow_scale);
+        if crate::perf_log::on() {
+            eprintln!("render settings: rebuilding for {}", settings.describe(scene_format));
+        }
+        // (the same cache object serves the new pipelines)
+        let disk = self.pipes.factory.disk.as_ref().map(|d| DiskCache { cache: d.cache.clone(), path: d.path.clone() });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rustudio viewport"),
+            source: wgpu::ShaderSource::Wgsl(shader_source(&settings).into()),
+        });
+        let shadow_side = crate::sun_shadow::depth_texels();
+        let shadow_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow"),
+            size: wgpu::Extent3d { width: shadow_side, height: shadow_side, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.shadow_view = shadow_tex.create_view(&Default::default());
+        self.sun = crate::sun_shadow::SunShadows::new(device, &self.shadow_view);
+        self.lshadow = LightShadows::new(device, settings.light_shadows);
+        self.probe = env_probe_gpu::ProbeGpu::new(device, queue, samples, scene_format, DEPTH_FORMAT, std::mem::size_of::<Globals>() as u64);
+        self.water = crate::water::WaterPass::new(device, queue, &self.globals_layout, &self.tex_layout, samples);
+        self.ssao_layout = Self::depth_layout(device, samples);
+        let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("shadow globals"), entries: &[Self::uniform_entry()] });
+        let pipeline_layout = |label: &str, groups: &[&wgpu::BindGroupLayout]| {
+            let groups: Vec<_> = groups.iter().map(|g| Some(*g)).collect();
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &groups, immediate_size: 0 })
+        };
+        let terrain_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("terrain params"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            }],
+        });
+        let factory = PipeFactory {
+            device: device.clone(),
+            shader,
+            disk,
+            samples,
+            scene_format,
+            layout: pipeline_layout("viewport", &[&self.globals_layout, &self.tex_layout]),
+            part_layout: pipeline_layout("parts with glass scene", &[&self.globals_layout, &self.tex_layout, &self.glass_layout]),
+            water_layout: self.water.layout.clone(),
+            lshadow_layout: pipeline_layout("light shadow", &[&shadow_bgl, &self.lshadow.face_layout]),
+            shadow_layout: pipeline_layout("shadow", &[&shadow_bgl, &self.sun.pass_layout]),
+            terrain_layout: pipeline_layout("terrain", &[&self.globals_layout, &terrain_bgl]),
+            post_layout: pipeline_layout("post with depth", &[&self.globals_layout, &self.tex_layout, &self.ssao_layout]),
+            ssao_layout: pipeline_layout("ssao", &[&self.globals_layout, &self.ssao_layout]),
+        };
+        self.pipes.abandon();
+        self.pipes = std::sync::Arc::new(Pipes::new(factory));
+        self.samples = samples;
+        self.scene_format = scene_format;
+        self.built_key = settings.build_key();
+        self.target = None;
+        self.clouds = None;
+        self.world_gui = None;
+        self.rebind_globals(device);
+        self.warm_pipelines();
     }
 
     /// The last frame as shown (RGBA8, top row first): width, height,
@@ -2360,16 +2466,21 @@ impl Renderer {
     /// Raw RGBA16Float scene before bloom/tone, for render diagnostics.
     pub fn read_hdr(&self, rs: &egui_wgpu::RenderState) -> Option<(u32, u32, Vec<u8>)> {
         let target = self.target.as_ref()?;
+        if self.scene_format != wgpu::TextureFormat::Rgba16Float {
+            return None; // (the readers expect half floats: HDR settings only)
+        }
         {
             if let Ok(path) = std::env::var("RUSTUDIO_DUMP_HDR") {
                 let half = [(target.size[0] >> 1).max(1), (target.size[1] >> 1).max(1)];
-                if let Some(texture) = &target.bloom_bright_capture {
-                    if let Some((w,h,data)) = self.read_hdr_texture(rs, texture, half) {
-                        let _ = std::fs::write(format!("{path}.extract-{w}x{h}"), data);
+                if let Some(bloom) = target.bloom.as_ref() {
+                    if let Some(texture) = &bloom.bright_capture {
+                        if let Some((w,h,data)) = self.read_hdr_texture(rs, texture, half) {
+                            let _ = std::fs::write(format!("{path}.extract-{w}x{h}"), data);
+                        }
                     }
-                }
-                if let Some((w,h,data)) = self.read_hdr_texture(rs, &target.bloom_textures[0], half) {
-                    let _ = std::fs::write(format!("{path}.bloom-{w}x{h}"), data);
+                    if let Some((w,h,data)) = self.read_hdr_texture(rs, &bloom.textures[0], half) {
+                        let _ = std::fs::write(format!("{path}.bloom-{w}x{h}"), data);
+                    }
                 }
                 // The scene environment probe's current slot, level 0 (env_probe.rs).
                 for f in 0..6 {
@@ -3131,217 +3242,148 @@ impl Renderer {
             return;
         }
         let device = &rs.device;
-        let tex =
-            |label: &str, format: wgpu::TextureFormat, samples: u32, usage: wgpu::TextureUsages| {
-                device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d {
-                        width: size[0],
-                        height: size[1],
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: samples,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage,
-                    view_formats: &[],
-                })
-            };
-        let msaa = tex(
-            "viewport-msaa",
-            HDR_FORMAT,
-            SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
-        );
-        let depth = tex(
-            "viewport-depth",
-            DEPTH_FORMAT,
-            SAMPLES,
-            // (read by the world GUI pass)
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let hdr = tex(
-            "viewport-hdr",
-            HDR_FORMAT,
-            1,
-            wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-        );
+        let (samples, scene_format) = (self.samples, self.scene_format);
+        let tex_at = |label: &str, size: [u32; 2], format: wgpu::TextureFormat, samples: u32, usage: wgpu::TextureUsages| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: size[0].max(1), height: size[1].max(1), depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let tex = |label: &str, format: wgpu::TextureFormat, samples: u32, usage: wgpu::TextureUsages| tex_at(label, size, format, samples, usage);
+        let attach = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        let msaa = (samples > 1).then(|| tex("viewport-msaa", scene_format, samples, wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default()));
+        // (the depth is read by the world GUI pass, water, glass, SSAO, DoF)
+        let depth = tex("viewport-depth", DEPTH_FORMAT, samples, attach);
+        let hdr = tex("viewport-hdr", scene_format, 1, attach | wgpu::TextureUsages::COPY_SRC);
         let hdr_view = hdr.create_view(&Default::default());
-        let scene_copy = tex(
-            "viewport-scene-copy",
-            HDR_FORMAT,
-            1,
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        );
+        let scene_copy = tex("viewport-scene-copy", scene_format, 1, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        let scene_copy_view = scene_copy.create_view(&Default::default());
         let depth_view = depth.create_view(&Default::default());
-        let water_depth = tex("water surface depth", DEPTH_FORMAT, SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
-        let water_bg = self.water.bind(device, &scene_copy.create_view(&Default::default()), &depth_view);
-        let glass_depth = tex("glass depth snapshot", wgpu::TextureFormat::R32Float, 1,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+        let water_depth = tex("water surface depth", DEPTH_FORMAT, samples, wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
+        let water_bg = self.water.bind(device, &scene_copy_view, &depth_view);
+        let glass_depth = tex("glass depth snapshot", wgpu::TextureFormat::R32Float, 1, attach).create_view(&Default::default());
         let glass_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("glass scene snapshot"), layout: &self.glass_layout,
+            label: Some("glass scene snapshot"),
+            layout: &self.glass_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&scene_copy.create_view(&Default::default())) },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&scene_copy_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&glass_depth) },
             ],
         });
-        // Bloom's half-resolution targets.
-        let half = [size[0].div_ceil(2).max(1), size[1].div_ceil(2).max(1)];
-        let half_tex = |label: &str| {
-            device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d {
-                        width: half[0],
-                        height: half[1],
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: HDR_FORMAT,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                })
-                .create_view(&Default::default())
-        };
-        let bloom_textures: Vec<_> = (1..=5).map(|level| device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("bloom pyramid"), size: wgpu::Extent3d { width: (size[0] >> level).max(1), height: (size[1] >> level).max(1), depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
-            dimension: wgpu::TextureDimension::D2, format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
-        })).collect();
-        let bloom_levels: Vec<_> = bloom_textures.iter().map(|t| t.create_view(&Default::default())).collect();
-        let bloom_view = bloom_levels[0].clone();
-        let bloom_bright_capture = std::env::var_os("RUSTUDIO_DUMP_HDR").map(|_| device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("diagnostic bloom extraction"),
-            size: wgpu::Extent3d { width: (size[0] >> 1).max(1), height: (size[1] >> 1).max(1), depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST, view_formats: &[],
-        }));
-        // Native CheapBokeh far path retains full-resolution color/CoC.
-        // Downsampling here imposes blur even as FarIntensity approaches zero.
-        let dof_tex = |label: &str| device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label), size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format: HDR_FORMAT, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        }).create_view(&Default::default());
-        let dof_views = [dof_tex("dof across"), dof_tex("dof down")];
+        let black = &self.black_view;
+        // A post pass's inputs (group 1): a texture, the sampler, two more.
         let pair = |label: &str, a: &wgpu::TextureView, b: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
                 layout: &self.tex_layout,
                 entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(a),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sky_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(b),
-                    },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.black_view) },
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(a) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sky_sampler) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(b) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(black) },
                 ],
             })
         };
-        let bloom_down_bgs = (0..5).map(|i| pair("bloom pyramid down", if i == 0 { &hdr_view } else { &bloom_levels[i-1] }, &hdr_view)).collect();
-        let bloom_up_bgs = (1..5).map(|i| pair("bloom pyramid up", &bloom_levels[i], &hdr_view)).collect();
-        let near_views: Vec<_> = (0..11).map(|i| device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("dof near quarter"), size: wgpu::Extent3d { width: (size[0]/4).max(1), height: if i == 0 {size[1]} else {(size[1]/4).max(1)}, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
-        }).create_view(&Default::default())).collect();
-        let near_bgs = (0..11).map(|i| pair("dof near", if i == 0 { &dof_views[1] } else if i == 8 { &near_views[1] } else { &near_views[i-1] }, if i == 8 || i == 9 { &near_views[7] } else { &self.black_view })).collect();
-        let dof_bgs = [pair("dof across", &hdr_view, &self.black_view), pair("dof down", &dof_views[0], &near_views[10])];
-        let hdr_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("post inputs"), layout: &self.tex_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sky_sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&bloom_view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dof_views[1]) },
-            ],
-        });
-        let half_float = |label: &str, format: wgpu::TextureFormat| {
-            device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d { width: half[0], height: half[1], depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                })
-                .create_view(&Default::default())
-        };
-        let ssao_depth_view = half_float("ssao depth", wgpu::TextureFormat::R32Float);
-        let ssao_views = [
-            half_float("ssao a", wgpu::TextureFormat::Rg32Float),
-            half_float("ssao b", wgpu::TextureFormat::Rg32Float),
-        ];
-        let ssao_bg = |label: &str, input: &wgpu::TextureView| {
+        // Group 2: the scene's depth, a pass's input, the scene copy.
+        let depth_group = |label: &str, input: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
                 layout: &self.ssao_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&depth_view) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&scene_copy.create_view(&Default::default())) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&scene_copy_view) },
                 ],
             })
         };
-        let post_depth_bg = ssao_bg("post depth and near", &near_views[10]);
-        // down (input unused) → a … occlusion reads the depth → a, blur
-        // across a → b, blur down b → a, apply reads a.
-        let ssao_bgs = [
-            ssao_bg("ssao down", &ssao_views[1]),
-            ssao_bg("ssao", &ssao_depth_view),
-            ssao_bg("ssao blur across", &ssao_views[0]),
-            ssao_bg("ssao blur down", &ssao_views[1]),
-        ];
-        let display = tex(
-            "viewport",
-            DISPLAY_FORMAT,
-            1,
-            wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-        );
+        // Bloom: half resolution down a level at a time.
+        let bloom = (self.settings.bloom_levels > 0).then(|| {
+            let n = (self.settings.bloom_levels as usize).min(BLOOM_LEVELS);
+            let textures: Vec<_> = (1..=n)
+                .map(|level| tex_at("bloom pyramid", [size[0] >> level, size[1] >> level], scene_format, 1, attach | wgpu::TextureUsages::COPY_SRC))
+                .collect();
+            let levels: Vec<_> = textures.iter().map(|t| t.create_view(&Default::default())).collect();
+            let bright_capture = std::env::var_os("RUSTUDIO_DUMP_HDR").map(|_| {
+                tex_at("diagnostic bloom extraction", [size[0] >> 1, size[1] >> 1], scene_format, 1, wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST)
+            });
+            BloomTargets {
+                view: levels[0].clone(),
+                bright_capture,
+                down_bgs: (0..n).map(|i| pair("bloom pyramid down", if i == 0 { &hdr_view } else { &levels[i - 1] }, &hdr_view)).collect(),
+                up_bgs: (1..n).map(|i| pair("bloom pyramid up", &levels[i], &hdr_view)).collect(),
+                textures,
+                levels,
+            }
+        });
+        // Depth of field. Native CheapBokeh's far path keeps full-resolution
+        // colour / CoC: downsampling here would blur even as FarIntensity
+        // approaches zero. The near field works at quarter resolution.
+        let dof = self.settings.dof.then(|| {
+            let views = [
+                tex("dof across", DOF_FORMAT, 1, attach).create_view(&Default::default()),
+                tex("dof down", DOF_FORMAT, 1, attach).create_view(&Default::default()),
+            ];
+            let near_views: Vec<_> = (0..NEAR_PASSES)
+                .map(|i| tex_at("dof near quarter", [size[0] / 4, if i == 0 { size[1] } else { size[1] / 4 }], DOF_FORMAT, 1, attach).create_view(&Default::default()))
+                .collect();
+            let near_bgs = (0..NEAR_PASSES)
+                .map(|i| {
+                    let a = if i == 0 { &views[1] } else if i == 8 { &near_views[1] } else { &near_views[i - 1] };
+                    let b = if i == 8 || i == 9 { &near_views[7] } else { black };
+                    pair("dof near", a, b)
+                })
+                .collect();
+            DofTargets {
+                bgs: [pair("dof across", &hdr_view, black), pair("dof down", &views[0], &near_views[NEAR_PASSES - 1])],
+                views,
+                near_bgs,
+                near_views,
+            }
+        });
+        let hdr_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("post inputs"),
+            layout: &self.tex_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sky_sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(bloom.as_ref().map_or(black, |b| &b.view)) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(dof.as_ref().map_or(black, |d| &d.views[1])) },
+            ],
+        });
+        let post_depth_bg = depth_group("post depth and near", dof.as_ref().map_or(black, |d| &d.near_views[NEAR_PASSES - 1]));
+        let depth_bg = depth_group("scene depth", black);
+        let half = [size[0].div_ceil(2), size[1].div_ceil(2)];
+        let ssao = self.settings.ssao.then(|| {
+            let depth_view = tex_at("ssao depth", half, wgpu::TextureFormat::R32Float, 1, attach).create_view(&Default::default());
+            let views = [
+                tex_at("ssao a", half, wgpu::TextureFormat::Rg32Float, 1, attach).create_view(&Default::default()),
+                tex_at("ssao b", half, wgpu::TextureFormat::Rg32Float, 1, attach).create_view(&Default::default()),
+            ];
+            // down (the depth alone) → AO depth; occlusion reads it → a;
+            // blur across a → b; blur down b → a; apply reads a.
+            let bgs = [depth_group("ssao", &depth_view), depth_group("ssao blur across", &views[0]), depth_group("ssao blur down", &views[1])];
+            SsaoTargets { depth_view, views, bgs }
+        });
+        let display = tex("viewport", DISPLAY_FORMAT, 1, attach | wgpu::TextureUsages::COPY_SRC);
         let display_view = display.create_view(&Default::default());
         let mut egui_renderer = rs.renderer.write();
         match self.texture_id {
-            Some(id) => egui_renderer.update_egui_texture_from_wgpu_texture(
-                device,
-                &display_view,
-                wgpu::FilterMode::Linear,
-                id,
-            ),
-            None => {
-                self.texture_id = Some(egui_renderer.register_native_texture(
-                    device,
-                    &display_view,
-                    wgpu::FilterMode::Linear,
-                ))
-            }
+            Some(id) => egui_renderer.update_egui_texture_from_wgpu_texture(device, &display_view, wgpu::FilterMode::Linear, id),
+            None => self.texture_id = Some(egui_renderer.register_native_texture(device, &display_view, wgpu::FilterMode::Linear)),
         }
         self.target = Some(Target {
             size,
-            msaa: msaa.create_view(&Default::default()),
+            msaa,
             depth: depth_view,
             hdr,
             hdr_view,
-            scene_copy_view: scene_copy.create_view(&Default::default()),
+            scene_copy_view,
             scene_copy,
             water_bg,
             water_depth,
@@ -3349,19 +3391,10 @@ impl Renderer {
             glass_depth,
             hdr_bg,
             post_depth_bg,
-            dof_views,
-            dof_bgs,
-            near_bgs,
-            near_views,
-            bloom_view,
-            bloom_bright_capture,
-            bloom_textures,
-            bloom_levels,
-            bloom_down_bgs,
-            bloom_up_bgs,
-            ssao_depth_view,
-            ssao_views,
-            ssao_bgs,
+            depth_bg,
+            dof,
+            bloom,
+            ssao,
             display,
             display_view,
         });
@@ -3378,9 +3411,10 @@ impl Renderer {
         tone_curve: Option<[f32; 5]>,
     ) -> bool {
         let Some(t) = self.target.as_ref() else { return false };
+        let (scene_format, samples) = (self.scene_format, self.samples);
         let pass = self
             .world_gui
-            .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT));
+            .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, scene_format, samples));
         pass.sun_atlas = self.sun.atlas_view.clone();
         pass.sun_grid = self.lightgrid_view.clone();
         pass.lightgrid = self.gui_lightgrid;
@@ -3412,6 +3446,13 @@ impl Renderer {
         self.target.as_ref().map(|t| t.size)
     }
 
+    /// One line for the perf log: the settings in force and how many of
+    /// the pipelines they can use are compiled (`Pipes`).
+    pub fn describe(&self) -> String {
+        let wanted = Pipe::all().into_iter().filter(|p| p.wanted(&self.settings)).count();
+        format!("{}; pipelines {} of {} built", self.settings.describe(self.scene_format), self.pipes.ready(), wanted)
+    }
+
     /// GPU milliseconds summed over the frames measured so far (shadows,
     /// scene, SSAO + bloom + DoF, post, whole) and their count; None when
     /// the device has no timestamp queries (see [`GpuTimer`]).
@@ -3422,28 +3463,76 @@ impl Renderer {
     /// The bloom and the final image again, from the HDR image as it is now
     /// (effects drawn into it after `render`; the frame's globals still
     /// bound).
+    /// The bloom pyramid: bright pass into level 0, down a level at a
+    /// time, then back up adding. Nothing without bloom in the settings
+    /// (the post pass then adds black). The levels used grow with the
+    /// view's size and the bloom's, up to the settings' count.
     fn encode_bloom(&self, encoder: &mut wgpu::CommandEncoder, target: &Target, size: f32) {
+        let Some(bloom) = target.bloom.as_ref() else { return };
         let scale = ((target.size[0] as f32 * target.size[1] as f32) / 2073600.0).sqrt();
-        let levels = (3.0 + (scale.log2() + (size / 7.0).log2().max(0.0)).max(-1.0)).min(5.999) as usize;
+        let levels = ((3.0 + (scale.log2() + (size / 7.0).log2().max(0.0)).max(-1.0)).min(5.999) as usize).min(bloom.levels.len());
         for i in 0..levels {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("bloom pyramid down"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &target.bloom_levels[i], depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                label: Some("bloom pyramid down"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &bloom.levels[i], depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
             });
-            pass.set_pipeline(if i == 0 { &self.bloom_bright } else { &self.bloom_down });
-            pass.set_bind_group(0, &self.globals_bg, &[]); pass.set_bind_group(1, &target.bloom_down_bgs[i], &[]); pass.draw(0..3, 0..1);
+            pass.set_pipeline(self.pipe(if i == 0 { Pipe::BloomBright } else { Pipe::BloomDown }));
+            pass.set_bind_group(0, &self.globals_bg, &[]); pass.set_bind_group(1, &bloom.down_bgs[i], &[]); pass.draw(0..3, 0..1);
             drop(pass);
             if i == 0 {
-                if let Some(texture) = &target.bloom_bright_capture {
-                    encoder.copy_texture_to_texture(target.bloom_textures[0].as_image_copy(), texture.as_image_copy(), texture.size());
+                if let Some(texture) = &bloom.bright_capture {
+                    encoder.copy_texture_to_texture(bloom.textures[0].as_image_copy(), texture.as_image_copy(), texture.size());
                 }
             }
         }
         for i in (1..levels).rev() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("bloom pyramid up"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &target.bloom_levels[i-1], depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                label: Some("bloom pyramid up"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &bloom.levels[i-1], depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
             });
-            pass.set_pipeline(&self.bloom_up); pass.set_bind_group(0, &self.globals_bg, &[]); pass.set_bind_group(1, &target.bloom_up_bgs[i-1], &[]); pass.draw(0..3, 0..1);
+            pass.set_pipeline(self.pipe(Pipe::BloomUp)); pass.set_bind_group(0, &self.globals_bg, &[]); pass.set_bind_group(1, &bloom.up_bgs[i-1], &[]); pass.draw(0..3, 0..1);
         }
+    }
+
+    /// One full-screen pass (vs_post) into `view`, cleared first.
+    fn fullscreen_pass(&self, encoder: &mut wgpu::CommandEncoder, label: &str, pipe: Pipe, bg: &wgpu::BindGroup, view: &wgpu::TextureView, depth: Option<&wgpu::BindGroup>) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(self.pipe(pipe));
+        pass.set_bind_group(0, &self.globals_bg, &[]);
+        pass.set_bind_group(1, bg, &[]);
+        if let Some(d) = depth {
+            pass.set_bind_group(2, d, &[]);
+        }
+        pass.draw(0..3, 0..1);
+    }
+
+    /// Depth of field: the far field, then the near field when `near`.
+    /// Nothing without it in the settings (no targets) or the frame.
+    fn encode_dof(&self, encoder: &mut wgpu::CommandEncoder, target: &Target, dof: bool, near: bool) {
+        let Some(d) = target.dof.as_ref().filter(|_| dof) else { return };
+        self.fullscreen_pass(encoder, "dof across", Pipe::DofH, &d.bgs[0], &d.views[0], Some(&target.depth_bg));
+        self.fullscreen_pass(encoder, "dof down", Pipe::DofV, &d.bgs[1], &d.views[1], None);
+        if near {
+            for i in 0..NEAR_PASSES {
+                self.fullscreen_pass(encoder, "dof near", Pipe::Near(i), &d.near_bgs[i], &d.near_views[i], Some(&target.depth_bg));
+            }
+        }
+    }
+
+    /// Exposure, tone mapping, bloom and colour correction into the
+    /// display texture.
+    fn encode_post(&self, encoder: &mut wgpu::CommandEncoder, target: &Target) {
+        self.fullscreen_pass(encoder, "post", Pipe::Post, &target.hdr_bg, &target.display_view, Some(&target.post_depth_bg));
     }
 
     fn finish_again(&self, rs: &egui_wgpu::RenderState) {
@@ -3451,51 +3540,8 @@ impl Renderer {
         let Some(target) = self.target.as_ref() else { return };
         let mut encoder = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("effects post") });
         self.encode_bloom(&mut encoder, target, self.post_bloom_size);
-        let steps: [(&str, &wgpu::RenderPipeline, &wgpu::BindGroup, Vec<&wgpu::TextureView>); 14] = [
-            ("dof across", &self.dof_h, &target.dof_bgs[0], vec![&target.dof_views[0]]),
-            ("dof down", &self.dof_v, &target.dof_bgs[1], vec![&target.dof_views[1]]),
-            ("dof near", &self.near_pipelines[0], &target.near_bgs[0], vec![&target.near_views[0]]),
-            ("dof near", &self.near_pipelines[1], &target.near_bgs[1], vec![&target.near_views[1]]),
-            ("dof near", &self.near_pipelines[2], &target.near_bgs[2], vec![&target.near_views[2]]),
-            ("dof near", &self.near_pipelines[3], &target.near_bgs[3], vec![&target.near_views[3]]),
-            ("dof near", &self.near_pipelines[4], &target.near_bgs[4], vec![&target.near_views[4]]),
-            ("dof near", &self.near_pipelines[5], &target.near_bgs[5], vec![&target.near_views[5]]),
-            ("dof near", &self.near_pipelines[6], &target.near_bgs[6], vec![&target.near_views[6]]),
-            ("dof near", &self.near_pipelines[7], &target.near_bgs[7], vec![&target.near_views[7]]),
-            ("dof near", &self.near_pipelines[8], &target.near_bgs[8], vec![&target.near_views[8]]),
-            ("dof near", &self.near_pipelines[9], &target.near_bgs[9], vec![&target.near_views[9]]),
-            ("dof near", &self.near_pipelines[10], &target.near_bgs[10], vec![&target.near_views[10]]),
-            ("post", &self.post, &target.hdr_bg, vec![&target.display_view]),
-        ];
-        for (label, pipeline, bg, views) in steps {
-            if label.starts_with("dof ") && !self.post_dof { continue; }
-            if label == "dof near" && !self.post_dof_near { continue; }
-            let attachments: Vec<_> = views
-                .iter()
-                .map(|v| {
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: v,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                    })
-                })
-                .collect();
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(label),
-                color_attachments: &attachments,
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, bg, &[]);
-            if label == "post" { pass.set_bind_group(2, &target.post_depth_bg, &[]); }
-            else if label == "dof across" || label == "dof near" { pass.set_bind_group(2, &target.ssao_bgs[0], &[]); }
-            pass.draw(0..3, 0..1);
-        }
+        self.encode_dof(&mut encoder, target, self.post_dof, self.post_dof_near);
+        self.encode_post(&mut encoder, target);
         rs.queue.submit([encoder.finish()]);
     }
 
@@ -3549,8 +3595,24 @@ impl Renderer {
             }
             globals.env_spec[3] = pf.blend;
         }
-        if !frame.ssao {
+        // The quality settings' pass switches (quality.rs): a pass that is
+        // off has no targets and nothing reads them; the globals tell the
+        // shaders so.
+        let settings = self.settings.clone();
+        let ssao = frame.ssao && settings.ssao;
+        if !ssao {
             globals.ssao[3] = 0.0;
+        }
+        if settings.bloom_levels == 0 {
+            globals.cc_tint[3] = 0.0;
+        }
+        if !settings.dof {
+            globals.dof[2] = 0.0;
+            globals.dof[3] = 0.0;
+        }
+        let shadows = frame.shadows && settings.sun_cascades > 0;
+        if !shadows {
+            globals.bloom[2] = 0.0;
         }
         self.post_bloom_size = globals.bloom[1];
         self.post_dof_near = globals.dof[2] > 0.0;
@@ -3570,8 +3632,13 @@ impl Renderer {
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
         self.gui_fog = Self::gui_fog(&frame.globals);
         self.gui_lightgrid = frame.globals.lightgrid;
-        self.gui_sun_params = [if frame.globals.sun_color[3] < 0.5 { 1.0 } else { 0.0 }, crate::mech::SUN_DIST, crate::mech::HYBRID_LERP_SLOPE, if frame.shadows { 1.0 } else { 0.0 }];
+        self.gui_sun_params = [if frame.globals.sun_color[3] < 0.5 { 1.0 } else { 0.0 }, crate::mech::SUN_DIST, crate::mech::HYBRID_LERP_SLOPE, if shadows { 1.0 } else { 0.0 }];
         self.gui_sun = crate::world_gui::SunCascades { local: frame.globals.sun_casc, sphere: frame.globals.sun_sphere, rect: frame.globals.sun_rect };
+        // (cascades past the settings' count are never drawn: a zero
+        // matrix puts every point outside their tiles, to the voxel sun)
+        for c in self.gui_sun.local.iter_mut().skip(settings.sun_cascades as usize) {
+            *c = [[0.0; 4]; 4];
+        }
         let mut stats = RenderStats {
             rebuilds: self.stats.rebuilds,
             ..Default::default()
@@ -3764,12 +3831,24 @@ impl Renderer {
 
         let n_lights = frame.lights.len().min(crate::mech::MAX_LIGHTS);
         self.gui_n_lights = n_lights as u32;
+        // (without local light shadows in the settings no light keeps the
+        // shadow slot lighting.rs gave it: the atlas is never drawn)
+        let unshadowed: Vec<LightRaw>;
+        let lights: &[LightRaw] = if settings.light_shadows {
+            &frame.lights[..n_lights]
+        } else {
+            unshadowed = frame.lights[..n_lights]
+                .iter()
+                .map(|l| {
+                    let mut l = *l;
+                    l.extra[3] = -1.0;
+                    l
+                })
+                .collect();
+            &unshadowed
+        };
         if n_lights > 0 {
-            queue.write_buffer(
-                &self.lights_buf,
-                0,
-                bytemuck::cast_slice(&frame.lights[..n_lights]),
-            );
+            queue.write_buffer(&self.lights_buf, 0, bytemuck::cast_slice(lights));
         }
 
         // The sun's shadow cascades (sun_shadow.rs): which to redraw.
@@ -3777,13 +3856,18 @@ impl Renderer {
         let scene_gen = self.static_gen.wrapping_add(if diagnostic_back { 1u64 << 63 } else { 0 });
         static GRASS_SHADOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let grass_shadows = *GRASS_SHADOWS.get_or_init(|| std::env::var_os("RUSTUDIO_NO_GRASS_SHADOW").is_none());
-        let sun_due = if frame.shadows {
+        let mut sun_due = if shadows {
             self.sun.upload(queue, &frame.sun_cascades);
             self.sun.plan(&frame.sun_cascades, scene_gen, !opaque_runs.is_empty() || !self.terrain_grass.is_empty())
         } else {
             self.sun.forget();
             [false; crate::sun_shadow::CASCADES]
         };
+        // Only the settings' first cascades are drawn (the shader hands the
+        // rest to the voxel sun: SUN_CASCADES).
+        for due in sun_due.iter_mut().skip(settings.sun_cascades as usize) {
+            *due = false;
+        }
 
         let target = self.target.as_ref()?;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3792,10 +3876,11 @@ impl Renderer {
         if let Some(t) = &self.gpu_timer {
             t.mark(&mut encoder, 0);
         }
-        match frame.clouds.as_ref().filter(|_| frame.sky) {
+        match frame.clouds.as_ref().filter(|_| frame.sky && settings.clouds) {
             Some(look) => {
+                let (scene_format, samples) = (self.scene_format, self.samples);
                 let clouds = self.clouds.get_or_insert_with(|| {
-                    crate::clouds::CloudsGpu::new(device, queue, &self.globals_layout, &shader_source(), HDR_FORMAT)
+                    crate::clouds::CloudsGpu::new(device, queue, &self.globals_layout, &shader_source(&settings), scene_format, samples)
                 });
                 clouds.encode(device, queue, &mut encoder, &self.globals_bg, look, -frame.globals.sun_dir[1], target.size);
             }
@@ -3847,7 +3932,7 @@ impl Renderer {
                 let side = cascade.tile.min(crate::sun_shadow::depth_texels());
                 pass.set_viewport(0.0, 0.0, side as f32, side as f32, 0.0, 1.0);
                 pass.set_scissor_rect(0, 0, side, side);
-                pass.set_pipeline(&self.shadow);
+                pass.set_pipeline(self.pipe(Pipe::Shadow));
                 pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
                 self.sun.bind(&mut pass, ci);
                 let cast =
@@ -3869,7 +3954,7 @@ impl Renderer {
                 if !self.terrain_chunks.is_empty() || !self.terrain_grass.is_empty() {
                     // Grass remains two-sided, including in the opt-in solid
                     // terrain BACK-culling attribution capture.
-                    pass.set_pipeline(&self.terrain_shadow);
+                    pass.set_pipeline(self.pipe(Pipe::TerrainShadow));
                     if let Some(dir) = std::env::var_os("RUSTUDIO_CULL_EXPORT") {
                         let dir = std::path::PathBuf::from(dir);
                         std::fs::create_dir_all(&dir).unwrap();
@@ -3886,7 +3971,7 @@ impl Renderer {
                         std::fs::write(dir.join(format!("cascade{ci}.json")),serde_json::to_vec_pretty(&serde_json::json!({"vp":vp.to_cols_array(),"tile":cascade.tile,"chunks":chunks,"vertices":clip.len()})).unwrap()).unwrap();
                     }
                     for (solid,c) in self.terrain_chunks.values().map(|c|(true,c)).chain(self.terrain_grass.values().filter(|_| grass_shadows).map(|c|(false,c))) {
-                        pass.set_pipeline(if solid && diagnostic_back { &self.terrain_shadow_back } else { &self.terrain_shadow });
+                        pass.set_pipeline(self.pipe(if solid && diagnostic_back { Pipe::TerrainShadowBack } else { Pipe::TerrainShadow }));
                         if box_visible(&sp, c.lo, c.hi) {
                             crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::SHADOW, 1, (c.count / 3) as u64);
                             pass.set_vertex_buffer(0, c.vbuf.slice(..));
@@ -3922,7 +4007,7 @@ impl Renderer {
                 }
                 h.finish()
             };
-            if !slots.is_empty() && self.lshadow.key != Some(key) {
+            if settings.light_shadows && !slots.is_empty() && self.lshadow.key != Some(key) {
                 self.lshadow.key = Some(key);
                 let n = crate::mech::LSHADOW_MAX_LIGHTS;
                 let mut slot_data = vec![0f32; n * 100];
@@ -3967,7 +4052,7 @@ impl Renderer {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                pass.set_pipeline(&self.lshadow_pipe);
+                pass.set_pipeline(self.pipe(Pipe::LightShadow));
                 pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
                 pass.set_vertex_buffer(1, self.static_buf.slice(..));
                 let cols = crate::mech::LSHADOW_ATLAS / crate::mech::LSHADOW_FACE;
@@ -4049,11 +4134,19 @@ impl Renderer {
                     {
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("env probe face"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &self.probe.face_msaa,
-                                depth_slice: None,
-                                resolve_target: Some(self.probe.face_resolve()),
-                                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Discard },
+                            color_attachments: &[Some(match self.probe.face_msaa.as_ref() {
+                                Some(msaa) => wgpu::RenderPassColorAttachment {
+                                    view: msaa,
+                                    depth_slice: None,
+                                    resolve_target: Some(self.probe.face_resolve()),
+                                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Discard },
+                                },
+                                None => wgpu::RenderPassColorAttachment {
+                                    view: self.probe.face_resolve(),
+                                    depth_slice: None,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                                },
                             })],
                             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                                 view: &self.probe.face_depth,
@@ -4071,16 +4164,16 @@ impl Renderer {
                             if !box_visible(&face_planes, b.lo, b.hi) {
                                 continue;
                             }
-                            pass.set_pipeline(if self.culls_back(b.key.0) { &self.opaque } else { &self.opaque_two_sided });
+                            pass.set_pipeline(self.pipe(if self.culls_back(b.key.0) { Pipe::Opaque } else { Pipe::OpaqueTwoSided }));
                             draw(&mut pass, b.key, b.start..b.start + b.count, &mut calls);
                         }
                         pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                         for r in &opaque_runs {
-                            pass.set_pipeline(if self.culls_back(r.0.0) { &self.opaque } else { &self.opaque_two_sided });
+                            pass.set_pipeline(self.pipe(if self.culls_back(r.0.0) { Pipe::Opaque } else { Pipe::OpaqueTwoSided }));
                             draw(&mut pass, r.0, r.1..r.2, &mut calls);
                         }
                         if !self.terrain_chunks.is_empty() {
-                            pass.set_pipeline(&self.terrain);
+                            pass.set_pipeline(self.pipe(Pipe::Terrain));
                             pass.set_bind_group(1, &self.terrain_bg, &[]);
                             for c in self.terrain_chunks.values() {
                                 if box_visible(&face_planes, c.lo, c.hi) {
@@ -4099,7 +4192,7 @@ impl Renderer {
         // Decals, then see-through parts back to front, then the hover overlay.
         let see_through = |pass: &mut wgpu::RenderPass, calls: &mut usize| {
             pass.set_bind_group(2, &target.glass_bg, &[]);
-            pass.set_pipeline(&self.transparent);
+            pass.set_pipeline(self.pipe(Pipe::Transparent));
             pass.set_vertex_buffer(1, self.static_buf.slice(..));
             for r in static_ranges.iter().filter(|r| r.0 == Pass::Decal) {
                 draw(pass, r.1, r.2..r.3, calls);
@@ -4109,34 +4202,48 @@ impl Renderer {
                 draw(pass, r.0, r.1..r.2, calls);
             }
             for r in &blend_runs {
-                pass.set_pipeline(if r.1 < glass_end {
-                    if self.culls_back(r.0 .0) { &self.glass_culled } else { &self.glass }
+                pass.set_pipeline(self.pipe(if r.1 < glass_end {
+                    if self.culls_back(r.0 .0) { Pipe::GlassCulled } else { Pipe::Glass }
                 } else if self.culls_back(r.0 .0) {
-                    &self.transparent_culled
+                    Pipe::TransparentCulled
                 } else {
-                    &self.transparent
-                });
+                    Pipe::Transparent
+                }));
                 draw(pass, r.0, r.1..r.2, calls);
             }
             if !overlay_runs.is_empty() {
-                pass.set_pipeline(&self.overlay);
+                pass.set_pipeline(self.pipe(Pipe::Overlay));
                 for r in &overlay_runs {
                     draw(pass, r.0, r.1..r.2, calls);
                 }
             }
         };
+        // The scene's colour attachment: the multisampled texture resolved
+        // into the scene, or the scene itself without MSAA.
+        let scene_attachment = |first: bool, last: bool| match target.msaa.as_ref() {
+            Some(msaa) => wgpu::RenderPassColorAttachment {
+                view: msaa,
+                depth_slice: None,
+                resolve_target: Some(&target.hdr_view),
+                ops: wgpu::Operations {
+                    load: if first { wgpu::LoadOp::Clear(wgpu::Color::BLACK) } else { wgpu::LoadOp::Load },
+                    store: if last { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store },
+                },
+            },
+            None => wgpu::RenderPassColorAttachment {
+                view: &target.hdr_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: if first { wgpu::LoadOp::Clear(wgpu::Color::BLACK) } else { wgpu::LoadOp::Load },
+                    store: wgpu::StoreOp::Store,
+                },
+            },
+        };
         let scene_pass = |encoder: &mut wgpu::CommandEncoder, label: &str, first: bool, last: bool| {
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(label),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target.msaa,
-                    depth_slice: None,
-                    resolve_target: Some(&target.hdr_view),
-                    ops: wgpu::Operations {
-                        load: if first { wgpu::LoadOp::Clear(wgpu::Color::BLACK) } else { wgpu::LoadOp::Load },
-                        store: if last { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store },
-                    },
-                })],
+                color_attachments: &[Some(scene_attachment(first, last))],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &target.depth,
                     depth_ops: Some(wgpu::Operations {
@@ -4158,18 +4265,14 @@ impl Renderer {
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_bind_group(1, &self.textures[0], &[]);
             if frame.sky {
-                pass.set_pipeline(&self.sky);
+                pass.set_pipeline(self.pipe(Pipe::Sky));
                 pass.draw(0..3, 0..1);
             }
 
             // Loaded meshes are two-sided unless set_mesh_cull culls them
             // (file meshes, unless a MeshPart is DoubleSided: as Studio).
             let opaque_pipe = |key: (usize, usize)| {
-                if self.culls_back(key.0) {
-                    &self.opaque
-                } else {
-                    &self.opaque_two_sided
-                }
+                self.pipe(if self.culls_back(key.0) { Pipe::Opaque } else { Pipe::OpaqueTwoSided })
             };
 
             pass.set_vertex_buffer(1, self.static_buf.slice(..));
@@ -4186,13 +4289,13 @@ impl Renderer {
             // shader rejects other blended materials and fractional coverage;
             // the invisible host never enters this pass. Keep the ordinary
             // sorted color pass for layer order and semitransparent edges.
-            pass.set_pipeline(&self.decal_depth);
+            pass.set_pipeline(self.pipe(Pipe::DecalDepth));
             for r in surface_decal_runs.iter().chain(&blend_runs) {
                 draw(&mut pass, r.0, r.1..r.2, &mut calls);
             }
             // Terrain chunks in view.
             if !self.terrain_chunks.is_empty() {
-                pass.set_pipeline(&self.terrain);
+                pass.set_pipeline(self.pipe(Pipe::Terrain));
                 pass.set_bind_group(1, &self.terrain_bg, &[]);
                 for c in self.terrain_chunks.values().chain(self.terrain_grass.values()) {
                     if box_visible(&planes, c.lo, c.hi) {
@@ -4208,7 +4311,7 @@ impl Renderer {
                 pass.set_bind_group(1, &self.textures[0], &[]);
             }
             if !surface_decal_runs.is_empty() {
-                pass.set_pipeline(&self.transparent);
+                pass.set_pipeline(self.pipe(Pipe::Transparent));
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                 for r in &surface_decal_runs {
                     draw(&mut pass, r.0, r.1..r.2, &mut calls);
@@ -4218,7 +4321,7 @@ impl Renderer {
 
             if !frame.lines.is_empty() {
                 pass.set_bind_group(1, &self.textures[0], &[]);
-                pass.set_pipeline(&self.lines);
+                pass.set_pipeline(self.pipe(Pipe::Lines));
                 pass.set_vertex_buffer(0, self.line_buf.slice(..));
                 pass.draw(0..frame.lines.len() as u32, 0..1);
             }
@@ -4241,15 +4344,7 @@ impl Renderer {
             if !water_runs.is_empty() {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("water"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &target.msaa,
-                        depth_slice: None,
-                        resolve_target: Some(&target.hdr_view),
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
+                    color_attachments: &[Some(scene_attachment(false, false))],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: &target.water_depth,
                         depth_ops: Some(wgpu::Operations {
@@ -4262,7 +4357,7 @@ impl Renderer {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                pass.set_pipeline(&self.water.pipeline);
+                pass.set_pipeline(self.pipe(Pipe::Water));
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 pass.set_bind_group(2, &target.water_bg, &[]);
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
@@ -4279,9 +4374,9 @@ impl Renderer {
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
                     depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
                 });
-                pass.set_pipeline(&self.glass_resolve);
+                pass.set_pipeline(self.pipe(Pipe::GlassResolve));
                 pass.set_bind_group(0, &self.globals_bg, &[]);
-                pass.set_bind_group(1, &target.ssao_bgs[0], &[]);
+                pass.set_bind_group(1, &target.depth_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
             let mut pass = scene_pass(&mut encoder, "see-through", false, true);
@@ -4299,15 +4394,15 @@ impl Renderer {
         // SSAO, then its multiply into the scene.
         // (Off: nothing reads its textures; the post passes take only the
         // scene's depth from that bind group.)
-        if frame.ssao {
-            let steps: [(&str, &wgpu::RenderPipeline, usize, &wgpu::TextureView, bool); 5] = [
-                ("ssao depth", &self.ssao_down, 0, &target.ssao_depth_view, true),
-                ("ssao", &self.ssao_main, 1, &target.ssao_views[0], true),
-                ("ssao blur across", &self.ssao_blur_x, 2, &target.ssao_views[1], true),
-                ("ssao blur down", &self.ssao_blur_y, 3, &target.ssao_views[0], true),
-                ("ssao apply", &self.ssao_apply, 2, &target.hdr_view, false),
+        if let Some(ao) = target.ssao.as_ref().filter(|_| ssao) {
+            let steps: [(&str, Pipe, &wgpu::BindGroup, &wgpu::TextureView, bool); 5] = [
+                ("ssao depth", Pipe::SsaoDown, &target.depth_bg, &ao.depth_view, true),
+                ("ssao", Pipe::SsaoMain, &ao.bgs[0], &ao.views[0], true),
+                ("ssao blur across", Pipe::SsaoBlurX, &ao.bgs[1], &ao.views[1], true),
+                ("ssao blur down", Pipe::SsaoBlurY, &ao.bgs[2], &ao.views[0], true),
+                ("ssao apply", Pipe::SsaoApply, &ao.bgs[1], &target.hdr_view, false),
             ];
-            for (label, pipeline, bg, view, clear) in steps {
+            for (label, pipe, bg, view, clear) in steps {
                 if label == "ssao apply" && (std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_NO_AO").is_some() || std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_ID").is_some()) { continue; }
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some(label),
@@ -4325,9 +4420,9 @@ impl Renderer {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                pass.set_pipeline(pipeline);
+                pass.set_pipeline(self.pipe(pipe));
                 pass.set_bind_group(0, &self.globals_bg, &[]);
-                pass.set_bind_group(1, &target.ssao_bgs[bg], &[]);
+                pass.set_bind_group(1, bg, &[]);
                 pass.draw(0..3, 0..1);
             }
         }
@@ -4338,69 +4433,11 @@ impl Renderer {
             c.composite(device, &mut encoder, &self.globals_bg, &target.hdr_view, &target.scene_copy_view, &target.depth);
         }
         self.encode_bloom(&mut encoder, target, globals.bloom[1]);
-        let mut fullscreen = |label: &str,
-                              pipeline: &wgpu::RenderPipeline,
-                              bg: &wgpu::BindGroup,
-                              views: &[&wgpu::TextureView]| {
-            let attachments: Vec<_> = views
-                .iter()
-                .map(|v| {
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: v,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })
-                })
-                .collect();
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(label),
-                color_attachments: &attachments,
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, bg, &[]);
-            if label == "dof across" || label == "dof near" { pass.set_bind_group(2, &target.ssao_bgs[0], &[]); }
-            pass.draw(0..3, 0..1);
-        };
-        if globals.dof[2] > 0.0 || globals.dof[3] > 0.0 {
-            fullscreen("dof across", &self.dof_h, &target.dof_bgs[0], &[&target.dof_views[0]]);
-            fullscreen("dof down", &self.dof_v, &target.dof_bgs[1], &[&target.dof_views[1]]);
-            if globals.dof[2] > 0.0 { for i in 0..11 { fullscreen("dof near", &self.near_pipelines[i], &target.near_bgs[i], &[&target.near_views[i]]); } }
-        }
+        self.encode_dof(&mut encoder, target, self.post_dof, self.post_dof_near);
         if let Some(t) = &self.gpu_timer {
             t.mark(&mut encoder, 3);
         }
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("post"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target.display_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.post);
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, &target.hdr_bg, &[]);
-            pass.set_bind_group(2, &target.post_depth_bg, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        self.encode_post(&mut encoder, target);
         self.probe.flush(queue);
         if let Some(t) = self.gpu_timer.as_mut() {
             t.mark(&mut encoder, 4);
@@ -4874,7 +4911,11 @@ fn to_raw(p: &PartDraw, bias: f32) -> InstanceRaw {
 }
 
 /// shader.wgsl with the measured constants from mech.rs put in front.
-fn shader_source() -> String {
+/// The viewport shader's WGSL: the tuning constants (mech.rs), the quality
+/// settings' constants (MSAA_SAMPLES, SUN_CASCADES) and shader.wgsl, its
+/// multisampled depth bindings made plain ones when MSAA is off.
+fn shader_source(settings: &crate::quality::RenderSettings) -> String {
+    let quality = format!("const MSAA_SAMPLES: i32 = {};\nconst SUN_CASCADES: i32 = {};\n", settings.msaa.max(1), settings.sun_cascades.min(crate::sun_shadow::CASCADES as u32));
     let grass = format!("const GRASS_RADIUS: f32 = {:?};\nconst GRASS_FADE_LEN: f32 = {:?};\nconst GRASS_NEAR_RADIUS: f32 = {:?};\nconst GRASS_NEAR_FADE_LEN: f32 = {:?};\n", crate::mech::GRASS_RADIUS, crate::mech::GRASS_FADE_LEN, crate::mech::GRASS_NEAR_RADIUS, crate::mech::GRASS_NEAR_FADE_LEN);
     use crate::mech as m;
     let [a, b, c, d, e] = m::TONE_CURVE;
@@ -4922,8 +4963,20 @@ fn shader_source() -> String {
         m::EVSM_BLEED_CUT,
         m::LSHADOW_ATLAS / m::LSHADOW_FACE,
         m::LSHADOW_FACE as f32 / m::LSHADOW_ATLAS as f32,
-        format!("const TERRAIN_CAPTURE_ID: bool = {};\nconst TERRAIN_CAPTURE_NO_AO: bool = {};\nconst DETILE_LEVELS: f32 = {:?};\nconst WANG_CELLS: f32 = {:?};\nconst MATERIAL_DIFFUSE_FADE_DEPTH: f32 = {:?};\nconst MATERIAL_LQ_DIFFUSE_CUTOFF: f32 = {:?};\n{}", std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_ID").is_some(), std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_NO_AO").is_some(), m::DETILE_LEVELS, m::WANG_CELLS, m::MATERIAL_DIFFUSE_FADE_DEPTH, m::MATERIAL_LQ_DIFFUSE_CUTOFF, format!("{grass}{}", include_str!("shader.wgsl")))
+        format!("const TERRAIN_CAPTURE_ID: bool = {};\nconst TERRAIN_CAPTURE_NO_AO: bool = {};\nconst DETILE_LEVELS: f32 = {:?};\nconst WANG_CELLS: f32 = {:?};\nconst MATERIAL_DIFFUSE_FADE_DEPTH: f32 = {:?};\nconst MATERIAL_LQ_DIFFUSE_CUTOFF: f32 = {:?};\n{}", std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_ID").is_some(), std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_NO_AO").is_some(), m::DETILE_LEVELS, m::WANG_CELLS, m::MATERIAL_DIFFUSE_FADE_DEPTH, m::MATERIAL_LQ_DIFFUSE_CUTOFF, format!("{quality}{grass}{}", msaa_wgsl(include_str!("shader.wgsl"), settings.msaa)))
     )
+}
+
+/// `src` for a scene drawn with `samples` samples: without multisampling
+/// its `texture_depth_multisampled_2d` bindings become `texture_depth_2d`
+/// (a `textureLoad` with a sample index of 0 then reads mip level 0;
+/// the sample loops run once: MSAA_SAMPLES).
+pub fn msaa_wgsl(src: &str, samples: u32) -> String {
+    if samples > 1 {
+        src.to_string()
+    } else {
+        src.replace("texture_depth_multisampled_2d", "texture_depth_2d")
+    }
 }
 
 fn mip_levels(w: u32, h: u32) -> u32 {

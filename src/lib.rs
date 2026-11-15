@@ -18,6 +18,7 @@ mod emote_wheel;
 pub mod android;
 pub mod touch_input;
 pub mod perf_log;
+pub mod quality;
 mod ribbon_quick;
 mod cmeta;
 mod studio_content;
@@ -355,6 +356,12 @@ pub(crate) fn wgpu_options(bench_mode: bool) -> egui_wgpu::WgpuConfiguration {
                 d.required_limits.max_sampled_textures_per_shader_stage = 24;
                 // Storage writes to R8 targets need the adapter-specific format features.
                 d.required_features |= adapter.features() & egui_wgpu::wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+                // The 32-bit float scene target of the Low / non-HDR
+                // settings (quality.rs scene_format), and the driver's
+                // pipeline cache the renderer keeps on disk so a second
+                // start compiles no shaders (render.rs PipelineCache).
+                let want = egui_wgpu::wgpu::Features::RG11B10UFLOAT_RENDERABLE | egui_wgpu::wgpu::Features::PIPELINE_CACHE;
+                d.required_features |= adapter.features() & want;
                 // GPU timestamps for the perf log's line (render::GpuTimer),
                 // where the device has them.
                 if crate::perf_log::on() {
@@ -389,7 +396,7 @@ pub(crate) fn wgpu_options(bench_mode: bool) -> egui_wgpu::WgpuConfiguration {
 /// notes the same halving on iOS). Three images let the next frame start
 /// while the last one is still queued. `RUSTUDIO_FRAME_LATENCY` (1 to 3)
 /// overrides, for measuring.
-fn frame_latency() -> u32 {
+pub fn frame_latency() -> u32 {
     let default = if cfg!(target_os = "android") { 2 } else { 1 };
     std::env::var("RUSTUDIO_FRAME_LATENCY")
         .ok()

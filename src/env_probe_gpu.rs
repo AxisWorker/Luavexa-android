@@ -19,7 +19,11 @@ pub struct ProbeGpu {
     src: wgpu::Texture,
     src_view: wgpu::TextureView,
     src_level_views: Vec<wgpu::TextureView>,
-    pub face_msaa: wgpu::TextureView,
+    /// The face's multisampled colour, resolved into `face_resolve_view`;
+    /// None without multisampling (the face is drawn into the resolve
+    /// view directly). Both in the scene's colour format: the scene's
+    /// own pipelines draw the face.
+    pub face_msaa: Option<wgpu::TextureView>,
     pub face_depth: wgpu::TextureView,
     face_resolve_view: wgpu::TextureView,
     pub globals_buf: wgpu::Buffer,
@@ -71,18 +75,18 @@ fn face_view(t: &wgpu::Texture, mip: u32, face: u32) -> wgpu::TextureView {
 }
 
 impl ProbeGpu {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, samples: u32, depth_format: wgpu::TextureFormat, globals_size: u64) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, samples: u32, face_format: wgpu::TextureFormat, depth_format: wgpu::TextureFormat, globals_size: u64) -> Self {
         let slots = [cube_tex(device, "env probe slot a"), cube_tex(device, "env probe slot b")];
         let slot_views = [cube_view(&slots[0], 0, None), cube_view(&slots[1], 0, None)];
         let src = cube_tex(device, "env probe source pyramid");
         let src_view = cube_view(&src, 0, None);
         let src_level_views = (0..LEVELS).map(|m| cube_view(&src, m, Some(1))).collect();
         let size = wgpu::Extent3d { width: env_probe::SIZE, height: env_probe::SIZE, depth_or_array_layers: 1 };
-        let face_msaa = device.create_texture(&wgpu::TextureDescriptor {
+        let face_msaa = (samples > 1).then(|| device.create_texture(&wgpu::TextureDescriptor {
             label: Some("env probe face"), size, mip_level_count: 1, sample_count: samples,
-            dimension: wgpu::TextureDimension::D2, format: FORMAT,
+            dimension: wgpu::TextureDimension::D2, format: face_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
-        }).create_view(&Default::default());
+        }).create_view(&Default::default()));
         let face_depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("env probe face depth"), size, mip_level_count: 1, sample_count: samples,
             dimension: wgpu::TextureDimension::D2, format: depth_format,
@@ -90,7 +94,7 @@ impl ProbeGpu {
         }).create_view(&Default::default());
         let face_resolve_view = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("env probe face resolve"), size, mip_level_count: 1, sample_count: 1,
-            dimension: wgpu::TextureDimension::D2, format: FORMAT,
+            dimension: wgpu::TextureDimension::D2, format: face_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
         }).create_view(&Default::default());
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {

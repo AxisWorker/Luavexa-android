@@ -1397,6 +1397,19 @@ impl Editor {
                     })
                     .unwrap_or((0, 0));
                 self.info(format!("Character body: {parts} parts, {meshes} of them MeshParts"));
+                // Everything a player expects of the character comes from
+                // Studio's content: the body with its face, Animate, and the
+                // PlayerModule whose CameraModule follows it and whose
+                // ControlModule moves it. Without, the game looks broken in
+                // three ways at once; say which one it is.
+                if meshes == 0 && crate::default_scripts::studio_dir().is_none() {
+                    self.warn(concat!(
+                        "Studio's content isn't installed yet, so this character is rustudio's stand-in: ",
+                        "no face, no animations, and no camera or movement scripts follow it. ",
+                        "The download that starts with rustudio ends with a \"Studio content … installed\" line above ",
+                        "(or says what failed); stop and press Play again after it.",
+                    ));
+                }
                 self.dress_character(m);
                 // The avatar's equipped emotes (Humanoid:PlayEmote, /e, the
                 // emote wheel read them from here).

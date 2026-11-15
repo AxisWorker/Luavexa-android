@@ -2291,7 +2291,10 @@ impl Editor {
         // WireframeHandleAdornments (domains/world_misc.rs).
         let (wire_lines, wire_texts) = crate::runtime::domains::world::misc::wire_geometry(&self.doc);
         lines.extend(wire_lines.into_iter().map(|(pos, color)| LineVertex { pos, color }));
-        let ppp = ctx.pixels_per_point() * self.render_scale.clamp(0.25, 1.0);
+        // The quality settings (quality.rs: the preset, RUSTUDIO_*
+        // switches, View > Render Scale / Ambient Occlusion).
+        let settings = self.render_settings();
+        let ppp = ctx.pixels_per_point() * settings.render_scale;
         let mut size = [
             (rect.width() * ppp).round().max(1.0) as u32,
             (rect.height() * ppp).round().max(1.0) as u32,
@@ -2304,13 +2307,17 @@ impl Editor {
             }
             None => rect,
         };
-        let (mut globals, lights, mut shadows, sun_cascades) = {
+        let (globals, lights, shadows, sun_cascades) = {
             let _l = crate::bench::scope("lighting");
             self.frame_lighting(rrect)
         };
+        // The renderer takes a settings change before the frame.
+        if let (Some(r), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
+            r.set_settings(&rs.device, &rs.queue, &settings);
+        }
         // Studio's scene environment probe (env_probe.rs): the PBR
         // technologies' 128 px indoor reflection cube.
-        let probe = (globals.env_spec[2] > 0.5 && std::env::var_os("RUSTUDIO_NO_ENV_PROBE").is_none()).then(|| {
+        let probe = (globals.env_spec[2] > 0.5 && settings.env_probe).then(|| {
             let _p = crate::bench::scope("env_probe");
             let revision = self.renderer.as_ref().map_or(0, |r| r.static_gen());
             let now = self.harness.started.elapsed().as_secs_f64();
@@ -2319,16 +2326,8 @@ impl Editor {
             let ray = |o: Vec3, d: Vec3, len: f32| crate::env_probe::world_ray(doc, scene, o, d, len);
             self.env_probe.update(self.cam.pos, self.cam.forward(), dt, now, revision, &ray)
         });
-        {
-            // RUSTUDIO_SUN_SHADOWS=0: the sun's shadow maps off, as with
-            // Lighting.GlobalShadows false (a device run's comparison;
-            // perf_log::env_switch). bloom.z is the shader's switch.
-            static SUN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if !crate::perf_log::env_switch(&SUN, "RUSTUDIO_SUN_SHADOWS", true) {
-                shadows = false;
-                globals.bloom[2] = 0.0;
-            }
-        }
+        // (the sun's shadow maps off — RUSTUDIO_SUN_SHADOWS=0, no cascades
+        // in the settings — is the renderer's: `shadows` there)
         let vp_render = crate::bench::scope("vp_render");
         let frame = Frame {
             globals,
@@ -2346,7 +2345,7 @@ impl Editor {
             },
             clouds: crate::clouds::look(&self.doc),
             probe,
-            ssao: self.ssao,
+            ssao: settings.ssao,
         };
         // Time shows in these: every frame is drawn afresh (ViewReuse). So
         // do the clouds (they drift with the wind) and the environment

@@ -761,7 +761,8 @@ pub struct WorldGuiPass {
     fx_tex: Option<([u32; 2], wgpu::TextureView)>,
 }
 
-/// The scene's HDR format (render.rs HDR_FORMAT) and the effects' buffer.
+/// The effects' buffer: linear light with alpha kept (the scene's own
+/// format may have no alpha; render.rs `Renderer::hdr_format`).
 const FX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// `WorldGuiPass::upload`'s result.
@@ -837,17 +838,24 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 "#;
 
 impl WorldGuiPass {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target: wgpu::TextureFormat) -> Self {
+    /// `target`: the GUI pipeline's colour format; `scene`: the scene's
+    /// colour format (render.rs `Renderer::hdr_format`), which the effects
+    /// are composed back into; `samples`: the scene depth's sample count
+    /// (read as it is, multisampled or not).
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target: wgpu::TextureFormat, scene: wgpu::TextureFormat, samples: u32) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("world gui"),
             source: wgpu::ShaderSource::Wgsl(
-                format!(
-                    "const EVSM_POS_EXP: f32 = {:?};\nconst EVSM_NEG_EXP: f32 = {:?};\nconst EVSM_SHADOW_BIAS: f32 = {:?};\nconst EVSM_BLEED_CUT: f32 = {:?};\n{}{SHADER}",
-                    crate::mech::EVSM_POS_EXP,
-                    crate::mech::EVSM_NEG_EXP,
-                    crate::mech::EVSM_SHADOW_BIAS,
-                    crate::mech::EVSM_BLEED_CUT,
-                    fx_constants(),
+                crate::render::msaa_wgsl(
+                    &format!(
+                        "const EVSM_POS_EXP: f32 = {:?};\nconst EVSM_NEG_EXP: f32 = {:?};\nconst EVSM_SHADOW_BIAS: f32 = {:?};\nconst EVSM_BLEED_CUT: f32 = {:?};\n{}{SHADER}",
+                        crate::mech::EVSM_POS_EXP,
+                        crate::mech::EVSM_NEG_EXP,
+                        crate::mech::EVSM_SHADOW_BIAS,
+                        crate::mech::EVSM_BLEED_CUT,
+                        fx_constants(),
+                    ),
+                    samples,
                 )
                 .into(),
             ),
@@ -861,7 +869,7 @@ impl WorldGuiPass {
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Depth,
                         view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: true,
+                        multisampled: samples > 1,
                     },
                     count: None,
                 },
@@ -1110,7 +1118,7 @@ impl WorldGuiPass {
             bind_group_layouts: &[Some(&fx_bgl)],
             immediate_size: 0,
         });
-        let full = |label: &str, entry: &str| {
+        let full = |label: &str, entry: &str, format: wgpu::TextureFormat| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&fx_layout),
@@ -1124,7 +1132,7 @@ impl WorldGuiPass {
                     module: &fx_module,
                     entry_point: Some(entry),
                     compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState { format: FX_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                    targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
                 }),
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: None,
@@ -1133,8 +1141,10 @@ impl WorldGuiPass {
                 cache: None,
             })
         };
-        let fx_in = full("world gui effects in", "fs_in");
-        let fx_out = full("world gui effects out", "fs_out");
+        // In: the scene into the effects' buffer; out: the buffer back
+        // into the scene (its own format).
+        let fx_in = full("world gui effects in", "fs_in", FX_FORMAT);
+        let fx_out = full("world gui effects out", "fs_out", scene);
         let no_lights = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("effects no lights"),
             size: std::mem::size_of::<crate::render::LightRaw>() as u64,

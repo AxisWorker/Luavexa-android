@@ -37,6 +37,13 @@ adb install -r target/x/debug/android/rustudio-android.apk
 adb logcat -s rustudio RustStdoutStderr
 ```
 
+**Install the release APK to judge speed.** The debug one builds the
+editor at opt-level 1 with debug assertions and overflow checks in every
+crate (Cargo's dev profile): several times slower in the physics, the Luau
+runtime and the renderer's CPU side, and a phone shows it first. The
+start line in logcat and the first `perf:` line say which one is running
+(`debug build, aarch64 android` / `release build, …`).
+
 `x build` without `--pem` signs with xbuild's debug key (installs with
 adb). A release key goes in as `--pem key.pem` or the `X_PEM` environment
 variable; CI reads it from the `ANDROID_SIGNING_PEM` secret when set.
@@ -189,6 +196,22 @@ bottom safe-area inset, so windows, menus and popups keep above it too
 inset it was given). The field's own scrolling brings the caret into view
 at the next keystroke.
 
+The keyboard is shown and hidden by egui-winit alone, from egui's IME
+output (up while a text field has the focus: `set_ime_allowed` →
+android-activity's `show_soft_input` / `hide_soft_input`); the user
+hiding it with Back or its own hide key is invisible to the app. On the
+first device runs it came straight back: the Properties and Explorer
+edit fields asked egui for the focus every frame while an edit was open,
+and egui counts every `request_focus` as an IME interruption
+(`should_interrupt_composition`), which egui-winit answers with a hide
+and a show. Now the fields ask only while they lack the focus and are
+not just back from losing it (`properties.rs`, `explorer.rs`,
+`account_ui.rs`), and `keyboard.rs` releases a field's focus once the
+keyboard has been down for 300 ms with the field it was up for still
+focused: the edit ends with its text kept (as a click away ends it), and
+a tap on the field starts it again. A focus move between two fields
+(hide and show within a poll or two) is under that time.
+
 The soft keyboard has no Ctrl, egui's text fields have no menu of their
 own and egui-winit has no clipboard on Android, so a long press on a text
 field opens `src/android/text_menu.rs`: Cut, Copy, Paste (the system
@@ -207,6 +230,27 @@ that are taps, long presses for its menus — and has none of the editor's
 reasons to tell a scroll from a drag. Switching off lets go of anything
 held; a finger down at a switch stays egui's until it lifts, so no press
 is left half delivered. Once a place opens, the layer is on.
+
+## The first Play on a phone: Studio's content
+
+Roblox's default character (the R15 body with its face and dynamic head),
+its `Animate` and `Health` scripts, and the PlayerModule whose
+CameraModule follows the character and whose ControlModule moves it all
+come from Studio's own content, which rustudio has none of in the APK: at
+its first start the editor downloads it from Roblox's CDN (about 60 MB
+compressed, 13 packages plus a hundred or so retired textures fetched one
+by one; `src/studio_content.rs`) into the app's files folder
+(`…/files/rustudio/studio`). That takes a few minutes on a phone. Until
+it is there, Play spawns rustudio's stand-in character — plain blocks, no
+face, no animation — and no camera or movement script follows it; Output
+says so at the spawn (`Studio's content isn't installed yet…`), lists
+each package as it comes (`Studio content: downloading …zip (3/13)…`)
+and ends with `Studio content <version> installed in …` or an error. Stop
+and press Play again after that line (fonts need a restart). The download
+goes on where it stopped at the next start when the app is killed
+meanwhile (packages already unpacked are kept in `.studio-partial`), and
+retries a dropped connection a couple of times by itself. Uninstalling
+the app removes the content with its data; `adb install -r` keeps it.
 
 ## Frame time on a phone
 
@@ -233,12 +277,71 @@ adb shell setprop debug.rustudio.env "RUSTUDIO_SUN_SHADOWS=0 RUSTUDIO_VIEW_REUSE
 ```
 
 then relaunch (`setprop debug.rustudio.env ""` clears). Space-separated
-`RUSTUDIO_*=value` pairs, 91 characters at most (`android::export_env`,
-`perf_log::env_switch`): `RUSTUDIO_SSAO`, `RUSTUDIO_VIEW_REUSE`,
-`RUSTUDIO_RENDER_SCALE`, `RUSTUDIO_SUN_SHADOWS` (the sun's shadow maps,
-as Lighting.GlobalShadows false), `RUSTUDIO_SHADOW_SCALE` (the shadow
-maps' texels across, 0.25 to 1; see below), `RUSTUDIO_FRAME_LATENCY`
-(swapchain images less one, 1 to 3; see below).
+`RUSTUDIO_*=value` pairs, 91 characters at most (`android::export_env`;
+the renderer's are read by `quality::RenderSettings::with_env`):
+`RUSTUDIO_QUALITY=low|medium|high` and the single settings over the
+preset — `RUSTUDIO_MSAA` (1, 2, 4), `RUSTUDIO_HDR` (0|1),
+`RUSTUDIO_RENDER_SCALE` (0.25 to 1), `RUSTUDIO_SUN_SHADOWS` (0: the
+sun's shadow maps off, as Lighting.GlobalShadows false),
+`RUSTUDIO_SUN_CASCADES` (0 to 4), `RUSTUDIO_SHADOW_SCALE` (the shadow
+maps' texels across, 0.25 to 1; see below), `RUSTUDIO_LIGHT_SHADOWS`
+(0|1), `RUSTUDIO_SSAO` (0|1), `RUSTUDIO_BLOOM` (levels, 0 off),
+`RUSTUDIO_DOF` (0|1), `RUSTUDIO_CLOUDS` (0|1), `RUSTUDIO_NO_ENV_PROBE` —
+and `RUSTUDIO_VIEW_REUSE` (0|1), `RUSTUDIO_FRAME_LATENCY` (swapchain
+images less one, 1 to 3; see below), `RUSTUDIO_NO_PIPELINE_CACHE`,
+`RUSTUDIO_NO_PIPELINE_WARMUP` (below). A switch wins over the saved
+View menu choice for the run.
+
+### Quality presets (`src/quality.rs`)
+
+The 3D view's per-frame fixed costs on the device — the 4× MSAA
+Rgba16Float scene and its resolve, a full-resolution Rgba16Float copy of
+it for glass and water, the five-level bloom pyramid, the half-resolution
+SSAO chain, two full- and eleven quarter-resolution depth-of-field
+targets, the sun's four cascades, the local lights' shadow atlas and the
+cloud layer — were paid whatever the scene held: an empty baseplate took
+31–37 ms of GPU a frame at 0.7 scale. View > Quality picks a preset, kept
+in the saved layout; a phone starts at Low, a computer at High
+(`Quality::platform_default`); Render Scale and Ambient Occlusion stay
+settable apart, over the preset.
+
+| | Low | Medium | High |
+|---|---|---|---|
+| MSAA | off | 2× | 4× |
+| Scene format | Rg11b10Ufloat (Rgba16Float where not renderable) | Rgba16Float | Rgba16Float |
+| Render scale | 0.7 (`mech::RENDER_SCALE_LOW`) | 1.0 | 1.0 |
+| Sun shadow cascades | 1, at half texel scale | 2, at 0.75 | 4, at 1.0 |
+| Local light shadows | off | on | on |
+| SSAO | off | off | on |
+| Bloom levels | 0 | 3 | 5 |
+| Depth of field | off | off | on |
+| Clouds | off | on | on |
+| Scene environment probe | off | on | on |
+
+What the renderer does with a preset (`render.rs`):
+
+- **Pipelines and targets only for what is on** (`Pipe::wanted`,
+  `Target`): the SSAO, bloom, depth-of-field, glass, water, cloud and
+  light-shadow targets exist, and their passes run, only in a preset that
+  uses them; the sun's atlas holds the preset's cascades (shader
+  constant `SUN_CASCADES` hands the rest to the voxel sun); without MSAA
+  the scene is drawn straight into the resolved texture (`MSAA_SAMPLES`
+  1; `render::msaa_wgsl` turns the shaders' multisampled depth reads
+  into plain ones).
+- **Pipelines compiled when first needed** (`Pipes`, `Renderer::pipe`),
+  the first frame's set in the background right after the shader module
+  (`warm_pipelines`; `RUSTUDIO_NO_PIPELINE_WARMUP=1` leaves it all to
+  first use), and Vulkan's pipeline cache kept across runs in the app's
+  cache directory (`DiskCache`, keyed by adapter and driver;
+  `RUSTUDIO_NO_PIPELINE_CACHE=1`): the ~10 s black screen between
+  adapter selection and the first frame was one shader module and some
+  forty pipelines compiled in a row before anything was drawn.
+- **A settings change rebuilds only what the key covers**
+  (`RenderSettings::build_key`: MSAA, format, shadow scale, light
+  shadows → `Renderer::rebuild`); the rest — passes on or off, the
+  render scale, the cascade count — applies to the next frame.
+- The perf line (every 5 s) names the preset and the settings in effect
+  and how many pipelines are built of those wanted.
 
 First measurements (a Galaxy Note20 Ultra, Adreno 650 on Vulkan, release
 APK, the window 1550 × 720 px at 60 Hz, the 3D view 816 × 310): 5–14 ms
@@ -258,11 +361,12 @@ What the port does about it:
   still (egui notes the same halving on iOS and leaves the default there).
   With a third image the next frame starts while the last one is still
   queued, and the CPU's work overlaps the GPU's.
-- **Render scale** (View > Render Scale; `RUSTUDIO_RENDER_SCALE`): the 3D
-  view at 0.7 of the panel's pixels on a first run.
-- **Half-size sun shadow maps** (`sun_shadow::texel_scale`;
-  `mech::SUN_SHADOW_TEXEL_SCALE_PHONE` 0.5, `RUSTUDIO_SHADOW_SCALE`
-  overrides): Studio's four cascades are 384 / 768 / 1024 / 2048 texels
+- **The Low quality preset** on a first run (the table above): the 3D
+  view at 0.7 of the panel's pixels, no MSAA, one shadow cascade, the
+  passes an empty baseplate paid for off.
+- **Half-size sun shadow maps** (`sun_shadow::texel_scale`; the preset's
+  `shadow_scale`, `RUSTUDIO_SHADOW_SCALE` overrides): Studio's four
+  cascades are 384 / 768 / 1024 / 2048 texels
   across in a 3200 × 2048 atlas, and a cascade that moved with the camera
   is drawn into the depth map and then blurred twice (EVSM) over its whole
   tile — the far cascade alone is 2048² × 8 bytes read five times and
@@ -272,9 +376,9 @@ What the port does about it:
   keeps its width in studs (`Cascade::level` counts texels), and a cascade
   whose texels are still finer than the view's pixels looks the same.
   `cargo test sun_shadow` keeps the full-scale layout at Studio's numbers.
-- **Ambient occlusion off** (View > Ambient Occlusion; `RUSTUDIO_SSAO`):
-  Studio's SSAO is five passes over the view for a darkening in corners
-  a phone's screen barely shows.
+- **Ambient occlusion off** (View > Ambient Occlusion; `RUSTUDIO_SSAO`;
+  on in High alone): Studio's SSAO is five passes over the view for a
+  darkening in corners a phone's screen barely shows.
 - **The last 3D frame shown again** while nothing in it changed
   (`viewport::ViewReuse`; `RUSTUDIO_VIEW_REUSE=0|1`, on by default on
   Android only): the frame's inputs are hashed (`render::frame_key`), the
@@ -297,10 +401,13 @@ What the port does about it:
   android.yml; the workspace profile is unchanged for desktops).
 
 Still to do, with measurements from the line above: a phone tier for the
-light grid's size and the local lights' shadow atlas, the sun's far
-cascades redrawn less often while the camera moves, and a leaner default
-layout for small screens (every panel open at once is most of the CPU
-time on a phone).
+light grid's size, the sun's far cascades redrawn less often while the
+camera moves (Medium and High), a Low preset for the terrain's grass
+and detail passes, and a leaner default layout for small screens (every
+panel open at once is most of the CPU time on a phone). The next
+device run's perf lines at Low against the ones above are what sizes the
+presets' next step (the quality table's numbers are estimates until
+then).
 
 ## Device-run notes (first APKs)
 
@@ -334,6 +441,14 @@ and here:
   (`android/text_menu.rs`) and the mirror in `android/clipboard.rs`.
 - **Typing behind the keyboard.** The window never shrank for the soft
   keyboard; `android/keyboard.rs` (see "Text" under "Fingers").
+- **The keyboard came back as soon as it was hidden** while a Properties
+  value or an Explorer name was being edited: the field asked for the
+  focus every frame, which egui turns into an IME hide-and-show each
+  time (see "Text" under "Fingers").
+- **Ten seconds of black before the first frame; 30+ ms of GPU a frame
+  for an empty baseplate.** Every pipeline compiled before the first
+  frame, and every pass of the desktop renderer run at full cost: the
+  quality presets and the lazy pipelines ("Frame time on a phone").
 - **Browser sign-in "always fails".** Closing the account popup (a tap
   outside it, Escape, Android's Back turned into Escape) cancelled the
   waiting sign-in; it now goes on behind the closed popup, every step is

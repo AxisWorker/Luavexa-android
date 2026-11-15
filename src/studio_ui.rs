@@ -256,6 +256,14 @@ pub const VIEW: &[M] = &[
     I("Zoom In", "Ctrl+=", "zoom_in"),
     I("Zoom Out", "Ctrl+-", "zoom_out"),
     I("Full Screen", "F11", "full_screen"),
+    // The 3D view's quality preset (src/quality.rs): MSAA, the scene's
+    // format, shadows, passes; it sets the render scale and ambient
+    // occlusion below too, which can then be set apart.
+    Sub("Quality", &[
+        I("Low", "", "quality_low"),
+        I("Medium", "", "quality_medium"),
+        I("High", "", "quality_high"),
+    ]),
     // The 3D view at fewer pixels than its panel, drawn scaled up: for
     // screens with more pixels than their GPU keeps up with (phones).
     Sub("Render Scale", &[
