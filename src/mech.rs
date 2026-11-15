@@ -654,8 +654,34 @@ pub const SUN_CASCADE_UP_FLIP: f32 = 0.7; // light space's up turns from +Y to +
 pub const SHADOW_SOFTNESS_BLUR: [f32; 2] = [1.71, 0.05]; // the blur's reach in studs = ShadowSoftness × [0] + [1] (as Studio); also what a cascade's sphere gives up for the shader's test
 pub const SUN_SHADOW_ATLAS: [u32; 2] = [3200, 2048]; // rustudio's atlas for the four tiles (Studio shares a 4096 × 7680 one with the local lights)
 pub const SUN_CASCADE_ORIGINS: [[u32; 2]; 4] = [[2816, 1024], [2048, 1024], [2048, 0], [0, 0]]; // each tile's corner in that atlas
-pub const SUN_SHADOW_TEXEL_SCALE_PHONE: f32 = 0.5; // Android: the cascades' tiles, atlas and depth map at this fraction of the texels across (a quarter of the shadow fill and blur work; RUSTUDIO_SHADOW_SCALE overrides) (estimated; a phone GPU has a tenth of a desktop card's bandwidth)
-pub const RENDER_SCALE_LOW: f32 = 0.7; // the Low quality preset's 3D view render scale (quality.rs): about half the pixels of the panel; the first phone measurements fell well under 60 Hz at full resolution (estimated)
+pub const SUN_SHADOW_TEXEL_SCALE_PHONE: f32 = 0.5; // the low graphics quality levels' cascade tiles, atlas and depth map at this fraction of the texels across (a quarter of the shadow fill and blur work; RUSTUDIO_SHADOW_SCALE overrides) (estimated; a phone GPU has a tenth of a desktop card's bandwidth)
+// Graphics quality levels (quality.rs; docs/MECHANICS.md "Graphics quality levels"): Studio's
+// Settings slider, 1 (cheapest) to 10, each a row of these tables (index = level − 1). Studio's
+// QualityLevel enum spans Level01..Level21 behind the same slider; level 10 is Studio's defaults.
+pub const QUALITY_LEVELS: u8 = 10;
+pub const QUALITY_VIEW_DISTANCE: [f32; 10] = [500.0, 700.0, 900.0, 1200.0, 1500.0, 2500.0, 4000.0, 6000.0, 10000.0, f32::INFINITY]; // studs: parts and terrain chunks wholly farther from the camera aren't drawn (Studio: about 500 studs at Level01, 100000 at Level21; estimated)
+pub const QUALITY_DETAIL_PX: [f32; 10] = [6.0, 4.0, 3.0, 2.0, 1.5, 1.2, 1.0, 1.0, 1.0, 1.0]; // a part whose bounding radius covers fewer pixels than this is skipped (LOD_MIN_PX at the top; Studio's low levels drop small distant parts first; estimated)
+pub const QUALITY_TEXTURE_TEXELS: [u32; 10] = [256, 256, 512, 512, 512, 1024, 1024, 1024, 1024, 1024]; // the material texture arrays' side (matpack::LAYER_SIZE at most): a quarter of the GPU memory and bandwidth per halving (Studio's low levels halve its texture resolution; estimated)
+pub const QUALITY_MSAA: [u32; 10] = [1, 1, 1, 1, 1, 2, 2, 2, 4, 4]; // scene multisampling (Studio: MSAA from Level19)
+pub const QUALITY_HDR_FROM: u8 = 5; // levels from this one draw the scene in 64-bit float (Rgba16Float); below, 32-bit Rg11b10Ufloat
+pub const QUALITY_RENDER_SCALE: [f32; 10] = [0.5, 0.6, 0.7, 0.8, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]; // the 3D view's pixels per panel pixel: the first phone measurements fell well under 60 Hz at full resolution (estimated)
+pub const QUALITY_SUN_CASCADES: [u32; 10] = [0, 1, 1, 2, 2, 2, 3, 4, 4, 4]; // sun shadow cascades drawn (0: the voxel sun alone, as Studio below Level04)
+pub const QUALITY_SHADOW_SCALE: [f32; 10] = [0.5, 0.5, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0, 1.0]; // the cascades' texels as a fraction of Studio's (SUN_SHADOW_TEXEL_SCALE_PHONE at the bottom)
+pub const QUALITY_LIGHT_SHADOWS_FROM: u8 = 5; // local lights' shadow maps from this level (Studio: ShadowMap from Level04, Future from Level05)
+pub const QUALITY_SSAO_FROM: u8 = 8; // screen-space ambient occlusion from this level (Studio: Level21)
+pub const QUALITY_BLOOM_LEVELS: [u32; 10] = [0, 0, 0, 3, 3, 3, 5, 5, 5, 5]; // bloom pyramid levels (Studio: bloom from Level06)
+pub const QUALITY_DOF_FROM: u8 = 8; // depth of field from this level (Studio: Level17)
+pub const QUALITY_CLOUDS_FROM: u8 = 5; // Terrain.Clouds from this level
+pub const QUALITY_ENV_PROBE_FROM: u8 = 5; // the scene environment probe from this level
+pub const QUALITY_DEFAULT_PHONE: u8 = 3; // Android starts here, in Automatic (a computer at 10, as Studio's Level21 default)
+pub const QUALITY_AUTO_FRAME_MS: f32 = 16.7; // Automatic quality's frame budget: one 60 Hz refresh
+pub const QUALITY_AUTO_SLOW: f32 = 1.35; // the median frame longer than this × the budget for QUALITY_AUTO_DOWN_S: a level down (estimated)
+pub const QUALITY_AUTO_DOWN_S: f32 = 2.0; // seconds of slow frames before a step down
+pub const QUALITY_AUTO_FAST: f32 = 1.1; // the median frame within this × the budget (vsync holds it at 1.0) for QUALITY_AUTO_UP_S: a level up (estimated)
+pub const QUALITY_AUTO_UP_S: f32 = 20.0; // seconds of fast frames before a step up
+pub const QUALITY_AUTO_HOLD_S: f32 = 90.0; // after a step down, the level left isn't gone back up to for this long (estimated)
+pub const QUALITY_AUTO_SETTLE_S: f32 = 0.5; // frames in the first this many seconds after a level change aren't counted: pipelines and render targets are remade then (estimated)
+pub const QUALITY_AUTO_IDLE_MS: f32 = 100.0; // a frame longer than this follows an idle pause (the editor repaints on input), not slow drawing: left out
 pub const SUN_DIST: f32 = 580.0; // Globals.sunDist: the sun's map hands off to the voxel sun from here, over 1 / HYBRID_LERP_SLOPE studs
 pub const LIGHT_INNER: f32 = 0.71; // light record m1 = Range × 1000 + this: full brightness to this × Range (all lights read)
 

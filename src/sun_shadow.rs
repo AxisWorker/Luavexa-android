@@ -30,7 +30,7 @@ pub fn texel_scale() -> f32 {
 }
 
 /// The scale in force: 1 until the renderer sets it from the quality
-/// settings (`RenderSettings::shadow_scale`: the Low preset's is
+/// settings (`RenderSettings::shadow_scale`: the low graphics levels' is
 /// mech::SUN_SHADOW_TEXEL_SCALE_PHONE; RUSTUDIO_SHADOW_SCALE overrides).
 static SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f80_0000);
 

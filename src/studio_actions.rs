@@ -106,13 +106,12 @@ impl Editor {
             "unlock_all" | "select_all" => (edit, None),
             "zoom_in" | "zoom_out" => (true, None),
             "full_screen" => (true, Some(self.ui.fullscreen)),
-            "quality_low" => (true, Some(self.quality == crate::quality::Quality::Low)),
-            "quality_medium" => (true, Some(self.quality == crate::quality::Quality::Medium)),
-            "quality_high" => (true, Some(self.quality == crate::quality::Quality::High)),
-            "render_scale_100" => (true, Some((self.render_scale - 1.0).abs() < 0.01)),
-            "render_scale_70" => (true, Some((self.render_scale - 0.7).abs() < 0.01)),
-            "render_scale_50" => (true, Some((self.render_scale - 0.5).abs() < 0.01)),
-            "ambient_occlusion" => (true, Some(self.ssao)),
+            "graphics_settings" => (true, Some(self.ui.graphics_settings)),
+            "quality_auto" => (true, Some(self.graphics.auto)),
+            q if q.strip_prefix("quality_").and_then(|n| n.parse::<u8>().ok()).is_some() => {
+                let n: u8 = q["quality_".len()..].parse().unwrap_or(0);
+                (true, Some(!self.graphics.auto && self.graphics.level == n))
+            }
             "show_grid" => (true, Some(self.show_grid)),
             "align_dragged" => (true, Some(self.align_dragged)),
             "dragger_menu" | "dragger_physical" | "dragger_geometric" => (true, None),
@@ -297,13 +296,12 @@ impl Editor {
             }
             "zoom_in" => self.ui.zoom = (self.ui.zoom + 0.1).min(2.0),
             "zoom_out" => self.ui.zoom = (self.ui.zoom - 0.1).max(0.5),
-            "quality_low" => self.set_quality(crate::quality::Quality::Low),
-            "quality_medium" => self.set_quality(crate::quality::Quality::Medium),
-            "quality_high" => self.set_quality(crate::quality::Quality::High),
-            "render_scale_100" => self.render_scale = 1.0,
-            "render_scale_70" => self.render_scale = 0.7,
-            "render_scale_50" => self.render_scale = 0.5,
-            "ambient_occlusion" => self.ssao = !self.ssao,
+            "graphics_settings" => self.ui.graphics_settings = !self.ui.graphics_settings,
+            "quality_auto" => self.set_quality(None),
+            q if q.strip_prefix("quality_").and_then(|n| n.parse::<u8>().ok()).is_some() => {
+                let n: u8 = q["quality_".len()..].parse().unwrap_or(crate::quality::LEVELS);
+                self.set_quality(Some(n));
+            }
             "full_screen" => {
                 self.ui.fullscreen = !self.ui.fullscreen;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.ui.fullscreen));

@@ -81,7 +81,7 @@ xbuild quirks worth knowing (commit e67b501):
 | Back button | — | closes what is open on top (Escape), otherwise `moveTaskToBack` — the activity isn't destroyed (`src/android/lifecycle.rs`) |
 | Activity destroyed | — | `onDestroy` hook: close request, then `process::exit(0)`; `android_main` always leaves the process when the loop ends (`lifecycle.rs`) |
 | UI zoom | 1.0 of the display's scale | first run: the zoom that fits ~1100 points across (0.8 … 1.6 of the density), then View > Zoom In / Out as saved |
-| 3D view render scale | 1.0 | first run 0.7 (View > Render Scale 100 / 70 / 50 %); saved with the layout |
+| Graphics quality | level 10 (Studio's defaults) | Automatic from level 3: the 3D view at 0.7 scale with 512² textures, 900 studs of view distance, no MSAA, one shadow cascade (View > Graphics Settings, the 1–10 bar; "Graphics quality" below); saved with the layout |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
 | Crash reports | `~/.cache/rustudio/crash/` | `<cache>/rustudio/crash/` (same `src/crash.rs`: panic hook + signal handlers chain to debuggerd) |
 | Studio content download | ureq + rustls (ring) | the same; started only when ConnectivityManager reports a validated network |
@@ -184,33 +184,43 @@ Android dependency, so its twelve tests run on the desktop
 winit never resizes an Android window for the soft keyboard (the
 manifest's `adjustResize` moves NativeActivity's content rect; the surface
 egui draws on stays the whole screen), so `src/android/keyboard.rs` makes
-the room: while a text field has the focus it asks the Java main thread
-for the keyboard's height every 100 ms (`jni::keyboard_height_later`:
-`WindowInsets.getInsets(Type.ime())` on API 30+, the system inset less
-the stable inset before that; the editor's thread never waits for the
-answer, which comes a frame or two later) and takes that much off the
-root `Ui` at the start of `App::ui` — the dock, the 3D view and the
-status bar move up as an Android view would — and gives it to egui as the
-bottom safe-area inset, so windows, menus and popups keep above it too
-(set every frame, zero when the keyboard is down: egui keeps the last
-inset it was given). The field's own scrolling brings the caret into view
-at the next keystroke.
+the room: while a text field has the focus, or the room is still made, it
+asks the Java main thread for the keyboard's height every 100 ms
+(`jni::keyboard_height_later`: `WindowInsets.getInsets(Type.ime())` on
+API 30+, the system inset less the stable inset before that; the editor's
+thread never waits for the answer, which comes a frame or two later) and
+takes that much off the root `Ui` at the start of `App::ui` — the dock,
+the 3D view and the status bar move up as an Android view would — and
+gives it to egui as the bottom safe-area inset, so windows, menus and
+popups keep above it too (set every frame, zero when the keyboard is
+down: egui keeps the last inset it was given). When the room is made or
+changes, the focused field's caret is scrolled into view
+(`keyboard::reveal_cursor`, from the Properties cells and the script
+editor: the field's `TextEditOutput` gives the caret's row).
 
 The keyboard is shown and hidden by egui-winit alone, from egui's IME
 output (up while a text field has the focus: `set_ime_allowed` →
 android-activity's `show_soft_input` / `hide_soft_input`); the user
-hiding it with Back or its own hide key is invisible to the app. On the
-first device runs it came straight back: the Properties and Explorer
-edit fields asked egui for the focus every frame while an edit was open,
-and egui counts every `request_focus` as an IME interruption
-(`should_interrupt_composition`), which egui-winit answers with a hide
-and a show. Now the fields ask only while they lack the focus and are
-not just back from losing it (`properties.rs`, `explorer.rs`,
-`account_ui.rs`), and `keyboard.rs` releases a field's focus once the
-keyboard has been down for 300 ms with the field it was up for still
-focused: the edit ends with its text kept (as a click away ends it), and
-a tap on the field starts it again. A focus move between two fields
-(hide and show within a poll or two) is under that time.
+hiding it with Back or its own hide key is invisible to the app. Two
+things made that a loop on the first device runs. The Properties and
+Explorer edit fields asked egui for the focus every frame while an edit
+was open, and egui counts every `request_focus` — a field's own on a tap
+inside it too — as an IME interruption (`should_interrupt_composition`),
+which egui-winit answers with a hide and a show: the fields now ask only
+while they lack the focus and are not just back from losing it
+(`properties.rs`, `explorer.rs`, `account_ui.rs`). And every height
+reading was acted on at once: the zero read during a hide-and-show took
+the room away (a re-layout of every panel), the show put it back, and
+releasing the focus on a short zero re-showed the keyboard the next tap
+asked for. The readings now go through hysteresis (`Keyboard::follow`):
+the first height above zero is taken at once (`soft keyboard up: N px, M
+ms after the focus` in logcat), a different height only after two equal
+readings running, a zero while a field is focused is ignored for 600 ms —
+longer than a hide-and-show's two animations and than the hide and show
+of a focus move between fields — and only then releases the field's focus
+(`soft keyboard hidden by the user`): the edit ends with its text kept, as
+a click away ends it, and a tap on the field starts it again. A zero with
+nothing focused takes the room away at once.
 
 The soft keyboard has no Ctrl, egui's text fields have no menu of their
 own and egui-winit has no clipboard on Android, so a long press on a text
@@ -279,20 +289,22 @@ adb shell setprop debug.rustudio.env "RUSTUDIO_SUN_SHADOWS=0 RUSTUDIO_VIEW_REUSE
 then relaunch (`setprop debug.rustudio.env ""` clears). Space-separated
 `RUSTUDIO_*=value` pairs, 91 characters at most (`android::export_env`;
 the renderer's are read by `quality::RenderSettings::with_env`):
-`RUSTUDIO_QUALITY=low|medium|high` and the single settings over the
-preset — `RUSTUDIO_MSAA` (1, 2, 4), `RUSTUDIO_HDR` (0|1),
-`RUSTUDIO_RENDER_SCALE` (0.25 to 1), `RUSTUDIO_SUN_SHADOWS` (0: the
-sun's shadow maps off, as Lighting.GlobalShadows false),
-`RUSTUDIO_SUN_CASCADES` (0 to 4), `RUSTUDIO_SHADOW_SCALE` (the shadow
-maps' texels across, 0.25 to 1; see below), `RUSTUDIO_LIGHT_SHADOWS`
-(0|1), `RUSTUDIO_SSAO` (0|1), `RUSTUDIO_BLOOM` (levels, 0 off),
-`RUSTUDIO_DOF` (0|1), `RUSTUDIO_CLOUDS` (0|1), `RUSTUDIO_NO_ENV_PROBE` —
-and `RUSTUDIO_VIEW_REUSE` (0|1), `RUSTUDIO_FRAME_LATENCY` (swapchain
-images less one, 1 to 3; see below), `RUSTUDIO_NO_PIPELINE_CACHE`,
-`RUSTUDIO_NO_PIPELINE_WARMUP` (below). A switch wins over the saved
-View menu choice for the run.
+`RUSTUDIO_QUALITY=auto|1..10` (`low` / `medium` / `high` = 3 / 6 / 10)
+and the single settings over the level — `RUSTUDIO_VIEW_DISTANCE`
+(studs, 0 unlimited), `RUSTUDIO_DETAIL_PX` (the smallest part drawn, in
+pixels), `RUSTUDIO_TEXTURE_TEXELS` (256, 512, 1024), `RUSTUDIO_MSAA`
+(1, 2, 4), `RUSTUDIO_HDR` (0|1), `RUSTUDIO_RENDER_SCALE` (0.25 to 1),
+`RUSTUDIO_SUN_SHADOWS` (0: the sun's shadow maps off, as
+Lighting.GlobalShadows false), `RUSTUDIO_SUN_CASCADES` (0 to 4),
+`RUSTUDIO_SHADOW_SCALE` (the shadow maps' texels across, 0.25 to 1; see
+below), `RUSTUDIO_LIGHT_SHADOWS` (0|1), `RUSTUDIO_SSAO` (0|1),
+`RUSTUDIO_BLOOM` (levels, 0 off), `RUSTUDIO_DOF` (0|1), `RUSTUDIO_CLOUDS`
+(0|1), `RUSTUDIO_NO_ENV_PROBE` — and `RUSTUDIO_VIEW_REUSE` (0|1),
+`RUSTUDIO_FRAME_LATENCY` (swapchain images less one, 1 to 3; see below),
+`RUSTUDIO_NO_PIPELINE_CACHE`, `RUSTUDIO_NO_PIPELINE_WARMUP` (below). A
+switch wins over the saved Graphics Settings choice for the run.
 
-### Quality presets (`src/quality.rs`)
+### Graphics quality (`src/quality.rs`, `src/graphics_settings.rs`)
 
 The 3D view's per-frame fixed costs on the device — the 4× MSAA
 Rgba16Float scene and its resolve, a full-resolution Rgba16Float copy of
@@ -300,30 +312,79 @@ it for glass and water, the five-level bloom pyramid, the half-resolution
 SSAO chain, two full- and eleven quarter-resolution depth-of-field
 targets, the sun's four cascades, the local lights' shadow atlas and the
 cloud layer — were paid whatever the scene held: an empty baseplate took
-31–37 ms of GPU a frame at 0.7 scale. View > Quality picks a preset, kept
-in the saved layout; a phone starts at Low, a computer at High
-(`Quality::platform_default`); Render Scale and Ambient Occlusion stay
-settable apart, over the preset.
+31–37 ms of GPU a frame at 0.7 scale; and the scene's own costs — every
+part in the frustum drawn however far and small, every material at 1024²
+— grew with the place. View > Graphics Settings has Studio's bar, a level
+from 1 (fastest) to 10 (Studio's defaults; the tables are `QUALITY_*` in
+`src/mech.rs`), or Automatic, and each setting apart from the level
+("Auto" follows it); View > Graphics Quality has the same levels as a
+menu. A phone starts in Automatic at level 3, a computer at 10
+(`Graphics::platform_default`); the choices are kept in the saved layout
+and the level mirrors Studio Settings > Rendering > Editor Quality Level
+(`settings().Rendering.EditQualityLevel`: Automatic or Level01–21, two
+Studio levels per bar step), set from either side.
 
-| | Low | Medium | High |
-|---|---|---|---|
-| MSAA | off | 2× | 4× |
-| Scene format | Rg11b10Ufloat (Rgba16Float where not renderable) | Rgba16Float | Rgba16Float |
-| Render scale | 0.7 (`mech::RENDER_SCALE_LOW`) | 1.0 | 1.0 |
-| Sun shadow cascades | 1, at half texel scale | 2, at 0.75 | 4, at 1.0 |
-| Local light shadows | off | on | on |
-| SSAO | off | off | on |
-| Bloom levels | 0 | 3 | 5 |
-| Depth of field | off | off | on |
-| Clouds | off | on | on |
-| Scene environment probe | off | on | on |
+| Level | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| View distance (studs) | 500 | 700 | 900 | 1200 | 1500 | 2500 | 4000 | 6000 | 10000 | all |
+| Smallest part drawn (px) | 6 | 4 | 3 | 2 | 1.5 | 1.2 | 1 | 1 | 1 | 1 |
+| Material textures | 256² | 256² | 512² | 512² | 512² | 1024² | 1024² | 1024² | 1024² | 1024² |
+| MSAA | off | off | off | off | off | 2× | 2× | 2× | 4× | 4× |
+| Scene format | RG11B10F | RG11B10F | RG11B10F | RG11B10F | RGBA16F | RGBA16F | RGBA16F | RGBA16F | RGBA16F | RGBA16F |
+| Render scale | 0.5 | 0.6 | 0.7 | 0.8 | 1 | 1 | 1 | 1 | 1 | 1 |
+| Sun shadow cascades | 0 (voxel sun) | 1 | 1 | 2 | 2 | 2 | 3 | 4 | 4 | 4 |
+| Shadow texel scale | 0.5 | 0.5 | 0.5 | 0.5 | 0.75 | 0.75 | 1 | 1 | 1 | 1 |
+| Local light shadows | off | off | off | off | on | on | on | on | on | on |
+| SSAO | off | off | off | off | off | off | off | on | on | on |
+| Bloom levels | 0 | 0 | 0 | 3 | 3 | 3 | 5 | 5 | 5 | 5 |
+| Depth of field | off | off | off | off | off | off | off | on | on | on |
+| Clouds, environment probe | off | off | off | off | on | on | on | on | on | on |
 
-What the renderer does with a preset (`render.rs`):
+(Rg11b10Ufloat where the device renders to it, else Rgba16Float. Roblox's
+own levels for the view distance: about 500 studs at Level01, 100000 at
+Level21; the rest of the table is an estimate until the next device run
+measures it.)
+
+**Automatic** (`quality::Auto`; Studio's QualityLevel.Automatic) watches
+the frames the 3D view draws back to back (frames shown again from the
+last one and frames after an idle pause don't count): the median frame
+over the last 2 s longer than 1.35 × a 60 Hz refresh → a level down; 20 s
+of frames at the refresh (within 1.1 ×) → a level up, but not back into a
+level left in the last 90 s; the half second after a change, pipelines
+and targets being remade, isn't counted. Each step logs `graphics
+quality (automatic): level N: …` with the settings in effect.
+
+The individual settings (the window's rows; `quality::Overrides`): Render
+Distance (500 to 10,000 studs or Unlimited), Part Detail (Low / Medium /
+High: parts under 4 / 2 / 1 px skipped), Texture Quality (256² / 512² /
+1024²), Anti-aliasing (off, 2×, 4×), HDR Scene (32- or 64-bit), Render
+Scale (50–100 %), Sun Shadows (Off / Low: one cascade at half texels /
+Medium: two at 0.75 / High: Studio's four), Light Shadows, Ambient
+Occlusion, Bloom, Depth of Field, Clouds, Reflections (the scene
+environment probe). "All Auto" clears them, "Restore Defaults" the
+platform's start.
+
+What the renderer does with the settings (`render.rs`):
+
+- **View distance and part detail** (`Renderer::render`): a static batch
+  cell, a moving part or a terrain chunk wholly farther than the view
+  distance from the camera is not drawn, and a part whose bounding radius
+  covers fewer pixels than the detail threshold (`mech::LOD_MIN_PX` at
+  level 7 and up) is skipped — what a 2–3× density phone screen never
+  showed at a stud or two a pixel. The sun's casters keep the cascades'
+  own reach.
+- **Texture quality** (`MaterialArrays`, `remake_materials`): the three
+  material arrays (albedo, surface, emission; 12 MB a 1024² layer with
+  mips, a quarter of that per halving) are made at the setting's size and
+  take each pack's mip chain from the level of that size; a change remakes
+  them from the packs kept in memory. The terrain shader's "never finer
+  than Studio's 512²" clamp reads the array's size (`textureDimensions`)
+  and stands down for smaller arrays.
 
 - **Pipelines and targets only for what is on** (`Pipe::wanted`,
   `Target`): the SSAO, bloom, depth-of-field, glass, water, cloud and
-  light-shadow targets exist, and their passes run, only in a preset that
-  uses them; the sun's atlas holds the preset's cascades (shader
+  light-shadow targets exist, and their passes run, only at a level that
+  uses them; the sun's atlas holds the level's cascades (shader
   constant `SUN_CASCADES` hands the rest to the voxel sun); without MSAA
   the scene is drawn straight into the resolved texture (`MSAA_SAMPLES`
   1; `render::msaa_wgsl` turns the shaders' multisampled depth reads
@@ -340,7 +401,7 @@ What the renderer does with a preset (`render.rs`):
   (`RenderSettings::build_key`: MSAA, format, shadow scale, light
   shadows → `Renderer::rebuild`); the rest — passes on or off, the
   render scale, the cascade count — applies to the next frame.
-- The perf line (every 5 s) names the preset and the settings in effect
+- The perf line (every 5 s) names the level and the settings in effect
   and how many pipelines are built of those wanted.
 
 First measurements (a Galaxy Note20 Ultra, Adreno 650 on Vulkan, release
@@ -361,10 +422,11 @@ What the port does about it:
   still (egui notes the same halving on iOS and leaves the default there).
   With a third image the next frame starts while the last one is still
   queued, and the CPU's work overlaps the GPU's.
-- **The Low quality preset** on a first run (the table above): the 3D
-  view at 0.7 of the panel's pixels, no MSAA, one shadow cascade, the
-  passes an empty baseplate paid for off.
-- **Half-size sun shadow maps** (`sun_shadow::texel_scale`; the preset's
+- **Level 3 on a first run, in Automatic** (the table above): the 3D
+  view at 0.7 of the panel's pixels, 512² textures, 900 studs of view
+  distance, no MSAA, one shadow cascade, the passes an empty baseplate
+  paid for off — and a level down after two seconds of slow frames.
+- **Half-size sun shadow maps** (`sun_shadow::texel_scale`; the level's
   `shadow_scale`, `RUSTUDIO_SHADOW_SCALE` overrides): Studio's four
   cascades are 384 / 768 / 1024 / 2048 texels
   across in a 3200 × 2048 atlas, and a cascade that moved with the camera
@@ -376,9 +438,9 @@ What the port does about it:
   keeps its width in studs (`Cascade::level` counts texels), and a cascade
   whose texels are still finer than the view's pixels looks the same.
   `cargo test sun_shadow` keeps the full-scale layout at Studio's numbers.
-- **Ambient occlusion off** (View > Ambient Occlusion; `RUSTUDIO_SSAO`;
-  on in High alone): Studio's SSAO is five passes over the view for a
-  darkening in corners a phone's screen barely shows.
+- **Ambient occlusion off** below level 8 (Graphics Settings > Ambient
+  Occlusion; `RUSTUDIO_SSAO`): Studio's SSAO is five passes over the view
+  for a darkening in corners a phone's screen barely shows.
 - **The last 3D frame shown again** while nothing in it changed
   (`viewport::ViewReuse`; `RUSTUDIO_VIEW_REUSE=0|1`, on by default on
   Android only): the frame's inputs are hashed (`render::frame_key`), the
@@ -402,17 +464,22 @@ What the port does about it:
 
 Still to do, with measurements from the line above: a phone tier for the
 light grid's size, the sun's far cascades redrawn less often while the
-camera moves (Medium and High), a Low preset for the terrain's grass
-and detail passes, and a leaner default layout for small screens (every
-panel open at once is most of the CPU time on a phone). The next
-device run's perf lines at Low against the ones above are what sizes the
-presets' next step (the quality table's numbers are estimates until
-then).
+camera moves (levels 7 and up), the terrain's grass and detail passes
+thinned at the low levels, particle limits and a leaner default layout
+for small screens (every panel open at once is most of the CPU time on a
+phone). The next device run's perf lines at each level against the ones
+above are what sizes the tables' next step (their numbers are estimates
+until then).
 
 ## Device-run notes (first APKs)
 
 Found on devices with the phase-1 APKs; the fixes are in the table above
-and here:
+and here. What a report from a device should carry: `adb logcat -s
+rustudio` filtered to `soft keyboard` (each height change, the focus
+release), `clipboard` (each copy put on the system clipboard, each read
+and its length, or "no clip"), `text menu` (open, cut, copy, paste,
+select all), `graphics quality` (each level change with the settings in
+effect) and the perf lines (every 5 s).
 
 - **Black window at first start, until leaving and coming back.** winit
   0.30 drops `MainEvent::Destroy`, so whenever the system destroyed the
@@ -433,9 +500,10 @@ and here:
   `lifecycle::hook`).
 - **Heavy lag.** The 3D view rendered at the panel's full pixel size — a
   phone's 2–3× density screen is more pixels than a laptop's — plus debug
-  builds. First run now renders the view at 0.7 scale (View > Render
-  Scale), and `x build --release` (or the `profiling` profile) is the
-  build to judge speed by; `RUSTUDIO_RENDER_SCALE` overrides.
+  builds. First run now renders the view at 0.7 scale (graphics level 3;
+  View > Graphics Settings), and `x build --release` (or the `profiling`
+  profile) is the build to judge speed by; `RUSTUDIO_RENDER_SCALE`
+  overrides.
 - **Clipboard.** egui-winit has no Android clipboard, and the soft
   keyboard has no Ctrl: the long-press menu on text fields
   (`android/text_menu.rs`) and the mirror in `android/clipboard.rs`.
@@ -448,7 +516,7 @@ and here:
 - **Ten seconds of black before the first frame; 30+ ms of GPU a frame
   for an empty baseplate.** Every pipeline compiled before the first
   frame, and every pass of the desktop renderer run at full cost: the
-  quality presets and the lazy pipelines ("Frame time on a phone").
+  graphics levels and the lazy pipelines ("Frame time on a phone").
 - **Browser sign-in "always fails".** Closing the account popup (a tap
   outside it, Escape, Android's Back turned into Escape) cancelled the
   waiting sign-in; it now goes on behind the closed popup, every step is

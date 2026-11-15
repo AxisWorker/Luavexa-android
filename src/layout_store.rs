@@ -96,15 +96,15 @@ pub struct Layout {
     /// Where each panel sat last in the main window.
     pub homes: HashMap<String, Home>,
     pub zoom: Option<f32>,
-    /// The 3D view's quality preset (View > Quality; quality.rs names).
+    /// The 3D view's graphics quality (View > Graphics Quality; quality.rs
+    /// `parse_level`: "auto", "1".."10", or the older "low" / "medium" /
+    /// "high").
     #[serde(default)]
     pub quality: Option<String>,
-    /// The 3D view's render scale (View > Render Scale).
+    /// The graphics settings set apart from the level (View > Graphics
+    /// Settings; quality.rs `Overrides`).
     #[serde(default)]
-    pub render_scale: Option<f32>,
-    /// View > Ambient Occlusion.
-    #[serde(default)]
-    pub ssao: Option<bool>,
+    pub graphics: Option<crate::quality::Overrides>,
     pub ribbon_tab: Option<String>,
     pub run_type: Option<String>,
     pub show_grid: Option<bool>,
@@ -225,18 +225,15 @@ impl Layout {
         if let Some(z) = self.zoom.and_then(finite) {
             ed.ui.zoom = z.clamp(0.5, 3.0);
         }
-        // (the preset first: it sets the render scale and AO, which the
-        // saved values of their own then override)
-        if let Some(q) = self.quality.as_deref().and_then(crate::quality::Quality::parse) {
-            if std::env::var_os("RUSTUDIO_QUALITY").is_none() {
+        // (RUSTUDIO_QUALITY, a device run's comparison, wins over the
+        // saved level)
+        if let Some(q) = self.quality.as_deref().and_then(crate::quality::parse_level) {
+            if crate::quality::Graphics::env_level().is_none() {
                 ed.set_quality(q);
             }
         }
-        if let Some(r) = self.render_scale.and_then(finite) {
-            ed.render_scale = r.clamp(0.25, 1.0);
-        }
-        if let Some(on) = self.ssao {
-            ed.ssao = on;
+        if let Some(o) = self.graphics {
+            ed.graphics.over = o;
         }
         if let Some(t) = &self.ribbon_tab {
             if let Some(t) = RibbonTab::ALL.into_iter().find(|r| format!("{r:?}") == *t) {
@@ -408,9 +405,8 @@ impl Saver {
             popped: saved_popped(panels),
             homes: panels.homes.clone(),
             zoom: Some(ed.ui.zoom),
-            quality: Some(ed.quality.name().to_string()),
-            render_scale: Some(ed.render_scale),
-            ssao: Some(ed.ssao),
+            quality: Some(ed.graphics.choice_name()),
+            graphics: ed.graphics.over.any().then_some(ed.graphics.over),
             ribbon_tab: Some(format!("{:?}", ed.ui.tab)),
             run_type: Some(format!("{:?}", ed.ui.run_type)),
             show_grid: Some(ed.show_grid),

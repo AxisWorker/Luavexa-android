@@ -47,11 +47,16 @@ impl TextMenu {
     pub fn end_frame(&mut self, ctx: &egui::Context) {
         let focused = focused_text(ctx);
         let response = focused.and_then(|id| ctx.read_response(id));
-        let clicked = match (focused, response.as_ref()) {
-            (Some(id), Some(r)) if r.secondary_clicked() && self.open.is_none() => Some((id, r)),
+        // A right click (a long press) on the focused field: by place, not
+        // by the field's response, since the Properties panel lays its
+        // own click catcher over its edit box (properties.rs `text_cell`).
+        let (secondary, at) = ctx.input(|i| (i.pointer.button_clicked(egui::PointerButton::Secondary), i.pointer.interact_pos()));
+        let clicked = match (focused, response.as_ref(), at) {
+            (Some(id), Some(r), Some(p)) if secondary && self.open.is_none() && r.rect.expand(4.0).contains(p) => Some((id, r)),
             _ => None,
         };
         if let Some((id, r)) = clicked {
+            log::info!("text menu: open for the focused text field");
             // The press moved the caret: the selection from before it is
             // what the menu is for.
             match (self.prev, egui::TextEdit::load_state(ctx, id)) {
@@ -123,6 +128,15 @@ impl TextMenu {
             }
             if let Some(event) = chosen {
                 keep = false;
+                log::info!(
+                    "text menu: {}",
+                    match &event {
+                        Event::Cut => "cut".to_string(),
+                        Event::Copy => "copy".to_string(),
+                        Event::Paste(t) => format!("paste {} chars", t.chars().count()),
+                        _ => "select all".to_string(),
+                    }
+                );
                 // A key press comes with its release, or egui holds the key.
                 if let Event::Key { key, modifiers, .. } = &event {
                     let up = Event::Key { key: *key, physical_key: None, pressed: false, repeat: false, modifiers: *modifiers };
@@ -132,8 +146,12 @@ impl TextMenu {
                     self.queued.push(event);
                 }
                 // The field takes the event next frame: it keeps the focus
-                // whatever this frame's tap did.
-                ctx.memory_mut(|m| m.request_focus(open.field));
+                // whatever this frame's tap did. (Asked only when it lacks
+                // it: egui counts a request as an IME interruption, which
+                // hides and shows the soft keyboard again.)
+                if focused != Some(open.field) {
+                    ctx.memory_mut(|m| m.request_focus(open.field));
+                }
             }
             if !keep {
                 let surrender = open.surrender;

@@ -559,6 +559,7 @@ pub fn clipboard_set(text: &str) -> Result<()> {
                     )?
                     .l()?;
                 env.call_method(&cm, jni_str!("setPrimaryClip"), jni_sig!("(Landroid/content/ClipData;)V"), &[JValue::Object(&clip)])?;
+                log::info!("clipboard: {} chars put on the system clipboard", text.chars().count());
                 Ok(())
             })
         },
@@ -579,6 +580,9 @@ pub fn clipboard_get() -> Result<Option<String>> {
                 }
                 let clip = env.call_method(&cm, jni_str!("getPrimaryClip"), jni_sig!("()Landroid/content/ClipData;"), &[])?.l()?;
                 if clip.is_null() {
+                    // Empty, or (Android 10+) this window hasn't the input
+                    // focus, which only the focused app's reads are allowed.
+                    log::info!("clipboard: the system clipboard has no clip (or this window lacks the focus)");
                     return Ok(None);
                 }
                 let n = env.call_method(&clip, jni_str!("getItemCount"), jni_sig!("()I"), &[])?.i()?;
@@ -596,7 +600,9 @@ pub fn clipboard_get() -> Result<Option<String>> {
                 }
                 let s = env.call_method(&cs, jni_str!("toString"), jni_sig!("()Ljava/lang/String;"), &[])?.l()?;
                 let s = env.as_cast::<jni::objects::JString>(&s)?;
-                Ok(Some((*s).to_string()))
+                let s = (*s).to_string();
+                log::info!("clipboard: {} chars read from the system clipboard", s.chars().count());
+                Ok(Some(s))
             })
         },
         std::time::Duration::from_millis(400),

@@ -286,6 +286,13 @@ Round 12 fidelity scores (render, settled shots): Place A 49.5, demo 69.3
   a Studio calibration scene (transparency steps over light and dark).
 - **Place A chapel brightness** (Soft spot lights) and the **skybox / stud scale**
   remain open.
+- **Graphics quality levels** (the Android port; `src/quality.rs`):
+  `settings().Rendering.EditQualityLevel` now does what Studio's does —
+  Automatic or Level01–21 onto a 1–10 bar of view distance, part detail,
+  texture size, MSAA, scene format, render scale, shadows and the post
+  passes (docs/ANDROID.md "Graphics quality"). A computer starts at level
+  10, Studio's defaults, which is what every fidelity figure above is
+  measured at; a shot at a lower level diverges by design.
 
 Round 13 fidelity (`fidelity.py run --round 13`): render Place A 49.5, demo
 69.3, control 68.5 (unchanged), all gates pass (MAE 32.4 / 21.7 / 23.1).

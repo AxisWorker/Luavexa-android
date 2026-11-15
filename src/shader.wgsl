@@ -1732,9 +1732,11 @@ fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32, blade: 
     if (layer >= 0 && !blade) {
         // Studio's terrain arrays are 512² (a 1024² pack drops its top
         // level), which is level 1 of the 1024² layer: never finer than that
-        // (magnified, Studio filters its 512² level).
-        let fp = max(length(dx), length(dy)) * 1024.0;
-        let k = select(1.0, 2.0 / max(fp, 1e-6), fp < 2.0);
+        // (magnified, Studio filters its 512² level). A smaller array (the
+        // texture quality setting, quality.rs) has no finer level to keep from.
+        let side = f32(textureDimensions(mat_albedo, 0u).x);
+        let fp = max(length(dx), length(dy)) * side;
+        let k = select(1.0, 2.0 / max(fp, 1e-6), fp < 2.0 && side > 512.0);
         t = textureSampleGrad(mat_albedo, studs_sampler, uv, layer, dx * k, dy * k);
         su = textureSampleGrad(mat_surface, studs_sampler, uv, layer, dx * k, dy * k);
         glow = textureSampleGrad(mat_emission, studs_sampler, uv, layer, dx * k, dy * k).r;

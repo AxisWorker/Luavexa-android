@@ -349,14 +349,17 @@ pub struct Editor {
     /// (camera aspect from it; drawn scaled into the panel): self-test
     /// steps that compare with a Studio capture at Studio's view size.
     pub view_render_size: Option<[u32; 2]>,
-    /// The 3D view's quality preset (View > Quality; src/quality.rs: Low
-    /// on phones, High on desktops; RUSTUDIO_QUALITY). Render scale and
-    /// ambient occlusion below start from it and can be set apart.
-    pub quality: crate::quality::Quality,
-    /// The 3D view rendered at this fraction of the panel's pixels and
-    /// drawn scaled up (View > Render Scale; 1 on desktops, less on phones,
-    /// whose screens have more pixels than their GPUs like at 60 Hz).
-    pub render_scale: f32,
+    /// The 3D view's graphics quality (View > Graphics Settings;
+    /// src/quality.rs): the level 1–10, Automatic, and the settings set
+    /// apart from the level. Phones start in Automatic at level 3,
+    /// computers at 10; `RUSTUDIO_QUALITY` overrides.
+    pub graphics: crate::quality::Graphics,
+    /// Automatic quality's frame-rate watch (quality.rs).
+    pub quality_auto: crate::quality::Auto,
+    /// Studio Settings > Rendering > Editor Quality Level as last seen:
+    /// a change there (the dialog, `settings()` from Luau) sets `graphics`
+    /// (`Editor::quality_tick`).
+    pub quality_studio_seen: u32,
     /// Fingers (Android): what the viewport laid out for them and the
     /// movement stick's state (src/touch_input.rs).
     pub touch: crate::touch_input::Touch,
@@ -364,10 +367,6 @@ pub struct Editor {
     /// layout: android::touch::auto_zoom).
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub auto_zoom: bool,
-    /// Screen-space ambient occlusion in the 3D view (View > Ambient
-    /// Occlusion; RUSTUDIO_SSAO=0|1). Off on phones by default: five
-    /// passes a small screen shows little of.
-    pub ssao: bool,
     /// The last 3D frame shown again while nothing in it changed
     /// (viewport.rs; RUSTUDIO_VIEW_REUSE=0|1, on by default on phones).
     pub view_reuse: crate::viewport::ViewReuse,
@@ -460,9 +459,9 @@ impl RustudioApp {
         }
         let render_state = cc.wgpu_render_state.clone();
         // (the renderer is made below, once the saved layout has said
-        // which quality preset it is for)
+        // which graphics level it is for)
         let renderer = None;
-        let preset = crate::quality::RenderSettings::platform_default();
+        let graphics = crate::quality::Graphics::platform_default();
         let mut ed = Editor {
             dialogs: crate::file_dialog::Dialogs::new(cc.egui_ctx.clone()),
             doc: Document::new_place(),
@@ -553,11 +552,11 @@ impl RustudioApp {
             game_cursor_hidden: false,
             cursor_log: Vec::new(),
             view_render_size: None,
-            quality: preset.quality,
-            render_scale: preset.render_scale,
+            graphics,
+            quality_auto: Default::default(),
+            quality_studio_seen: graphics.studio_level(),
             touch: Default::default(),
             auto_zoom: false,
-            ssao: preset.ssao,
             view_reuse: crate::viewport::ViewReuse::new(
                 std::env::var("RUSTUDIO_VIEW_REUSE").map_or(cfg!(target_os = "android"), |v| v != "0"),
             ),
@@ -660,6 +659,10 @@ impl RustudioApp {
             }
             layout = Some(crate::layout_store::Saver::new(saved.as_ref()));
         }
+        // (the saved layout's graphics choice, or the platform's, into
+        // Studio Settings > Rendering > Editor Quality Level)
+        ed.quality_studio_seen = ed.graphics.studio_level();
+        crate::studio_settings::set_edit_quality_level(ed.quality_studio_seen);
         let settings = ed.render_settings();
         ed.renderer = ed.render_state.as_ref().map(|rs| {
             if crate::perf_log::on() {
@@ -763,23 +766,74 @@ impl Editor {
 // ------------------------------------------------------------------ actions
 
 impl Editor {
-    /// The quality preset, the render scale and ambient occlusion as set
-    /// here (View menu, saved layout), then the run's `RUSTUDIO_*`
-    /// switches over them (a device run's comparison wins over the saved
-    /// choices).
+    /// What the 3D view draws with: the graphics level's settings, the
+    /// settings set apart from it (View > Graphics Settings, the saved
+    /// layout), then the run's `RUSTUDIO_*` switches over them (a device
+    /// run's comparison wins over the saved choices).
     pub fn render_settings(&self) -> crate::quality::RenderSettings {
-        let mut s = crate::quality::RenderSettings::preset(self.quality);
-        s.render_scale = self.render_scale;
-        s.ssao = self.ssao;
-        s.with_env().normalized()
+        self.graphics.settings()
     }
 
-    /// Chooses a preset: its render scale and ambient occlusion too.
-    pub fn set_quality(&mut self, quality: crate::quality::Quality) {
-        self.quality = quality;
-        let s = crate::quality::RenderSettings::preset(quality).with_env();
-        self.render_scale = s.render_scale;
-        self.ssao = s.ssao;
+    /// Chooses the graphics level (`Some(1..=10)`) or Automatic (`None`,
+    /// from the level it is at), as the View menu, the Graphics Settings
+    /// window, the saved layout and Studio Settings do.
+    pub fn set_quality(&mut self, choice: Option<u8>) {
+        let before = self.graphics;
+        self.graphics.apply_choice(choice);
+        if self.graphics != before {
+            self.quality_auto.reset();
+            self.quality_changed(true);
+        }
+    }
+
+    /// After a graphics change: the log, and (`mirror`) the level into
+    /// Studio Settings > Rendering > Editor Quality Level.
+    pub fn quality_changed(&mut self, mirror: bool) {
+        if mirror {
+            self.quality_studio_seen = self.graphics.studio_level();
+            crate::studio_settings::set_edit_quality_level(self.quality_studio_seen);
+        }
+        if crate::perf_log::on() {
+            let s = self.render_settings();
+            let format = match self.render_state.as_ref() {
+                Some(rs) => s.scene_format(&rs.device),
+                None => egui_wgpu::wgpu::TextureFormat::Rgba16Float,
+            };
+            eprintln!("graphics quality{}: {}", if self.graphics.auto { " (automatic)" } else { "" }, s.describe(format));
+        }
+    }
+
+    /// Once a frame: Studio Settings' Editor Quality Level changed by the
+    /// dialog or Luau (`settings().Rendering.EditQualityLevel`) sets the
+    /// graphics; Automatic quality steps the level by the frame rate while
+    /// the 3D view is drawn frame after frame (quality.rs `Auto`).
+    pub fn quality_tick(&mut self, now: Instant, dt: f32) {
+        let studio = crate::studio_settings::edit_quality_level();
+        if studio != self.quality_studio_seen {
+            // (Studio's value stays as set: Level05 reads back as Level05,
+            // though the bar shows 3)
+            self.quality_studio_seen = studio;
+            let before = self.graphics;
+            self.graphics.apply_choice(crate::quality::level_from_studio(studio));
+            if self.graphics != before {
+                self.quality_auto.reset();
+                self.quality_changed(false);
+            }
+        }
+        if !self.graphics.auto {
+            return;
+        }
+        // (a frame shown again, not drawn, says nothing about drawing)
+        let drawn = self.hud.viewport_drawn && !self.view_reuse.reused_now;
+        let step = if drawn { self.quality_auto.frame(now, dt, self.graphics.level) } else { None };
+        if let Some(step) = step {
+            match step {
+                crate::quality::Step::Down => self.graphics.level = self.graphics.level.saturating_sub(1).max(1),
+                crate::quality::Step::Up => self.graphics.level = (self.graphics.level + 1).min(crate::quality::LEVELS),
+            }
+            // (Automatic stays Automatic in Studio's enum: no mirror)
+            self.quality_changed(false);
+        }
     }
 
     pub fn set_document(&mut self, doc: Document) {
@@ -2038,8 +2092,11 @@ impl eframe::App for RustudioApp {
             let start_page = self.ed.start.visible && self.ed.doc.id == self.ed.start.doc_id;
             self.ed.touch.set_enabled(!start_page, raw);
             self.ed.touch.filter(_ctx, raw, self.ed.frame_no);
-            self.text_menu.before_frame(raw);
+            // (the clipboard first: it swaps egui-winit's pastes, Ctrl+V,
+            // for the system clipboard's text; the menu's paste comes with
+            // its text)
             crate::android::clipboard::before_frame(raw);
+            self.text_menu.before_frame(raw);
             self.keyboard.before_frame(_ctx, raw);
             crate::android::lifecycle::back_pressed(_ctx, raw);
         }
@@ -2320,6 +2377,7 @@ impl eframe::App for RustudioApp {
         let ed = &mut self.ed;
         ed.insert_popup_ui(&ctx);
         ed.about_ui(&ctx);
+        ed.graphics_settings_ui(&ctx);
         ed.studio_settings_ui(&ctx);
         ed.user_screenshot_tick(&ctx);
         crate::runtime::domains::assets_cloud::capture::frame_tick(&ctx, ed.viewport_rect);
@@ -2334,6 +2392,7 @@ impl eframe::App for RustudioApp {
         ed.ui_shots_tick(&ctx);
         let work_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
         ed.last_work_ms = work_ms;
+        ed.quality_tick(now, dt);
         if let Some(b) = ed.harness.bench.as_mut() {
             // Edit-mode benchmark: turn the camera slowly so several views count.
             if !b.play {

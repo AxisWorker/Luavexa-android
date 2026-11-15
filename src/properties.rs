@@ -498,6 +498,10 @@ impl Editor {
             })
             .inner;
         let resp = out.response.response.clone();
+        // The soft keyboard came up (or changed) under the panel: the row
+        // being typed into scrolls into the room left above it.
+        #[cfg(target_os = "android")]
+        crate::android::keyboard::reveal_cursor(p.ui, &out);
         // Sits over the edit box so egui's own click handling never runs.
         p.ui.interact(resp.rect, eid.with("mouse"), egui::Sense::CLICK | egui::Sense::DRAG).on_hover_cursor(egui::CursorIcon::Text);
         self.props.edit_layout = Some((key.to_string(), out.galley.clone(), out.galley_pos, resp.rect));

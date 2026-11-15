@@ -7,8 +7,11 @@
 //! egui-winit swallows the paste shortcut while its own string is empty
 //! (no `Event::Paste` at all), so the first frame gives it a marker text:
 //! every paste then arrives as `Paste(marker)` and is swapped for the
-//! system clipboard's text here. The soft keyboard's own paste key commits
-//! text through the IME and needs none of this.
+//! system clipboard's text here (`before_frame` runs before the text
+//! menu's, text_menu.rs, whose paste comes with its text). The soft
+//! keyboard's own paste key commits text through the IME and needs none
+//! of this. Every read and write is logged (`adb logcat -s rustudio`:
+//! "clipboard: ..."); Android 10+ lets only the focused app read.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;

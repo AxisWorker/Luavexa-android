@@ -280,8 +280,9 @@ pub mod touch {
     pub const FIT_POINTS: f32 = 1100.0;
     pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.8..=1.6;
 
-    /// (The 3D view's first-run render scale, MSAA, shadows and passes are
-    /// the Low quality preset's: src/quality.rs, app.rs `Editor::quality`.)
+    /// (The 3D view's first-run render scale, view distance, textures,
+    /// MSAA, shadows and passes are graphics level 3's, in Automatic:
+    /// src/quality.rs, app.rs `Editor::graphics`.)
     pub fn setup(app: &mut crate::app::RustudioApp, ctx: &egui::Context) {
         let saved = crate::layout_store::load();
         // (the window's size isn't known until the first frame: auto_zoom)

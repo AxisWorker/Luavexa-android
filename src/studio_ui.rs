@@ -102,6 +102,8 @@ pub struct UiState {
     pub show_gui: bool,
     pub grid_size: f32,
     pub about: bool,
+    /// View > Graphics Settings (src/graphics_settings.rs).
+    pub graphics_settings: bool,
     /// File > Studio Settings (src/studio_settings.rs).
     pub studio_settings: crate::studio_settings::Dialog,
     pub insert_popup: Option<InsertPopup>,
@@ -124,6 +126,7 @@ impl Default for UiState {
             show_gui: true,
             grid_size: crate::mech::GRID_SPACING,
             about: false,
+            graphics_settings: false,
             studio_settings: Default::default(),
             insert_popup: None,
             recent: load_recent(),
@@ -256,23 +259,25 @@ pub const VIEW: &[M] = &[
     I("Zoom In", "Ctrl+=", "zoom_in"),
     I("Zoom Out", "Ctrl+-", "zoom_out"),
     I("Full Screen", "F11", "full_screen"),
-    // The 3D view's quality preset (src/quality.rs): MSAA, the scene's
-    // format, shadows, passes; it sets the render scale and ambient
-    // occlusion below too, which can then be set apart.
-    Sub("Quality", &[
-        I("Low", "", "quality_low"),
-        I("Medium", "", "quality_medium"),
-        I("High", "", "quality_high"),
+    // The 3D view's graphics quality (src/quality.rs): Studio's 1–10 bar
+    // (view distance, textures, MSAA, the scene's format, shadows, the
+    // post passes) or Automatic, by the frame rate; the window has the
+    // bar and each setting apart from it (src/graphics_settings.rs).
+    I("Graphics Settings...", "", "graphics_settings"),
+    Sub("Graphics Quality", &[
+        I("Automatic", "", "quality_auto"),
+        S,
+        I("1 (fastest)", "", "quality_1"),
+        I("2", "", "quality_2"),
+        I("3", "", "quality_3"),
+        I("4", "", "quality_4"),
+        I("5", "", "quality_5"),
+        I("6", "", "quality_6"),
+        I("7", "", "quality_7"),
+        I("8", "", "quality_8"),
+        I("9", "", "quality_9"),
+        I("10 (best)", "", "quality_10"),
     ]),
-    // The 3D view at fewer pixels than its panel, drawn scaled up: for
-    // screens with more pixels than their GPU keeps up with (phones).
-    Sub("Render Scale", &[
-        I("100%", "", "render_scale_100"),
-        I("70%", "", "render_scale_70"),
-        I("50%", "", "render_scale_50"),
-    ]),
-    // Studio's SSAO: five passes over the view; phones start without.
-    I("Ambient Occlusion", "", "ambient_occlusion"),
     S,
     I("Show View Selector", "", "view_selector"),
     I("Show Wind Direction", "", "wind_direction"),

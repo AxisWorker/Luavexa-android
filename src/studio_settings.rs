@@ -274,11 +274,29 @@ pub fn reset_all() {
 }
 
 /// Pushes a value into the engine parts that keep their own copy.
+/// (Rendering > Editor Quality Level is read by the editor each frame
+/// instead: `edit_quality_level`, app.rs `quality_tick`.)
 fn apply(i: usize) {
     let d = &DEFS[i];
     if (d.class, d.prop) == ("Studio", "Main Volume") {
         crate::audio::set_studio_main(num("Studio", "Main Volume", 1.0) as f32);
     }
+}
+
+/// Rendering > Editor Quality Level (`settings().Rendering.EditQualityLevel`):
+/// Studio's QualityLevel value, 0 Automatic, 1..=21 Level01..Level21
+/// (quality.rs maps it onto the 1–10 bar).
+pub fn edit_quality_level() -> u32 {
+    match get("RenderSettings", "EditQualityLevel") {
+        Some(Val::Enum(e)) => e.min(21),
+        _ => 21,
+    }
+}
+
+/// The editor's graphics choice back into Rendering > Editor Quality Level
+/// (the View menu, the Graphics Settings window, the saved layout).
+pub fn set_edit_quality_level(level: u32) {
+    set("RenderSettings", "EditQualityLevel", Val::Enum(level.min(21)));
 }
 
 fn apply_all() {

@@ -367,16 +367,20 @@ impl Editor {
                         }
                         ui.fonts_mut(|f| f.layout_job(job))
                     };
-                    let resp = ui.add(
-                        egui::TextEdit::multiline(&mut buf.text)
-                            .id(editor_id)
-                            .code_editor()
-                            .frame(egui::Frame::NONE)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(lines.max(24))
-                            .lock_focus(true)
-                            .layouter(&mut layouter),
-                    );
+                    let out = egui::TextEdit::multiline(&mut buf.text)
+                        .id(editor_id)
+                        .code_editor()
+                        .frame(egui::Frame::NONE)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(lines.max(24))
+                        .lock_focus(true)
+                        .layouter(&mut layouter)
+                        .show(ui);
+                    // The soft keyboard came up under the editor: the caret
+                    // scrolls into the room left above it.
+                    #[cfg(target_os = "android")]
+                    crate::android::keyboard::reveal_cursor(ui, &out);
+                    let resp = out.response.response;
                     if resp.changed() {
                         changed = true;
                         buf.edited = Instant::now();

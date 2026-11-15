@@ -497,7 +497,7 @@ mod gpu_tests {
         limits.max_sampled_textures_per_shader_stage = 24;
         limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() })).unwrap();
-        let mut renderer = Renderer::new(&device, &queue, None, crate::quality::RenderSettings::preset(crate::quality::Quality::High));
+        let mut renderer = Renderer::new(&device, &queue, None, crate::quality::RenderSettings::level(crate::quality::LEVELS));
         let mut vox = crate::terrain::Voxels::empty();
         // Same FillBlock: x,z in [0,32), y in [-16,0), full Grass voxels.
         for x in 0..8 { for y in -4..0 { for z in 0..8 { vox.set([x,y,z],2,1.0); } } }
@@ -538,17 +538,22 @@ mod gpu_tests {
         let desc = wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() };
         let (device, queue) = pollster::block_on(adapter.request_device(&desc))
             .unwrap_or_else(|e| panic!("{} ({:?}) refused rustudio's limits: {e}", info.name, info.backend));
-        // Every preset: the multisampled shader and the plain one, the
-        // HDR scene format and (where the device has it) the 32-bit one.
-        for quality in crate::quality::Quality::ALL {
-            let settings = crate::quality::RenderSettings::preset(quality);
+        // Every quality level's build (quality.rs): the multisampled
+        // shaders and the plain one, the HDR scene format and (where the
+        // device has it) the 32-bit one, the light shadow atlas on and off.
+        let mut built = std::collections::HashSet::new();
+        for level in 1..=crate::quality::LEVELS {
+            let settings = crate::quality::RenderSettings::level(level);
+            if !built.insert(settings.build_key()) {
+                continue;
+            }
             let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let r = Renderer::new(&device, &queue, None, settings);
             r.build_all_pipelines();
             drop(r);
             let err = pollster::block_on(scope.pop());
-            assert!(err.is_none(), "{} ({:?}) at {quality:?}: {err:?}", info.name, info.backend);
-            eprintln!("renderer built on {} ({:?}) at {quality:?}", info.name, info.backend);
+            assert!(err.is_none(), "{} ({:?}) at level {level}: {err:?}", info.name, info.backend);
+            eprintln!("renderer built on {} ({:?}) at level {level}", info.name, info.backend);
         }
     }
 }
@@ -846,9 +851,17 @@ impl MaterialArrays {
         }
     }
 
+    /// Mip levels of a pack's chain (matpack::LAYER_SIZE² first) left out:
+    /// an array smaller than the packs (the texture quality setting) takes
+    /// the chain from the level of its size.
+    fn skipped_mips(&self) -> usize {
+        (crate::matpack::LAYER_SIZE / self.size.max(1)).max(1).trailing_zeros() as usize
+    }
+
     fn upload(&self, queue: &wgpu::Queue, layer: u32, maps: &crate::matpack::Maps) {
+        let skip = self.skipped_mips();
         for (tex, data, channels) in [(&self.albedo, &maps.albedo, 4), (&self.surface, &maps.surface, 4), (&self.emission, &maps.emissive, 1)] {
-            for (mip, (at, size)) in crate::matpack::mip_levels().into_iter().enumerate() {
+            for (mip, (at, size)) in crate::matpack::mip_levels().into_iter().enumerate().skip(skip) {
                 let at = at / (4 / channels) as usize;
                 let bytes = (size * size * channels) as usize;
                 let Some(level) = data.get(at..at + bytes) else {
@@ -857,7 +870,7 @@ impl MaterialArrays {
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: tex,
-                        mip_level: mip as u32,
+                        mip_level: (mip - skip) as u32,
                         origin: wgpu::Origin3d {
                             x: 0,
                             y: 0,
@@ -2312,8 +2325,12 @@ impl Renderer {
             || settings.dof != self.settings.dof
             || (settings.bloom_levels > 0) != (self.settings.bloom_levels > 0)
             || settings.bloom_levels.max(1) != self.settings.bloom_levels.max(1);
+        let textures_differ = settings.texture_texels != self.settings.texture_texels;
         self.settings = settings;
         self.generation = self.generation.wrapping_add(1);
+        if textures_differ && !self.materials.cpu.is_empty() {
+            self.remake_materials(device, queue, self.materials.capacity);
+        }
         if self.settings.build_key() != self.built_key {
             self.rebuild(device, queue);
             return;
@@ -3087,21 +3104,30 @@ impl Renderer {
         let layer = self.materials.cpu.len() as u32;
         self.materials.cpu.push(maps.clone());
         self.materials.layers.insert(maps.pack, layer);
-        if layer >= self.materials.capacity || self.materials.size != crate::matpack::LAYER_SIZE {
-            let cap = (layer + 1).next_power_of_two().max(4);
-            let params = std::mem::take(&mut self.materials.params);
-            let mut grown = MaterialArrays::with_params(device, crate::matpack::LAYER_SIZE, cap, params);
-            grown.layers = std::mem::take(&mut self.materials.layers);
-            grown.cpu = std::mem::take(&mut self.materials.cpu);
-            for (i, m) in grown.cpu.iter().enumerate() {
-                grown.upload(queue, i as u32, m);
-            }
-            self.materials = grown;
-            self.rebind_globals(device);
+        if layer >= self.materials.capacity || self.materials.size != self.settings.texture_texels {
+            let cap = (layer + 1).next_power_of_two().max(4).max(self.materials.capacity);
+            self.remake_materials(device, queue, cap);
         } else {
             self.materials.upload(queue, layer, maps);
         }
         layer as i32
+    }
+
+    /// New material arrays of `capacity` layers at the settings' texture
+    /// size (`RenderSettings::texture_texels`), the packs so far uploaded
+    /// again from their chains.
+    fn remake_materials(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, capacity: u32) {
+        self.generation = self.generation.wrapping_add(1);
+        let size = self.settings.texture_texels.clamp(1, crate::matpack::LAYER_SIZE);
+        let params = std::mem::take(&mut self.materials.params);
+        let mut made = MaterialArrays::with_params(device, size, capacity.max(1), params);
+        made.layers = std::mem::take(&mut self.materials.layers);
+        made.cpu = std::mem::take(&mut self.materials.cpu);
+        for (i, m) in made.cpu.iter().enumerate() {
+            made.upload(queue, i as u32, m);
+        }
+        self.materials = made;
+        self.rebind_globals(device);
     }
 
     /// Studio's material constants for the parts drawn with material layer
@@ -3669,9 +3695,12 @@ impl Renderer {
             frame.globals.cam_pos[2],
         );
         let planes = frustum(frame.cull_view_proj);
-        // A part whose bounding radius covers less than LOD_MIN_PX pixels is skipped.
+        // A part whose bounding radius covers less than `detail_px` pixels
+        // is skipped (quality.rs: mech::LOD_MIN_PX at the top level), and
+        // so is anything wholly beyond the view distance.
         let focal = size[1] as f32 * 0.5 / (frame.fov_y * 0.5).tan().max(1e-3);
-        let lod_k = crate::mech::LOD_MIN_PX / focal;
+        let lod_k = settings.detail_px / focal;
+        let view_distance = settings.view_distance;
 
         // Static batches: frustum test per cell, then trim the smallest parts.
         let mut static_ranges: Vec<(Pass, (usize, usize), u32, u32)> = Vec::new();
@@ -3680,7 +3709,12 @@ impl Renderer {
                 stats.culled_batches += 1;
                 continue;
             }
-            let r_min = lod_k * box_distance(cam, b.lo, b.hi);
+            let near = box_distance(cam, b.lo, b.hi);
+            if near > view_distance {
+                stats.culled_batches += 1;
+                continue;
+            }
+            let r_min = lod_k * near;
             let radii = &self.st.radii[b.start as usize..(b.start + b.count) as usize];
             let n = radii.partition_point(|r| *r >= r_min) as u32;
             stats.lod_skipped += (b.count - n) as usize;
@@ -3720,7 +3754,7 @@ impl Renderer {
                     continue;
                 }
                 let dist = (d.xf.pos - cam).length();
-                if rad < lod_k * (dist - rad).max(0.0) {
+                if rad < lod_k * (dist - rad).max(0.0) || dist - rad > view_distance {
                     stats.lod_skipped += 1;
                     continue;
                 }
@@ -4298,7 +4332,7 @@ impl Renderer {
                 pass.set_pipeline(self.pipe(Pipe::Terrain));
                 pass.set_bind_group(1, &self.terrain_bg, &[]);
                 for c in self.terrain_chunks.values().chain(self.terrain_grass.values()) {
-                    if box_visible(&planes, c.lo, c.hi) {
+                    if box_visible(&planes, c.lo, c.hi) && box_distance(cam, c.lo, c.hi) <= view_distance {
                         crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::SCENE, 1, (c.count / 3) as u64);
                         pass.set_vertex_buffer(0, c.vbuf.slice(..));
                         if c.grass_ranges.is_empty() { pass.draw(0..c.count, 0..1); }

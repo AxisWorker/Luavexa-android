@@ -2291,8 +2291,8 @@ impl Editor {
         // WireframeHandleAdornments (domains/world_misc.rs).
         let (wire_lines, wire_texts) = crate::runtime::domains::world::misc::wire_geometry(&self.doc);
         lines.extend(wire_lines.into_iter().map(|(pos, color)| LineVertex { pos, color }));
-        // The quality settings (quality.rs: the preset, RUSTUDIO_*
-        // switches, View > Render Scale / Ambient Occlusion).
+        // The graphics settings (quality.rs: the level, the settings set
+        // apart from it, RUSTUDIO_* switches).
         let settings = self.render_settings();
         let ppp = ctx.pixels_per_point() * settings.render_scale;
         let mut size = [

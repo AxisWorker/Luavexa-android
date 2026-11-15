@@ -19,6 +19,7 @@ pub mod android;
 pub mod touch_input;
 pub mod perf_log;
 pub mod quality;
+mod graphics_settings;
 mod ribbon_quick;
 mod cmeta;
 mod studio_content;
