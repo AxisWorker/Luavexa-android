@@ -12,7 +12,12 @@ library (src/lib.rs) — inside a `NativeActivity`. What differs is in
 
 CI (`.github/workflows/android.yml`) builds four APKs on every push / PR
 that touches Rust sources — arm64 and x64, debug and release — and uploads
-them as artifacts (`rustudio-<arch>-<profile>.apk`). Locally:
+them as artifacts (`rustudio-<arch>-<profile>.apk`). A `v*` tag builds the
+two release APKs and adds them to the tag's GitHub release beside the
+desktop downloads (`rustudio-android-arm64-v8a.apk`,
+`rustudio-android-x86_64.apk`, `SHA256SUMS-android`); the editor's update
+notice (src/update.rs) stays off on Android, where the system installs
+APKs. Locally:
 
 ```sh
 # once
@@ -148,7 +153,9 @@ stream (dropping egui-winit's stand-in pointer events):
 | Finger | Becomes |
 |---|---|
 | moves at once (> 8 pt before 320 ms) on the chrome | a scroll of the panel under it (`MouseWheel` events in a Start/Move/End phase, applied 1:1), with a fling after the lift |
-| still for 320 ms | a normal press, dragging from then on (Explorer rows, text selection, sliders, splitters, windows); a long press without moving opens egui's context menu (its own long-touch) |
+| still for 320 ms on the 3D view | a left press (grabs the part or handle under it), dragging from then on |
+| still for 320 ms on the chrome, then moves | a left press where it landed, dragging from then on (Explorer rows, text selection, sliders, splitters, windows) |
+| still for 650 ms on the chrome | a right click where it landed: the context menus (Explorer rows, dock tabs) and the text fields' Cut / Copy / Paste / Select all menu (`src/android/text_menu.rs`); no left press goes out before it, so a selection under the finger is kept for the menu; the lift is nothing (and if no menu opened, a move from there is the drag below after all) |
 | lifted without moving | a tap (press + release at the landing point) |
 | moves at once on the 3D view | a right-button drag: the editor camera's look; in Play the game camera (the PlayerModule's right-drag orbit, mouse deltas from the finger) |
 | on a transform handle | a left press at once (drags the handle) |
@@ -159,10 +166,39 @@ The viewport publishes where things are each frame (`Zones`: its rect,
 whether the game has the input, the stick and jump areas, a handle under
 the pointer) and draws the stick and button in Play (`Touch::paint`). The
 chrome's egui settings for fingers are in `android::touch::setup`. The
-tuning numbers (hold 320 ms, slop 8 pt, fling, stick and button sizes)
-are `mech::TOUCH_*` with their rows in docs/MECHANICS.md ("Touch
-screens") and mechanics.json. The module has no Android dependency, so
-its nine tests run on the desktop (`cargo test touch_input`).
+tuning numbers (hold 320 ms, long press 650 ms, slop 8 pt, fling, stick
+and button sizes) are `mech::TOUCH_*` with their rows in
+docs/MECHANICS.md ("Touch screens") and mechanics.json. The module has no
+Android dependency, so its twelve tests run on the desktop
+(`cargo test touch_input`).
+
+### Text: the soft keyboard, Cut / Copy / Paste
+
+winit never resizes an Android window for the soft keyboard (the
+manifest's `adjustResize` moves NativeActivity's content rect; the surface
+egui draws on stays the whole screen), so `src/android/keyboard.rs` makes
+the room: while a text field has the focus it asks the Java main thread
+for the keyboard's height every 100 ms (`jni::keyboard_height_later`:
+`WindowInsets.getInsets(Type.ime())` on API 30+, the system inset less
+the stable inset before that; the editor's thread never waits for the
+answer, which comes a frame or two later) and takes that much off the
+root `Ui` at the start of `App::ui` — the dock, the 3D view and the
+status bar move up as an Android view would — and gives it to egui as the
+bottom safe-area inset, so windows, menus and popups keep above it too
+(set every frame, zero when the keyboard is down: egui keeps the last
+inset it was given). The field's own scrolling brings the caret into view
+at the next keystroke.
+
+The soft keyboard has no Ctrl, egui's text fields have no menu of their
+own and egui-winit has no clipboard on Android, so a long press on a text
+field opens `src/android/text_menu.rs`: Cut, Copy, Paste (the system
+clipboard's text, `jni::clipboard_get`) and Select all, fed to egui as
+the events the shortcuts would be (`Event::Cut` / `Copy` / `Paste` /
+Ctrl+A) through `raw_input_hook` on the next frame; the copies reach
+`ClipboardManager` through `src/android/clipboard.rs`. The menu keeps the
+field's focus for its tap (egui's rule is a click outside takes it) and
+puts back the selection egui's right click collapsed. Objects are cut,
+copied and pasted from the Explorer's long-press menu as before.
 
 The layer is **off on the Start Page** (`Touch::set_enabled` from
 `raw_input_hook`, while `start_page_ui` would draw): that page is plain
@@ -177,7 +213,7 @@ is left half delivered. Once a place opens, the layer is on.
 Every few seconds the editor logs a line like
 
 ```
-perf: 136 frames in 5.0 s: 36.9 ms apart (p95 72.3, worst 89); editor 5.2 ms + egui 1.2 ms on the CPU, 30.5 ms GPU/vsync wait; 3D GPU 9.8 ms per drawn frame = shadows 3.1 + scene 4.2 + ssao/bloom/dof 1.5 + post 1.0 (68 measured); window 1550x720 px at 1.40 px/pt, 3D view 816x310 px (scale 0.70, AO off), 3D frames drawn 68 / shown again 68; sections (ms/frame): dock_panels 4.3, viewport 3.4, vp_render 3.0
+perf: 136 frames in 5.0 s: 36.9 ms apart (p95 72.3, worst 89); editor 5.2 ms + egui 1.2 ms on the CPU, 30.5 ms GPU/vsync wait; 3D GPU 9.8 ms per drawn frame = shadows 3.1 + scene 4.2 + ssao/bloom/dof 1.5 + post 1.0 (68 measured); window 1550x720 px at 1.40 px/pt, 3D view 816x310 px (scale 0.70, AO off, shadow maps x0.50), 3D frames drawn 68 / shown again 68; sections (ms/frame): dock_panels 4.3, viewport 3.4, vp_render 3.0
 ```
 
 (`src/perf_log.rs`; `adb logcat -s rustudio`, or `RUSTUDIO_PERF_LOG=1` on
@@ -200,17 +236,42 @@ then relaunch (`setprop debug.rustudio.env ""` clears). Space-separated
 `RUSTUDIO_*=value` pairs, 91 characters at most (`android::export_env`,
 `perf_log::env_switch`): `RUSTUDIO_SSAO`, `RUSTUDIO_VIEW_REUSE`,
 `RUSTUDIO_RENDER_SCALE`, `RUSTUDIO_SUN_SHADOWS` (the sun's shadow maps,
-as Lighting.GlobalShadows false).
+as Lighting.GlobalShadows false), `RUSTUDIO_SHADOW_SCALE` (the shadow
+maps' texels across, 0.25 to 1; see below), `RUSTUDIO_FRAME_LATENCY`
+(swapchain images less one, 1 to 3; see below).
 
-First measurements (S20 Ultra, Adreno 650 on Vulkan, release APK, the
-window 1550 × 720 px, the 3D view 816 × 310): ~6 ms of CPU a frame and
-~31 ms waited on the GPU whether the camera moved or not, 21–27 fps; the
-"3D GPU" figure above is what the next run has to show.
+First measurements (a Galaxy Note20 Ultra, Adreno 650 on Vulkan, release
+APK, the window 1550 × 720 px at 60 Hz, the 3D view 816 × 310): 5–14 ms
+of CPU a frame and 30–50 ms of "wait" with the camera still as with it
+moving, 20–27 fps; a frame that drew the 3D view afresh cost about 10 ms
+more than one that showed the last one again. The "3D GPU" figure above
+is what the next run has to show (it is an illustration until then).
 
 What the port does about it:
 
+- **Three swapchain images** (`lib::frame_latency`; `RUSTUDIO_FRAME_LATENCY`
+  1 to 3 overrides): egui's low-latency default asks for one frame of
+  latency, two images. Android's compositor keeps the image on screen
+  until it has latched the next one, so with two images every frame first
+  waits for that — a vsync of nothing before any drawing, half the
+  refresh rate at best, which is the ~31 ms "wait" above with the camera
+  still (egui notes the same halving on iOS and leaves the default there).
+  With a third image the next frame starts while the last one is still
+  queued, and the CPU's work overlaps the GPU's.
 - **Render scale** (View > Render Scale; `RUSTUDIO_RENDER_SCALE`): the 3D
   view at 0.7 of the panel's pixels on a first run.
+- **Half-size sun shadow maps** (`sun_shadow::texel_scale`;
+  `mech::SUN_SHADOW_TEXEL_SCALE_PHONE` 0.5, `RUSTUDIO_SHADOW_SCALE`
+  overrides): Studio's four cascades are 384 / 768 / 1024 / 2048 texels
+  across in a 3200 × 2048 atlas, and a cascade that moved with the camera
+  is drawn into the depth map and then blurred twice (EVSM) over its whole
+  tile — the far cascade alone is 2048² × 8 bytes read five times and
+  written twice, which a phone GPU's bandwidth pays for in frames rather
+  than fractions of one. On Android the tiles, atlas and depth map are
+  half as many texels across (a quarter of the fill and blur); the blur
+  keeps its width in studs (`Cascade::level` counts texels), and a cascade
+  whose texels are still finer than the view's pixels looks the same.
+  `cargo test sun_shadow` keeps the full-scale layout at Studio's numbers.
 - **Ambient occlusion off** (View > Ambient Occlusion; `RUSTUDIO_SSAO`):
   Studio's SSAO is five passes over the view for a darkening in corners
   a phone's screen barely shows.
@@ -220,8 +281,9 @@ What the port does about it:
   renderer counts its own changes (`Renderer::generation`, bumped by
   every mesh, texture, item, terrain, sky and grid upload), and a frame
   is drawn afresh when either moved, when time shows (a game running,
-  terrain water, world GUIs and effects, the test harness) and at least
-  every 500 ms. With a still camera the chrome then redraws at egui's
+  terrain water, Terrain.Clouds drifting, the scene environment probe's
+  frames of GPU work, world GUIs and effects, the test harness) and at
+  least every 500 ms. With a still camera the chrome then redraws at egui's
   own pace — taps and scrolls in the Explorer and Properties no longer
   wait for a 3D frame each. (The first device run showed exactly every
   other frame reused: the effects system hands over a frame of effects
@@ -235,10 +297,10 @@ What the port does about it:
   android.yml; the workspace profile is unchanged for desktops).
 
 Still to do, with measurements from the line above: a phone tier for the
-sun's shadow tiles (all four cascades are redrawn, with their EVSM
-blurs, whenever the camera moves) and for the light grid's size, and a
-leaner default layout for small screens (every panel open at once is
-most of the CPU time on a phone).
+light grid's size and the local lights' shadow atlas, the sun's far
+cascades redrawn less often while the camera moves, and a leaner default
+layout for small screens (every panel open at once is most of the CPU
+time on a phone).
 
 ## Device-run notes (first APKs)
 
@@ -267,8 +329,25 @@ and here:
   builds. First run now renders the view at 0.7 scale (View > Render
   Scale), and `x build --release` (or the `profiling` profile) is the
   build to judge speed by; `RUSTUDIO_RENDER_SCALE` overrides.
-- **Clipboard.** egui-winit has no Android clipboard; see
-  `android/clipboard.rs`.
+- **Clipboard.** egui-winit has no Android clipboard, and the soft
+  keyboard has no Ctrl: the long-press menu on text fields
+  (`android/text_menu.rs`) and the mirror in `android/clipboard.rs`.
+- **Typing behind the keyboard.** The window never shrank for the soft
+  keyboard; `android/keyboard.rs` (see "Text" under "Fingers").
+- **Browser sign-in "always fails".** Closing the account popup (a tap
+  outside it, Escape, Android's Back turned into Escape) cancelled the
+  waiting sign-in; it now goes on behind the closed popup, every step is
+  logged (`[Info] Roblox: browser sign-in: …`, the failure as
+  `[Error] Roblox: …`), and a session Roblox accepted is kept for the run
+  even when the Keystore-backed store can't save it
+  (`Client::sign_in_with`). On Android every Output line goes to logcat
+  (`RustStdoutStderr`), not only warnings and errors: the panel is small
+  on a phone and a report needs the Info lines.
+- **No character in Test Play.** Run (not Play) has no character by
+  design; the other reasons a spawn is skipped now say so in the Output
+  (`No character: …`), and a spawn logs `Character: R15|R6 (from the …)`
+  and what the body is made of (`Character body: N parts, M of them
+  MeshParts`).
 - **Browser sign-in never opened the code page.** Two causes: eframe's
   `links` feature (and so `ctx.open_url`) isn't in the Android feature
   set, and `keyring::Entry::new` failed on Android so the session check
@@ -286,6 +365,12 @@ and here:
   is plain egui; it is off until a place opens (see "Fingers").
 - **Lag on a Baseplate with a release APK.** The chrome redrew the 3D
   view every frame it drew itself; see "Frame time on a phone".
+- **The 3D view lags while the camera moves, the chrome less so.** The
+  perf lines showed ~31 ms of wait a frame with the camera still (the 3D
+  view shown again, not drawn), so the frame itself, not the 3D pass, was
+  the floor: two swapchain images under Android's compositor (see "Frame
+  time on a phone", three images now), with the shadow cascades at half
+  the texels on top for the frames that do draw.
 
 ## Later steps (in order)
 

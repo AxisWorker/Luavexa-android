@@ -9,10 +9,14 @@
 //! * A finger that moves at once scrolls the panel under it (wheel events,
 //!   which every `ScrollArea` takes) and keeps going for a moment after the
 //!   lift (a fling).
-//! * A finger that stays put for [`HOLD`] becomes a normal press: from then
-//!   on it drags (Explorer rows, text selection, sliders, panel splitters,
-//!   windows), as press-and-hold does in every mobile UI.
+//! * A finger that stays put for [`HOLD`] and then moves is a normal
+//!   press and drag (Explorer rows, text selection, sliders, panel
+//!   splitters, windows), as press-and-hold does in every mobile UI.
 //! * A finger lifted without moving is a tap (a click).
+//! * A finger still for [`LONG_PRESS`] is a right click where it landed:
+//!   the context menus (Explorer rows, dock tabs, the text fields' Cut /
+//!   Copy / Paste menu, src/text_menu.rs). No left press goes out before
+//!   it, so a selection under the finger is kept for the menu.
 //! * On the 3D view a finger that moves at once is a right-button drag:
 //!   the editor camera's look, the game's camera in Play. A finger on a
 //!   transform handle drags it at once. A second finger makes a pinch
@@ -36,6 +40,8 @@ use egui::{Event, Key, Modifiers, MouseWheelUnit, PointerButton, Pos2, Rect, Tou
 pub const HOLD: Duration = Duration::from_millis(mech::TOUCH_HOLD_MS);
 /// Moved this far (points) before [`HOLD`]: a scroll (or a look).
 pub const SLOP: f32 = mech::TOUCH_SLOP_POINTS;
+/// Still for this long on the chrome: a right click (a context menu).
+pub const LONG_PRESS: Duration = Duration::from_millis(mech::TOUCH_LONG_PRESS_MS);
 /// A fling slower than this (points / s) stops.
 const FLING_STOP: f32 = mech::TOUCH_FLING_STOP_POINTS_PER_S;
 /// Fling speed decays by e^-FLING_DECAY per second.
@@ -103,6 +109,8 @@ pub enum Mode {
     Press,
     /// Two or more fingers on the 3D view: pinch / pan, no pointer.
     Multi,
+    /// Delivered a long press (its menu is open): nothing until the lift.
+    Done,
 }
 
 struct Pointer {
@@ -365,6 +373,12 @@ impl Touch {
                                 out.push(button(p.start, PointerButton::Secondary, true));
                                 out.push(Event::PointerMoved(pos));
                                 p.mode = Mode::Look;
+                            } else if now.duration_since(p.since) >= HOLD {
+                                // Held, then moved: a drag from where it landed.
+                                out.push(Event::PointerMoved(p.start));
+                                out.push(button(p.start, PointerButton::Primary, true));
+                                out.push(Event::PointerMoved(pos));
+                                p.mode = Mode::Press;
                             } else {
                                 out.push(wheel(Vec2::ZERO, TouchPhase::Start));
                                 out.push(wheel(pos - p.start, TouchPhase::Move));
@@ -379,6 +393,17 @@ impl Touch {
                         out.push(Event::PointerMoved(pos));
                     }
                     Mode::Look | Mode::Press => out.push(Event::PointerMoved(pos)),
+                    Mode::Done => {
+                        // Nothing came of the long press (no menu under the
+                        // finger): a move from here is the hold-then-drag
+                        // of a slow hand (a splitter, a window's title).
+                        if !egui::Popup::is_any_open(ctx) && (pos - p.start).length() > SLOP {
+                            out.push(Event::PointerMoved(p.start));
+                            out.push(button(p.start, PointerButton::Primary, true));
+                            out.push(Event::PointerMoved(pos));
+                            p.mode = Mode::Press;
+                        }
+                    }
                     Mode::Multi => {}
                 }
             }
@@ -435,7 +460,7 @@ impl Touch {
                         out.push(button(p.pos, PointerButton::Primary, false));
                         out.push(Event::PointerGone);
                     }
-                    Mode::Multi => out.push(Event::PointerGone),
+                    Mode::Multi | Mode::Done => out.push(Event::PointerGone),
                 }
             }
         }
@@ -453,15 +478,27 @@ impl Touch {
             if p.mode == Mode::Pending {
                 let held = now.duration_since(p.since);
                 let on_handle = p.in_view && self.zones.frame == frame_no && self.zones.handle_hover;
-                if held >= HOLD || on_handle {
+                if p.in_view && (held >= HOLD || on_handle) {
+                    // On the 3D view the press goes out at the hold: a part
+                    // is grabbed where the finger rests, then dragged.
                     out.push(Event::PointerMoved(p.start));
                     out.push(button(p.start, PointerButton::Primary, true));
                     if p.pos != p.start {
                         out.push(Event::PointerMoved(p.pos));
                     }
                     p.mode = Mode::Press;
+                } else if !p.in_view && held >= LONG_PRESS {
+                    // On the chrome a still finger is a right click where
+                    // it landed (context menus); the press for a drag waits
+                    // for the first move (`on_touch`), so nothing has
+                    // touched the widget under it before its menu opens.
+                    out.push(Event::PointerMoved(p.start));
+                    out.push(button(p.start, PointerButton::Secondary, true));
+                    out.push(button(p.start, PointerButton::Secondary, false));
+                    p.mode = Mode::Done;
                 } else {
-                    ctx.request_repaint_after(HOLD.saturating_sub(held).max(Duration::from_millis(16)));
+                    let next = if p.in_view { HOLD } else { LONG_PRESS };
+                    ctx.request_repaint_after(next.saturating_sub(held).max(Duration::from_millis(16)));
                 }
             }
         }
@@ -536,7 +573,7 @@ impl Touch {
         self.release_all(out);
         if let Some(p) = self.pointer.take() {
             match p.mode {
-                Mode::Pending | Mode::Multi => {}
+                Mode::Pending | Mode::Multi | Mode::Done => {}
                 Mode::Scroll => out.push(wheel(Vec2::ZERO, TouchPhase::End)),
                 Mode::Look => {
                     out.push(Event::PointerMoved(p.pos));
@@ -679,6 +716,7 @@ mod tests {
     fn switching_off_lets_go_of_a_press_in_front_of_the_frame() {
         let ctx = egui::Context::default();
         let mut t = Touch::default();
+        t.zones = Zones { viewport: Rect::from_min_max(Pos2::ZERO, Pos2::new(500.0, 500.0)), frame: 1, ..Default::default() };
         run(&mut t, &ctx, vec![touch(1, TouchPhase::Start, Pos2::new(10.0, 10.0))]);
         std::thread::sleep(HOLD + Duration::from_millis(20));
         let out = run(&mut t, &ctx, vec![]);
@@ -710,6 +748,73 @@ mod tests {
         let gone = out.iter().position(|e| matches!(e, Event::PointerGone)).expect("pointer gone");
         let released = out.iter().position(|e| matches!(e, Event::PointerButton { pressed: false, .. })).expect("release");
         assert!(gone > released, "{out:?}");
+    }
+
+    fn buttons(out: &[Event]) -> Vec<(PointerButton, bool)> {
+        out.iter()
+            .filter_map(|e| match e {
+                Event::PointerButton { button, pressed, .. } => Some((*button, *pressed)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn on_the_chrome_a_still_finger_is_a_right_click_and_nothing_before() {
+        let ctx = egui::Context::default();
+        let mut t = Touch::default();
+        let at = Pos2::new(10.0, 10.0);
+        run(&mut t, &ctx, vec![touch(1, TouchPhase::Start, at)]);
+        std::thread::sleep(HOLD + Duration::from_millis(20));
+        // Held past the hold: still no press (a selection under the finger
+        // stays for the menu).
+        let out = run(&mut t, &ctx, vec![]);
+        assert!(buttons(&out).is_empty(), "{out:?}");
+        assert_eq!(t.mode(), Some(Mode::Pending));
+        std::thread::sleep(LONG_PRESS.saturating_sub(HOLD));
+        let out = run(&mut t, &ctx, vec![]);
+        assert_eq!(buttons(&out), vec![(PointerButton::Secondary, true), (PointerButton::Secondary, false)], "{out:?}");
+        assert!(out.iter().any(|e| matches!(e, Event::PointerMoved(p) if *p == at)), "{out:?}");
+        assert_eq!(t.mode(), Some(Mode::Done));
+        // The lift is neither a tap nor a release.
+        let out = run(&mut t, &ctx, vec![touch(1, TouchPhase::End, at)]);
+        assert!(buttons(&out).is_empty(), "{out:?}");
+        assert!(out.iter().any(|e| matches!(e, Event::PointerGone)), "{out:?}");
+        assert!(t.mode().is_none());
+    }
+
+    #[test]
+    fn a_long_press_that_opened_nothing_still_drags_when_moved() {
+        let ctx = egui::Context::default();
+        let mut t = Touch::default();
+        let at = Pos2::new(10.0, 10.0);
+        run(&mut t, &ctx, vec![touch(1, TouchPhase::Start, at)]);
+        std::thread::sleep(LONG_PRESS + Duration::from_millis(20));
+        let out = run(&mut t, &ctx, vec![]);
+        assert_eq!(buttons(&out), vec![(PointerButton::Secondary, true), (PointerButton::Secondary, false)], "{out:?}");
+        assert_eq!(t.mode(), Some(Mode::Done));
+        // No popup opened (a plain egui context): the move is a drag.
+        let out = run(&mut t, &ctx, vec![touch(1, TouchPhase::Move, Pos2::new(60.0, 10.0))]);
+        assert_eq!(buttons(&out), vec![(PointerButton::Primary, true)], "{out:?}");
+        assert_eq!(t.mode(), Some(Mode::Press));
+    }
+
+    #[test]
+    fn on_the_chrome_a_held_finger_that_moves_drags_from_where_it_landed() {
+        let ctx = egui::Context::default();
+        let mut t = Touch::default();
+        let at = Pos2::new(10.0, 10.0);
+        run(&mut t, &ctx, vec![touch(1, TouchPhase::Start, at)]);
+        std::thread::sleep(HOLD + Duration::from_millis(20));
+        run(&mut t, &ctx, vec![]);
+        let out = run(&mut t, &ctx, vec![touch(1, TouchPhase::Move, Pos2::new(40.0, 10.0))]);
+        assert_eq!(buttons(&out), vec![(PointerButton::Primary, true)], "{out:?}");
+        assert!(matches!(out.first(), Some(Event::PointerMoved(p)) if *p == at), "{out:?}");
+        assert!(out.iter().any(|e| matches!(e, Event::PointerMoved(p) if *p == Pos2::new(40.0, 10.0))), "{out:?}");
+        assert!(!out.iter().any(|e| matches!(e, Event::MouseWheel { .. })), "{out:?}");
+        assert_eq!(t.mode(), Some(Mode::Press));
+        let out = run(&mut t, &ctx, vec![touch(1, TouchPhase::End, Pos2::new(40.0, 10.0))]);
+        assert_eq!(buttons(&out), vec![(PointerButton::Primary, false)], "{out:?}");
     }
 
     #[test]

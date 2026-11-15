@@ -23,10 +23,12 @@
 mod assets;
 pub mod clipboard;
 pub mod jni;
+pub mod keyboard;
 pub mod lifecycle;
 mod logcat;
 pub mod sensors;
 pub mod storage;
+pub mod text_menu;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -214,6 +216,9 @@ pub fn run(app: AndroidApp) {
     } else {
         log::warn!("no network: Studio content download postponed");
     }
+    // Studio Settings: the user's, kept in the app's folder (as a plain
+    // desktop run keeps them; src/studio_settings.rs).
+    crate::studio_settings::init(true);
     // A place or model this activity was started with (VIEW intent,
     // content: URI): copied into the app's folder and opened.
     let open = storage::launch_file(&app);

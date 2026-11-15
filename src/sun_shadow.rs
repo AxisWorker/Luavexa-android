@@ -18,6 +18,54 @@ pub const CASCADES: usize = 4;
 const PASS_STRIDE: u64 = 256;
 const ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// Texels across, as a fraction of Studio's sizes (`mech::SUN_CASCADE_TILES`,
+/// the atlas, the depth map): 1 on a computer; on a phone
+/// `mech::SUN_SHADOW_TEXEL_SCALE_PHONE`, a quarter of the shadow fill and
+/// blur work for cascades whose texels are still finer than the view's
+/// pixels. `RUSTUDIO_SHADOW_SCALE` (0.25 to 1) overrides. Read once, before
+/// the renderer is made; the blur stays the same width in studs
+/// (`Cascade::level` counts texels).
+pub fn texel_scale() -> f32 {
+    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        let default = if cfg!(target_os = "android") { mech::SUN_SHADOW_TEXEL_SCALE_PHONE } else { 1.0 };
+        std::env::var("RUSTUDIO_SHADOW_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|s| s.is_finite())
+            .map_or(default, |s| s.clamp(0.25, 1.0))
+    })
+}
+
+/// `v` texels at [`texel_scale`], rounded down to a multiple of 16 (so
+/// the scaled tiles still pack without overlapping), at least 16.
+fn scaled(v: u32) -> u32 {
+    (((v as f32 * texel_scale()).floor() as u32) & !15).max(16)
+}
+
+/// Texels across each cascade's tile.
+pub fn tiles() -> [u32; CASCADES] {
+    mech::SUN_CASCADE_TILES.map(scaled)
+}
+
+/// Each tile's corner in the atlas.
+pub fn origins() -> [[u32; 2]; CASCADES] {
+    mech::SUN_CASCADE_ORIGINS.map(|o| o.map(scaled))
+}
+
+/// The atlas: what the scaled tiles reach (Studio's 3200 × 2048 at scale 1).
+pub fn atlas() -> [u32; 2] {
+    let (t, o) = (tiles(), origins());
+    let reach = |axis: usize| (0..CASCADES).map(|i| o[i][axis] + t[i]).max().unwrap_or(16).next_multiple_of(16);
+    [reach(0), reach(1)]
+}
+
+/// The square depth map the cascades are drawn into one at a time
+/// (render.rs): the largest tile across.
+pub fn depth_texels() -> u32 {
+    scaled(mech::SHADOW_MAP_TEXELS).max(tiles().into_iter().max().unwrap_or(16))
+}
+
 /// Kernel tables by blur level − 1 (levels 1..24). Across: the centre weight
 /// and one per texel either side (9 floats a row; Studio's horizontal EVSM
 /// blur). Down: the centre weight and one per bilinear tap pair at these
@@ -142,7 +190,7 @@ pub fn cascades(cam: Vec3, forward: Vec3, tan_half: [f32; 2], sun: Vec3, softnes
     let (right, up) = light_basis(travel);
     let blur = softness * mech::SHADOW_SOFTNESS_BLUR[0] + mech::SHADOW_SOFTNESS_BLUR[1];
     let hyp = (tan_half[0] * tan_half[0] + tan_half[1] * tan_half[1]).sqrt();
-    let origins = mech::SUN_CASCADE_ORIGINS;
+    let (origins, tiles) = (origins(), tiles());
     std::array::from_fn(|i| {
         let (near, far) = (mech::SUN_CASCADE_SPLITS[i], mech::SUN_CASCADE_SPLITS[i + 1]);
         let to_far = far * hyp;
@@ -160,7 +208,7 @@ pub fn cascades(cam: Vec3, forward: Vec3, tan_half: [f32; 2], sun: Vec3, softnes
             let s: DVec3 = snap(right) + snap(up) + snap(travel);
             s.as_vec3()
         };
-        let tile = mech::SUN_CASCADE_TILES[i];
+        let tile = tiles[i];
         // The blur's reach in texels, the blur width through
         // the cascade's projection (1 / radius) times its tile, rounded.
         let level = ((tile as f32 * blur / radius + 0.5) as u32).clamp(1, EVSM_H_WEIGHTS.len() as u32);
@@ -204,7 +252,7 @@ impl Cascade {
 
     /// The tile in the atlas: corner and size in UV.
     pub fn rect(&self) -> [f32; 4] {
-        let [w, h] = mech::SUN_SHADOW_ATLAS.map(|v| v as f32);
+        let [w, h] = atlas().map(|v| v as f32);
         let t = self.tile as f32;
         [self.origin[0] as f32 / w, self.origin[1] as f32 / h, t / w, t / h]
     }
@@ -226,6 +274,7 @@ struct SunPass {
     hw: array<vec4<f32>, 3>,    // across: centre weight, then one per texel out
     vw: array<vec4<f32>, 2>,    // down: centre weight, then one per tap pair
     vo: vec4<f32>,              // down: the tap pairs' texel offsets
+    centre: vec4<f32>,          // the cascade's sphere centre (grass sink)
 };
 @group(0) @binding(0) var<uniform> u: SunPass;
 @group(0) @binding(1) var depth_tex: texture_depth_2d;
@@ -286,6 +335,11 @@ struct PassRaw {
     hw: [f32; 12],
     vw: [f32; 8],
     vo: [f32; 4],
+    /// The cascade's sphere centre: Studio's caster Globals CameraPosition
+    /// (cb0[11]) in the sun passes, which the grass caster's distance sink
+    /// measures from (GrassShadowVS_; capture checks/grass-full-re/sweep
+    /// writer-constants-f32.json event 267: clip (0, 0, 0.518) of its box).
+    centre: [f32; 4],
 }
 
 /// What a cascade's tile was last drawn from.
@@ -329,8 +383,8 @@ impl SunShadows {
                 })
                 .create_view(&Default::default())
         };
-        let side = mech::SUN_CASCADE_TILES.iter().copied().max().unwrap_or(1);
-        let atlas_view = tex("sun shadow atlas", mech::SUN_SHADOW_ATLAS);
+        let side = tiles().into_iter().max().unwrap_or(16);
+        let atlas_view = tex("sun shadow atlas", atlas());
         let temp_view = tex("sun shadow blur", [side, side]);
         let pass_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sun shadow passes"),
@@ -500,6 +554,7 @@ impl SunShadows {
                 hw: [0.0; 12],
                 vw: [0.0; 8],
                 vo: EVSM_V_OFFSETS[k],
+                centre: c.centre.extend(0.0).to_array(),
             };
             raw.hw[..9].copy_from_slice(&EVSM_H_WEIGHTS[k]);
             raw.vw[..5].copy_from_slice(&EVSM_V_WEIGHTS[k]);
@@ -555,6 +610,17 @@ impl SunShadows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn at_full_scale_the_tiles_pack_studios_atlas() {
+        if texel_scale() != 1.0 {
+            return; // RUSTUDIO_SHADOW_SCALE set for this run
+        }
+        assert_eq!(tiles(), mech::SUN_CASCADE_TILES);
+        assert_eq!(origins(), mech::SUN_CASCADE_ORIGINS);
+        assert_eq!(atlas(), mech::SUN_SHADOW_ATLAS);
+        assert_eq!(depth_texels(), mech::SHADOW_MAP_TEXELS);
+    }
 
     /// A running Studio (a test place, ShadowSoftness 0.2): Globals
     /// spheres of radius 22.322 / 50.716 / 158.609 / 681.042, blur kernels

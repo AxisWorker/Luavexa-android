@@ -1636,6 +1636,14 @@
    "source": "rustudio"
   },
   {
+   "name": "sun shadow texel scale on a phone",
+   "group": "lighting",
+   "value": 0.5,
+   "unit": "fraction",
+   "estimated": true,
+   "source": "Android: the cascades' tiles, atlas and depth map at half the texels across, a quarter of the shadow fill and blur work (a phone GPU has a tenth of a desktop card's bandwidth); RUSTUDIO_SHADOW_SCALE overrides"
+  },
+  {
    "name": "shadow extent",
    "group": "lighting",
    "value": 128,

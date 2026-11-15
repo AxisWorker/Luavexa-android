@@ -383,8 +383,15 @@ impl Client {
         let cookie = Cookie::new(raw).ok_or(SignedOut::NoCookie)?;
         let c = Self::open_with(config, cookie, CookieSource::Keyring)?;
         session::mark_file_seen();
-        session::keyring_store(c.session.cookie())
-            .map_err(|e| SignedOut::Rejected(format!("signed in, but {e}")))?;
+        if let Err(e) = session::keyring_store(c.session.cookie()) {
+            // Android: the Keystore-backed store failing mustn't lose a
+            // session Roblox just accepted; it lasts until the app closes
+            // and the report says why it won't be there next time.
+            #[cfg(target_os = "android")]
+            eprintln!("[Warn] Roblox: signed in, but {e}; the session isn't kept for next time");
+            #[cfg(not(target_os = "android"))]
+            return Err(SignedOut::Rejected(format!("signed in, but {e}")));
+        }
         let _ = c.remember_account();
         Ok(c)
     }

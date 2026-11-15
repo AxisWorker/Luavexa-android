@@ -7,7 +7,13 @@
 //! lives here; what only one kind of system has is behind
 //! `#[cfg(target_os = "android")]` / `#[cfg(not(target_os = "android"))]`.
 
+mod grass_stream;
+mod update;
+mod env_probe;
 mod account_ui;
+mod char_builder;
+mod game_avatar;
+mod emote_wheel;
 #[cfg(target_os = "android")]
 pub mod android;
 pub mod touch_input;
@@ -37,6 +43,8 @@ mod bin_dump;
 mod camera;
 mod collision;
 mod collision_groups;
+#[cfg(unix)]
+mod control;
 mod coverage;
 mod crash;
 mod default_scripts;
@@ -47,6 +55,7 @@ mod explorer;
 mod file_dialog;
 mod hypr;
 mod game_settings;
+mod studio_settings;
 mod fbx;
 mod api;
 mod api_stubs;
@@ -79,6 +88,8 @@ mod mesh;
 mod truss;
 mod mesh_bvh;
 mod physics;
+mod humanoid;
+mod physics_mesh;
 mod play;
 mod project;
 mod project_config;
@@ -88,6 +99,7 @@ mod project_sync;
 mod project_values;
 mod properties;
 mod render;
+mod clouds;
 mod sun_shadow;
 mod replicate;
 mod anim_replicate;
@@ -116,7 +128,9 @@ mod studio_ribbon;
 mod studio_panels;
 mod start_page;
 mod ui_shots;
+mod grass_temporal;
 mod viewport;
+mod viewport_menu;
 mod water;
 mod wrap;
 
@@ -339,6 +353,8 @@ pub(crate) fn wgpu_options(bench_mode: bool) -> egui_wgpu::WgpuConfiguration {
             setup.device_descriptor = std::sync::Arc::new(move |adapter| {
                 let mut d = descriptor(adapter);
                 d.required_limits.max_sampled_textures_per_shader_stage = 24;
+                // Storage writes to R8 targets need the adapter-specific format features.
+                d.required_features |= adapter.features() & egui_wgpu::wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
                 // GPU timestamps for the perf log's line (render::GpuTimer),
                 // where the device has them.
                 if crate::perf_log::on() {
@@ -350,15 +366,35 @@ pub(crate) fn wgpu_options(bench_mode: bool) -> egui_wgpu::WgpuConfiguration {
             egui_wgpu::WgpuSetup::CreateNew(setup)
         },
         surface: egui_wgpu::SurfaceConfig {
-            present_mode: if bench_mode {
+            // No vsync when measuring or driven for captures: a shot waits
+            // for a few frames after each camera move.
+            present_mode: if bench_mode || std::env::var_os("RUSTUDIO_CONTROL").is_some() {
                 egui_wgpu::wgpu::PresentMode::AutoNoVsync
             } else {
                 egui_wgpu::wgpu::PresentMode::AutoVsync
             },
-            ..egui_wgpu::SurfaceConfig::LOW_LATENCY
+            desired_maximum_frame_latency: Some(frame_latency()),
         },
         ..Default::default()
     }
+}
+
+/// Frames the presentation engine may hold ahead of the one being drawn:
+/// the swapchain gets one image more than this. 1 (two images) on a
+/// computer, egui's low-latency default. On Android it is 2: the
+/// compositor keeps the image on screen until it has latched the next
+/// one, so with two images every frame first waits for that — a vsync of
+/// nothing, half the refresh rate at best (the first phone measurements:
+/// ~31 ms waited per frame at 60 Hz whether the camera moved or not; egui
+/// notes the same halving on iOS). Three images let the next frame start
+/// while the last one is still queued. `RUSTUDIO_FRAME_LATENCY` (1 to 3)
+/// overrides, for measuring.
+fn frame_latency() -> u32 {
+    let default = if cfg!(target_os = "android") { 2 } else { 1 };
+    std::env::var("RUSTUDIO_FRAME_LATENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map_or(default, |n| n.clamp(1, 3))
 }
 
 /// The desktop program: command-line options, the test harness, then the
@@ -798,6 +834,7 @@ pub fn desktop_main() -> eframe::Result<()> {
         shot_after,
         log_out,
         actions,
+        pointer: None,
         started: std::time::Instant::now(),
         screenshot,
         selftest: selftest.map(selftest::SelfTest::new),
@@ -837,6 +874,8 @@ pub fn desktop_main() -> eframe::Result<()> {
         None if harness.selftest.is_some() => [1265.0, 867.0],
         None => [1600.0, 900.0],
     };
+    // Studio Settings: the user's for plain runs (src/studio_settings.rs).
+    studio_settings::init(layout_store::enabled(&harness));
     // The saved window (src/layout_store.rs), for plain interactive runs.
     let saved_layout = layout_store::enabled(&harness).then(layout_store::load).flatten();
     let icon = egui::IconData {
@@ -852,6 +891,12 @@ pub fn desktop_main() -> eframe::Result<()> {
         .with_icon(icon);
     if let Some(l) = &saved_layout {
         viewport = l.window_builder(viewport);
+    }
+    // Driven for comparison captures (src/control.rs): open without taking
+    // focus and stay below other windows, so it never covers the person's
+    // work (X11 keeps drawing covered windows, and shots read the frame back).
+    if std::env::var_os("RUSTUDIO_CONTROL").is_some() {
+        viewport = viewport.with_active(false).with_window_level(egui::WindowLevel::AlwaysOnBottom);
     }
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,

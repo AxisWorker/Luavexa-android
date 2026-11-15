@@ -43,7 +43,19 @@ quite yet.
 
 ## Install
 
-You need a Rust toolchain (1.85+) and a GPU with Vulkan (or OpenGL), or on
+**Download:** prebuilt Linux (x86_64), Windows (x64) and macOS (Apple Silicon
+and Intel) builds are on the
+[releases page](https://github.com/rippelz/rustudio/releases). Unpack and run
+`rustudio` (`rustudio.exe` on Windows); on a Mac, move `rustudio.app` to
+Applications and the first time right-click it > Open (it isn't notarized).
+A downloaded copy checks for a newer release when it starts and can update
+itself (each download is checked against the release's `SHA256SUMS`); set
+`RUSTUDIO_NO_UPDATE_CHECK=1` to turn that off. An Android APK
+(`rustudio-android-arm64-v8a.apk`; `x86_64` for the emulator) is on the same
+page: install it with `adb install` or by opening it on the device — it
+doesn't update itself. See [docs/ANDROID.md](docs/ANDROID.md).
+
+**Build from source:** you need a Rust toolchain (1.85+) and a GPU with Vulkan (or OpenGL), or on
 a Mac, macOS 11 or later (Metal).
 
 ```sh

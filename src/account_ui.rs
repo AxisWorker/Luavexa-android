@@ -510,9 +510,15 @@ impl AccountUi {
         let (code, note, stop) = (view.code.clone(), view.note.clone(), view.stop.clone());
         *note.lock().unwrap() = "Getting a code from Roblox…".into();
         self.quick = Some(view);
+        // Each step to stderr (logcat on Android) as well as the panel: a
+        // failed sign-in's report then says how far it got.
+        fn trace(line: &str) {
+            eprintln!("[Info] Roblox: browser sign-in: {line}");
+        }
         self.connect("Signing in with the browser", true, move |cfg| {
             let fail = |m: String| SignedOut::Rejected(m);
             let q = QuickLogin::start().map_err(|e| fail(e.to_string()))?;
+            trace(&format!("code {} shown; waiting for the browser", q.code));
             *code.lock().unwrap() = Some(q.code.clone());
             *note.lock().unwrap() = "Waiting for you to enter the code…".into();
             let mut why = "the sign-in code expired; try again".to_string();
@@ -524,15 +530,26 @@ impl AccountUi {
                         QuickStatus::Validated => "Confirmed, signing in…".into(),
                         QuickStatus::Cancelled => {
                             why = "the sign-in was turned down in the browser".into();
+                            trace("turned down in the browser");
+                            return;
+                        }
+                        QuickStatus::Expired => {
+                            trace("the code expired");
                             return;
                         }
                         _ => return,
                     };
+                    trace(&line);
                     *note.lock().unwrap() = line;
                 })
                 .map_err(|e| fail(e.to_string()))?;
             match got {
-                Some(raw) => Client::sign_in_with(cfg, &raw),
+                Some(raw) => {
+                    trace("Roblox issued a session; checking it");
+                    let c = Client::sign_in_with(cfg, &raw)?;
+                    trace(&format!("signed in as @{}", c.session.profile.name));
+                    Ok(c)
+                }
                 None if stop.load(Ordering::Relaxed) => Err(fail("sign-in cancelled".into())),
                 None => Err(fail(why)),
             }
@@ -743,12 +760,15 @@ impl Editor {
         let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         if outside || esc {
             self.account.open = false;
-            if let Some(q) = &self.account.quick {
-                q.cancel();
+            // A browser sign-in that is waiting goes on behind the closed
+            // popup (the browser took the screen; a tap back here, or
+            // Android's Back, mustn't throw the code away): its Cancel
+            // button is the way to stop it.
+            if self.account.quick.is_none() {
+                self.account.adding = false;
+                self.account.cookie_input.clear();
+                self.account.add_error = None;
             }
-            self.account.adding = false;
-            self.account.cookie_input.clear();
-            self.account.add_error = None;
         }
     }
 
