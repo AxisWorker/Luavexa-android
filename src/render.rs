@@ -1011,6 +1011,8 @@ pub struct GpuTimer {
     /// SSAO + bloom + DoF, post, whole; and how many frames.
     sum: [f64; 5],
     frames: u32,
+    /// The last frame read, whole (ms): a few frames behind the one drawn.
+    last_ms: Option<f32>,
 }
 
 impl GpuTimer {
@@ -1044,7 +1046,7 @@ impl GpuTimer {
                 (buf, std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)))
             })
             .collect();
-        Some(GpuTimer { set, resolve, ring, slot: None, period_ns: queue.get_timestamp_period(), sum: [0.0; 5], frames: 0 })
+        Some(GpuTimer { set, resolve, ring, slot: None, period_ns: queue.get_timestamp_period(), sum: [0.0; 5], frames: 0, last_ms: None })
     }
 
     /// Timestamp `i` at this point of the encoder's work.
@@ -1091,6 +1093,7 @@ impl GpuTimer {
                             self.sum[3] += ms(t[3], t[4]);
                             self.sum[4] += ms(t[0], t[4]);
                             self.frames += 1;
+                            self.last_ms = Some(ms(t[0], t[4]) as f32);
                         }
                     }
                     buf.unmap();
@@ -1105,6 +1108,12 @@ impl GpuTimer {
     /// The sums so far (ms per section) and the frames in them.
     pub fn totals(&self) -> ([f64; 5], u32) {
         (self.sum, self.frames)
+    }
+
+    /// The GPU time of the last 3D frame read (ms; the read runs a few
+    /// frames behind), None before the first.
+    pub fn last_ms(&self) -> Option<f32> {
+        self.last_ms
     }
 }
 
@@ -3559,6 +3568,12 @@ impl Renderer {
         self.gpu_timer.as_ref().map(|t| t.totals())
     }
 
+    /// The GPU time of the last 3D frame the timestamps came back for
+    /// (ms); None without timestamps (Automatic quality, app.rs).
+    pub fn gpu_last_frame_ms(&self) -> Option<f32> {
+        self.gpu_timer.as_ref().and_then(|t| t.last_ms())
+    }
+
     /// The bloom and the final image again, from the HDR image as it is now
     /// (effects drawn into it after `render`; the frame's globals still
     /// bound).
@@ -3776,6 +3791,10 @@ impl Renderer {
             frame.globals.cam_pos[1],
             frame.globals.cam_pos[2],
         );
+        // (the perf log's sections of a 3D frame's CPU time: vpr_cull the
+        // visibility and draw lists, vpr_shadows / vpr_scene / vpr_post
+        // the passes' encoding, vpr_submit the driver taking the frame)
+        let section = crate::bench::scope("vpr_cull");
         let planes = frustum(frame.cull_view_proj);
         // A part whose bounding radius covers less than `detail_px` pixels
         // is skipped (quality.rs: mech::LOD_MIN_PX at the top level), and
@@ -3966,6 +3985,8 @@ impl Renderer {
         if n_lights > 0 {
             queue.write_buffer(&self.lights_buf, 0, bytemuck::cast_slice(lights));
         }
+        drop(section);
+        let section = crate::bench::scope("vpr_shadows");
 
         // The sun's shadow cascades (sun_shadow.rs): which to redraw.
         let diagnostic_back = std::env::var_os("RUSTUDIO_CULL_BACK").is_some() || std::env::var_os("RUSTUDIO_CULL_SWITCH").is_some_and(|p| std::path::Path::new(&p).exists());
@@ -4202,6 +4223,8 @@ impl Renderer {
         if let Some(t) = &self.gpu_timer {
             t.mark(&mut encoder, 1);
         }
+        drop(section);
+        let section = crate::bench::scope("vpr_scene");
         // With terrain water in view the scene is drawn in three passes:
         // the opaque scene; then (after copying its colour) the water,
         // which looks through it; then decals and see-through parts.
@@ -4500,9 +4523,16 @@ impl Renderer {
             see_through(&mut pass, &mut calls);
         }
         stats.draw_calls = calls;
-        // Scene colour snapshot (water/glass reads are complete).
-        encoder.copy_texture_to_texture(target.hdr.as_image_copy(), target.scene_copy.as_image_copy(),
-            wgpu::Extent3d { width: target.size[0], height: target.size[1], depth_or_array_layers: 1 });
+        drop(section);
+        let section = crate::bench::scope("vpr_post");
+        // Scene colour snapshot (water/glass reads are complete) for SSAO's
+        // encoded-scene reads (shader.wgsl ssao_scene); nothing after it
+        // reads the copy otherwise (clouds take their own), so it is only
+        // made when SSAO is on.
+        if ssao && target.ssao.is_some() {
+            encoder.copy_texture_to_texture(target.hdr.as_image_copy(), target.scene_copy.as_image_copy(),
+                wgpu::Extent3d { width: target.size[0], height: target.size[1], depth_or_array_layers: 1 });
+        }
         if let Some(t) = &self.gpu_timer {
             t.mark(&mut encoder, 2);
         }
@@ -4559,7 +4589,11 @@ impl Renderer {
             t.mark(&mut encoder, 4);
             t.resolve(&mut encoder);
         }
-        queue.submit([encoder.finish()]);
+        drop(section);
+        {
+            let _submit = crate::bench::scope("vpr_submit");
+            queue.submit([encoder.finish()]);
+        }
         if let Some(c) = self.clouds.as_mut() {
             c.after_submit();
         }

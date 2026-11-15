@@ -578,14 +578,21 @@ impl SunShadows {
     pub fn blur(&self, encoder: &mut wgpu::CommandEncoder, c: &Cascade, i: usize) {
         let offset = [(i as u64 * PASS_STRIDE) as u32];
         let t = c.tile as f32;
-        fn begin<'a>(encoder: &'a mut wgpu::CommandEncoder, view: &wgpu::TextureView) -> wgpu::RenderPass<'a> {
+        // The pass across writes the scratch texture, so nothing in it is
+        // kept: cleared, not loaded (a tiler loads a whole attachment it is
+        // told to keep, the scratch's every tile, before the first draw;
+        // a clear is free). The atlas keeps the other cascades' tiles.
+        fn begin<'a>(encoder: &'a mut wgpu::CommandEncoder, view: &wgpu::TextureView, keep: bool) -> wgpu::RenderPass<'a> {
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sun shadow blur"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: if keep { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) },
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -594,14 +601,14 @@ impl SunShadows {
             })
         }
         {
-            let mut pass = begin(encoder, &self.temp_view);
+            let mut pass = begin(encoder, &self.temp_view, false);
             pass.set_viewport(0.0, 0.0, t, t, 0.0, 1.0);
             pass.set_scissor_rect(0, 0, c.tile, c.tile);
             pass.set_pipeline(&self.h_pipe);
             pass.set_bind_group(0, &self.h_bg, &offset);
             pass.draw(0..3, 0..1);
         }
-        let mut pass = begin(encoder, &self.atlas_view);
+        let mut pass = begin(encoder, &self.atlas_view, true);
         pass.set_viewport(c.origin[0] as f32, c.origin[1] as f32, t, t, 0.0, 1.0);
         pass.set_scissor_rect(c.origin[0], c.origin[1], c.tile, c.tile);
         pass.set_pipeline(&self.v_pipe);

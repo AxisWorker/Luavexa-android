@@ -1828,9 +1828,9 @@
    "name": "play frame-rate cap by quality level",
    "group": "performance",
    "value": [
-    30,
-    30,
-    30,
+    0,
+    0,
+    0,
     0,
     0,
     0,
@@ -1841,7 +1841,7 @@
    ],
    "unit": "fps",
    "estimated": true,
-   "source": "frames per second at most while a game runs (0 none): a frame that comes early waits out its period; heat and battery on a phone at the low levels"
+   "source": "frames per second at most while a game runs (0 none: the display's rate, as Roblox's phone client at every level); a cap under the display's rate with FIFO vsync lands frames on every second or third refresh by turns (30 asked on a 60 Hz panel showed ~20 fps on the first phone), so the levels set none; RUSTUDIO_FPS_CAP and the setting are the player's choice for heat and battery"
   },
   {
    "name": "sun shadow cascades by quality level",

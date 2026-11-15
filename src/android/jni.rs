@@ -58,8 +58,30 @@ pub fn sdk_int() -> i32 {
     super::AndroidApp::sdk_version()
 }
 
+/// The display's refresh rate in Hz (`Display.getRefreshRate`: what the
+/// panel runs at now, 60 or 120 on a phone that switches; 0 when unknown).
+pub fn display_refresh_rate() -> Result<f32> {
+    with_activity(|env, activity| {
+        // Context.getDisplay from API 30; the WindowManager's default
+        // display before (deprecated there, still answered).
+        let display = if sdk_int() >= 30 {
+            env.call_method(activity, jni_str!("getDisplay"), jni_sig!("()Landroid/view/Display;"), &[])?.l()?
+        } else {
+            let wm = env.call_method(activity, jni_str!("getWindowManager"), jni_sig!("()Landroid/view/WindowManager;"), &[])?.l()?;
+            if wm.is_null() {
+                return Ok(0.0);
+            }
+            env.call_method(&wm, jni_str!("getDefaultDisplay"), jni_sig!("()Landroid/view/Display;"), &[])?.l()?
+        };
+        if display.is_null() {
+            return Ok(0.0);
+        }
+        env.call_method(&display, jni_str!("getRefreshRate"), jni_sig!("()F"), &[])?.f()
+    })
+}
+
 /// `context.getSystemService(name)` (null when the device has none).
-fn system_service<'l>(env: &mut Env<'l>, context: &JObject, name: &str) -> jni::errors::Result<JObject<'l>> {
+pub(super) fn system_service<'l>(env: &mut Env<'l>, context: &JObject, name: &str) -> jni::errors::Result<JObject<'l>> {
     let name = env.new_string(name)?;
     env.call_method(
         context,

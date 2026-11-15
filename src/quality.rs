@@ -601,8 +601,9 @@ impl Default for RenderSettings {
 /// should move.
 #[derive(Debug)]
 pub struct Auto {
-    /// Frame times (ms) of frames drawn back to back, with when they ended.
-    frames: VecDeque<(Instant, f32)>,
+    /// Frames drawn back to back: when each ended, its interval (ms) and
+    /// its cost (ms; the interval where nothing better is known).
+    frames: VecDeque<(Instant, f32, f32)>,
     last_change: Option<Instant>,
     /// A level stepped down from, and until when it isn't gone back to.
     hold: Option<(u8, Instant)>,
@@ -622,9 +623,15 @@ pub enum Step {
 }
 
 impl Auto {
-    /// A frame of `dt` seconds since the last. Returns the step to take
-    /// from `level`, if any; the caller changes the level and logs.
-    pub fn frame(&mut self, now: Instant, dt: f32, level: u8) -> Option<Step> {
+    /// A frame of `dt` seconds since the last, whose drawing cost `cost`
+    /// seconds — the interval itself where that is all that is known, or
+    /// the greater of the frame's CPU time and its GPU time where the
+    /// device times the GPU (app.rs): a frame held back by the display's
+    /// pacing is then not a slow one. The interval tells an idle pause and
+    /// frames back to back apart; the cost is what is judged. Returns the
+    /// step to take from `level`, if any; the caller changes the level and
+    /// logs.
+    pub fn frame(&mut self, now: Instant, dt: f32, cost: f32, level: u8) -> Option<Step> {
         let ms = dt * 1000.0;
         if !(ms > 0.0) || ms > mech::QUALITY_AUTO_IDLE_MS {
             // An idle pause (or the first frame): the frames before it
@@ -637,9 +644,9 @@ impl Auto {
             // (pipelines and targets remade for the new level: not its frames)
             return None;
         }
-        self.frames.push_back((now, ms));
+        self.frames.push_back((now, ms, (cost * 1000.0).max(0.0)));
         let keep = Duration::from_secs_f32(mech::QUALITY_AUTO_UP_S);
-        while self.frames.front().is_some_and(|(t, _)| now.duration_since(*t) > keep) {
+        while self.frames.front().is_some_and(|(t, _, _)| now.duration_since(*t) > keep) {
             self.frames.pop_front();
         }
         if self.hold.is_some_and(|(_, until)| now >= until) {
@@ -649,9 +656,10 @@ impl Auto {
         // Down: the last QUALITY_AUTO_DOWN_S of frames, their median long.
         if level > 1 && since_change >= mech::QUALITY_AUTO_DOWN_S {
             let span = Duration::from_secs_f32(mech::QUALITY_AUTO_DOWN_S);
-            let recent: Vec<f32> = self.frames.iter().filter(|(t, _)| now.duration_since(*t) <= span).map(|(_, ms)| *ms).collect();
-            let covered: f32 = recent.iter().sum::<f32>() / 1000.0;
-            if recent.len() >= 20 && covered >= mech::QUALITY_AUTO_DOWN_S * 0.8 && median(&recent) > budget * mech::QUALITY_AUTO_SLOW {
+            let recent: Vec<&(Instant, f32, f32)> = self.frames.iter().filter(|(t, _, _)| now.duration_since(*t) <= span).collect();
+            let covered: f32 = recent.iter().map(|(_, ms, _)| *ms).sum::<f32>() / 1000.0;
+            let costs: Vec<f32> = recent.iter().map(|(_, _, c)| *c).collect();
+            if recent.len() >= 20 && covered >= mech::QUALITY_AUTO_DOWN_S * 0.8 && median(&costs) > budget * mech::QUALITY_AUTO_SLOW {
                 self.last_change = Some(now);
                 self.hold = Some((level, now + Duration::from_secs_f32(mech::QUALITY_AUTO_HOLD_S)));
                 self.frames.clear();
@@ -661,9 +669,9 @@ impl Auto {
         // Up: QUALITY_AUTO_UP_S of frames back to back, their median at
         // the refresh, and not into a level just left.
         if level < LEVELS && since_change >= mech::QUALITY_AUTO_UP_S && !self.hold.is_some_and(|(held, _)| level + 1 >= held) {
-            let all: Vec<f32> = self.frames.iter().map(|(_, ms)| *ms).collect();
-            let covered: f32 = all.iter().sum::<f32>() / 1000.0;
-            if all.len() >= 200 && covered >= mech::QUALITY_AUTO_UP_S * 0.8 && median(&all) <= budget * mech::QUALITY_AUTO_FAST {
+            let covered: f32 = self.frames.iter().map(|(_, ms, _)| *ms).sum::<f32>() / 1000.0;
+            let costs: Vec<f32> = self.frames.iter().map(|(_, _, c)| *c).collect();
+            if costs.len() >= 200 && covered >= mech::QUALITY_AUTO_UP_S * 0.8 && median(&costs) <= budget * mech::QUALITY_AUTO_FAST {
                 self.last_change = Some(now);
                 self.frames.clear();
                 return Some(Step::Up);
@@ -804,7 +812,7 @@ mod tests {
         // Three seconds of 30 ms frames: one step down, not two.
         for _ in 0..100 {
             now += Duration::from_millis(30);
-            if let Some(s) = auto.frame(now, 0.030, level) {
+            if let Some(s) = auto.frame(now, 0.030, 0.030, level) {
                 steps.push(s);
                 level -= 1;
             }
@@ -815,7 +823,7 @@ mod tests {
         // (and no step down from the slow frames still in the window).
         for _ in 0..(25 * 60) {
             now += Duration::from_micros(16_700);
-            if let Some(s) = auto.frame(now, 0.0167, level) {
+            if let Some(s) = auto.frame(now, 0.0167, 0.0167, level) {
                 steps.push(s);
             }
         }
@@ -824,7 +832,7 @@ mod tests {
         now += Duration::from_secs_f32(mech::QUALITY_AUTO_HOLD_S);
         for _ in 0..(25 * 60) {
             now += Duration::from_micros(16_700);
-            if let Some(s) = auto.frame(now, 0.0167, level) {
+            if let Some(s) = auto.frame(now, 0.0167, 0.0167, level) {
                 steps.push(s);
                 level += 1;
             }
@@ -833,13 +841,33 @@ mod tests {
         assert_eq!(level, 5);
     }
 
+    /// Frames 37 ms apart whose work is 9 ms (held back by the display's
+    /// pacing, as the first phone's) don't take the level down; the same
+    /// frames judged by their interval would.
+    #[test]
+    fn automatic_judges_the_cost_not_the_wait() {
+        let mut auto = Auto::default();
+        let mut now = Instant::now();
+        for _ in 0..200 {
+            now += Duration::from_millis(37);
+            assert_eq!(auto.frame(now, 0.037, 0.009, 5), None);
+        }
+        let mut auto = Auto::default();
+        let mut stepped = false;
+        for _ in 0..200 {
+            now += Duration::from_millis(37);
+            stepped |= auto.frame(now, 0.037, 0.037, 5) == Some(Step::Down);
+        }
+        assert!(stepped);
+    }
+
     #[test]
     fn automatic_ignores_idle_pauses() {
         let mut auto = Auto::default();
         let mut now = Instant::now();
         for _ in 0..100 {
             now += Duration::from_millis(500);
-            assert_eq!(auto.frame(now, 0.5, 5), None);
+            assert_eq!(auto.frame(now, 0.5, 0.5, 5), None);
         }
     }
 }

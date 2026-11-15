@@ -434,6 +434,10 @@ pub struct RustudioApp {
     /// The text fields' long-press menu (src/android/text_menu.rs).
     #[cfg(target_os = "android")]
     text_menu: crate::android::text_menu::TextMenu,
+    /// The display's refresh rate in Hz (0 unknown): the frame budget the
+    /// CPU governor is told (src/android/perf_hint.rs), the perf log's
+    /// line, the frame-rate cap's lead.
+    refresh_hz: f32,
 }
 
 /// Studio's starting layout, from the placement table (src/panels.rs):
@@ -708,7 +712,31 @@ impl RustudioApp {
             keyboard: Default::default(),
             #[cfg(target_os = "android")]
             text_menu: Default::default(),
+            refresh_hz: display_refresh_hz(),
         }
+    }
+}
+
+/// The display's refresh rate (Android asks the Display; 0 elsewhere:
+/// unknown, taken as 60 where a budget is needed).
+fn display_refresh_hz() -> f32 {
+    #[cfg(target_os = "android")]
+    {
+        match crate::android::jni::display_refresh_rate() {
+            Ok(hz) if hz > 1.0 => {
+                log::info!("display: {hz:.0} Hz");
+                hz
+            }
+            Ok(_) => 0.0,
+            Err(e) => {
+                log::info!("display refresh rate unknown: {e}");
+                0.0
+            }
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        0.0
     }
 }
 
@@ -826,7 +854,7 @@ impl Editor {
     /// dialog or Luau (`settings().Rendering.EditQualityLevel`) sets the
     /// graphics; Automatic quality steps the level by the frame rate while
     /// the 3D view is drawn frame after frame (quality.rs `Auto`).
-    pub fn quality_tick(&mut self, now: Instant, dt: f32) {
+    pub fn quality_tick(&mut self, now: Instant, dt: f32, cost: f32) {
         let studio = crate::studio_settings::edit_quality_level();
         if studio != self.quality_studio_seen {
             // (Studio's value stays as set: Level05 reads back as Level05,
@@ -844,7 +872,7 @@ impl Editor {
         }
         // (a frame shown again, not drawn, says nothing about drawing)
         let drawn = self.hud.viewport_drawn && !self.view_reuse.reused_now;
-        let step = if drawn { self.quality_auto.frame(now, dt, self.graphics.level) } else { None };
+        let step = if drawn { self.quality_auto.frame(now, dt, cost, self.graphics.level) } else { None };
         if let Some(step) = step {
             match step {
                 crate::quality::Step::Down => self.graphics.level = self.graphics.level.saturating_sub(1).max(1),
@@ -2160,10 +2188,34 @@ impl eframe::App for RustudioApp {
         }
         ed.frame_no += 1;
         let frame_start = Instant::now();
+        // The CPU governor's frame hint (src/android/perf_hint.rs): the
+        // last frame's time on the CPU (eframe's, without the wait for the
+        // display) against this frame's budget — the display's period, or
+        // the frame-rate cap's while a game is capped.
+        #[cfg(target_os = "android")]
+        if let Some(cpu) = _frame.info().cpu_usage {
+            let cap = if ed.play.is_some() { ed.render_settings().fps_cap } else { 0 };
+            let hz = if cap > 0 { cap as f32 } else if self.refresh_hz > 1.0 { self.refresh_hz } else { 60.0 };
+            crate::android::perf_hint::frame(
+                std::time::Duration::from_secs_f32(cpu.max(0.0)),
+                std::time::Duration::from_secs_f32(1.0 / hz),
+            );
+        }
+        let causes = ctx.repaint_causes();
+        if crate::perf_log::on() {
+            self.perf.repaint_causes(&causes);
+        }
         let now = Instant::now();
         let dt = now.duration_since(ed.last_frame).as_secs_f32();
         ed.last_frame = now;
-        if dt > 0.0 {
+        // The status bar's fps counts the frames that followed the frame
+        // before at once — asked for by it, or brought by input — not the
+        // ones a timer woke the editor for (a poll, a tooltip, a sway) or
+        // the first after an idle pause: eframe draws on request, and on a
+        // phone, where no pointer hovers, a still editor's few frames a
+        // second are its idleness, not its frame rate.
+        let timed = !ctx.requested_repaint_last_pass() && !causes.is_empty();
+        if dt > 0.0 && dt < mech::QUALITY_AUTO_IDLE_MS / 1000.0 && !timed {
             ed.fps = ed.fps * 0.9 + (1.0 / dt) * 0.1;
         }
         ed.hud = HudStats::default();
@@ -2411,8 +2463,20 @@ impl eframe::App for RustudioApp {
         ed.ui_shots_tick(&ctx);
         let work_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
         ed.last_work_ms = work_ms;
-        // (a frame's wait for the frame-rate cap isn't slowness)
-        ed.quality_tick(now, (dt - ed.cap_wait).max(0.0));
+        // Automatic quality judges a frame by its work, not by what it
+        // waited: the frame's CPU time (eframe's, the frame before, the
+        // wait for the display left out) against the renderer's GPU time
+        // per 3D frame where the device times it — a frame held back by
+        // the swapchain or the display's pacing would otherwise take the
+        // level down for nothing. Without GPU timestamps the interval is
+        // all there is (a frame's wait for the frame-rate cap isn't
+        // slowness either way).
+        let interval = (dt - ed.cap_wait).max(0.0);
+        let cost = match (_frame.info().cpu_usage, ed.renderer.as_ref().and_then(|r| r.gpu_last_frame_ms())) {
+            (Some(cpu), Some(gpu_ms)) => cpu.max(gpu_ms / 1000.0).max(work_ms / 1000.0).min(interval),
+            _ => interval,
+        };
+        ed.quality_tick(now, interval, cost);
         if let Some(b) = ed.harness.bench.as_mut() {
             // Edit-mode benchmark: turn the camera slowly so several views count.
             if !b.play {
@@ -2503,9 +2567,11 @@ impl eframe::App for RustudioApp {
         if crate::perf_log::on() {
             let (renderer, render_state) = (&self.ed.renderer, &self.ed.render_state);
             let view_reuse = &mut self.ed.view_reuse;
+            let refresh_hz = self.refresh_hz;
             self.perf.frame(
                 work_ms,
                 _frame.info().cpu_usage,
+                ctx.requested_repaint_last_pass(),
                 renderer.as_ref().and_then(|r| r.gpu_totals()),
                 || {
                     let r = ctx.viewport_rect();
@@ -2525,13 +2591,16 @@ impl eframe::App for RustudioApp {
                     let rs = render_state.as_ref()?;
                     let i = rs.adapter.get_info();
                     Some(format!(
-                        "GPU {} ({:?}, {} {}), {:?}; frame latency {} (swapchain images less one)",
+                        "GPU {} ({:?}, {} {}), {:?}; surface {:?}, {}, frame latency {} (swapchain images less one); display {}",
                         i.name,
                         i.backend,
                         i.driver,
                         i.driver_info,
                         i.device_type,
-                        crate::frame_latency()
+                        rs.target_format,
+                        crate::present_mode_name(),
+                        crate::frame_latency(),
+                        if refresh_hz > 1.0 { format!("{refresh_hz:.0} Hz") } else { "rate unknown".to_string() },
                     ))
                 },
             );
@@ -2542,8 +2611,11 @@ impl eframe::App for RustudioApp {
 }
 
 impl RustudioApp {
-    /// Play's frame-rate cap (quality.rs `fps_cap`: 30 at levels 1 to 3,
-    /// `RUSTUDIO_FPS_CAP`): a frame that comes early waits out the period
+    /// Play's frame-rate cap (quality.rs `fps_cap`: none by level,
+    /// `RUSTUDIO_FPS_CAP` or the Play Frame Rate setting; under FIFO vsync
+    /// a cap below the display's rate lands frames on every second or
+    /// third refresh by turns, so it is the player's choice, for heat and
+    /// battery): a frame that comes early waits out the period
     /// before eframe presents it, so a phone drawing a game at a low level
     /// draws fewer frames and runs cooler for longer. The editor isn't
     /// capped (it repaints on input). The wait stays out of Automatic

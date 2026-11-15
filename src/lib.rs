@@ -376,15 +376,36 @@ pub(crate) fn wgpu_options(bench_mode: bool) -> egui_wgpu::WgpuConfiguration {
         surface: egui_wgpu::SurfaceConfig {
             // No vsync when measuring or driven for captures: a shot waits
             // for a few frames after each camera move.
-            present_mode: if bench_mode || std::env::var_os("RUSTUDIO_CONTROL").is_some() {
-                egui_wgpu::wgpu::PresentMode::AutoNoVsync
-            } else {
-                egui_wgpu::wgpu::PresentMode::AutoVsync
-            },
+            present_mode: present_mode(bench_mode || std::env::var_os("RUSTUDIO_CONTROL").is_some()),
             desired_maximum_frame_latency: Some(frame_latency()),
         },
         ..Default::default()
     }
+}
+
+/// The swapchain's present mode: vsync (`AutoVsync`: FIFO, relaxed where
+/// the driver has it) unless `no_vsync`. `RUSTUDIO_PRESENT_MODE` overrides
+/// for measuring — `fifo`, `relaxed`, `mailbox`, `immediate`, `vsync`,
+/// `novsync`; a mode the surface lacks falls back to FIFO in wgpu, with a
+/// warning in its log.
+pub fn present_mode(no_vsync: bool) -> egui_wgpu::wgpu::PresentMode {
+    use egui_wgpu::wgpu::PresentMode;
+    match std::env::var("RUSTUDIO_PRESENT_MODE").ok().as_deref().map(str::trim) {
+        Some("fifo") => PresentMode::Fifo,
+        Some("relaxed") => PresentMode::FifoRelaxed,
+        Some("mailbox") => PresentMode::Mailbox,
+        Some("immediate") => PresentMode::Immediate,
+        Some("vsync") => PresentMode::AutoVsync,
+        Some("novsync") => PresentMode::AutoNoVsync,
+        _ if no_vsync => PresentMode::AutoNoVsync,
+        _ => PresentMode::AutoVsync,
+    }
+}
+
+/// The present mode's name for the perf log (the editor's: never the
+/// bench's or the control harness's).
+pub fn present_mode_name() -> String {
+    format!("{:?}", present_mode(false))
 }
 
 /// Frames the presentation engine may hold ahead of the one being drawn:

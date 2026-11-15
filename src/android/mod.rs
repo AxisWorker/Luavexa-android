@@ -26,6 +26,7 @@ pub mod jni;
 pub mod keyboard;
 pub mod lifecycle;
 mod logcat;
+pub mod perf_hint;
 pub mod sensors;
 pub mod storage;
 pub mod text_menu;
@@ -253,6 +254,7 @@ pub fn run(app: AndroidApp) {
     if let Err(e) = result {
         log::error!("eframe: {e}");
     }
+    perf_hint::stop();
     lifecycle::LOOP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
     // The next launch gets a fresh process: the handles kept in this one's
     // statics (APP, the folders, the destroy hook's context) belong to this

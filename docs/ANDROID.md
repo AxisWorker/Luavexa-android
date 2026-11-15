@@ -81,7 +81,7 @@ xbuild quirks worth knowing (commit e67b501):
 | Back button | — | closes what is open on top (Escape), otherwise `moveTaskToBack` — the activity isn't destroyed (`src/android/lifecycle.rs`) |
 | Activity destroyed | — | `onDestroy` hook: close request, then `process::exit(0)`; `android_main` always leaves the process when the loop ends (`lifecycle.rs`) |
 | UI zoom | 1.0 of the display's scale | first run: the zoom that fits ~1100 points across (0.8 … 1.6 of the density), then View > Zoom In / Out as saved |
-| Graphics quality | level 10 (Studio's defaults) | Automatic from level 3: the 3D view at 0.7 scale (0.5 while the camera moves, scaled up by EASU + RCAS) with 512² textures, 900 studs of view distance, the lite shader, 2× anisotropy, no MSAA, one shadow cascade, Play capped at 30 fps (View > Graphics Settings, the 1–10 bar; "Graphics quality" below); saved with the layout |
+| Graphics quality | level 10 (Studio's defaults) | Automatic from level 3: the 3D view at 0.7 scale (0.5 while the camera moves, scaled up by EASU + RCAS) with 512² textures, 900 studs of view distance, the lite shader, 2× anisotropy, no MSAA, one shadow cascade, no frame-rate cap (View > Graphics Settings, the 1–10 bar; "Graphics quality" below); saved with the layout |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
 | Crash reports | `~/.cache/rustudio/crash/` | `<cache>/rustudio/crash/` (same `src/crash.rs`: panic hook + signal handlers chain to debuggerd) |
 | Studio content download | ureq + rustls (ring) | the same; started only when ConnectivityManager reports a validated network |
@@ -267,18 +267,54 @@ the app removes the content with its data; `adb install -r` keeps it.
 Every few seconds the editor logs a line like
 
 ```
-perf: 136 frames in 5.0 s: 36.9 ms apart (p95 72.3, worst 89); editor 5.2 ms + egui 1.2 ms on the CPU, 30.5 ms GPU/vsync wait; 3D GPU 9.8 ms per drawn frame = shadows 3.1 + scene 4.2 + ssao/bloom/dof 1.5 + post 1.0 (68 measured); window 1550x720 px at 1.40 px/pt, 3D view 816x310 px (scale 0.70, AO off, shadow maps x0.50), 3D frames drawn 68 / shown again 68; sections (ms/frame): dock_panels 4.3, viewport 3.4, vp_render 3.0
+perf: 136 frames in 5.0 s: 36.9 ms apart (p95 72.3, worst 89), 120 back to back 33.4 ms apart = 6.4 ms CPU + 27.0 ms GPU/display wait, 16 after a pause; editor 5.2 ms + egui 1.2 ms on the CPU; 3D GPU 9.8 ms per drawn frame = shadows 3.1 + scene 4.2 + ssao/bloom/dof 1.5 + post 1.0 (68 measured); window 1550x720 px at 1.40 px/pt, 3D view 816x310 px (scale 0.70, AO off, shadow maps x0.50), 3D frames drawn 68 / shown again 68; sections (ms/frame): dock_panels 4.3, viewport 3.4, vp_render 3.0, vpr_scene 1.1, vpr_submit 0.8, vpr_cull 0.6; frames asked by: app.rs:2531 x120, viewport.rs:2113 x16
 ```
 
 (`src/perf_log.rs`; `adb logcat -s rustudio`, or `RUSTUDIO_PERF_LOG=1` on
-a desktop). "editor" is `App::ui`'s own time, "egui" the layout and
-painting eframe adds, the "wait" what is left of the interval (the GPU,
-vsync, the loop). "3D GPU" is the renderer's own GPU time by timestamp
+a desktop). eframe draws a frame when the frame before asked for one
+(`request_repaint`) or input arrives, so the frames split in two: the
+"back to back" ones, asked for at once by the frame before
+(`egui::Context::requested_repaint_last_pass`), whose interval is CPU
+work plus the wait for the GPU and the display and nothing else; and the
+frames "after a pause", whose interval is mostly the editor sleeping — a
+still editor at 5 frames a second is not slow, it is idle. "editor" is
+`App::ui`'s own time, "egui" the layout and painting eframe adds, the
+"wait" what is left of a back-to-back interval (the GPU, the display's
+pacing). "3D GPU" is the renderer's own GPU time by timestamp
 queries (`render::GpuTimer`, where the device has them), per frame drawn
 afresh and by section; what the wait holds beyond it is egui's own GPU
-pass and vsync. The first line names the GPU and the wgpu backend (Vulkan
-is the one wanted; a GL fallback is slow). An idle editor logs nothing: no
-input, no frames.
+pass and vsync. The sections are the editor's own (`bench::scope`); the
+`vpr_*` ones split a 3D frame's CPU time (`vp_render`) into the
+visibility and draw lists (`vpr_cull`), the passes' encoding
+(`vpr_shadows`, `vpr_scene`, `vpr_post`) and the driver taking the frame
+(`vpr_submit`). "frames asked by" names the `request_repaint` call sites
+of the frame before each (`egui::Context::repaint_causes`), with how many
+frames each asked for, and "input/other" the frames nobody asked for
+(touches, the first ones): which code keeps a still editor drawing — a
+spinner, a poll, a pointer that never lifted — shows there. The first
+line names the GPU and the wgpu backend (Vulkan is the one wanted; a GL
+fallback is slow), the surface format, the present mode and frame latency
+asked for, and the display's refresh rate (`Display.getRefreshRate`: a
+phone that switches between 60 and 120 Hz says which it is on). An idle
+editor logs nothing: no input, no frames.
+
+Reading it: the display's period is the budget (16.7 ms at 60 Hz, 8.3 at
+120), and only the back-to-back frames are measured against it (the
+status bar's fps counts the frames that followed the frame before at
+once — asked for, or brought by a touch — and leaves out the ones a
+timer woke the editor for and the first after a pause, for the same
+reason). "editor + egui" over
+the budget is a CPU-bound frame (the sections say
+where; in Play `play_tick` and its `p6_client_lua` / `rt_domains_step` /
+`animate_step` are the game's scripts, runtime and animations). "3D GPU"
+over it is a GPU-bound one (the quality level's knobs: scale, shadows,
+MSAA). A wait far over both, with the view small and the CPU idle, is
+pacing: the swapchain (`RUSTUDIO_FRAME_LATENCY`, `RUSTUDIO_PRESENT_MODE`
+below), a frame-rate cap beating against vsync, or a build without the
+governor's hint (below). And "debug build" in the first line is the
+answer before any of that: the debug APK runs the editor at opt-level 1
+with debug assertions in every crate, several times slower than the
+release APK.
 
 Switches for a device, which has no shell environment to launch from:
 
@@ -306,8 +342,12 @@ texture samplers' taps: 1, 2, 4, 8, 16), `RUSTUDIO_LITE` (the lite
 shader's bits, 0 to 31; below), `RUSTUDIO_FPS_CAP` (Play's frames per
 second at most, 0 none) — and `RUSTUDIO_VIEW_REUSE` (0|1),
 `RUSTUDIO_FRAME_LATENCY` (swapchain images less one, 1 to 3; see below),
-`RUSTUDIO_NO_PIPELINE_CACHE`, `RUSTUDIO_NO_PIPELINE_WARMUP` (below). A
-switch wins over the saved Graphics Settings choice for the run.
+`RUSTUDIO_PRESENT_MODE` (`fifo`, `relaxed`, `mailbox`, `immediate`,
+`vsync`, `novsync`; a mode the surface lacks falls back to FIFO),
+`RUSTUDIO_NO_PERF_HINT` (no ADPF hint session for the frame thread;
+below), `RUSTUDIO_NO_PIPELINE_CACHE`, `RUSTUDIO_NO_PIPELINE_WARMUP`
+(below). A switch wins over the saved Graphics Settings choice for the
+run.
 
 ### Graphics quality (`src/quality.rs`, `src/graphics_settings.rs`)
 
@@ -340,7 +380,7 @@ Studio levels per bar step), set from either side.
 | Scale while the camera moves | 0.5 | 0.5 | 0.5 | 0.6 | 0.7 | 0.8 | 1 | 1 | 1 | 1 |
 | Texture filtering (anisotropic taps) | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 4 | 8 | 8 |
 | Lite shader (bits, below) | 7 | 7 | 7 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| Play frame-rate cap | 30 | 30 | 30 | — | — | — | — | — | — | — |
+| Play frame-rate cap | — | — | — | — | — | — | — | — | — | — |
 | Sun shadow cascades | 0 (voxel sun) | 1 | 1 | 2 | 2 | 2 | 3 | 4 | 4 | 4 |
 | Shadow texel scale | 0.5 | 0.5 | 0.5 | 0.5 | 0.75 | 0.75 | 1 | 1 | 1 | 1 |
 | Local light shadows | off | off | off | off | on | on | on | on | on | on |
@@ -360,8 +400,13 @@ last one and frames after an idle pause don't count): the median frame
 over the last 2 s longer than 1.35 × a 60 Hz refresh → a level down; 20 s
 of frames at the refresh (within 1.1 ×) → a level up, but not back into a
 level left in the last 90 s; the half second after a change, pipelines
-and targets being remade, isn't counted. Each step logs `graphics
-quality (automatic): level N: …` with the settings in effect.
+and targets being remade, isn't counted. A frame is judged by its work,
+not by what it waited for: the greater of its CPU time (eframe's, the
+wait for the display left out) and the renderer's GPU time per 3D frame
+(`render::GpuTimer`) where the device has timestamps — a frame held back
+by the swapchain or the display's pacing took the level down for nothing
+before; where it has none, the interval is all there is. Each step logs
+`graphics quality (automatic): level N: …` with the settings in effect.
 
 The individual settings (the window's rows; `quality::Overrides`): Render
 Distance (500 to 10,000 studs or Unlimited), Part Detail (Low / Medium /
@@ -430,12 +475,16 @@ What the renderer does with the settings (`render.rs`):
   degree, and at 0.5 scale no one tells. A change remakes the samplers and
   the part textures' bind groups (the key holds it).
 - **Play's frame-rate cap** (`RustudioApp::cap_frame_rate`,
-  `RenderSettings::fps_cap`; 30 at levels 1 to 3, `RUSTUDIO_FPS_CAP`):
-  while a game runs, a frame that comes early waits out its period before
-  eframe presents it — fewer frames drawn, less heat, longer battery; the
-  editor isn't capped (it repaints on input). The wait is kept out of
-  Automatic quality's frame time (`Editor::quality_tick`): a capped frame
-  isn't a slow one.
+  `RenderSettings::fps_cap`; none at any level, `RUSTUDIO_FPS_CAP` or the
+  Play Frame Rate setting turn one on): while a game runs, a frame that
+  comes early waits out its period before eframe presents it — fewer
+  frames drawn, less heat, longer battery; the editor isn't capped (it
+  repaints on input). The wait is kept out of Automatic quality's frame
+  time (`Editor::quality_tick`): a capped frame isn't a slow one. The
+  levels used to cap 30 fps at 1 to 3; under FIFO vsync a cap below the
+  display's rate lands frames on every second or third refresh by turns
+  (30 asked on a 60 Hz panel showed ~20 fps), and Roblox's phone client
+  runs at the display's rate at every level, so none is set now.
 - **Compressed material textures** (not done): the material arrays are
   RGBA8 (12 MB a 1024² layer; 3 MB at 512²); ASTC 4×4 would be a quarter
   of that and half the bandwidth, and every Vulkan phone GPU has it (the
@@ -520,6 +569,43 @@ What the port does about it:
   other frame reused: the effects system hands over a frame of effects
   whether or not it holds any, and an empty one counted as "effects on a
   reused frame", which asks for a fresh one.)
+- **The CPU governor told the frame budget** (`src/android/perf_hint.rs`;
+  `RUSTUDIO_NO_PERF_HINT` turns it off): Android's performance hints
+  (ADPF, `PerformanceHintManager`, API 31+). A frame loop that works for
+  8 ms and then waits 25 ms for the display looks idle to the governor,
+  which keeps the big core at its lowest clock — the 8 ms become 15, the
+  frame misses its vsync and waits for the next, and looks idler still.
+  The session is opened for eframe's thread (the editor, egui and the
+  renderer's encoding all run on it) with the display's period as the
+  target, or the frame-rate cap's while a game is capped, and every frame
+  reports the last frame's CPU time (eframe's, without the wait for the
+  display); the governor raises the clocks when the work runs close to the
+  budget and lowers them when it has slack. This is what Android's games
+  get through the Frame Pacing library and Unity / Unreal through their
+  ADPF plug-ins; the vendors put it at 10–20 % off the CPU side of a frame
+  and a steadier frame. The same thread is given Android's display
+  priority (`Process.setThreadPriority(THREAD_PRIORITY_DISPLAY)`, nice
+  −4, what an app's RenderThread runs at): `android_main` runs on a
+  thread of android-activity's at the default priority, level with the
+  editor's own workers (texture decoding, downloads, the content
+  install), and a frame should not wait its turn behind them. The startup
+  log says `frame thread N: display priority` and `perf hints: session
+  for thread N at 16.7 ms a frame`, or why not (API 30 and below, or a
+  vendor that returns no session).
+- **No frame-rate cap by level** (`mech::QUALITY_FPS_CAP`, all 0; the
+  first phone round capped Play at 30 fps on levels 1 to 3): under FIFO
+  vsync a cap below the display's rate puts frames on every second or
+  third refresh by turns — the 30 asked for showed ~20 fps — and Roblox's
+  phone client runs at the display's rate at every level. The cap stays
+  as the player's choice (`RUSTUDIO_FPS_CAP`, the Play Frame Rate
+  setting), for heat and battery.
+- **The shadow blur's scratch texture cleared, not loaded**
+  (`SunShadows::blur`): a tiler asked to keep an attachment loads every
+  tile of it before the first draw; the pass across rewrites the scratch
+  whole, so it is cleared (free) and only the atlas, which keeps the
+  other cascades' tiles, is loaded. Every other attachment was already
+  cleared or discarded where it can be (the MSAA colour is resolved and
+  discarded; the depth is kept for the world GUI pass).
 - **No cursor commands in Play.** `mouse_lock::note_window` took the
   Android window for one that can't lock the cursor, so a game's
   LockCenter grab fell back to Confined and sent a cursor position every
