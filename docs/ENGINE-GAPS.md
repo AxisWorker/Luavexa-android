@@ -289,10 +289,16 @@ Round 12 fidelity scores (render, settled shots): Place A 49.5, demo 69.3
 - **Graphics quality levels** (the Android port; `src/quality.rs`):
   `settings().Rendering.EditQualityLevel` now does what Studio's does —
   Automatic or Level01–21 onto a 1–10 bar of view distance, part detail,
-  texture size, MSAA, scene format, render scale, shadows and the post
-  passes (docs/ANDROID.md "Graphics quality"). A computer starts at level
-  10, Studio's defaults, which is what every fidelity figure above is
-  measured at; a shot at a lower level diverges by design.
+  texture size, texture filtering, the lite shader (no normal maps,
+  ambient-cube reflections, one material read at levels 1–3), MSAA, scene
+  format, render scale and the scale while the camera moves (the frame
+  brought up to the panel by FSR 1.0's EASU and RCAS), Play's frame-rate
+  cap, shadows and the post passes (docs/ANDROID.md "Graphics quality").
+  A computer starts at level 10, Studio's defaults — full shading, 8×
+  anisotropy, no motion scale, no cap — which is what every fidelity
+  figure above is measured at; a shot at a lower level diverges by
+  design. Open at the low levels: compressed (ASTC) material textures,
+  deferred for want of an on-device encoder (docs/ANDROID.md).
 
 Round 13 fidelity (`fidelity.py run --round 13`): render Place A 49.5, demo
 69.3, control 68.5 (unchanged), all gates pass (MAE 32.4 / 21.7 / 23.1).

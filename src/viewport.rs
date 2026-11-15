@@ -37,6 +37,37 @@ pub struct ViewReuse {
     drawn: u64,
 }
 
+/// Whether the camera is moving: its view matrix changed within the last
+/// `mech::QUALITY_MOTION_HOLD_S`, or a game runs (the world moves then
+/// whatever the camera does). The 3D view is drawn at the graphics
+/// settings' motion scale while it does (`RenderSettings::scale_now`) and
+/// scaled up to the panel by the renderer (EASU and RCAS); a camera come to
+/// rest gets a frame at the render scale once the hold is over (the
+/// viewport asks for that repaint).
+#[derive(Default)]
+pub struct Motion {
+    last: Option<[f32; 16]>,
+    until: Option<std::time::Instant>,
+}
+
+impl Motion {
+    /// This frame's view matrix in; whether the view counts as moving.
+    pub fn frame(&mut self, now: std::time::Instant, view_proj: &glam::Mat4, playing: bool) -> bool {
+        let m = view_proj.to_cols_array();
+        let changed = self.last.is_some_and(|l| l != m);
+        self.last = Some(m);
+        if changed {
+            self.until = Some(now + std::time::Duration::from_secs_f32(crate::mech::QUALITY_MOTION_HOLD_S));
+        }
+        playing || self.until.is_some_and(|t| now < t)
+    }
+
+    /// How long until a still camera's frame at the render scale is due.
+    pub fn settles_in(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.until.filter(|t| *t > now).map(|t| t - now)
+    }
+}
+
 impl ViewReuse {
     /// A frame shown again is at most this old.
     pub const MAX_AGE: std::time::Duration = std::time::Duration::from_millis(500);
@@ -2292,17 +2323,30 @@ impl Editor {
         let (wire_lines, wire_texts) = crate::runtime::domains::world::misc::wire_geometry(&self.doc);
         lines.extend(wire_lines.into_iter().map(|(pos, color)| LineVertex { pos, color }));
         // The graphics settings (quality.rs: the level, the settings set
-        // apart from it, RUSTUDIO_* switches).
+        // apart from it, RUSTUDIO_* switches). The view is drawn at the
+        // render scale, or the motion scale while the camera moves or a
+        // game runs (`Motion`), and the renderer scales it up to the panel.
         let settings = self.render_settings();
-        let ppp = ctx.pixels_per_point() * settings.render_scale;
+        let now = std::time::Instant::now();
+        let moving = self.motion.frame(now, &self.cam.view_proj(rect), self.play.is_some());
+        if let Some(d) = self.motion.settles_in(now).filter(|_| self.play.is_none()) {
+            ctx.request_repaint_after(d);
+        }
+        let full = ctx.pixels_per_point();
+        let ppp = full * settings.scale_now(moving);
+        let mut out = [
+            (rect.width() * full).round().max(1.0) as u32,
+            (rect.height() * full).round().max(1.0) as u32,
+        ];
         let mut size = [
             (rect.width() * ppp).round().max(1.0) as u32,
             (rect.height() * ppp).round().max(1.0) as u32,
         ];
-        // (a fixed render size: the camera takes its aspect)
+        // (a fixed render size: the camera takes its aspect; no scaling up)
         let rrect = match self.view_render_size {
             Some(s) => {
                 size = s;
+                out = s;
                 Rect::from_min_size(rect.min, egui::vec2(s[0] as f32, s[1] as f32) / ppp)
             }
             None => rect,
@@ -2363,11 +2407,11 @@ impl Editor {
             || frame.probe.as_ref().is_some_and(|p| !p.tasks.is_empty() || p.swap);
         let tex = match (self.renderer.as_mut(), self.render_state.as_ref()) {
             (Some(r), Some(rs)) => {
-                let key = crate::render::frame_key(size, &frame);
+                let key = crate::render::frame_key(size, out, &frame);
                 match self.view_reuse.again(key, r.generation(), live || r.water_drawn()) {
                     Some(tex) => Some(tex),
                     None => {
-                        let tex = r.render(rs, size, &frame);
+                        let tex = r.render(rs, size, out, &frame);
                         self.view_reuse.drawn(key, r.generation(), tex);
                         tex
                     }

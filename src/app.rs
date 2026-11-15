@@ -370,6 +370,12 @@ pub struct Editor {
     /// The last 3D frame shown again while nothing in it changed
     /// (viewport.rs; RUSTUDIO_VIEW_REUSE=0|1, on by default on phones).
     pub view_reuse: crate::viewport::ViewReuse,
+    /// Whether the camera moves (viewport.rs): the 3D view's scale.
+    pub motion: crate::viewport::Motion,
+    /// Play's frame-rate cap (quality.rs `fps_cap`): when the next frame
+    /// may go out, and how long the last one waited for its turn (s).
+    pub cap_next: Option<Instant>,
+    pub cap_wait: f32,
     /// CPU time of the last frame's update + draw submission (ms).
     pub last_work_ms: f32,
     /// Local lights, sky faces and the sky-visibility map.
@@ -560,6 +566,9 @@ impl RustudioApp {
             view_reuse: crate::viewport::ViewReuse::new(
                 std::env::var("RUSTUDIO_VIEW_REUSE").map_or(cfg!(target_os = "android"), |v| v != "0"),
             ),
+            motion: Default::default(),
+            cap_next: None,
+            cap_wait: 0.0,
             last_work_ms: 0.0,
             lighting: Default::default(),
             project: None,
@@ -667,6 +676,16 @@ impl RustudioApp {
         ed.renderer = ed.render_state.as_ref().map(|rs| {
             if crate::perf_log::on() {
                 eprintln!("render settings: {}", settings.describe(settings.scene_format(&rs.device)));
+                // (the compressed texture formats the device could hold the
+                // material arrays in: docs/ANDROID.md "Material textures")
+                let f = rs.adapter.features();
+                let has = |name: &str, feature: egui_wgpu::wgpu::Features| if f.contains(feature) { name.to_string() } else { format!("no {name}") };
+                eprintln!(
+                    "texture compression: {}, {}, {}",
+                    has("ASTC", egui_wgpu::wgpu::Features::TEXTURE_COMPRESSION_ASTC),
+                    has("ETC2", egui_wgpu::wgpu::Features::TEXTURE_COMPRESSION_ETC2),
+                    has("BC", egui_wgpu::wgpu::Features::TEXTURE_COMPRESSION_BC)
+                );
             }
             Renderer::new(&rs.device, &rs.queue, Some(&rs.adapter.get_info()), settings.clone())
         });
@@ -2392,7 +2411,8 @@ impl eframe::App for RustudioApp {
         ed.ui_shots_tick(&ctx);
         let work_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
         ed.last_work_ms = work_ms;
-        ed.quality_tick(now, dt);
+        // (a frame's wait for the frame-rate cap isn't slowness)
+        ed.quality_tick(now, (dt - ed.cap_wait).max(0.0));
         if let Some(b) = ed.harness.bench.as_mut() {
             // Edit-mode benchmark: turn the camera slowly so several views count.
             if !b.play {
@@ -2516,7 +2536,37 @@ impl eframe::App for RustudioApp {
                 },
             );
         }
+        self.cap_frame_rate();
         self.watchdog.complete();
+    }
+}
+
+impl RustudioApp {
+    /// Play's frame-rate cap (quality.rs `fps_cap`: 30 at levels 1 to 3,
+    /// `RUSTUDIO_FPS_CAP`): a frame that comes early waits out the period
+    /// before eframe presents it, so a phone drawing a game at a low level
+    /// draws fewer frames and runs cooler for longer. The editor isn't
+    /// capped (it repaints on input). The wait stays out of Automatic
+    /// quality's frame time (`Editor::quality_tick`) and out of the perf
+    /// log's editor time; it shows in the frame interval.
+    fn cap_frame_rate(&mut self) {
+        let ed = &mut self.ed;
+        ed.cap_wait = 0.0;
+        let cap = if ed.play.is_some() { ed.render_settings().fps_cap } else { 0 };
+        if cap == 0 {
+            ed.cap_next = None;
+            return;
+        }
+        let period = std::time::Duration::from_secs_f64(1.0 / cap as f64);
+        let now = Instant::now();
+        if let Some(next) = ed.cap_next.filter(|n| *n > now) {
+            std::thread::sleep(next - now);
+            ed.cap_wait = (next - now).as_secs_f32();
+        }
+        // (a frame late by more than a period restarts the beat: no burst
+        // of frames to catch up)
+        let base = ed.cap_next.map_or(now, |n| n.max(now - period));
+        ed.cap_next = Some(base + period);
     }
 }
 

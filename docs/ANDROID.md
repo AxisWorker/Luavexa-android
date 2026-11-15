@@ -81,7 +81,7 @@ xbuild quirks worth knowing (commit e67b501):
 | Back button | — | closes what is open on top (Escape), otherwise `moveTaskToBack` — the activity isn't destroyed (`src/android/lifecycle.rs`) |
 | Activity destroyed | — | `onDestroy` hook: close request, then `process::exit(0)`; `android_main` always leaves the process when the loop ends (`lifecycle.rs`) |
 | UI zoom | 1.0 of the display's scale | first run: the zoom that fits ~1100 points across (0.8 … 1.6 of the density), then View > Zoom In / Out as saved |
-| Graphics quality | level 10 (Studio's defaults) | Automatic from level 3: the 3D view at 0.7 scale with 512² textures, 900 studs of view distance, no MSAA, one shadow cascade (View > Graphics Settings, the 1–10 bar; "Graphics quality" below); saved with the layout |
+| Graphics quality | level 10 (Studio's defaults) | Automatic from level 3: the 3D view at 0.7 scale (0.5 while the camera moves, scaled up by EASU + RCAS) with 512² textures, 900 studs of view distance, the lite shader, 2× anisotropy, no MSAA, one shadow cascade, Play capped at 30 fps (View > Graphics Settings, the 1–10 bar; "Graphics quality" below); saved with the layout |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
 | Crash reports | `~/.cache/rustudio/crash/` | `<cache>/rustudio/crash/` (same `src/crash.rs`: panic hook + signal handlers chain to debuggerd) |
 | Studio content download | ureq + rustls (ring) | the same; started only when ConnectivityManager reports a validated network |
@@ -299,7 +299,12 @@ Lighting.GlobalShadows false), `RUSTUDIO_SUN_CASCADES` (0 to 4),
 `RUSTUDIO_SHADOW_SCALE` (the shadow maps' texels across, 0.25 to 1; see
 below), `RUSTUDIO_LIGHT_SHADOWS` (0|1), `RUSTUDIO_SSAO` (0|1),
 `RUSTUDIO_BLOOM` (levels, 0 off), `RUSTUDIO_DOF` (0|1), `RUSTUDIO_CLOUDS`
-(0|1), `RUSTUDIO_NO_ENV_PROBE` — and `RUSTUDIO_VIEW_REUSE` (0|1),
+(0|1), `RUSTUDIO_NO_ENV_PROBE`, `RUSTUDIO_MOTION_SCALE` (the render scale
+while the camera moves or a game runs, 0.25 to 1), `RUSTUDIO_UPSCALE` (0:
+egui's bilinear blit in place of EASU + RCAS), `RUSTUDIO_ANISOTROPY` (the
+texture samplers' taps: 1, 2, 4, 8, 16), `RUSTUDIO_LITE` (the lite
+shader's bits, 0 to 31; below), `RUSTUDIO_FPS_CAP` (Play's frames per
+second at most, 0 none) — and `RUSTUDIO_VIEW_REUSE` (0|1),
 `RUSTUDIO_FRAME_LATENCY` (swapchain images less one, 1 to 3; see below),
 `RUSTUDIO_NO_PIPELINE_CACHE`, `RUSTUDIO_NO_PIPELINE_WARMUP` (below). A
 switch wins over the saved Graphics Settings choice for the run.
@@ -332,6 +337,10 @@ Studio levels per bar step), set from either side.
 | MSAA | off | off | off | off | off | 2× | 2× | 2× | 4× | 4× |
 | Scene format | RG11B10F | RG11B10F | RG11B10F | RG11B10F | RGBA16F | RGBA16F | RGBA16F | RGBA16F | RGBA16F | RGBA16F |
 | Render scale | 0.5 | 0.6 | 0.7 | 0.8 | 1 | 1 | 1 | 1 | 1 | 1 |
+| Scale while the camera moves | 0.5 | 0.5 | 0.5 | 0.6 | 0.7 | 0.8 | 1 | 1 | 1 | 1 |
+| Texture filtering (anisotropic taps) | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 4 | 8 | 8 |
+| Lite shader (bits, below) | 7 | 7 | 7 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| Play frame-rate cap | 30 | 30 | 30 | — | — | — | — | — | — | — |
 | Sun shadow cascades | 0 (voxel sun) | 1 | 1 | 2 | 2 | 2 | 3 | 4 | 4 | 4 |
 | Shadow texel scale | 0.5 | 0.5 | 0.5 | 0.5 | 0.75 | 0.75 | 1 | 1 | 1 | 1 |
 | Local light shadows | off | off | off | off | on | on | on | on | on | on |
@@ -357,12 +366,14 @@ quality (automatic): level N: …` with the settings in effect.
 The individual settings (the window's rows; `quality::Overrides`): Render
 Distance (500 to 10,000 studs or Unlimited), Part Detail (Low / Medium /
 High: parts under 4 / 2 / 1 px skipped), Texture Quality (256² / 512² /
-1024²), Anti-aliasing (off, 2×, 4×), HDR Scene (32- or 64-bit), Render
-Scale (50–100 %), Sun Shadows (Off / Low: one cascade at half texels /
-Medium: two at 0.75 / High: Studio's four), Light Shadows, Ambient
-Occlusion, Bloom, Depth of Field, Clouds, Reflections (the scene
-environment probe). "All Auto" clears them, "Restore Defaults" the
-platform's start.
+1024²), Texture Filtering (trilinear, or 2× to 16× anisotropic), Shading
+(Simple: the lite shader, bits 7; Full), Anti-aliasing (off, 2×, 4×), HDR
+Scene (32- or 64-bit), Render Scale (50–100 %), Scale While Moving
+(40–100 %, never above the render scale), Play Frame Rate (uncapped, 30,
+45, 60), Sun Shadows (Off / Low: one cascade at half texels / Medium: two
+at 0.75 / High: Studio's four), Light Shadows, Ambient Occlusion, Bloom,
+Depth of Field, Clouds, Reflections (the scene environment probe). "All
+Auto" clears them, "Restore Defaults" the platform's start.
 
 What the renderer does with the settings (`render.rs`):
 
@@ -381,6 +392,59 @@ What the renderer does with the settings (`render.rs`):
   than Studio's 512²" clamp reads the array's size (`textureDimensions`)
   and stands down for smaller arrays.
 
+- **The scale while the camera moves, and the frame scaled up**
+  (`viewport::Motion`, `RenderSettings::scale_now`, `Pipe::Easu`,
+  `Pipe::Rcas`, `Target::upscale`): a frame is drawn at the motion scale
+  while the camera's view matrix changed within the last 0.25 s
+  (`mech::QUALITY_MOTION_HOLD_S`) or a game runs, at the render scale
+  otherwise, and a camera come to rest gets its frame at the render scale
+  once the hold is over (the viewport asks for that repaint). What the
+  pixels don't show while things move, they don't have to be drawn — the
+  phone's 0.5 scale is a quarter of the fragments. A frame drawn under
+  the panel's size is brought up to it by AMD's FidelityFX Super
+  Resolution 1.0 written in WGSL (`shader.wgsl` "upscaling": EASU, the
+  edge-adaptive 12-tap kernel, then RCAS, the contrast-adaptive sharpening
+  at `mech::UPSCALE_SHARPNESS`), two full-screen passes over the
+  tone-mapped image into panel-sized textures, in place of the bilinear
+  blit egui's image did (`RUSTUDIO_UPSCALE=0` brings that back); egui
+  shows RCAS's output.
+- **The lite shader** (`RenderSettings::lite`, shader constant `LITE`;
+  levels 1 to 3 build with bits 7, `RUSTUDIO_LITE=0..31` chooses): the
+  part and terrain fragment shaders compiled without what a phone screen
+  at 0.5 scale doesn't show — bit 1 no normal maps (parts' material and
+  SurfaceAppearance normals, the terrain's normal blend; the geometric
+  normal stands), bit 2 reflections from the ambient cube instead of the
+  environment probe (`env_reflect`; the probe isn't drawn below level 5
+  either way), bit 4 a single read per material (no detiling's second,
+  rotated read, no Wang tiling's four), bit 8 no material maps at all
+  (the part's colour, roughness and metalness from the material's
+  constants), bit 16 no studs (the legacy surface atlas). Every varying
+  the fragment shader doesn't interpolate (`PartOut`'s per-instance
+  values) is `@interpolate(flat)` in every build. The lite bits are part
+  of the build key: a change rebuilds the pipelines.
+- **Texture filtering** (`RenderSettings::anisotropy`, `repeat_sampler`,
+  `WaterPass::new`): the part textures', material maps' and water
+  normals' samplers take the level's anisotropic taps — 2 to level 7
+  (Studio's own default is `mech::TEXTURE_ANISOTROPY` = 8), 8 at the
+  top; a phone GPU's anisotropic filtering costs a tap per sample per
+  degree, and at 0.5 scale no one tells. A change remakes the samplers and
+  the part textures' bind groups (the key holds it).
+- **Play's frame-rate cap** (`RustudioApp::cap_frame_rate`,
+  `RenderSettings::fps_cap`; 30 at levels 1 to 3, `RUSTUDIO_FPS_CAP`):
+  while a game runs, a frame that comes early waits out its period before
+  eframe presents it — fewer frames drawn, less heat, longer battery; the
+  editor isn't capped (it repaints on input). The wait is kept out of
+  Automatic quality's frame time (`Editor::quality_tick`): a capped frame
+  isn't a slow one.
+- **Compressed material textures** (not done): the material arrays are
+  RGBA8 (12 MB a 1024² layer; 3 MB at 512²); ASTC 4×4 would be a quarter
+  of that and half the bandwidth, and every Vulkan phone GPU has it (the
+  perf log's first lines say `texture compression: ASTC, ETC2, no BC` for
+  the device). The packs are decoded from Studio's PNG/DDS at load, so
+  compressing them needs an ASTC encoder on the device (a minute of CPU
+  for 30 packs at 1024²) or a cached, pre-encoded pack set; neither is in
+  this port. The 256² and 512² levels and the skipped mips cut the memory
+  the same way for now.
 - **Pipelines and targets only for what is on** (`Pipe::wanted`,
   `Target`): the SSAO, bloom, depth-of-field, glass, water, cloud and
   light-shadow targets exist, and their passes run, only at a level that
@@ -399,8 +463,9 @@ What the renderer does with the settings (`render.rs`):
   forty pipelines compiled in a row before anything was drawn.
 - **A settings change rebuilds only what the key covers**
   (`RenderSettings::build_key`: MSAA, format, shadow scale, light
-  shadows → `Renderer::rebuild`); the rest — passes on or off, the
-  render scale, the cascade count — applies to the next frame.
+  shadows, the lite bits, the anisotropy → `Renderer::rebuild`); the rest
+  — passes on or off, the render and motion scales, the cascade count,
+  the frame-rate cap — applies to the next frame.
 - The perf line (every 5 s) names the level and the settings in effect
   and how many pipelines are built of those wanted.
 

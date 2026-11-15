@@ -365,10 +365,11 @@ pub struct Frame<'a> {
 /// [`Renderer::generation`] or the size changed (or time has to show: water,
 /// a game running). The animated material clock is left out (it only
 /// shows on the few materials that move).
-pub fn frame_key(size: [u32; 2], frame: &Frame) -> u64 {
+pub fn frame_key(size: [u32; 2], out: [u32; 2], frame: &Frame) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     size.hash(&mut h);
+    out.hash(&mut h);
     h.write(bytemuck::bytes_of(&frame.globals));
     for v in frame.cull_view_proj.to_cols_array() {
         v.to_bits().hash(&mut h);
@@ -540,10 +541,16 @@ mod gpu_tests {
             .unwrap_or_else(|e| panic!("{} ({:?}) refused rustudio's limits: {e}", info.name, info.backend));
         // Every quality level's build (quality.rs): the multisampled
         // shaders and the plain one, the HDR scene format and (where the
-        // device has it) the 32-bit one, the light shadow atlas on and off.
+        // device has it) the 32-bit one, the light shadow atlas on and off,
+        // the lite shader of the low levels and (RUSTUDIO_LITE=31) the
+        // litest one, the samplers' anisotropy.
+        let mut builds: Vec<(String, crate::quality::RenderSettings)> =
+            (1..=crate::quality::LEVELS).map(|level| (format!("level {level}"), crate::quality::RenderSettings::level(level))).collect();
+        let mut litest = crate::quality::RenderSettings::level(1);
+        litest.lite = crate::quality::LITE_ALL;
+        builds.push(("level 1, RUSTUDIO_LITE=31".to_string(), litest.normalized()));
         let mut built = std::collections::HashSet::new();
-        for level in 1..=crate::quality::LEVELS {
-            let settings = crate::quality::RenderSettings::level(level);
+        for (name, settings) in builds {
             if !built.insert(settings.build_key()) {
                 continue;
             }
@@ -552,8 +559,8 @@ mod gpu_tests {
             r.build_all_pipelines();
             drop(r);
             let err = pollster::block_on(scope.pop());
-            assert!(err.is_none(), "{} ({:?}) at level {level}: {err:?}", info.name, info.backend);
-            eprintln!("renderer built on {} ({:?}) at level {level}", info.name, info.backend);
+            assert!(err.is_none(), "{} ({:?}) at {name}: {err:?}", info.name, info.backend);
+            eprintln!("renderer built on {} ({:?}) at {name}", info.name, info.backend);
         }
     }
 }
@@ -933,9 +940,27 @@ struct Target {
     bloom: Option<BloomTargets>,
     /// SSAO's half-resolution targets, when the settings have it.
     ssao: Option<SsaoTargets>,
-    /// The tone-mapped image egui shows.
+    /// The tone-mapped image, `size` pixels; what egui shows unless the
+    /// frame is scaled up.
     display: wgpu::Texture,
     display_view: wgpu::TextureView,
+    /// The panel's size in pixels: the display image is scaled up to it
+    /// when it differs from `size` (quality.rs `render_scale`,
+    /// `motion_scale`).
+    out_size: [u32; 2],
+    /// EASU then RCAS from `display` to the panel's size, when the frame
+    /// is drawn under it and the settings have the upscale.
+    upscale: Option<UpscaleTargets>,
+}
+
+/// The frame scaled up (shader.wgsl fs_easu, fs_rcas): EASU's output and
+/// the bind groups reading the display image and it; RCAS's output is
+/// what egui shows.
+struct UpscaleTargets {
+    easu_bg: wgpu::BindGroup,
+    easu_view: wgpu::TextureView,
+    rcas_bg: wgpu::BindGroup,
+    view: wgpu::TextureView,
 }
 
 /// Depth of field: the far field (two full-resolution passes) and the
@@ -1118,10 +1143,13 @@ pub enum Pipe {
     /// One of the near field's passes (NEAR_ENTRIES).
     Near(usize),
     Post,
+    /// The frame scaled up to the panel (quality.rs `upscale`): EASU, then RCAS.
+    Easu,
+    Rcas,
 }
 
 impl Pipe {
-    const COUNT: usize = 28 + NEAR_PASSES;
+    const COUNT: usize = 30 + NEAR_PASSES;
 
     fn index(self) -> usize {
         match self {
@@ -1153,7 +1181,9 @@ impl Pipe {
             Pipe::DofH => 25,
             Pipe::DofV => 26,
             Pipe::Post => 27,
-            Pipe::Near(i) => 28 + i.min(NEAR_PASSES - 1),
+            Pipe::Easu => 28,
+            Pipe::Rcas => 29,
+            Pipe::Near(i) => 30 + i.min(NEAR_PASSES - 1),
         }
     }
 
@@ -1165,6 +1195,8 @@ impl Pipe {
             Pipe::Opaque,
             Pipe::OpaqueTwoSided,
             Pipe::Post,
+            Pipe::Easu,
+            Pipe::Rcas,
             Pipe::Lines,
             Pipe::Shadow,
             Pipe::Transparent,
@@ -1204,6 +1236,7 @@ impl Pipe {
             Pipe::SsaoDown | Pipe::SsaoMain | Pipe::SsaoBlurX | Pipe::SsaoBlurY | Pipe::SsaoApply => s.ssao,
             Pipe::BloomBright | Pipe::BloomDown | Pipe::BloomUp => s.bloom_levels > 0,
             Pipe::DofH | Pipe::DofV | Pipe::Near(_) => s.dof,
+            Pipe::Easu | Pipe::Rcas => s.upscales(),
             _ => true,
         }
     }
@@ -1473,6 +1506,9 @@ impl PipeFactory {
             Pipe::Near(i) => fullscreen("dof near", &self.post_layout, NEAR_ENTRIES[i.min(NEAR_PASSES - 1)], DOF_FORMAT, None),
             // Exposure, tone mapping, bloom and colour correction into the display texture.
             Pipe::Post => fullscreen("post", &self.post_layout, "fs_post", DISPLAY_FORMAT, None),
+            // The display texture scaled up to the panel's size (Target::upscale).
+            Pipe::Easu => fullscreen("upscale easu", &self.layout, "fs_easu", DISPLAY_FORMAT, None),
+            Pipe::Rcas => fullscreen("upscale rcas", &self.layout, "fs_rcas", DISPLAY_FORMAT, None),
         }
     }
 }
@@ -1534,7 +1570,7 @@ pub struct Renderer {
     settings: crate::quality::RenderSettings,
     /// The settings the pipelines, layouts and atlases were built for
     /// (`RenderSettings::build_key`): a change rebuilds them.
-    built_key: (u32, bool, u32, bool),
+    built_key: crate::quality::BuildKey,
     /// The scene's sample count and colour format, from the settings.
     samples: u32,
     scene_format: wgpu::TextureFormat,
@@ -1617,6 +1653,10 @@ pub struct Renderer {
     sampler: wgpu::Sampler,
     /// Texture bind groups; index 0 is plain white.
     textures: Vec<wgpu::BindGroup>,
+    /// Each one's views (the texture, the emissive mask, the surface
+    /// maps): the bind groups are made again when the sampler changes
+    /// (`rebuild`, the anisotropy).
+    texture_views: Vec<[wgpu::TextureView; 3]>,
     /// Per-frame instances: moving and see-through parts, overlay.
     instance_buf: wgpu::Buffer,
     instance_cap: usize,
@@ -1635,6 +1675,10 @@ pub struct Renderer {
     line_buf: wgpu::Buffer,
     line_cap: usize,
     target: Option<Target>,
+    /// The target before the last size change, kept for the camera's
+    /// starting and stopping (the motion scale's size and the render
+    /// scale's by turns): taken back, not made again.
+    spare_target: Option<Target>,
     pub texture_id: Option<egui::TextureId>,
     /// Counts what changes the picture besides the frame's own inputs
     /// (meshes, textures, items, terrain, sky, grids): the viewport shows
@@ -1922,18 +1966,8 @@ impl Renderer {
         });
         let studs_view = Self::studs_texture(device, queue, 1, 1, &[128, 128, 128, 255]);
         let materials = MaterialArrays::new(device, 1, 1);
-        let studs_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("studs"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            // Also the material maps' sampler: Studio's anisotropic filter
-            // at the device default (mech::TEXTURE_ANISOTROPY).
-            anisotropy_clamp: crate::mech::TEXTURE_ANISOTROPY,
-            ..Default::default()
-        });
+        // (also the material maps' sampler)
+        let studs_sampler = Self::repeat_sampler(device, "studs", settings.anisotropy);
         let lshadow = LightShadows::new(device, settings.light_shadows);
         let sun = crate::sun_shadow::SunShadows::new(device, &shadow_view);
         // Studio's scene environment probe (env_probe.rs): binding 13 is its
@@ -2045,18 +2079,7 @@ impl Renderer {
                 &[0, 0, 0, 255],
             )
             .create_view(&Default::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("texture"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            // Mipmapped and anisotropic, like Studio: finely tiled textures
-            // average out at a distance instead of sparkling.
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            anisotropy_clamp: crate::mech::TEXTURE_ANISOTROPY,
-            ..Default::default()
-        });
+        let sampler = Self::repeat_sampler(device, "texture", settings.anisotropy);
         let glass_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("glass scene"),
             entries: &[
@@ -2074,7 +2097,7 @@ impl Renderer {
             bind_group_layouts: &[Some(&bgl), Some(&tex_layout), Some(&glass_layout)],
             immediate_size: 0,
         });
-        let water = crate::water::WaterPass::new(device, queue, &bgl, &tex_layout, samples);
+        let water = crate::water::WaterPass::new(device, queue, &bgl, &tex_layout, samples, settings.anisotropy);
         let lshadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("light shadow"),
             bind_group_layouts: &[Some(&shadow_bgl), Some(&lshadow.face_layout)],
@@ -2212,6 +2235,7 @@ impl Renderer {
             tex_layout,
             sampler,
             textures: Vec::new(),
+            texture_views: Vec::new(),
             black_view,
             instance_buf: Self::make_buf(
                 device,
@@ -2240,6 +2264,7 @@ impl Renderer {
             ),
             line_cap,
             target: None,
+            spare_target: None,
             texture_id: None,
             generation: 0,
             water_drawn: false,
@@ -2248,6 +2273,24 @@ impl Renderer {
         r.add_texture(device, queue, 1, 1, &[255, 255, 255, 255]);
         r.warm_pipelines();
         r
+    }
+
+    /// The part textures' and material maps' sampler: repeating,
+    /// mipmapped and trilinear, like Studio's (finely tiled textures
+    /// average out at a distance instead of sparkling), with the quality
+    /// settings' anisotropy (`RenderSettings::anisotropy`; Studio's device
+    /// default is mech::TEXTURE_ANISOTROPY).
+    fn repeat_sampler(device: &wgpu::Device, label: &str, anisotropy: u16) -> wgpu::Sampler {
+        device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some(label),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            anisotropy_clamp: anisotropy.max(1),
+            ..Default::default()
+        })
     }
 
     /// Binding 0 of the globals (and the shadow passes' globals-only group).
@@ -2323,6 +2366,7 @@ impl Renderer {
         }
         let targets_differ = settings.ssao != self.settings.ssao
             || settings.dof != self.settings.dof
+            || settings.upscale != self.settings.upscale
             || (settings.bloom_levels > 0) != (self.settings.bloom_levels > 0)
             || settings.bloom_levels.max(1) != self.settings.bloom_levels.max(1);
         let textures_differ = settings.texture_texels != self.settings.texture_texels;
@@ -2337,6 +2381,7 @@ impl Renderer {
         }
         if targets_differ {
             self.target = None;
+            self.spare_target = None;
         }
         if !self.settings.clouds {
             self.clouds = None;
@@ -2374,7 +2419,16 @@ impl Renderer {
         self.sun = crate::sun_shadow::SunShadows::new(device, &self.shadow_view);
         self.lshadow = LightShadows::new(device, settings.light_shadows);
         self.probe = env_probe_gpu::ProbeGpu::new(device, queue, samples, scene_format, DEPTH_FORMAT, std::mem::size_of::<Globals>() as u64);
-        self.water = crate::water::WaterPass::new(device, queue, &self.globals_layout, &self.tex_layout, samples);
+        self.water = crate::water::WaterPass::new(device, queue, &self.globals_layout, &self.tex_layout, samples, settings.anisotropy);
+        // The samplers' anisotropy: the globals group is rebound below; the
+        // part textures' bind groups are made again over their views.
+        if settings.anisotropy != self.built_key.5 {
+            self.studs_sampler = Self::repeat_sampler(device, "studs", settings.anisotropy);
+            self.sampler = Self::repeat_sampler(device, "texture", settings.anisotropy);
+            for (bg, views) in self.textures.iter_mut().zip(&self.texture_views) {
+                *bg = Self::texture_bind_group(device, &self.tex_layout, &self.sampler, views);
+            }
+        }
         self.ssao_layout = Self::depth_layout(device, samples);
         let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("shadow globals"), entries: &[Self::uniform_entry()] });
         let pipeline_layout = |label: &str, groups: &[&wgpu::BindGroupLayout]| {
@@ -2411,6 +2465,7 @@ impl Renderer {
         self.scene_format = scene_format;
         self.built_key = settings.build_key();
         self.target = None;
+        self.spare_target = None;
         self.clouds = None;
         self.world_gui = None;
         self.rebind_globals(device);
@@ -2664,37 +2719,35 @@ impl Renderer {
             &mips,
         );
         let view = tex.create_view(&Default::default());
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("part texture"),
-            layout: &self.tex_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(
-                        mask_view.as_ref().unwrap_or(&self.black_view),
-                    ),
-                },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&surface_view) },
-            ],
-        });
+        let views = [view, mask_view.unwrap_or_else(|| self.black_view.clone()), surface_view];
+        let bg = Self::texture_bind_group(device, &self.tex_layout, &self.sampler, &views);
         // An EditableImage texture re-uploaded: into its old slot (the old
         // bind group and its textures are freed), not a new one.
         if let Some(i) = REUSE_TEXTURE_SLOT.with(|c| c.take()) {
-            if let Some(slot) = self.textures.get_mut(i as usize) {
+            if let (Some(slot), Some(v)) = (self.textures.get_mut(i as usize), self.texture_views.get_mut(i as usize)) {
                 *slot = bg;
+                *v = views;
                 return i;
             }
         }
         self.textures.push(bg);
+        self.texture_views.push(views);
         (self.textures.len() - 1) as u32
+    }
+
+    /// Group 1 of the part pipelines for a texture: it, the sampler, its
+    /// emissive mask (or black) and its SurfaceAppearance maps.
+    fn texture_bind_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, views: &[wgpu::TextureView; 3]) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("part texture"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[0]) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[1]) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&views[2]) },
+            ],
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3263,11 +3316,20 @@ impl Renderer {
         })
     }
 
-    fn ensure_target(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2]) {
-        if self.target.as_ref().is_some_and(|t| t.size == size) {
+    fn ensure_target(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], out: [u32; 2]) {
+        if self.target.as_ref().is_some_and(|t| t.size == size && t.out_size == out) {
             return;
         }
         let device = &rs.device;
+        if self.spare_target.as_ref().is_some_and(|t| t.size == size && t.out_size == out) {
+            std::mem::swap(&mut self.target, &mut self.spare_target);
+            let t = self.target.as_ref().expect("the spare target, just swapped in");
+            let shown = t.upscale.as_ref().map_or(&t.display_view, |u| &u.view);
+            if let Some(id) = self.texture_id {
+                rs.renderer.write().update_egui_texture_from_wgpu_texture(device, shown, wgpu::FilterMode::Linear, id);
+            }
+            return;
+        }
         let (samples, scene_format) = (self.samples, self.scene_format);
         let tex_at = |label: &str, size: [u32; 2], format: wgpu::TextureFormat, samples: u32, usage: wgpu::TextureUsages| {
             device.create_texture(&wgpu::TextureDescriptor {
@@ -3398,13 +3460,24 @@ impl Renderer {
         });
         let display = tex("viewport", DISPLAY_FORMAT, 1, attach | wgpu::TextureUsages::COPY_SRC);
         let display_view = display.create_view(&Default::default());
+        // Drawn under the panel's size: EASU into a panel-sized texture,
+        // RCAS into another, and egui shows that one.
+        let upscale = (out != size && self.settings.upscale).then(|| {
+            let easu_view = tex_at("viewport upscaled", out, DISPLAY_FORMAT, 1, attach).create_view(&Default::default());
+            let view = tex_at("viewport sharpened", out, DISPLAY_FORMAT, 1, attach).create_view(&Default::default());
+            UpscaleTargets { easu_bg: pair("upscale easu", &display_view, black), rcas_bg: pair("upscale rcas", &easu_view, black), easu_view, view }
+        });
+        let shown = upscale.as_ref().map_or(&display_view, |u| &u.view);
         let mut egui_renderer = rs.renderer.write();
         match self.texture_id {
-            Some(id) => egui_renderer.update_egui_texture_from_wgpu_texture(device, &display_view, wgpu::FilterMode::Linear, id),
-            None => self.texture_id = Some(egui_renderer.register_native_texture(device, &display_view, wgpu::FilterMode::Linear)),
+            Some(id) => egui_renderer.update_egui_texture_from_wgpu_texture(device, shown, wgpu::FilterMode::Linear, id),
+            None => self.texture_id = Some(egui_renderer.register_native_texture(device, shown, wgpu::FilterMode::Linear)),
         }
+        self.spare_target = self.target.take();
         self.target = Some(Target {
             size,
+            out_size: out,
+            upscale,
             msaa,
             depth: depth_view,
             hdr,
@@ -3556,9 +3629,14 @@ impl Renderer {
     }
 
     /// Exposure, tone mapping, bloom and colour correction into the
-    /// display texture.
+    /// display texture; then, drawn under the panel's size, EASU and RCAS
+    /// up to it.
     fn encode_post(&self, encoder: &mut wgpu::CommandEncoder, target: &Target) {
         self.fullscreen_pass(encoder, "post", Pipe::Post, &target.hdr_bg, &target.display_view, Some(&target.post_depth_bg));
+        if let Some(u) = target.upscale.as_ref() {
+            self.fullscreen_pass(encoder, "upscale easu", Pipe::Easu, &u.easu_bg, &u.easu_view, None);
+            self.fullscreen_pass(encoder, "upscale rcas", Pipe::Rcas, &u.rcas_bg, &u.view, None);
+        }
     }
 
     fn finish_again(&self, rs: &egui_wgpu::RenderState) {
@@ -3587,16 +3665,20 @@ impl Renderer {
         (g.fog, c)
     }
 
-    /// Renders a frame at `size` physical pixels; returns the texture to show.
+    /// Renders a frame at `size` physical pixels for a panel of `out`
+    /// pixels (the frame is scaled up to it when they differ); returns the
+    /// texture to show.
     pub fn render(
         &mut self,
         rs: &egui_wgpu::RenderState,
         size: [u32; 2],
+        out: [u32; 2],
         frame: &Frame,
     ) -> Option<egui::TextureId> {
         let svc_t0 = Instant::now();
         let size = [size[0].clamp(1, 8192), size[1].clamp(1, 8192)];
-        self.ensure_target(rs, size);
+        let out = [out[0].clamp(1, 8192), out[1].clamp(1, 8192)];
+        self.ensure_target(rs, size, out);
         let device = &rs.device;
         let queue = &rs.queue;
         // cam_pos.w is unused by the camera math. Keep material animation
@@ -4946,10 +5028,17 @@ fn to_raw(p: &PartDraw, bias: f32) -> InstanceRaw {
 
 /// shader.wgsl with the measured constants from mech.rs put in front.
 /// The viewport shader's WGSL: the tuning constants (mech.rs), the quality
-/// settings' constants (MSAA_SAMPLES, SUN_CASCADES) and shader.wgsl, its
-/// multisampled depth bindings made plain ones when MSAA is off.
+/// settings' constants (MSAA_SAMPLES, SUN_CASCADES, the lite shader's
+/// LITE bits, RCAS_SHARPNESS) and shader.wgsl, its multisampled depth
+/// bindings made plain ones when MSAA is off.
 fn shader_source(settings: &crate::quality::RenderSettings) -> String {
-    let quality = format!("const MSAA_SAMPLES: i32 = {};\nconst SUN_CASCADES: i32 = {};\n", settings.msaa.max(1), settings.sun_cascades.min(crate::sun_shadow::CASCADES as u32));
+    let quality = format!(
+        "const MSAA_SAMPLES: i32 = {};\nconst SUN_CASCADES: i32 = {};\nconst LITE: u32 = {}u;\nconst RCAS_SHARPNESS: f32 = {:?};\n",
+        settings.msaa.max(1),
+        settings.sun_cascades.min(crate::sun_shadow::CASCADES as u32),
+        settings.lite & crate::quality::LITE_ALL,
+        crate::mech::UPSCALE_SHARPNESS
+    );
     let grass = format!("const GRASS_RADIUS: f32 = {:?};\nconst GRASS_FADE_LEN: f32 = {:?};\nconst GRASS_NEAR_RADIUS: f32 = {:?};\nconst GRASS_NEAR_FADE_LEN: f32 = {:?};\n", crate::mech::GRASS_RADIUS, crate::mech::GRASS_FADE_LEN, crate::mech::GRASS_NEAR_RADIUS, crate::mech::GRASS_NEAR_FADE_LEN);
     use crate::mech as m;
     let [a, b, c, d, e] = m::TONE_CURVE;

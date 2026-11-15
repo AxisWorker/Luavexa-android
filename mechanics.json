@@ -1753,6 +1753,97 @@
    "source": "the 3D view's pixels per panel pixel, drawn scaled up; the first phone measurements fell well under 60 Hz at full resolution; the graphics quality levels (quality.rs; docs/MECHANICS.md \"Graphics quality levels\"): Studio's Settings slider 1 to 10 over its QualityLevel Level01..Level21; level 10 is Studio's defaults; the rows below the phone measurements in docs/ANDROID.md"
   },
   {
+   "name": "motion render scale by quality level",
+   "group": "performance",
+   "value": [
+    0.5,
+    0.5,
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    1,
+    1,
+    1,
+    1
+   ],
+   "unit": "fraction",
+   "estimated": true,
+   "source": "the 3D view's scale while the camera moves or a game runs (never above the render scale); the frame is scaled up to the panel by FSR 1.0's EASU and RCAS (shader.wgsl); what the pixels don't show in motion needn't be drawn"
+  },
+  {
+   "name": "motion render scale hold",
+   "group": "performance",
+   "value": 0.25,
+   "unit": "s",
+   "estimated": true,
+   "source": "how long after the camera's last movement the motion scale stays before a frame at the render scale is drawn"
+  },
+  {
+   "name": "upscale sharpness",
+   "group": "performance",
+   "value": 0.2,
+   "unit": "stops",
+   "estimated": true,
+   "source": "FSR 1.0 RCAS sharpness: 0 the sharpest, 2 the least (AMD's recommended default range)"
+  },
+  {
+   "name": "texture anisotropy by quality level",
+   "group": "performance",
+   "value": [
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    4,
+    8,
+    8
+   ],
+   "unit": "taps",
+   "estimated": true,
+   "source": "the part texture, material map and water normal samplers' anisotropic taps per level (Studio's default 8 is the top); a phone GPU pays a tap per sample per degree"
+  },
+  {
+   "name": "lite shader bits by quality level",
+   "group": "performance",
+   "value": [
+    7,
+    7,
+    7,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "estimated": true,
+   "source": "the shader build's LITE bits: 1 no normal maps, 2 ambient-cube reflections, 4 one material read, 8 no material maps, 16 no studs; levels 1 to 3 build with 7"
+  },
+  {
+   "name": "play frame-rate cap by quality level",
+   "group": "performance",
+   "value": [
+    30,
+    30,
+    30,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "unit": "fps",
+   "estimated": true,
+   "source": "frames per second at most while a game runs (0 none): a frame that comes early waits out its period; heat and battery on a phone at the low levels"
+  },
+  {
    "name": "sun shadow cascades by quality level",
    "group": "performance",
    "value": [

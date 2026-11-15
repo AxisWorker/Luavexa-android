@@ -22,9 +22,14 @@
 //!
 //! The renderer (render.rs) makes only the pipelines and render targets
 //! the settings call for and skips the passes they turn off; the viewport
-//! sizes its target by `render_scale`; parts and terrain beyond
+//! sizes its target by `render_scale` — by `motion_scale` while the camera
+//! moves or a game runs — and the renderer scales the frame up to the panel
+//! with EASU and RCAS (`upscale`); parts and terrain beyond
 //! `view_distance` and parts smaller than `detail_px` are not drawn; the
-//! material texture arrays are `texture_texels` across.
+//! material texture arrays are `texture_texels` across, filtered with
+//! `anisotropy` taps; `lite` picks the shader build with the costly
+//! material and reflection paths left out; `fps_cap` paces the frames
+//! while playing.
 //! `RUSTUDIO_QUALITY=auto|low|medium|high|1..10` and the per-field
 //! `RUSTUDIO_*` switches ([`RenderSettings::with_env`]) override for a
 //! run (on Android through `adb shell setprop debug.rustudio.env`,
@@ -142,6 +147,14 @@ pub struct Overrides {
     pub msaa: Option<u32>,
     pub hdr: Option<bool>,
     pub render_scale: Option<f32>,
+    /// The scale while the camera moves or a game runs.
+    pub motion_scale: Option<f32>,
+    /// Anisotropic filter taps: 1 (off), 2, 4, 8, 16.
+    pub anisotropy: Option<u16>,
+    /// The lite shader build (`RenderSettings::lite` 7) or the full one (0).
+    pub lite: Option<bool>,
+    /// Frames per second at most while playing (0: none).
+    pub fps_cap: Option<u32>,
     pub shadows: Option<Shadows>,
     pub light_shadows: Option<bool>,
     pub ssao: Option<bool>,
@@ -250,6 +263,27 @@ pub struct RenderSettings {
     /// The 3D view's pixels per panel pixel, 0.25 ..= 1 (the viewport
     /// sizes the target by it).
     pub render_scale: f32,
+    /// The pixels per panel pixel while the camera moves and while a game
+    /// runs, 0.25 ..= 1: the lesser of this and `render_scale` then
+    /// (`scale_now`). A still camera gets the render scale back after
+    /// `mech::QUALITY_MOTION_HOLD_S`.
+    pub motion_scale: f32,
+    /// A frame drawn under the panel's size is scaled up by EASU and RCAS
+    /// (shader.wgsl fs_easu, fs_rcas) rather than egui's bilinear blit
+    /// (`RUSTUDIO_UPSCALE=0` for the comparison).
+    pub upscale: bool,
+    /// The material maps' and part textures' anisotropic filter taps, 1
+    /// (off) ..= 16 (rebuild: the samplers).
+    pub anisotropy: u16,
+    /// The lite shader's bits (shader.wgsl `LITE_*`; rebuild: the shader
+    /// module): 1 no normal maps, 2 reflections from the ambient cube, 4
+    /// one material read, 8 no material maps, 16 no studs. 0 is the full
+    /// shader.
+    pub lite: u32,
+    /// Frames per second at most while a game runs, 0 for none (app.rs:
+    /// the frame waits for its turn; the time waited isn't counted by
+    /// Automatic quality).
+    pub fps_cap: u32,
     /// The sun's shadow cascades drawn, 0 (no shadow maps: the voxel sun
     /// alone, as Lighting.GlobalShadows off) ..= 4. Points outside the
     /// drawn cascades take the voxel sun, as beyond the last cascade.
@@ -287,6 +321,11 @@ impl RenderSettings {
             msaa: mech::QUALITY_MSAA[i],
             hdr: level >= mech::QUALITY_HDR_FROM,
             render_scale: mech::QUALITY_RENDER_SCALE[i],
+            motion_scale: mech::QUALITY_MOTION_SCALE[i],
+            upscale: true,
+            anisotropy: mech::QUALITY_ANISOTROPY[i],
+            lite: mech::QUALITY_LITE[i],
+            fps_cap: mech::QUALITY_FPS_CAP[i],
             sun_cascades: mech::QUALITY_SUN_CASCADES[i],
             shadow_scale: mech::QUALITY_SHADOW_SCALE[i],
             light_shadows: level >= mech::QUALITY_LIGHT_SHADOWS_FROM,
@@ -318,6 +357,18 @@ impl RenderSettings {
         }
         if let Some(v) = o.render_scale {
             self.render_scale = v;
+        }
+        if let Some(v) = o.motion_scale {
+            self.motion_scale = v;
+        }
+        if let Some(v) = o.anisotropy {
+            self.anisotropy = v;
+        }
+        if let Some(v) = o.lite {
+            self.lite = if v { LITE_PHONE } else { 0 };
+        }
+        if let Some(v) = o.fps_cap {
+            self.fps_cap = v;
         }
         if let Some(s) = o.shadows {
             let (cascades, scale) = s.cascades();
@@ -357,7 +408,10 @@ impl RenderSettings {
     /// (0|1), `RUSTUDIO_SSAO` (0|1), `RUSTUDIO_BLOOM` (levels, 0 off),
     /// `RUSTUDIO_DOF` (0|1), `RUSTUDIO_CLOUDS` (0|1), `RUSTUDIO_NO_ENV_PROBE`,
     /// `RUSTUDIO_VIEW_DISTANCE` (studs, 0 unlimited), `RUSTUDIO_DETAIL_PX`,
-    /// `RUSTUDIO_TEXTURE_TEXELS` (256, 512, 1024).
+    /// `RUSTUDIO_TEXTURE_TEXELS` (256, 512, 1024), `RUSTUDIO_MOTION_SCALE`
+    /// (0.25 to 1), `RUSTUDIO_UPSCALE` (0: egui's bilinear blit),
+    /// `RUSTUDIO_ANISOTROPY` (1, 2, 4, 8, 16), `RUSTUDIO_LITE` (the lite
+    /// shader's bits, 0 to 31), `RUSTUDIO_FPS_CAP` (0 none).
     pub fn with_env(mut self) -> Self {
         let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let flag = |k: &str| var(k).map(|v| v != "0" && !v.eq_ignore_ascii_case("off") && !v.eq_ignore_ascii_case("false"));
@@ -370,6 +424,21 @@ impl RenderSettings {
         }
         if let Some(s) = num("RUSTUDIO_RENDER_SCALE") {
             self.render_scale = s;
+        }
+        if let Some(s) = num("RUSTUDIO_MOTION_SCALE") {
+            self.motion_scale = s;
+        }
+        if let Some(on) = flag("RUSTUDIO_UPSCALE") {
+            self.upscale = on;
+        }
+        if let Some(n) = num("RUSTUDIO_ANISOTROPY") {
+            self.anisotropy = n.clamp(1.0, 16.0) as u16;
+        }
+        if let Some(n) = num("RUSTUDIO_LITE") {
+            self.lite = n.clamp(0.0, 31.0) as u32;
+        }
+        if let Some(n) = num("RUSTUDIO_FPS_CAP") {
+            self.fps_cap = n.clamp(0.0, 1000.0) as u32;
         }
         if flag("RUSTUDIO_SUN_SHADOWS") == Some(false) {
             self.sun_cascades = 0;
@@ -422,16 +491,40 @@ impl RenderSettings {
             _ => 4,
         };
         self.render_scale = if self.render_scale.is_finite() { self.render_scale.clamp(0.25, 1.0) } else { 1.0 };
+        self.motion_scale = if self.motion_scale.is_finite() { self.motion_scale.clamp(0.25, 1.0) } else { 1.0 };
+        self.anisotropy = match self.anisotropy {
+            0 | 1 => 1,
+            2 | 3 => 2,
+            4..=7 => 4,
+            8..=15 => 8,
+            _ => 16,
+        };
+        self.lite &= LITE_ALL;
+        // (a frame cap under 10 a second would be a stall; 0 is none)
+        self.fps_cap = if self.fps_cap == 0 { 0 } else { self.fps_cap.clamp(10, 1000) };
         self.sun_cascades = self.sun_cascades.min(crate::sun_shadow::CASCADES as u32);
         self.shadow_scale = if self.shadow_scale.is_finite() { self.shadow_scale.clamp(0.25, 1.0) } else { 1.0 };
         self.bloom_levels = self.bloom_levels.min(5);
         self
     }
 
-    /// The settings that shape the pipelines and the render targets: equal
-    /// keys share a renderer build.
-    pub fn build_key(&self) -> (u32, bool, u32, bool) {
-        (self.msaa, self.hdr, (self.shadow_scale * 100.0).round() as u32, self.light_shadows)
+    /// The settings that shape the shader module, the pipelines, the
+    /// samplers and the render targets: equal keys share a renderer build.
+    pub fn build_key(&self) -> BuildKey {
+        (self.msaa, self.hdr, (self.shadow_scale * 100.0).round() as u32, self.light_shadows, self.lite, self.anisotropy)
+    }
+
+    /// The scale the 3D view is drawn at now: the render scale, or while
+    /// the camera moves or a game runs (`moving`) the lesser of it and the
+    /// motion scale.
+    pub fn scale_now(&self, moving: bool) -> f32 {
+        if moving { self.motion_scale.min(self.render_scale) } else { self.render_scale }
+    }
+
+    /// Whether a frame drawn under the panel's size is scaled up by EASU
+    /// and RCAS (the pipelines are wanted) rather than the bilinear blit.
+    pub fn upscales(&self) -> bool {
+        self.upscale && (self.render_scale < 1.0 || self.motion_scale < 1.0)
     }
 
     /// The scene's colour format on `device`: Rgba16Float for HDR, else
@@ -450,11 +543,13 @@ impl RenderSettings {
     pub fn describe(&self, scene_format: wgpu::TextureFormat) -> String {
         let onoff = |b: bool| if b { "on" } else { "off" };
         format!(
-            "level {}: view distance {}, detail {} px, textures {}², MSAA {}, scene {}, render scale {:.2}, sun cascades {} at x{:.2}, light shadows {}, AO {}, bloom {}, DoF {}, clouds {}, env probe {}",
+            "level {}: view distance {}, detail {} px, textures {}² at {}x filtering, {} shader, MSAA {}, scene {}, render scale {:.2} ({:.2} moving, {}), sun cascades {} at x{:.2}, light shadows {}, AO {}, bloom {}, DoF {}, clouds {}, env probe {}, {}",
             self.level,
             if self.view_distance.is_finite() { format!("{:.0} studs", self.view_distance) } else { "unlimited".to_string() },
             self.detail_px,
             self.texture_texels,
+            self.anisotropy,
+            if self.lite == 0 { "full".to_string() } else { format!("lite {}", self.lite) },
             if self.msaa > 1 { format!("{}x", self.msaa) } else { "off".to_string() },
             match scene_format {
                 wgpu::TextureFormat::Rgba16Float => "RGBA16F",
@@ -462,6 +557,8 @@ impl RenderSettings {
                 _ => "other",
             },
             self.render_scale,
+            self.scale_now(true),
+            if self.upscale { "EASU" } else { "bilinear" },
             self.sun_cascades,
             self.shadow_scale,
             onoff(self.light_shadows),
@@ -470,9 +567,26 @@ impl RenderSettings {
             onoff(self.dof),
             onoff(self.clouds),
             onoff(self.env_probe),
+            if self.fps_cap > 0 { format!("{} fps cap in Play", self.fps_cap) } else { "no fps cap".to_string() },
         )
     }
 }
+
+/// `RenderSettings::build_key`: MSAA, HDR, the shadow scale in percent,
+/// light shadows, the lite shader's bits, the anisotropy.
+pub type BuildKey = (u32, bool, u32, bool, u32, u16);
+
+/// The lite shader's bits (shader.wgsl `LITE_*`).
+pub const LITE_NO_NORMAL_MAP: u32 = 1;
+pub const LITE_NO_ENV_REFLECT: u32 = 2;
+pub const LITE_ONE_MATERIAL_READ: u32 = 4;
+pub const LITE_NO_MATERIAL: u32 = 8;
+pub const LITE_NO_STUDS: u32 = 16;
+pub const LITE_ALL: u32 = 31;
+/// The phone levels' lite shader (`mech::QUALITY_LITE`; the Graphics
+/// Settings window's "Lite"): no normal maps, ambient-cube reflections,
+/// one material read. Materials and studs stay.
+pub const LITE_PHONE: u32 = LITE_NO_NORMAL_MAP | LITE_NO_ENV_REFLECT | LITE_ONE_MATERIAL_READ;
 
 impl Default for RenderSettings {
     fn default() -> Self {
@@ -589,6 +703,10 @@ mod tests {
                 assert!(s.detail_px <= p.detail_px, "{level}");
                 assert!(s.texture_texels >= p.texture_texels, "{level}");
                 assert!(s.render_scale >= p.render_scale, "{level}");
+                assert!(s.motion_scale >= p.motion_scale, "{level}");
+                assert!(s.anisotropy >= p.anisotropy, "{level}");
+                assert!(s.lite <= p.lite, "{level}");
+                assert!(s.fps_cap == 0 || p.fps_cap >= s.fps_cap, "{level}");
                 assert!(s.msaa >= p.msaa, "{level}");
             }
             prev = Some(s);
@@ -600,9 +718,24 @@ mod tests {
         assert!(top.view_distance.is_infinite());
         assert_eq!(top.detail_px, mech::LOD_MIN_PX);
         assert_eq!(top.texture_texels, crate::matpack::LAYER_SIZE);
+        assert_eq!(top.anisotropy, mech::TEXTURE_ANISOTROPY);
+        assert_eq!((top.lite, top.fps_cap, top.motion_scale), (0, 0, 1.0));
         let bottom = RenderSettings::level(1);
         assert_eq!(bottom.msaa, 1);
         assert!(!bottom.hdr);
+        assert_eq!(bottom.lite, LITE_PHONE);
+        assert_eq!(bottom.scale_now(true), bottom.motion_scale.min(bottom.render_scale));
+        assert_eq!(bottom.scale_now(false), bottom.render_scale);
+        assert!(bottom.upscales() && !top.upscales());
+    }
+
+    #[test]
+    fn switches_and_overrides_normalise() {
+        let s = RenderSettings { anisotropy: 5, lite: 0xFF, fps_cap: 3, motion_scale: 2.0, ..RenderSettings::level(LEVELS) }.normalized();
+        assert_eq!((s.anisotropy, s.lite, s.fps_cap, s.motion_scale), (4, LITE_ALL, 10, 1.0));
+        let s = RenderSettings::level(LEVELS).with_overrides(&Overrides { lite: Some(true), fps_cap: Some(30), anisotropy: Some(2), ..Default::default() });
+        assert_eq!((s.lite, s.fps_cap, s.anisotropy), (LITE_PHONE, 30, 2));
+        assert_eq!(RenderSettings::level(1).with_overrides(&Overrides { lite: Some(false), ..Default::default() }).lite, 0);
     }
 
     #[test]
@@ -613,9 +746,18 @@ mod tests {
         b.bloom_levels = 0;
         b.render_scale = 0.5;
         b.view_distance = 500.0;
+        b.motion_scale = 0.5;
+        b.fps_cap = 30;
         assert_eq!(a.build_key(), b.build_key());
         b.msaa = 1;
         assert_ne!(a.build_key(), b.build_key());
+        // The lite shader and the samplers' anisotropy are builds of their own.
+        let mut c = a;
+        c.lite = LITE_PHONE;
+        assert_ne!(a.build_key(), c.build_key());
+        let mut d = a;
+        d.anisotropy = 2;
+        assert_ne!(a.build_key(), d.build_key());
     }
 
     #[test]

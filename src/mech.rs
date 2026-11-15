@@ -188,7 +188,7 @@ pub const SHADOW_LOD_SCALE: f32 = 2.0; // casters can be this much smaller on sc
 pub const ENV_SPEC_ROUGHNESS: f32 = 0.5; // the roughness of every material for the sky reflection and the sun highlight (Studio: 0.089 + 0.911 × a per-material vertex value, VARYING4.w; the table isn't read yet; estimated from Place B Newer's N1 road)
 pub const ENV_SPEC_LOD_SPAN: f32 = 5.0; // the sky reflection reads the skybox at mip (coarsest − this × (1 − roughness)); Studio's part FS reads its prefiltered cube at roughness × 5 (ShadowMap part FS)
 pub const ENV_DIFFUSE_GAIN: f32 = 1.0; // EnvironmentDiffuseScale × skybox irradiance × this (calibrated against Studio)
-pub const TEXTURE_ANISOTROPY: u16 = 8; // part textures: mipmapped, trilinear, 8× anisotropic, no mip bias. Studio binds material maps with filter 2 and anisotropy 0 = the device default, which a running offline Studio holds at 8; Vulkan's sampler has mipLodBias 0
+pub const TEXTURE_ANISOTROPY: u16 = 8; // part textures at the top graphics quality levels (QUALITY_ANISOTROPY): mipmapped, trilinear, 8× anisotropic, no mip bias. Studio binds material maps with filter 2 and anisotropy 0 = the device default, which a running offline Studio holds at 8; Vulkan's sampler has mipLodBias 0
 pub const LIGHT_TEST_TOLERANCE: u8 = 8; // self-test: lit colours within this many levels (0-255) of Studio's
 // Light grid skylight (lightgrid.rs; Studio measurements "Light grid
 // (skylight)"): read from Studio and a running Studio.
@@ -665,6 +665,12 @@ pub const QUALITY_TEXTURE_TEXELS: [u32; 10] = [256, 256, 512, 512, 512, 1024, 10
 pub const QUALITY_MSAA: [u32; 10] = [1, 1, 1, 1, 1, 2, 2, 2, 4, 4]; // scene multisampling (Studio: MSAA from Level19)
 pub const QUALITY_HDR_FROM: u8 = 5; // levels from this one draw the scene in 64-bit float (Rgba16Float); below, 32-bit Rg11b10Ufloat
 pub const QUALITY_RENDER_SCALE: [f32; 10] = [0.5, 0.6, 0.7, 0.8, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]; // the 3D view's pixels per panel pixel: the first phone measurements fell well under 60 Hz at full resolution (estimated)
+pub const QUALITY_MOTION_SCALE: [f32; 10] = [0.5, 0.5, 0.5, 0.6, 0.7, 0.8, 1.0, 1.0, 1.0, 1.0]; // the 3D view's pixels per panel pixel while the camera moves and while playing (the lesser of this and the render scale; viewport.rs): the moving frames are the ones that can't be shown again, and at a phone's density a half-resolution frame scaled up by EASU reads well in motion (estimated)
+pub const QUALITY_MOTION_HOLD_S: f32 = 0.25; // the camera still for this long draws the view at the render scale again (estimated: a flick's settling time)
+pub const UPSCALE_SHARPNESS: f32 = 0.2; // RCAS's sharpness after EASU scales the 3D view up (shader.wgsl fs_rcas): 0 the sharpest, 2 the least; AMD's recommended setting for FSR 1.0's Quality mode
+pub const QUALITY_ANISOTROPY: [u16; 10] = [2, 2, 2, 2, 2, 2, 2, 4, TEXTURE_ANISOTROPY, TEXTURE_ANISOTROPY]; // the material maps' and part textures' anisotropic filter: 8 taps per sample at a grazing angle were a fifth of a phone's material cost (Roblox: better filtering from Level07, the most from Level09; estimated)
+pub const QUALITY_LITE: [u32; 10] = [7, 7, 7, 0, 0, 0, 0, 0, 0, 0]; // the lite shader's bits (shader.wgsl LITE_*: 1 no normal maps, 2 reflections from the ambient cube, 4 one material read; 8 and 16, diagnostics, off): a separate shader build (RenderSettings::build_key), as Studio's LQ variants are separate programs below Level04 (estimated)
+pub const QUALITY_FPS_CAP: [u32; 10] = [30, 30, 30, 0, 0, 0, 0, 0, 0, 0]; // frames per second at most while playing (0: none): a scene whose scripts and physics take 26 ms a frame shows 33 ms and 50 ms frames by turns at 60 Hz; held to 30 they come evenly (estimated)
 pub const QUALITY_SUN_CASCADES: [u32; 10] = [0, 1, 1, 2, 2, 2, 3, 4, 4, 4]; // sun shadow cascades drawn (0: the voxel sun alone, as Studio below Level04)
 pub const QUALITY_SHADOW_SCALE: [f32; 10] = [0.5, 0.5, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0, 1.0]; // the cascades' texels as a fraction of Studio's (SUN_SHADOW_TEXEL_SCALE_PHONE at the bottom)
 pub const QUALITY_LIGHT_SHADOWS_FROM: u8 = 5; // local lights' shadow maps from this level (Studio: ShadowMap from Level04, Future from Level05)

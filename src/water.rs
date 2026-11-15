@@ -59,6 +59,7 @@ impl WaterPass {
         globals: &wgpu::BindGroupLayout,
         textures: &wgpu::BindGroupLayout,
         samples: u32,
+        anisotropy: u16,
     ) -> Self {
         let frag = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
             binding,
@@ -122,9 +123,11 @@ impl WaterPass {
             address_mode_v: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            // Mipmapped: far ripples average out instead of shimmering.
+            // Mipmapped: far ripples average out instead of shimmering
+            // (the quality settings' anisotropy, mech::TEXTURE_ANISOTROPY
+            // at the top).
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            anisotropy_clamp: crate::mech::TEXTURE_ANISOTROPY,
+            anisotropy_clamp: anisotropy.max(1),
             ..Default::default()
         });
         WaterPass {

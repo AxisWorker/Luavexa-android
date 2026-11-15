@@ -1,9 +1,11 @@
 //! View > Graphics Settings: Studio's graphics quality bar (1 to 10, or
 //! Automatic) and each setting apart from it — render distance, part
-//! detail, texture quality, anti-aliasing, the scene's format, render
-//! scale, the sun's and the lights' shadows, ambient occlusion, bloom,
-//! depth of field, clouds, reflections — each "Auto" (from the level)
-//! unless chosen (src/quality.rs `Graphics`, `Overrides`). The choices
+//! detail, texture quality, texture filtering, the lite shader,
+//! anti-aliasing, the scene's format, render scale and the scale while the
+//! camera moves, Play's frame-rate cap, the sun's and the lights' shadows,
+//! ambient occlusion, bloom, depth of field, clouds, reflections — each
+//! "Auto" (from the level) unless chosen (src/quality.rs `Graphics`,
+//! `Overrides`). The choices
 //! live in the saved layout (layout_store.rs); the level mirrors Studio
 //! Settings > Rendering > Editor Quality Level. Built for a thumb: one
 //! combo box per setting, no drags but the bar's.
@@ -102,6 +104,22 @@ impl Editor {
             );
             choice(
                 ui,
+                "Texture Filtering",
+                &mut o.anisotropy,
+                &anisotropy(lv.anisotropy),
+                &[(1, "Trilinear"), (2, "2x anisotropic"), (4, "4x anisotropic"), (8, "8x anisotropic"), (16, "16x anisotropic")],
+                |v| anisotropy(*v),
+            );
+            choice(
+                ui,
+                "Shading",
+                &mut o.lite,
+                lite(lv.lite),
+                &[(true, "Simple"), (false, "Full")],
+                |v| lite(if *v { crate::quality::LITE_PHONE } else { 0 }).to_string(),
+            );
+            choice(
+                ui,
                 "Anti-aliasing",
                 &mut o.msaa,
                 &msaa(lv.msaa),
@@ -123,6 +141,22 @@ impl Editor {
                 &percent(lv.render_scale),
                 &[(0.5, "50%"), (0.6, "60%"), (0.7, "70%"), (0.8, "80%"), (1.0, "100%")],
                 |v| percent(*v),
+            );
+            choice(
+                ui,
+                "Scale While Moving",
+                &mut o.motion_scale,
+                &percent(lv.motion_scale.min(lv.render_scale)),
+                &[(0.4, "40%"), (0.5, "50%"), (0.6, "60%"), (0.7, "70%"), (0.8, "80%"), (1.0, "100%")],
+                |v| percent(*v),
+            );
+            choice(
+                ui,
+                "Play Frame Rate",
+                &mut o.fps_cap,
+                &fps(lv.fps_cap),
+                &[(0, "Uncapped"), (30, "30 fps"), (45, "45 fps"), (60, "60 fps")],
+                |v| fps(*v),
             );
             choice(
                 ui,
@@ -211,6 +245,18 @@ fn hdr(on: bool) -> String {
 
 fn percent(s: f32) -> String {
     format!("{}%", (s * 100.0).round())
+}
+
+fn anisotropy(n: u16) -> String {
+    if n > 1 { format!("{n}x anisotropic") } else { "Trilinear".to_string() }
+}
+
+fn lite(bits: u32) -> &'static str {
+    if bits == 0 { "Full" } else { "Simple" }
+}
+
+fn fps(cap: u32) -> String {
+    if cap > 0 { format!("{cap} fps") } else { "Uncapped".to_string() }
 }
 
 fn onoff(on: bool) -> &'static str {

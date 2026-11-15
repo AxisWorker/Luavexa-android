@@ -7,6 +7,20 @@
 // and the post pass applies exposure, the tone mapper (Default: Studio's
 // measured curve; Retro: sqrt), colour correction and bloom.
 
+// The lite shader (quality.rs `RenderSettings::lite`; render.rs
+// shader_source puts `LITE`, a bitmask, in front of this file: the phone
+// levels 1 to 3 build with 7, `RUSTUDIO_LITE` any): what the part, terrain
+// and water fragment shaders leave out. Decided when the module is
+// compiled, so each branch on these below folds away in the driver's
+// compiler, as Studio's LQ shader variants are separate programs.
+const LITE_NO_NORMAL_MAP: bool = (LITE & 1u) != 0u;      // no normal-map reads or tangent frames (parts' material maps, SurfaceAppearance, terrain); roughness the material's flat value, no metalness
+const LITE_NO_ENV_REFLECT: bool = (LITE & 2u) != 0u;     // reflections from the ambient cube along the reflection ray, not the sky and indoor cubes' mips
+const LITE_ONE_MATERIAL_READ: bool = (LITE & 4u) != 0u;  // one albedo read per material: no detiling copies, far/near fade copies, detail normal or emission mask
+const LITE_NO_MATERIAL: bool = (LITE & 8u) != 0u;        // no material maps at all: parts and terrain in their flat colours (a diagnostic)
+const LITE_NO_STUDS: bool = (LITE & 16u) != 0u;          // no studs, inlets or other surface textures (a diagnostic)
+/// A surface texel that bends nothing: flat normal, rough, no metal.
+const SURFACE_FLAT: vec4<f32> = vec4<f32>(0.5, 0.5, 1.0, 0.0);
+
 struct Globals {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>, // camera-relative (camera at the origin): world = cam_pos + (inv * ndc).xyz / w
@@ -342,20 +356,27 @@ struct PartIn {
     @location(11) vcol: vec4<f32>,     // per-vertex colour (sRGB; a 0 = the part's Color): a 1 union child colours, a in [-2, -1] mesh vertex colours (alpha -a - 1)
 };
 
+// The part shaders' varyings. What is the same over a whole instance
+// (its shading code, emission, half size, material scale: the instance
+// attributes copied through) is `flat`: the rasteriser interpolates
+// nothing for it, and the fragment shader's branches and `mat_params`
+// index on `extra` read one value per instance rather than a blend.
+// `color`, `objn` and `vtint` vary per vertex on meshes (vertex colours,
+// vertex normals) and stay interpolated.
 struct PartOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) world: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
-    @location(3) extra: vec4<f32>,
+    @location(3) @interpolate(flat) extra: vec4<f32>,
     @location(4) local: vec3<f32>,
     @location(5) uv: vec2<f32>,
-    @location(6) emissive: vec3<f32>,
-    @location(7) emissive_albedo: f32,
-    @location(8) half: vec3<f32>,
+    @location(6) @interpolate(flat) emissive: vec3<f32>,
+    @location(7) @interpolate(flat) emissive_albedo: f32,
+    @location(8) @interpolate(flat) half: vec3<f32>,
     @location(9) objn: vec3<f32>,
     // Material map scale per stud (uvt.xy).
-    @location(10) mscale: vec4<f32>,
+    @location(10) @interpolate(flat) mscale: vec4<f32>,
     @location(11) @interpolate(flat) oblique: u32,
     // Mesh vertex colour (squared) and alpha; (1, 1, 1, 1) without one.
     @location(12) vtint: vec4<f32>,
@@ -625,6 +646,11 @@ fn brdf_ab(rough: f32, nv: f32) -> vec2<f32> {
 /// the sky tinted by SkyGradientBottom..Top by the ray's height, blended by
 /// the skylight (HQ part FS).
 fn env_reflect(r: vec3<f32>, rough: f32, sky: f32, sharp: bool) -> vec3<f32> {
+    // The lite shader: the ambient cube along the ray, no cube samples
+    // (Studio's LQ part shaders reflect nothing at all).
+    if (LITE_NO_ENV_REFLECT) {
+        return env_cube(r, sky);
+    }
     let m = select(rough * ENV_SPEC_MIP_PER_ROUGHNESS, 0.0, sharp);
     let top_s = f32(textureNumLevels(sky_tex)) - 1.0;
     let top_i = f32(textureNumLevels(indoor_tex)) - 1.0;
@@ -925,7 +951,7 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
     // extra.x: shading kind (0..7), + 8 mesh-UV mapping, + 16 × (layer + 1).
     let code = u32(in.extra.x + 0.5);
     let kind = f32(code & 7u);
-    let layer = i32(code >> 4u) - 1;
+    let layer = select(i32(code >> 4u) - 1, -1, LITE_NO_MATERIAL);
     // Modern Realistic lighting uses the HQ material variant even when
     // an old Technology property is absent (env_spec.z is legacy state).
     let material_lq = layer >= 0 && g.env_spec.z <= 0.5 && g.sun_color.w > 0.5;
@@ -1007,20 +1033,22 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
     // Tiled FS); -1 = the flat parts' per-material value (env_spec.y).
     var mat_rough = -1.0;
     var mat_metal = 0.0;
-    let sa = textureSample(surface_tex, tex_sampler, in.uv);
-    let udx = dpdx(in.uv);
-    let udy = dpdy(in.uv);
-    if ((mode == 1u || mode >= 3u) && textureDimensions(surface_tex).x > 1u) {
-        mat_rough = sa.b;
-        mat_metal = sa.a;
-        let det = udx.x * udy.y - udx.y * udy.x;
-        if (abs(det) > 1e-10) {
-            let tangent = (wdx * udy.y - wdy * udx.y) / det;
-            let bitangent = (wdy * udx.x - wdx * udy.x) / det;
-            let tn = mat_normal(sa);
-            let tt = normalize(tangent - n * dot(n, tangent));
-            let bb = normalize(bitangent - n * dot(n, bitangent));
-            n = normalize(tt * tn.x - bb * tn.y + n * tn.z);
+    if (!LITE_NO_NORMAL_MAP) {
+        let sa = textureSample(surface_tex, tex_sampler, in.uv);
+        let udx = dpdx(in.uv);
+        let udy = dpdy(in.uv);
+        if ((mode == 1u || mode >= 3u) && textureDimensions(surface_tex).x > 1u) {
+            mat_rough = sa.b;
+            mat_metal = sa.a;
+            let det = udx.x * udy.y - udx.y * udy.x;
+            if (abs(det) > 1e-10) {
+                let tangent = (wdx * udy.y - wdy * udx.y) / det;
+                let bitangent = (wdy * udx.x - wdx * udy.x) / det;
+                let tn = mat_normal(sa);
+                let tt = normalize(tangent - n * dot(n, tangent));
+                let bb = normalize(bitangent - n * dot(n, bitangent));
+                n = normalize(tt * tn.x - bb * tn.y + n * tn.z);
+            }
         }
     }
     var material_emission = vec3<f32>(0.0);
@@ -1045,11 +1073,21 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
         let depth = 1.0 / in.clip.w;
         let fades = clamp(vec2<f32>(1.0) - depth * vec2<f32>(1.0 / MATERIAL_DIFFUSE_FADE_DEPTH, ENV_SPEC_FADE), vec2<f32>(0.0), vec2<f32>(1.0));
         var a: vec4<f32>;
-        var su: vec4<f32>;
+        // (the lite shader without normal maps reads no surface map: a
+        // flat texel, the material's flat roughness below)
+        var su = SURFACE_FLAT;
         var nm: vec3<f32>;
         var duv = muv;
         var dk = 1.0;
-        if (mp1.y > 0.5) {
+        if (mp1.y > 0.5 && LITE_ONE_MATERIAL_READ) {
+            // The lite shader's detiled material: the maps once, at the
+            // detiling's own scale, no noise.
+            a = textureSampleGrad(mat_albedo, studs_sampler, muv, layer, mdx, mdy);
+            if (!LITE_NO_NORMAL_MAP) {
+                su = textureSampleGrad(mat_surface, studs_sampler, muv, layer, mdx, mdy);
+            }
+            nm = mat_normal(su);
+        } else if (mp1.y > 0.5) {
             // DefaultUnifiedDetiledFS: two copies of the maps, moved by
             // sin((3, 7) × i) for the noise level i and i + 1, mixed by its
             // fraction (the uv's own gradients for both).
@@ -1060,10 +1098,13 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
             let ub = muv + sin(vec2<f32>(3.0, 7.0) * (i + 1.0));
             a = mix(textureSampleGrad(mat_albedo, studs_sampler, ua, layer, mdx, mdy),
                 textureSampleGrad(mat_albedo, studs_sampler, ub, layer, mdx, mdy), f);
-            let sa = textureSampleGrad(mat_surface, studs_sampler, ua, layer, mdx, mdy);
-            let sb = textureSampleGrad(mat_surface, studs_sampler, ub, layer, mdx, mdy);
-            su = mix(sa, sb, f);
-            nm = mix(mat_normal(sa), mat_normal(sb), f);
+            nm = vec3<f32>(0.0, 0.0, 1.0);
+            if (!LITE_NO_NORMAL_MAP) {
+                let sa = textureSampleGrad(mat_surface, studs_sampler, ua, layer, mdx, mdy);
+                let sb = textureSampleGrad(mat_surface, studs_sampler, ub, layer, mdx, mdy);
+                su = mix(sa, sb, f);
+                nm = mix(mat_normal(sa), mat_normal(sb), f);
+            }
         } else if (shader_type == 6u) {
             // DefaultUnifiedWangFS: atlas coordinates, gradients of the
             // unsplit uv. Detail normal still uses the original tiled uv.
@@ -1071,17 +1112,21 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
             dk = mp0.w;
             let atlas = wang_uv(duv);
             a = textureSampleGrad(mat_albedo, studs_sampler, atlas, layer, mdx * dk, mdy * dk);
-            su = textureSampleGrad(mat_surface, studs_sampler, atlas, layer, mdx * dk, mdy * dk);
+            if (!LITE_NO_NORMAL_MAP) {
+                su = textureSampleGrad(mat_surface, studs_sampler, atlas, layer, mdx * dk, mdy * dk);
+            }
             nm = mat_normal(su);
         } else {
             // DefaultUnifiedTiledFS: uv × textureTiling.
             duv = muv * mp0.w;
             dk = mp0.w;
             a = textureSampleGrad(mat_albedo, studs_sampler, duv, layer, mdx * dk, mdy * dk);
-            su = textureSampleGrad(mat_surface, studs_sampler, duv, layer, mdx * dk, mdy * dk);
+            if (!LITE_NO_NORMAL_MAP) {
+                su = textureSampleGrad(mat_surface, studs_sampler, duv, layer, mdx * dk, mdy * dk);
+            }
             // LQ's diffuse switch uses unscaled VARYING0 and fixed cutoff
             // 0.6. HQ HideDiffuse/HideAll use the material's cutoff.
-            if (lq || shader_type == 7u || shader_type == 8u) {
+            if (!LITE_ONE_MATERIAL_READ && (lq || shader_type == 7u || shader_type == 8u)) {
                 let cutoff = select(mc.x, MATERIAL_LQ_DIFFUSE_CUTOFF, lq);
                 let uv = select(duv, muv, lq);
                 let dx = select(mdx * dk, mdx, lq);
@@ -1090,14 +1135,15 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
                 let near = textureSampleGrad(mat_albedo, studs_sampler, uv, layer, dx, dy);
                 a = mix(far, near, clamp((fades.x - cutoff) * ms.x, 0.0, 1.0));
             }
-            if ((!lq && shader_type == 8u) || shader_type == 10u || shader_type == 11u) {
+            if (!LITE_ONE_MATERIAL_READ && !LITE_NO_NORMAL_MAP && ((!lq && shader_type == 8u) || shader_type == 10u || shader_type == 11u)) {
                 let sn = textureSampleGrad(mat_surface, studs_sampler, duv * mf.y, layer, mdx * dk * mf.y, mdy * dk * mf.y);
                 let ss = textureSampleGrad(mat_surface, studs_sampler, duv * mf.z, layer, mdx * dk * mf.z, mdy * dk * mf.z);
                 su = vec4<f32>(mix(sn.rg, su.rg, clamp((fades.y - mc.y) * ms.y, 0.0, 1.0)), mix(ss.ba, su.ba, clamp((fades.y - mc.z) * ms.z, 0.0, 1.0)));
             }
             nm = mat_normal(su);
         }
-        mat_rough = su.b;
+        // (without the surface map, the flat parts' per-material roughness)
+        mat_rough = select(su.b, -1.0, LITE_NO_NORMAL_MAP);
         mat_metal = su.a;
         if (shader_type == 10u || shader_type == 11u) {
             glass_alpha = clamp(2.0 * alpha - 1.0 + a.a, 0.0, 1.0);
@@ -1107,7 +1153,7 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
         // GlassFS multiplies Color3 directly; diffuse alpha only controls coverage.
         let tint = select(1.0, a.a, mp1.w > 0.5 && shader_type != 10u && shader_type != 11u);
         base = sq(mix(vec3<f32>(1.0), sqrt(max(base, vec3<f32>(0.0))), vec3<f32>(tint)) * a.rgb);
-        if (shader_type == 9u) {
+        if (shader_type == 9u && !LITE_ONE_MATERIAL_READ) {
             let mask = textureSampleGrad(mat_emission, studs_sampler, duv, layer, mdx * dk, mdy * dk).r;
             material_emission = vec3<f32>(mf.w, mc.w, ms.w) * mask;
         }
@@ -1115,7 +1161,7 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
         let z = nm.z * select(1.0, 10.0, shader_type == 10u || shader_type == 11u);
         // The detail normal (the material's second pack) at normalDetailTiling
         // × the main repeat: its xy × normalDetailScale added (z kept).
-        if (mp0.x >= 0.0 && mp0.z != 0.0) {
+        if (mp0.x >= 0.0 && mp0.z != 0.0 && !LITE_NO_NORMAL_MAP && !LITE_ONE_MATERIAL_READ) {
             let t = mp0.y * dk;
             let dn = textureSampleGrad(mat_surface, studs_sampler, duv * mp0.y, i32(mp0.x), mdx * t, mdy * t);
             xy += (dn.rg * 2.0 - vec2<f32>(1.0)) * mp0.z;
@@ -1128,7 +1174,7 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
         // Studio WangVS supplies a rotated object tangent; WangFS uses
         // T * normal.x + cross(N, T) * normal.y + N * normal.z.
         let det = mdx.x * mdy.y - mdx.y * mdy.x;
-        if (!lq && abs(det) > 1e-20) {
+        if (!lq && !LITE_NO_NORMAL_MAP && abs(det) > 1e-20) {
             let t = (wdx * mdy.y - wdy * mdx.y) / det;
             let b = (wdy * mdx.x - wdx * mdy.x) / det;
             let tt = normalize(t - n * dot(n, t));
@@ -1140,7 +1186,7 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
     let ddx = dpdx(in.local);
     let ddy = dpdy(in.local);
     // The six faces' surfaces (18 bits; bit 19 is CastShadow, vs_shadow's).
-    let faces = (packed >> 1u) & 0x3FFFFu;
+    let faces = select((packed >> 1u) & 0x3FFFFu, 0u, LITE_NO_STUDS);
     if (faces != 0u) {
         base *= surface_shade(faces, in.objn, in.local, in.half, ddx, ddy);
     }
@@ -1729,7 +1775,7 @@ fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32, blade: 
         // Grass color has no texture tint mask: native multiplies the tint directly.
         su.a = 1.0;
     }
-    if (layer >= 0 && !blade) {
+    if (layer >= 0 && !blade && !LITE_NO_MATERIAL) {
         // Studio's terrain arrays are 512² (a 1024² pack drops its top
         // level), which is level 1 of the 1024² layer: never finer than that
         // (magnified, Studio filters its 512² level). A smaller array (the
@@ -1738,8 +1784,16 @@ fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32, blade: 
         let fp = max(length(dx), length(dy)) * side;
         let k = select(1.0, 2.0 / max(fp, 1e-6), fp < 2.0 && side > 512.0);
         t = textureSampleGrad(mat_albedo, studs_sampler, uv, layer, dx * k, dy * k);
-        su = textureSampleGrad(mat_surface, studs_sampler, uv, layer, dx * k, dy * k);
-        glow = textureSampleGrad(mat_emission, studs_sampler, uv, layer, dx * k, dy * k).r;
+        // (the lite shader: the albedo alone; a flat, rough surface texel
+        // whose tint mask, below, is whole, and no glow)
+        if (!LITE_NO_NORMAL_MAP) {
+            su = textureSampleGrad(mat_surface, studs_sampler, uv, layer, dx * k, dy * k);
+        } else {
+            su.a = 1.0;
+        }
+        if (!LITE_ONE_MATERIAL_READ) {
+            glow = textureSampleGrad(mat_emission, studs_sampler, uv, layer, dx * k, dy * k).r;
+        }
     }
     // MaterialColors recolour (luma scale, chroma turn): Studio bakes it
     // into the array texels, so it blends as YCoCg.
@@ -1816,16 +1870,17 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
     // tangent (N.z, 0, −N.x) and bitangent (0, 1, 0) for corners on axes
     // 0–7 (the XZ plane), (−N.y, N.x, 0) and (0, −N.z, N.y) for axes 8–17
     // (up and down), blended by the weights.
-    let nt = (s0.nxy * w.x + s1.nxy * w.y + s2.nxy * w.z) * 2.0 - vec2<f32>(1.0);
-    let nz = sqrt(clamp(1.0 - dot(nt, nt), 0.0, 1.0));
-    let nb = normalize((vec3<f32>(nt, nz) - vec3<f32>(0.0, 0.0, 1.0)) * inverseSqrt(max(dot(w, w), 1e-4)) + vec3<f32>(0.0, 0.0, 1.0));
-    let edge = dot(vec3<f32>(vec3<u32>(in.axis.x, in.axis.y, in.axis.z) > vec3<u32>(7u)), w);
-    let tan = mix(vec3<f32>(n0.z, 0.0, -n0.x), vec3<f32>(-n0.y, n0.x, 0.0), edge);
-    let bit = mix(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, -n0.z, n0.y), edge);
-    var n = normalize(tan * nb.x + bit * nb.y + n0 * nb.z);
-    if (in.palette.w > 0u) {
-        // Flat blade colour still follows Terrain.MaterialColors via recolor.
-        n = n0;
+    var n = n0;
+    if (!LITE_NO_NORMAL_MAP && in.palette.w == 0u) {
+        // (blades keep the flat normal: their colour still follows
+        // Terrain.MaterialColors via the recolour)
+        let nt = (s0.nxy * w.x + s1.nxy * w.y + s2.nxy * w.z) * 2.0 - vec2<f32>(1.0);
+        let nz = sqrt(clamp(1.0 - dot(nt, nt), 0.0, 1.0));
+        let nb = normalize((vec3<f32>(nt, nz) - vec3<f32>(0.0, 0.0, 1.0)) * inverseSqrt(max(dot(w, w), 1e-4)) + vec3<f32>(0.0, 0.0, 1.0));
+        let edge = dot(vec3<f32>(vec3<u32>(in.axis.x, in.axis.y, in.axis.z) > vec3<u32>(7u)), w);
+        let tan = mix(vec3<f32>(n0.z, 0.0, -n0.x), vec3<f32>(-n0.y, n0.x, 0.0), edge);
+        let bit = mix(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, -n0.z, n0.y), edge);
+        n = normalize(tan * nb.x + bit * nb.y + n0 * nb.z);
     }
     let rough = 0.089 + 0.911 * (s0.rough * w.x + s1.rough * w.y + s2.rough * w.z);
     // Emission (FS HQ: Σ bary × the material's emissive strength (tint
@@ -2434,6 +2489,185 @@ fn fs_post(in: PostOut) -> @location(0) vec4<f32> {
         c = c * g.cc_tint.rgb;
     }
     return vec4<f32>(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+
+// ------------------------------------------------------------- upscaling
+// The 3D view drawn under the panel's size (the render scale, and the
+// scale while the camera moves: quality.rs, viewport.rs) is brought up to
+// it the way AMD's FidelityFX Super Resolution 1.0 does (MIT; its FsrEasuF
+// and FsrRcasF, written out with texel loads in place of its gathers):
+// EASU, an edge-adaptive 12-tap kernel that keeps edges clean where the
+// bilinear blit it replaces smeared them, then RCAS, a contrast-adaptive
+// sharpening of the result. Both read the display image (gamma 2.0, as
+// FSR wants a perceptual input) through `hdr_tex` (group 1, binding 0):
+// the post pass's output for EASU, EASU's for RCAS.
+
+/// EASU's and RCAS's luma × 2.
+fn fsr_luma(c: vec3<f32>) -> f32 {
+    return c.b * 0.5 + (c.r * 0.5 + c.g);
+}
+
+/// A texel of the pass's input, edges clamped.
+fn fsr_load(p: vec2<i32>, dim: vec2<i32>) -> vec3<f32> {
+    return textureLoad(hdr_tex, clamp(p, vec2<i32>(0), dim - vec2<i32>(1)), 0).rgb;
+}
+
+/// EASU's edge direction and length gathered at one of the four nearest
+/// texels (`c`, with `a` above it, `b` left, `d` right, `e` below),
+/// weighted by that texel's bilinear weight `w` (FsrEasuSetF).
+fn easu_set(dir: ptr<function, vec2<f32>>, len: ptr<function, f32>, w: f32, la: f32, lb: f32, lc: f32, ld: f32, le: f32) {
+    // Direction is the '+' difference; length turns a gradient reversal
+    // into 0 and a clean ramp into 1, squared, both axes added.
+    let dc = ld - lc;
+    let cb = lc - lb;
+    let dir_x = ld - lb;
+    (*dir).x += dir_x * w;
+    var len_x = clamp(abs(dir_x) / max(max(abs(dc), abs(cb)), 1e-5), 0.0, 1.0);
+    len_x *= len_x;
+    *len += len_x * w;
+    let ec = le - lc;
+    let ca = lc - la;
+    let dir_y = le - la;
+    (*dir).y += dir_y * w;
+    var len_y = clamp(abs(dir_y) / max(max(abs(ec), abs(ca)), 1e-5), 0.0, 1.0);
+    len_y *= len_y;
+    *len += len_y * w;
+}
+
+/// One of EASU's twelve taps: the offset turned into the edge's frame and
+/// stretched along it, then the Lanczos-like window
+/// (25/16 (2/5 x² − 1)² − 9/16) (x²/4 − 1)² clipped at the window's end
+/// (FsrEasuTapF).
+fn easu_tap(ac: ptr<function, vec3<f32>>, aw: ptr<function, f32>, off: vec2<f32>, dir: vec2<f32>, len: vec2<f32>, lob: f32, clp: f32, c: vec3<f32>) {
+    let v = vec2<f32>(off.x * dir.x + off.y * dir.y, off.x * (-dir.y) + off.y * dir.x) * len;
+    let d2 = min(dot(v, v), clp);
+    var wb = 2.0 / 5.0 * d2 - 1.0;
+    var wa = lob * d2 - 1.0;
+    wb *= wb;
+    wa *= wa;
+    wb = 25.0 / 16.0 * wb - (25.0 / 16.0 - 1.0);
+    let w = wb * wa;
+    *ac += c * w;
+    *aw += w;
+}
+
+@fragment
+fn fs_easu(in: PostOut) -> @location(0) vec4<f32> {
+    let dim = vec2<i32>(textureDimensions(hdr_tex));
+    // The output pixel's centre in input texels, half a texel back: the
+    // texel 'f' at its floor, `pp` where it lies within f g / j k.
+    let p = in.uv * vec2<f32>(dim) - vec2<f32>(0.5);
+    let fp = vec2<i32>(floor(p));
+    let pp = p - floor(p);
+    //    b c
+    //  e f g h
+    //  i j k l
+    //    n o
+    let b = fsr_load(fp + vec2<i32>(0, -1), dim);
+    let c = fsr_load(fp + vec2<i32>(1, -1), dim);
+    let e = fsr_load(fp + vec2<i32>(-1, 0), dim);
+    let f = fsr_load(fp, dim);
+    let g = fsr_load(fp + vec2<i32>(1, 0), dim);
+    let h = fsr_load(fp + vec2<i32>(2, 0), dim);
+    let i = fsr_load(fp + vec2<i32>(-1, 1), dim);
+    let j = fsr_load(fp + vec2<i32>(0, 1), dim);
+    let k = fsr_load(fp + vec2<i32>(1, 1), dim);
+    let l = fsr_load(fp + vec2<i32>(2, 1), dim);
+    let n = fsr_load(fp + vec2<i32>(0, 2), dim);
+    let o = fsr_load(fp + vec2<i32>(1, 2), dim);
+    let bl = fsr_luma(b);
+    let cl = fsr_luma(c);
+    let el = fsr_luma(e);
+    let fl = fsr_luma(f);
+    let gl = fsr_luma(g);
+    let hl = fsr_luma(h);
+    let il = fsr_luma(i);
+    let jl = fsr_luma(j);
+    let kl = fsr_luma(k);
+    let ll = fsr_luma(l);
+    let nl = fsr_luma(n);
+    let ol = fsr_luma(o);
+    // The edge at f, g, j and k, each by its bilinear weight.
+    var dir = vec2<f32>(0.0);
+    var len = 0.0;
+    easu_set(&dir, &len, (1.0 - pp.x) * (1.0 - pp.y), bl, el, fl, gl, jl);
+    easu_set(&dir, &len, pp.x * (1.0 - pp.y), cl, fl, gl, hl, kl);
+    easu_set(&dir, &len, (1.0 - pp.x) * pp.y, fl, il, jl, kl, nl);
+    easu_set(&dir, &len, pp.x * pp.y, gl, jl, kl, ll, ol);
+    // Normalised; a flat patch takes the x axis.
+    let dir_rr = dot(dir, dir);
+    let flat = dir_rr < 1.0 / 32768.0;
+    let dir_r = select(inverseSqrt(max(dir_rr, 1e-20)), 1.0, flat);
+    dir = vec2<f32>(select(dir.x, 1.0, flat), dir.y) * dir_r;
+    // 0..2 to 0..1, shaped with a square.
+    len = len * 0.5;
+    len *= len;
+    // The kernel stretched to √2 on a diagonal; its length 1 → the
+    // stretch along the edge, 1 → ½ across it, by the amount of edge; the
+    // negative lobe's window from ±√2 to a little past 2.
+    let stretch = dot(dir, dir) / max(abs(dir.x), abs(dir.y));
+    let len2 = vec2<f32>(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
+    let lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
+    let clp = 1.0 / lob;
+    // The taps, then the result held within the four nearest (deringing).
+    let min4 = min(min(f, g), min(j, k));
+    let max4 = max(max(f, g), max(j, k));
+    var ac = vec3<f32>(0.0);
+    var aw = 0.0;
+    easu_tap(&ac, &aw, vec2<f32>(0.0, -1.0) - pp, dir, len2, lob, clp, b);
+    easu_tap(&ac, &aw, vec2<f32>(1.0, -1.0) - pp, dir, len2, lob, clp, c);
+    easu_tap(&ac, &aw, vec2<f32>(-1.0, 1.0) - pp, dir, len2, lob, clp, i);
+    easu_tap(&ac, &aw, vec2<f32>(0.0, 1.0) - pp, dir, len2, lob, clp, j);
+    easu_tap(&ac, &aw, vec2<f32>(0.0, 0.0) - pp, dir, len2, lob, clp, f);
+    easu_tap(&ac, &aw, vec2<f32>(-1.0, 0.0) - pp, dir, len2, lob, clp, e);
+    easu_tap(&ac, &aw, vec2<f32>(1.0, 1.0) - pp, dir, len2, lob, clp, k);
+    easu_tap(&ac, &aw, vec2<f32>(2.0, 1.0) - pp, dir, len2, lob, clp, l);
+    easu_tap(&ac, &aw, vec2<f32>(2.0, 0.0) - pp, dir, len2, lob, clp, h);
+    easu_tap(&ac, &aw, vec2<f32>(1.0, 0.0) - pp, dir, len2, lob, clp, g);
+    easu_tap(&ac, &aw, vec2<f32>(1.0, 2.0) - pp, dir, len2, lob, clp, o);
+    easu_tap(&ac, &aw, vec2<f32>(0.0, 2.0) - pp, dir, len2, lob, clp, n);
+    return vec4<f32>(min(max4, max(min4, ac / max(aw, 1e-5))), 1.0);
+}
+
+/// RCAS over EASU's output: the pixel and its four neighbours (a '+'),
+/// sharpened by a negative lobe sized so no channel over- or undershoots
+/// the ring's range, scaled by 2^−RCAS_SHARPNESS (mech.rs; 0 is the
+/// sharpest, 2 the least) and eased off on noise.
+@fragment
+fn fs_rcas(in: PostOut) -> @location(0) vec4<f32> {
+    let dim = vec2<i32>(textureDimensions(hdr_tex));
+    let sp = vec2<i32>(in.pos.xy);
+    //    b
+    //  d e f
+    //    h
+    let b = fsr_load(sp + vec2<i32>(0, -1), dim);
+    let d = fsr_load(sp + vec2<i32>(-1, 0), dim);
+    let e = fsr_load(sp, dim);
+    let f = fsr_load(sp + vec2<i32>(1, 0), dim);
+    let h = fsr_load(sp + vec2<i32>(0, 1), dim);
+    let bl = fsr_luma(b);
+    let dl = fsr_luma(d);
+    let el = fsr_luma(e);
+    let fl = fsr_luma(f);
+    let hl = fsr_luma(h);
+    // Noise: how far the centre sits from its neighbours' mean, against
+    // the ring's range.
+    let lmax = max(max(max(bl, dl), max(el, fl)), hl);
+    let lmin = min(min(min(bl, dl), min(el, fl)), hl);
+    var nz = 0.25 * bl + 0.25 * dl + 0.25 * fl + 0.25 * hl - el;
+    nz = clamp(abs(nz) / max(lmax - lmin, 1e-5), 0.0, 1.0);
+    nz = -0.5 * nz + 1.0;
+    // The ring's range per channel sets the lobe that keeps the result
+    // within 0..1 and the ring.
+    let mn4 = min(min(b, d), min(f, h));
+    let mx4 = max(max(b, d), max(f, h));
+    let hit_min = mn4 / max(4.0 * mx4, vec3<f32>(1e-5));
+    let hit_max = (vec3<f32>(1.0) - mx4) / min(4.0 * mn4 - vec3<f32>(4.0), vec3<f32>(-1e-5));
+    let lobe_rgb = max(-hit_min, hit_max);
+    var lobe = max(-(0.25 - 1.0 / 16.0), min(max(max(lobe_rgb.r, lobe_rgb.g), lobe_rgb.b), 0.0)) * exp2(-RCAS_SHARPNESS);
+    lobe *= nz;
+    let rcp_l = 1.0 / (4.0 * lobe + 1.0);
+    return vec4<f32>((lobe * b + lobe * d + lobe * h + lobe * f + e) * rcp_l, 1.0);
 }
 
 // ------------------------------------------------------------------ SSAO
