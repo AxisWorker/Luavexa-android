@@ -371,7 +371,17 @@ pub(crate) fn wgpu_options(bench_mode: bool) -> egui_wgpu::WgpuConfiguration {
                 }
                 d
             });
-            egui_wgpu::WgpuSetup::CreateNew(setup)
+            // On a Snapdragon phone with the Turnip driver swapped in
+            // (android::turnip), the renderer's objects are made on
+            // Turnip's loader up front and handed over as they are.
+            #[cfg(target_os = "android")]
+            let turnip = crate::android::turnip::wgpu_setup(&setup);
+            #[cfg(not(target_os = "android"))]
+            let turnip: Option<egui_wgpu::WgpuSetupExisting> = None;
+            match turnip {
+                Some(existing) => egui_wgpu::WgpuSetup::Existing(existing),
+                None => egui_wgpu::WgpuSetup::CreateNew(setup),
+            }
         },
         surface: egui_wgpu::SurfaceConfig {
             // No vsync when measuring or driven for captures: a shot waits

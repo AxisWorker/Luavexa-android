@@ -211,6 +211,10 @@ fn gpu_driver_section(ui: &mut egui::Ui) {
     } else {
         ui.small(format!("This run: {} — {}.", st.device, st.driver));
     }
+    let renderer = turnip::renderer();
+    if !renderer.is_empty() {
+        ui.small(format!("Renderer on: {renderer}."));
+    }
     if !(st.available || st.active) {
         return;
     }

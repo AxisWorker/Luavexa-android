@@ -5,23 +5,40 @@
 //! (TouseefX's libadrenotools-native, a fork of bylaws/libadrenotools made
 //! for apps with no Java of their own; tools/android/fetch-turnip.sh puts
 //! it there with its hook libraries) and `libvulkan_freedreno.so` (Mesa's
-//! Turnip, nihui's Android build). libadrenotools opens a private copy of
-//! the system's Vulkan loader (`libvulkan.so`) in a linker namespace of its
-//! own, with a hook that makes that copy load the Turnip driver instead of
-//! the vendor's `vulkan.adreno.so`, then patches the system loader's
-//! `vkGetInstanceProcAddr` / `vkGetDeviceProcAddr` in place (an inline
-//! hook, shadowhook) so they answer from the private copy. wgpu reaches
-//! Vulkan the ordinary way — ash's `dlopen("libvulkan.so")`,
-//! `dlsym("vkGetInstanceProcAddr")`, and every other entry point through
-//! that one — so with the patch in place every instance, device and
-//! swapchain it makes is Turnip's, with the system loader's own swapchain
-//! code on top (Mesa's Android builds leave window surfaces to the loader,
-//! as the vendor driver does). Nothing in wgpu or eframe changes; what
-//! matters is the order: [`activate`] runs in `android_main` before eframe
-//! starts, i.e. before wgpu's first `Entry::load()`, while the launch
-//! screen is still up. A probe through the loader afterwards says which
-//! driver answers (the log, Graphics Settings > GPU driver, the perf line's
-//! adapter name).
+//! Turnip, nihui's Android build). libadrenotools' `adrenotools_open_libvulkan`
+//! opens a private copy of the system's Vulkan loader (`libvulkan.so`) in a
+//! linker namespace of its own, with a hook that makes that copy load the
+//! Turnip driver instead of the vendor's `vulkan.adreno.so`, and returns
+//! that copy's handle: its `vkGetInstanceProcAddr` leads to Turnip, with
+//! the loader's own swapchain code on top (Mesa's Android builds leave
+//! window surfaces to the loader, as the vendor driver does). [`activate`]
+//! runs in `android_main` before eframe starts, while the launch screen
+//! is still up: it loads the shim, runs the fork's own initialisation
+//! (`JNI_OnLoad`: Mesa's environment, the shader cache folder, its hooks),
+//! opens a Turnip-backed loader of its own and probes it (which driver
+//! answers: the log, Graphics Settings > GPU driver, the perf line's
+//! adapter name). Then [`wgpu_setup`] builds wgpu's instance, adapter,
+//! device and queue on that loader — ash's `Entry::from_static_fn` on its
+//! `vkGetInstanceProcAddr`, the instance exactly as wgpu-hal's own
+//! `Instance::init` makes one, `wgpu_hal::vulkan::Instance::from_raw`,
+//! `wgpu::Instance::from_hal` — and `wgpu_options` hands them to eframe as
+//! `egui_wgpu::WgpuSetup::Existing`. wgpu itself is unchanged.
+//!
+//! Why not the fork's patch of the system loader. The fork also inline-hooks
+//! the system `libvulkan.so`'s `vkGetInstanceProcAddr` /
+//! `vkGetDeviceProcAddr` (shadowhook, shared mode) to answer from its
+//! private copy, so that a plain `dlopen("libvulkan.so")` — wgpu-hal's
+//! `ash::Entry::load()` — would land on Turnip. It doesn't hold: its proxy
+//! functions return without `SHADOWHOOK_POP_STACK`, so the per-thread
+//! frame shadowhook pushes for a call is never popped, and shadowhook
+//! takes every later call of the same function on that thread for a
+//! recursive one, which it sends to the original — i.e. only the first
+//! `vkGetInstanceProcAddr` call per thread reaches Turnip, every one after
+//! it reaches the vendor's loader (the first device run showed exactly
+//! this: the probe's instance was Turnip's, wgpu's right after it on the
+//! same thread was Adreno's). Hence the loader handle of our own and the
+//! pre-built wgpu objects; the fork's patch stays in place but nothing
+//! here depends on it.
 //!
 //! Only on Snapdragon: Turnip drives Adreno GPUs through Qualcomm's KGSL
 //! kernel driver, so the device must have `/dev/kgsl-3d0` (or name
@@ -38,7 +55,7 @@
 //! `RUSTUDIO_TU_DEBUG=<flags>` hands Turnip its `TU_DEBUG` options
 //! (`sysmem`, `gmem`, `nobin`, `noubwc`, `nolrz`, …).
 
-use std::ffi::{c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -67,6 +84,48 @@ static STATUS: OnceLock<Status> = OnceLock::new();
 /// The outcome of this start's [`activate`] (a default before it ran).
 pub fn status() -> Status {
     STATUS.get().cloned().unwrap_or_default()
+}
+
+/// The Turnip-backed Vulkan loader [`activate`] opened for this process
+/// (`adrenotools_open_libvulkan`): its `vkGetInstanceProcAddr`, from
+/// which [`wgpu_setup`] makes wgpu's instance. The loader stays loaded
+/// for the life of the process.
+static LOADER: OnceLock<vk::PFN_vkGetInstanceProcAddr> = OnceLock::new();
+
+/// ash's entry points on the Turnip-backed loader, when there is one.
+pub fn entry() -> Option<ash::Entry> {
+    // SAFETY: a vkGetInstanceProcAddr dlsym'd from a loaded copy of
+    // libvulkan.so that is never closed.
+    LOADER.get().map(|&gipa| unsafe { ash::Entry::from_static_fn(ash::StaticFn { get_instance_proc_addr: gipa }) })
+}
+
+/// Which driver the renderer's wgpu device was made on, once
+/// `wgpu_options` ran ("Turnip Adreno (TM) 650 — …", or the device's
+/// driver with the reason); "" before.
+static RENDERER: OnceLock<String> = OnceLock::new();
+
+pub fn renderer() -> String {
+    RENDERER.get().cloned().unwrap_or_default()
+}
+
+/// libadrenotools.so is loaded, so its patch of the system loader is (or
+/// is about to be) in place.
+static SHIM_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// For the ordinary wgpu start after the fork's patch went in but Turnip
+/// isn't used: one pass of ash's loading through the system loader on
+/// this thread, so that its first `vkGetInstanceProcAddr` call — the one
+/// the fork's leaked shadowhook frame lets through to Turnip's loader
+/// (module docs) — is spent here, on a pointer nobody calls, and
+/// wgpu-hal's own calls, all later ones on the same thread, reach the
+/// vendor's loader uniformly, as without the patch.
+fn settle_system_loader() {
+    // SAFETY: ash's ordinary dlopen / dlsym of libvulkan.so; the Entry is
+    // dropped at once and nothing of it is called.
+    match unsafe { ash::Entry::load() } {
+        Ok(entry) => drop(entry),
+        Err(e) => log::warn!("turnip: settling the system loader: {e}"),
+    }
 }
 
 /// The marker files, under the app's files folder.
@@ -217,6 +276,43 @@ unsafe fn symbol<F: Copy>(handle: *mut c_void, name: &CStr) -> Result<F, String>
     Ok(std::mem::transmute_copy::<*mut c_void, F>(&p))
 }
 
+/// A copy of the system's Vulkan loader with the Turnip driver behind it,
+/// through libadrenotools' own entry point (what the fork's initialisation
+/// does for its hooks, once more for a handle of our own): its
+/// `vkGetInstanceProcAddr`. `lib_dir` is the APK's native library folder,
+/// where the hook libraries and `libvulkan_freedreno.so` are.
+///
+/// # Safety
+/// `handle` must be the loaded `libadrenotools.so`.
+unsafe fn open_turnip_loader(handle: *mut c_void, lib_dir: &Path) -> Result<vk::PFN_vkGetInstanceProcAddr, String> {
+    // include/adrenotools/driver.h: dlopenMode, featureFlags, tmpLibDir
+    // (unused from API 29 on), hookLibDir, customDriverDir, customDriverName,
+    // fileRedirectDir, userMappingHandle.
+    type Open = unsafe extern "C" fn(c_int, c_int, *const c_char, *const c_char, *const c_char, *const c_char, *const c_char, *mut *mut c_void) -> *mut c_void;
+    const ADRENOTOOLS_DRIVER_CUSTOM: c_int = 1 << 0;
+    let open: Open = symbol(handle, c"adrenotools_open_libvulkan")?;
+    let tmp = super::cache_dir().join("turnip_tmp");
+    let _ = std::fs::create_dir_all(&tmp);
+    let c = |s: String| CString::new(s).map_err(|e| e.to_string());
+    let tmp = c(tmp.to_string_lossy().into_owned())?;
+    let hook_dir = c(lib_dir.to_string_lossy().into_owned())?;
+    let driver_dir = c(format!("{}/", lib_dir.display()))?;
+    let loader = open(
+        libc::RTLD_NOW | libc::RTLD_LOCAL,
+        ADRENOTOOLS_DRIVER_CUSTOM,
+        tmp.as_ptr(),
+        hook_dir.as_ptr(),
+        driver_dir.as_ptr(),
+        c"libvulkan_freedreno.so".as_ptr(),
+        std::ptr::null(),
+        std::ptr::null_mut(),
+    );
+    if loader.is_null() {
+        return Err("adrenotools_open_libvulkan returned no loader (its lines under logcat tag AdrenoToolsPatch say why)".into());
+    }
+    symbol::<vk::PFN_vkGetInstanceProcAddr>(loader, c"vkGetInstanceProcAddr")
+}
+
 /// What the loader answered after the swap.
 struct Probe {
     device: String,
@@ -225,15 +321,13 @@ struct Probe {
     turnip: bool,
 }
 
-/// A Vulkan instance through libvulkan.so, as wgpu will make one: whose
-/// driver is behind it. The instance is destroyed again; the driver it
-/// loaded stays in the process, which wgpu's own instance reuses.
-fn probe() -> Result<Probe, String> {
-    // SAFETY: the loader's entry points through dlopen / dlsym; each call
-    // below is made with valid arguments and the instance is destroyed
-    // before the function returns.
+/// A Vulkan instance on `entry` (the Turnip-backed loader, the one wgpu's
+/// instance is made on): whose driver is behind it. The instance is
+/// destroyed again; the driver it loaded stays in the process.
+fn probe(entry: &ash::Entry) -> Result<Probe, String> {
+    // SAFETY: each call below is made with valid arguments and the
+    // instance is destroyed before the function returns.
     unsafe {
-        let entry = ash::Entry::load().map_err(|e| format!("loading libvulkan.so: {e}"))?;
         let loader_version = entry
             .try_enumerate_instance_version()
             .map_err(|e| format!("vkEnumerateInstanceVersion: {e}"))?
@@ -332,6 +426,9 @@ pub fn activate() {
     } else {
         log::warn!("turnip: not active — {} (Vulkan answered with {} / {}); {:.0} ms", status.note, status.device, status.driver, took.as_secs_f64() * 1e3);
     }
+    if !status.active && SHIM_LOADED.load(std::sync::atomic::Ordering::Relaxed) {
+        settle_system_loader();
+    }
     let _ = STATUS.set(status);
 }
 
@@ -420,6 +517,7 @@ fn try_activate() -> Result<Status, Status> {
         let _ = std::fs::remove_file(markers.join("pending"));
         return Err(skip(format!("dlopen {}: {}", shim.display(), dlerror()), true));
     }
+    SHIM_LOADED.store(true, std::sync::atomic::Ordering::Relaxed);
     set_tu_debug();
 
     // The fork's own initialisation, the way System.loadLibrary would run
@@ -449,9 +547,36 @@ fn try_activate() -> Result<Status, Status> {
     let jni_version = unsafe { on_load(vm, std::ptr::null_mut()) };
     log::info!("turnip: libadrenotools initialised (JNI {:#x}) in {:.0} ms", jni_version, t.elapsed().as_secs_f64() * 1e3);
 
-    // Which driver answers now.
+    // Mesa's disk shader cache folder: the fork's initialisation sets it
+    // from the app's cache dir; should that have failed, the same here.
+    if std::env::var_os("MESA_SHADER_CACHE_DIR").is_none() {
+        let d = super::cache_dir().join("turnip_shader_cache");
+        let _ = std::fs::create_dir_all(&d);
+        // SAFETY: as for TU_DEBUG above.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("MESA_SHADER_CACHE_DIR", &d)
+        };
+    }
+
+    // A Turnip-backed loader of our own, for wgpu (the module docs on why
+    // the fork's patch of the system loader isn't relied on).
     let t = Instant::now();
-    let probe = probe();
+    // SAFETY: `handle` is libadrenotools.so, loaded above.
+    let gipa = match unsafe { open_turnip_loader(handle, &lib_dir) } {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = std::fs::remove_file(markers.join("pending"));
+            return Err(skip(format!("libadrenotools couldn't open a Turnip-backed loader: {e}; the device's driver is in use"), true));
+        }
+    };
+    log::info!("turnip: Turnip-backed loader opened in {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+    let _ = LOADER.set(gipa);
+    let entry = entry().expect("set just above");
+
+    // Which driver answers through it.
+    let t = Instant::now();
+    let probe = probe(&entry);
     let probe_ms = t.elapsed().as_secs_f64() * 1e3;
     let mut status = match probe {
         Ok(p) => {
@@ -462,21 +587,20 @@ fn try_activate() -> Result<Status, Status> {
                 note: if p.turnip {
                     "Turnip answers this run's Vulkan calls".into()
                 } else {
-                    "libadrenotools didn't take over the loader (its logcat lines, tag AdrenoToolsPatch, say why); the device's driver is in use".into()
+                    "libadrenotools' loader answered with the device's driver (Turnip didn't load; its logcat lines, tag AdrenoToolsPatch, say why)".into()
                 },
                 device: p.device,
                 driver: p.driver,
             }
         }
         Err(e) => {
-            // Either way the start goes on: wgpu makes its own attempt (and
-            // has OpenGL ES to fall back to). The pending marker stays, so
-            // a start that dies here keeps Turnip off next time.
-            log::error!("turnip: the Vulkan probe after the swap failed: {e}");
-            Status { active: false, available: true, note: format!("Vulkan probe after the swap failed: {e}"), device: String::new(), driver: String::new() }
+            // The start goes on with the device's driver (wgpu makes its
+            // own instance, and has OpenGL ES to fall back to).
+            log::error!("turnip: the Vulkan probe on the Turnip-backed loader failed: {e}");
+            Status { active: false, available: true, note: format!("Vulkan probe on the Turnip-backed loader failed: {e}; the device's driver is in use"), device: String::new(), driver: String::new() }
         }
     };
-    if !status.active && !status.device.is_empty() {
+    if !status.active {
         // The device's driver is in use: nothing to guard.
         let _ = std::fs::remove_file(markers.join("pending"));
     }
@@ -496,4 +620,93 @@ fn try_activate() -> Result<Status, Status> {
         }
     }
     Ok(status)
+}
+
+/// The renderer's wgpu instance, adapter, device and queue on the
+/// Turnip-backed loader, for `egui_wgpu::WgpuSetup::Existing`: what
+/// `wgpu_options` hands eframe when [`activate`] succeeded. `template` is
+/// the configuration the ordinary start would use; its instance flags,
+/// memory thresholds and device descriptor apply here too. None (with the
+/// reason logged and kept for Graphics Settings) when Turnip isn't active
+/// or anything fails: the ordinary start goes ahead on the device's
+/// driver.
+pub fn wgpu_setup(template: &egui_wgpu::WgpuSetupCreateNew) -> Option<egui_wgpu::WgpuSetupExisting> {
+    if !STATUS.get().is_some_and(|s| s.active) {
+        return None;
+    }
+    let t = Instant::now();
+    match build_wgpu(template) {
+        Ok((setup, note)) => {
+            log::info!("turnip: wgpu: {note}; {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+            let _ = RENDERER.set(note);
+            Some(setup)
+        }
+        Err(e) => {
+            log::error!("turnip: wgpu on the Turnip-backed loader failed, the device's driver is in use: {e}");
+            let _ = RENDERER.set(format!("the device's driver ({e})"));
+            // Nothing of Turnip's is in use: nothing to guard.
+            let _ = std::fs::remove_file(dir().join("pending"));
+            settle_system_loader();
+            None
+        }
+    }
+}
+
+/// [`wgpu_setup`]'s work: the objects and a line saying what they are on.
+fn build_wgpu(template: &egui_wgpu::WgpuSetupCreateNew) -> Result<(egui_wgpu::WgpuSetupExisting, String), String> {
+    use egui_wgpu::wgpu;
+    let entry = entry().ok_or("no Turnip-backed loader")?;
+    let desc = &template.instance_descriptor;
+    // No validation layers in the APK, and debug utils would want a
+    // messenger of ours: release behaviour either way.
+    let flags = desc.flags.difference(wgpu::InstanceFlags::DEBUG | wgpu::InstanceFlags::VALIDATION | wgpu::InstanceFlags::GPU_BASED_VALIDATION);
+    let sdk = super::AndroidApp::sdk_version().max(0) as u32;
+    // SAFETY: the calls wgpu-hal's Instance::init makes, on an entry whose
+    // loader stays loaded; the instance is handed to wgpu-hal, which owns
+    // it from then on.
+    let hal = unsafe {
+        let instance_api_version = entry
+            .try_enumerate_instance_version()
+            .map_err(|e| format!("vkEnumerateInstanceVersion: {e}"))?
+            .unwrap_or(vk::API_VERSION_1_0);
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(c"rustudio")
+            .application_version(1)
+            .engine_name(c"wgpu-hal")
+            .engine_version(2)
+            // wgpu-hal's choice: a 1.0 loader takes nothing else, 1.3 is
+            // the most it knows.
+            .api_version(if instance_api_version < vk::API_VERSION_1_1 { vk::API_VERSION_1_0 } else { vk::API_VERSION_1_3 });
+        let extensions = wgpu::hal::vulkan::Instance::desired_extensions(&entry, instance_api_version, flags).map_err(|e| format!("instance extensions: {e}"))?;
+        let names: Vec<*const c_char> = extensions.iter().map(|e| e.as_ptr()).collect();
+        let create_info = vk::InstanceCreateInfo::default().application_info(&app_info).enabled_extension_names(&names);
+        let raw = entry.create_instance(&create_info, None).map_err(|e| format!("vkCreateInstance: {e}"))?;
+        wgpu::hal::vulkan::Instance::from_raw(entry, raw, instance_api_version, sdk, None, extensions, flags, desc.memory_budget_thresholds, false, None)
+            .map_err(|e| format!("wgpu-hal instance: {e}"))?
+    };
+    // SAFETY: a Vulkan instance made for it just above; wgpu owns it from
+    // here on.
+    let instance = unsafe { wgpu::Instance::from_hal::<wgpu::hal::api::Vulkan>(hal) };
+    let adapter = block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN))
+        .into_iter()
+        .next()
+        .ok_or("the instance on the Turnip-backed loader has no adapter")?;
+    let info = adapter.get_info();
+    let device_desc = (template.device_descriptor)(&adapter);
+    let (device, queue) = block_on(adapter.request_device(&device_desc)).map_err(|e| format!("request_device on {}: {e}", info.name))?;
+    let note = format!("{} — {} {}", info.name, info.driver, info.driver_info.replace('\n', " ")).trim().to_string();
+    Ok((egui_wgpu::WgpuSetupExisting { instance, adapter, device, queue }, note))
+}
+
+/// Runs a wgpu future to its end on this thread. wgpu's native futures
+/// are ready at their first poll; this only has to be correct.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(v) => return v,
+            std::task::Poll::Pending => std::thread::yield_now(),
+        }
+    }
 }

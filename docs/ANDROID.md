@@ -709,9 +709,8 @@ and, since xbuild stores libraries compressed and the manifest doesn't
 say `extractNativeLibs=false`, the installer unpacks them into the app's
 native library folder (`ApplicationInfo.nativeLibraryDir`) as real
 files. That folder is where libadrenotools must find its hook libraries
-and the driver. At start, in `android_main` before eframe exists —
-before wgpu's one `dlopen("libvulkan.so")` and while the launch screen is
-up — `turnip::activate()`:
+and the driver. At start, in `android_main` before eframe exists — while
+the launch screen is up — `turnip::activate()`:
 
 1. Decides whether the device qualifies: arm64-v8a; `/dev/kgsl-3d0`
    present (Qualcomm's GPU kernel driver, what Turnip's KGSL backend
@@ -724,27 +723,58 @@ up — `turnip::activate()`:
    its `JNI_OnLoad` with the process's JavaVM — the fork's own
    initialisation, the one `System.loadLibrary` would run — right there,
    so it is done when the call returns (the fork also starts a fallback
-   thread for native loads; a `call_once` inside makes the two one). The
-   fork opens a private copy of the system's `libvulkan.so` in a linker
-   namespace of its own, with a hook that makes that copy load
-   `libvulkan_freedreno.so` instead of `vulkan.adreno.so`, then patches
-   the system loader's `vkGetInstanceProcAddr` / `vkGetDeviceProcAddr`
-   in place (shadowhook) to answer from the private copy. It also sets
-   `MESA_SHADER_CACHE_DIR` under the app's cache folder and a `TU_DEBUG`
-   of its choosing.
-3. Probes: a Vulkan instance through `libvulkan.so` the way ash makes
-   one, the first physical device's name and `VK_KHR_driver_properties`
-   (`turnip: probe: Turnip Adreno (TM) 650 — turnip Mesa 26.3.0 …`), then
-   destroys it. The driver stays loaded for wgpu's instance.
+   thread for native loads; a `call_once` inside makes the two one). It
+   sets Mesa's environment (`MESA_SHADER_CACHE_DIR` under the app's cache
+   folder, a `TU_DEBUG` of its choosing, …), opens a private copy of the
+   system's `libvulkan.so` with Turnip behind it and installs its hooks
+   on the system loader (see below for why those aren't relied on).
+3. Opens a Turnip-backed loader of its own through the fork's exported
+   `adrenotools_open_libvulkan` (`RTLD_NOW | RTLD_LOCAL`,
+   `ADRENOTOOLS_DRIVER_CUSTOM`, the native library folder as hook and
+   driver folder, `libvulkan_freedreno.so`): a fresh copy of
+   `/system/lib64/libvulkan.so` in a linker namespace of its own, whose
+   `android_load_sphal_library` is overridden to load the Turnip driver
+   instead of `vulkan.adreno.so`. Its `vkGetInstanceProcAddr` is kept
+   (`turnip::entry()`).
+4. Probes that loader: a Vulkan instance, the first physical device's
+   name and `VK_KHR_driver_properties` (`turnip: probe: Turnip Adreno
+   (TM) 650 — turnip Mesa driver Mesa 26.3.0-lto (Vulkan 1.3.363)`),
+   then destroys it. `turnip: ACTIVE — …` follows when it is Turnip.
 
-wgpu needs no change for this: ash gets `vkGetInstanceProcAddr` by
-`dlsym` from the system loader and every other entry point through it,
-so after the patch every instance, device and swapchain is Turnip's,
-with the system loader's own swapchain code on top (Mesa's Android builds
-leave window surfaces to the loader, as the vendor driver does). The
-perf line's adapter name says which driver drew (`GPU Turnip Adreno (TM)
-650 (Vulkan, turnip Mesa 26.3.0 …)`), as does View > Graphics Settings >
-GPU Driver.
+Then `wgpu_options` (src/lib.rs) asks `turnip::wgpu_setup()` for the
+renderer's objects: ash's `Entry::from_static_fn` on that
+`vkGetInstanceProcAddr`, a `VkInstance` made exactly as wgpu-hal's own
+`Instance::init` makes one (its `desired_extensions`, application info,
+API version), `wgpu_hal::vulkan::Instance::from_raw`,
+`wgpu::Instance::from_hal`, the first adapter, and a device from the
+same device descriptor the ordinary start uses — handed to eframe as
+`egui_wgpu::WgpuSetup::Existing`. The log line is `turnip: wgpu: Turnip
+Adreno (TM) 650 — turnip Mesa driver …`; egui_wgpu's "Using wgpu
+adapter" line and the perf line's adapter name say the same, as does
+View > Graphics Settings > GPU Driver ("Renderer on: …"). wgpu itself is
+unchanged; window surfaces and swapchains come from the loader copy's
+own swapchain code (Mesa's Android builds leave them to the loader, as
+the vendor driver does).
+
+*Why not the fork's patch of the system loader.* libadrenotools-native
+also inline-hooks the system `libvulkan.so`'s `vkGetInstanceProcAddr` /
+`vkGetDeviceProcAddr` (shadowhook in shared mode) to answer from its
+private copy, so that a plain `dlopen("libvulkan.so")` — wgpu-hal's
+`ash::Entry::load()` — would land on Turnip without any of the above.
+The first device run showed it doesn't hold: the probe's instance was
+Turnip's, wgpu's instance made right after it on the same thread was
+the Adreno driver's (`AdrenoVK-0: Driver Path : /vendor/lib64/hw/vulkan.adreno.so`
+appeared between the two). The cause is in the fork's `src/driver.cpp`:
+its proxies (`hooked_vkGetInstanceProcAddr` → `g_turnip_gipa(...)`)
+return without `SHADOWHOOK_POP_STACK()`, so the per-thread frame
+shadowhook pushes for each call is never popped, and shadowhook's hub
+(`sh_hub_push_stack`: a frame with the same `orig_addr` already on the
+thread's stack = recursive call) sends every later call of the function
+on that thread to the original — only the first `vkGetInstanceProcAddr`
+call per thread ever reaches Turnip. (Upstream fix: end each proxy with
+`SHADOWHOOK_POP_STACK()`, or initialise shadowhook in unique mode.)
+rustudio therefore never goes through the patched system loader; the
+patch stays in place but nothing depends on it.
 
 **Switches.** Graphics Settings > GPU Driver has the checkbox (a marker
 file `files/turnip/off`; takes effect at the next start). From adb:
@@ -763,11 +793,13 @@ start that dies in between leaves it, and the next start turns it into
 window ("Try again" clears it; so does `RUSTUDIO_TURNIP=1`). When
 libadrenotools' initialisation fails without crashing (the driver file
 missing, the hook not taking: its own lines are under the logcat tag
-`AdrenoToolsPatch`), the probe finds the Adreno driver still answering,
-which is logged as `turnip: not active — …` and the start goes on with
-it. A probe that fails outright leaves the marker, so a loader left in a
-bad state costs one start, not every one. OpenGL ES remains wgpu's
-fallback in every case. Known limits: Turnip builds come per Mesa
+`AdrenoToolsPatch`), `adrenotools_open_libvulkan` returns nothing or the
+probe finds the Adreno driver answering through the opened loader, which
+is logged as `turnip: not active — …` / `not used — …`, the marker is
+removed and the start goes on with the device's driver. The same when
+`wgpu_setup` fails after a good probe (`turnip: wgpu on the Turnip-backed
+loader failed …`): wgpu makes its ordinary instance. OpenGL ES remains
+wgpu's fallback in every case. Known limits: Turnip builds come per Mesa
 release and a device's Vulkan loader must accept the driver's
 `VK_ANDROID_native_buffer` version (Android 14–16 take any; nihui's
 builds target API 26+); Adreno 5xx and older have no Turnip; a 16 KB
