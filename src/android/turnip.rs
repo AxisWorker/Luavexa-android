@@ -56,9 +56,9 @@
 //! lists the useful ones ([`SWITCHES`]: LRZ, binning, tiled rendering,
 //! …) and keeps them in `files/turnip/debug`, which the driver watches
 //! (Mesa's `TU_DEBUG_FILE`: the ones Mesa can change while running change
-//! at once, the others at the next start); `RUSTUDIO_TU_DEBUG=<flags>`
-//! replaces the start-time set the fork's constructor would leave
-//! ([`TU_DEBUG_BASE`]).
+//! at once, the others at the next start; `nolrz` is on by default, see
+//! [`SWITCHES`]); `RUSTUDIO_TU_DEBUG=<flags>` replaces the start-time set
+//! the fork's constructor would leave ([`TU_DEBUG_BASE`]).
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
@@ -202,9 +202,16 @@ pub struct Switch {
 
 /// The switches, the likeliest fixes for missing or flickering geometry
 /// first (Mesa docs/drivers/freedreno.rst; the runtime set is
-/// `tu_runtime_debug_flags` in src/freedreno/vulkan/tu_util.cc).
+/// `tu_runtime_debug_flags` in src/freedreno/vulkan/tu_util.cc). LRZ is
+/// off by default: with it, Mesa 26.3.0 on an Adreno 650 dropped whole
+/// terrain chunks (one draw each) from the viewport pass — draws of the
+/// plainest kind for LRZ (depth test GREATER, depth write, no discard,
+/// no blending, after opaque parts drawn the same way), which Turnip's
+/// own rules (tu_lrz.cc `tu6_calculate_lrz_state`) accept; `nolrz`
+/// brought them back on the spot, at no measurable cost on the baseplate
+/// (120 fps either way).
 pub const SWITCHES: &[Switch] = &[
-    Switch { flag: "nolrz", name: "LRZ off", hint: "No low-resolution depth buffer (Turnip's early rejection of hidden pixels). The first thing to try when parts of the scene go missing or flicker; costs some speed in dense scenes.", live: true },
+    Switch { flag: "nolrz", name: "LRZ off", hint: "No low-resolution depth buffer (Turnip's early rejection of hidden pixels). Off by default: Mesa 26.3.0 on an Adreno 650 lost whole terrain chunks with it. Untick to try LRZ with a newer Turnip build; costs some speed in dense scenes when off.", live: true },
     Switch { flag: "nolrzfc", name: "LRZ fast clear off", hint: "Keeps LRZ but clears it the slow way (a known trouble spot on some Adreno 6xx).", live: true },
     Switch { flag: "nobin", name: "Binning off", hint: "No visibility pre-pass over the screen's tiles: every draw is rasterised in every tile it might touch.", live: true },
     Switch { flag: "sysmem", name: "Tiled rendering off", hint: "Render passes draw straight to memory instead of tile by tile: slower, fewer moving parts (no tile loads, stores, resolves).", live: true },
@@ -214,8 +221,8 @@ pub const SWITCHES: &[Switch] = &[
 ];
 
 /// The switches on by default: the fork's `dynamic` (the first device
-/// runs were with it).
-pub const DEFAULT_SWITCHES: &[&str] = &["dynamic"];
+/// runs were with it) and `nolrz` (the terrain chunks, above).
+pub const DEFAULT_SWITCHES: &[&str] = &["dynamic", "nolrz"];
 
 /// Mesa's `TU_DEBUG_FILE`: the options on, comma-separated, in the app's
 /// files folder. Readable and writable from a shell too

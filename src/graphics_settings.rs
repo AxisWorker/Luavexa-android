@@ -251,7 +251,7 @@ fn turnip_switches(ui: &mut egui::Ui) {
             turnip::reset_debug_flags();
         }
     });
-    ui.small(RichText::new("For missing or flickering geometry: try them top down, one at a time. The ones marked take effect at the next start.").weak());
+    ui.small(RichText::new("LRZ is off by default (Mesa 26.3.0 lost terrain chunks with it on an Adreno 650). For other missing or flickering geometry: try the rest top down, one at a time; the ones marked take effect at the next start.").weak());
     let flags = turnip::debug_flags();
     for s in turnip::SWITCHES {
         let mut on = flags.iter().any(|f| f == s.flag);

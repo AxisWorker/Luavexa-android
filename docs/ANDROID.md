@@ -786,20 +786,43 @@ KGSL property; thermal limits still apply; works with either driver).
 
 *Turnip's own switches* (Mesa's `TU_DEBUG` options) are under the same
 heading while Turnip is active, for when something draws wrong with it —
-the emulator panels' "driver settings": **LRZ off** (`nolrz`), **LRZ fast
-clear off** (`nolrzfc`), **Binning off** (`nobin`), **Tiled rendering
-off** (`sysmem`), **Flush caches after every draw** (`flushall`), and,
-at the next start, **Passes through dynamic rendering** (`dynamic`, on by
-default: libadrenotools' own setting) and **Bandwidth compression off**
-(`noubwc`). They are kept in `files/turnip/debug` (comma-separated flag
-names), which is handed to the driver as `TU_DEBUG_FILE`: Mesa reads it
-at start-up and watches it (inotify), so a flag of its runtime set
-(`tu_runtime_debug_flags` in `src/freedreno/vulkan/tu_util.cc`: the five
-live ones above, also `gmem`, `forcebin`, `syncdraw`, …) changes the
-running driver the moment the box is ticked — the renderer needs no
-restart, and a chunk that was missing comes back (or doesn't) on the
-spot. The file persists, so a fix found this way stays; "Default" writes
-`dynamic` back. The start-time `TU_DEBUG` is `turnip::TU_DEBUG_BASE`
+the emulator panels' "driver settings": **LRZ off** (`nolrz`; on by
+default, below), **LRZ fast clear off** (`nolrzfc`), **Binning off**
+(`nobin`), **Tiled rendering off** (`sysmem`), **Flush caches after
+every draw** (`flushall`), and, at the next start, **Passes through
+dynamic rendering** (`dynamic`, on by default: libadrenotools' own
+setting) and **Bandwidth compression off** (`noubwc`). They are kept in
+`files/turnip/debug` (comma-separated flag names), which is handed to
+the driver as `TU_DEBUG_FILE`: Mesa reads it at start-up and watches it
+(inotify), so a flag of its runtime set (`tu_runtime_debug_flags` in
+`src/freedreno/vulkan/tu_util.cc`: the five live ones above, also
+`gmem`, `forcebin`, `syncdraw`, …) changes the running driver the moment
+the box is ticked — the renderer needs no restart, and a chunk that was
+missing comes back (or doesn't) on the spot. The file persists, so a fix
+found this way stays; "Default" writes `dynamic,nolrz` back.
+
+**LRZ is off by default** (`turnip::DEFAULT_SWITCHES`). Found on the
+S20 Ultra with Mesa 26.3.0: a flat terrain drew, then whole chunks of it
+went missing while their neighbours stayed, each chunk one draw of the
+viewport pass; ticking LRZ off brought them back on the spot, and the
+baseplate runs at the same 120 fps without LRZ. The renderer's side was
+checked against Turnip's own LRZ rules (`tu_lrz.cc`
+`tu6_calculate_lrz_state`): every scene pipeline tests GREATER /
+GREATER_OR_EQUAL (reverse Z, one direction for the whole pass), nothing
+writes depth with ALWAYS or NOT_EQUAL or with blending (the sky and the
+lines on top test ALWAYS without writing, which only skips LRZ for those
+draws), the decal-depth draws are depth-only with `discard` (LRZ write
+off for them and, as they come after colour, for the rest of the pass —
+conservative, not wrong), and the terrain draws themselves are the
+plainest kind: depth test GREATER, depth write, no discard, no blending,
+after opaque parts drawn the same way. A draw like that can only vanish
+in whole if the low-resolution depth buffer holds nearer depth than was
+ever drawn — the driver's (the binning pass's position-only vertex
+shader variant, LRZ fast clear and the on-GPU direction tracking of
+Adreno 650 are the moving parts), not the renderer's. To narrow it on a
+device: untick LRZ off, tick LRZ fast clear off — chunks staying means
+`nolrzfc` alone would do, which keeps most of LRZ's early rejection. To
+try LRZ with a newer Turnip build (`TURNIP_ZIP_URL`): untick it. The start-time `TU_DEBUG` is `turnip::TU_DEBUG_BASE`
 (the fork's list less `dynamic`; the names Mesa doesn't know are
 harmless), and `RUSTUDIO_TU_DEBUG=<flags>` replaces it for a run (the
 file's flags still add to it). A flag in `TU_DEBUG` can't be turned off
@@ -849,8 +872,9 @@ shortens the view distance (500–900 studs at levels 1–3,
 aren't drawn on either driver; a fixed level in the window, or
 `RUSTUDIO_VIEW_DISTANCE=0`, tells. (2) `RUSTUDIO_TURNIP=0`: the same on
 the vendor's driver means the renderer, not Turnip. (3) Turnip's
-switches, top down, one at a time, watching the scene: LRZ off fixing it
-points at the depth pre-pass (then `nolrzfc` alone, to narrow it),
+switches, top down, one at a time, watching the scene (LRZ off is already
+on by default; with a Turnip build that has it off, LRZ off fixing it
+points at the depth pre-pass, then `nolrzfc` alone, to narrow it),
 Binning off at the visibility stream, Tiled rendering off at tile loads /
 stores / resolves (a `LoadOp::Load` on an attachment that was
 `StoreOp::Discard`ed shows here), Flush caches at a barrier or cache
@@ -867,7 +891,13 @@ driver (build of 10/2021) held ~30 fps with 35–49 ms of each frame spent
 in the present wait; Turnip (Mesa 26.3.0) on the same build runs it at a
 steady 120 fps. The first run with the `from_raw` hand-over logged
 `turnip: wgpu: Turnip Adreno (TM) 650 — turnip Mesa driver …` and no
-`AdrenoVK-0` line, as expected.
+`AdrenoVK-0` line, as expected. Second round, same device, LRZ off: the
+baseplate holds 120 fps at quality level 10 (4× MSAA, four shadow
+cascades, SSAO, bloom, depth of field, clouds); a flat terrain at level
+10 runs at 20 fps — the terrain shader, its shadow cascades and the
+full-resolution post passes, not the driver — and in Automatic mode
+(level 3 to start) the chunks beyond the level's view distance are
+expected to go (the "Something draws wrong" ladder above).
 
 ## Device-run notes (first APKs)
 
@@ -952,6 +982,19 @@ effect) and the perf lines (every 5 s).
   the floor: two swapchain images under Android's compositor (see "Frame
   time on a phone", three images now), with the shadow cascades at half
   the texels on top for the frames that do draw.
+- **~30 fps on the baseplate whatever the settings (Snapdragon 865).**
+  The vendor's Vulkan driver, not the renderer: 35–49 ms of each frame in
+  the present wait. The Turnip driver ("Turnip driver (Snapdragon)"
+  above) runs the same build at 120 fps.
+- **Terrain chunks vanishing under Turnip.** A flat terrain drew, then
+  whole chunks went missing while their neighbours stayed. Turnip's LRZ
+  (its low-resolution depth pre-pass) culling draws it shouldn't;
+  "LRZ off" in Graphics Settings > GPU driver > Turnip switches brought
+  them back on the spot and is the default now (the "LRZ is off by
+  default" paragraph above has the renderer-side check). Not to be
+  confused with Automatic quality stepping down and shortening the view
+  distance, which also drops far chunks — on either driver, logged as
+  `graphics quality (automatic)`.
 
 ## Later steps (in order)
 
