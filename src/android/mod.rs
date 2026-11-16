@@ -19,6 +19,9 @@
 //!   orientation, window insets, connectivity; [`sensors`]: accelerometer,
 //!   gyroscope, rotation; [`storage`]: files opened through the system
 //!   picker / share sheet).
+//! * The GPU driver: on Snapdragon devices the Turnip (Mesa) Vulkan
+//!   driver shipped in the APK is swapped in for the Adreno driver before
+//!   wgpu starts ([`turnip`]).
 
 mod assets;
 pub mod clipboard;
@@ -30,6 +33,7 @@ pub mod perf_hint;
 pub mod sensors;
 pub mod storage;
 pub mod text_menu;
+pub mod turnip;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -168,7 +172,7 @@ fn export_env() {
 }
 
 /// An Android system property (`adb shell getprop`), or "".
-fn system_property(name: &str) -> String {
+pub(crate) fn system_property(name: &str) -> String {
     extern "C" {
         fn __system_property_get(name: *const std::os::raw::c_char, value: *mut std::os::raw::c_char) -> std::os::raw::c_int;
     }
@@ -206,6 +210,10 @@ pub fn run(app: AndroidApp) {
     // A panic or fatal signal leaves a report in the cache folder, listed
     // in Output at the next start (and logcat gets the panic message).
     crate::crash::install();
+    // The Turnip (Mesa) Vulkan driver in place of the Adreno driver on
+    // Snapdragon devices (turnip.rs): now, before eframe exists, because
+    // wgpu loads libvulkan.so once, at its first instance.
+    turnip::activate();
     if let Err(e) = assets::unpack(&app) {
         log::error!("assets: {e}");
     }

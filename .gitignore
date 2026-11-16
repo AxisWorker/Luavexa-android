@@ -7,3 +7,6 @@ tools/parity_probe/*/runs/
 *.rbxlx.lock
 tools/fidelity/truss/build.log
 tools/fidelity/truss/tests.log
+
+# Prebuilt Android libraries fetched by tools/android/fetch-turnip.sh
+crates/rustudio-android/libs/**/*.so

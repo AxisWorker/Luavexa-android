@@ -192,6 +192,41 @@ impl Editor {
         if crate::quality::Graphics::env_level().is_some() {
             ui.small(RichText::new("RUSTUDIO_QUALITY is set for this run: it overrides the level.").weak());
         }
+        #[cfg(target_os = "android")]
+        gpu_driver_section(ui);
+    }
+}
+
+/// Android: which Vulkan driver this run has, and the switch for the
+/// Turnip (Mesa) driver the APK ships for Snapdragon devices
+/// (src/android/turnip.rs; takes effect at the next start).
+#[cfg(target_os = "android")]
+fn gpu_driver_section(ui: &mut egui::Ui) {
+    use crate::android::turnip;
+    ui.separator();
+    ui.label(RichText::new("GPU Driver").strong());
+    let st = turnip::status();
+    if st.device.is_empty() {
+        ui.small(format!("This run: the device's driver ({}).", st.note));
+    } else {
+        ui.small(format!("This run: {} — {}.", st.device, st.driver));
+    }
+    if !(st.available || st.active) {
+        return;
+    }
+    let mut on = turnip::wanted();
+    if ui.checkbox(&mut on, "Turnip (Mesa) Vulkan driver").on_hover_text("Mesa's open-source Adreno driver in place of the phone's, from the next start on").changed() {
+        turnip::set_wanted(on);
+    }
+    if turnip::failed_last_time() {
+        ui.horizontal_wrapped(|ui| {
+            ui.small(RichText::new("Off since a start with it didn't reach the first frame.").weak());
+            if ui.small_button("Try again").clicked() {
+                turnip::retry();
+            }
+        });
+    } else if on != st.active {
+        ui.small(RichText::new("Takes effect at the next start.").weak());
     }
 }
 

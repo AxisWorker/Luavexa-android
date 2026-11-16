@@ -4126,6 +4126,7 @@ name = "rustudio"
 version = "0.1.0"
 dependencies = [
  "android_logger",
+ "ash",
  "blake2",
  "blake3",
  "bytemuck",

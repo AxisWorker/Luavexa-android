@@ -23,6 +23,7 @@ on:
       - "build.rs"
       - "api-dump.json"
       - "mechanics.json"
+      - "tools/android/**"
       - ".github/workflows/android.yml"
   pull_request:
     paths:
@@ -35,6 +36,7 @@ on:
       - "build.rs"
       - "api-dump.json"
       - "mechanics.json"
+      - "tools/android/**"
       - ".github/workflows/android.yml"
   workflow_dispatch:
     inputs:
@@ -44,6 +46,21 @@ on:
         default: "both"
         type: choice
         options: [debug, release, both]
+      turnip:
+        description: "Ship the Turnip (Mesa) Vulkan driver + libadrenotools in the arm64 APK (docs/ANDROID.md, Turnip driver)"
+        required: false
+        default: true
+        type: boolean
+      turnip_zip:
+        description: "Turnip driver zip URL (libvulkan_freedreno.so inside); empty = the pinned nihui/mesa-turnip-android-driver release"
+        required: false
+        default: ""
+        type: string
+      adrenotools_zip:
+        description: "libadrenotools zip URL (libadrenotools.so + hook libraries inside); empty = the pinned TouseefX/libadrenotools-native release"
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: android-${{ github.ref }}
@@ -119,6 +136,24 @@ jobs:
 
       - name: x doctor
         run: x doctor
+
+      # The arm64 APK carries the Turnip (Mesa) Vulkan driver and
+      # libadrenotools in lib/arm64-v8a (tools/android/fetch-turnip.sh →
+      # crates/rustudio-android/libs/arm64-v8a, manifest.yaml runtime_libs);
+      # the app swaps the driver in on Snapdragon devices at start
+      # (src/android/turnip.rs). Push / PR builds take the pinned releases;
+      # a manual run can point at other zips or leave the driver out.
+      - name: Turnip driver + libadrenotools (arm64-v8a)
+        if: matrix.arch == 'arm64' && github.event.inputs.turnip != 'false'
+        env:
+          TURNIP_ZIP: ${{ github.event.inputs.turnip_zip }}
+          ADRENOTOOLS_ZIP: ${{ github.event.inputs.adrenotools_zip }}
+        run: |
+          set -euo pipefail
+          # An empty override means the pinned default.
+          [ -n "${TURNIP_ZIP:-}" ] || unset TURNIP_ZIP
+          [ -n "${ADRENOTOOLS_ZIP:-}" ] || unset ADRENOTOOLS_ZIP
+          bash tools/android/fetch-turnip.sh
 
       - name: Build APK
         env:

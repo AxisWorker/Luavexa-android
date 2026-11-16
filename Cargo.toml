@@ -104,6 +104,10 @@ ndk-sys = "0.6"
 # piped there too, see src/android/logcat.rs).
 log = "0.4"
 android_logger = "0.15"
+# The Vulkan loader, for the probe that checks which driver answers after
+# the Turnip swap (src/android/turnip.rs): the same crate and version
+# wgpu-hal drives Vulkan with, so nothing extra is built.
+ash = "0.38"
 
 [target.'cfg(windows)'.dependencies]
 # The Recycle Bin (platform.rs).

@@ -2181,6 +2181,11 @@ impl eframe::App for RustudioApp {
                 ctx.request_repaint();
             }
             crate::android::touch::auto_zoom(ed, &ctx);
+            // Two frames went through the swapchain: a start on the Turnip
+            // driver (android/turnip.rs) counts as good from here.
+            if ed.frame_no == 2 {
+                crate::android::turnip::mark_healthy();
+            }
         }
         ed.poll_file_dialogs();
         if let crate::update::Action::Restart = self.updater.show(&ctx) {

@@ -144,3 +144,14 @@ android:
   # paths::resource finds it.
   assets:
     - ../../api-dump.json
+  # Extra native libraries for the APK's lib/<abi>/: libs/arm64-v8a holds
+  # the Turnip (Mesa) Vulkan driver and libadrenotools, which the app loads
+  # in place of the device's Adreno driver on Snapdragon phones
+  # (src/android/turnip.rs; tools/android/fetch-turnip.sh fills the folder,
+  # empty folders build a plain APK). xbuild wants a folder for every ABI
+  # it builds, so libs/x86_64 exists too, empty. The libraries are stored
+  # compressed, so the installer extracts them to the app's native library
+  # folder (no extractNativeLibs=false), which is where libadrenotools has
+  # to find its hook libraries and the driver.
+  runtime_libs:
+    - libs

@@ -27,6 +27,10 @@ cargo install --git https://github.com/rust-mobile/xbuild \
   --rev e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1 xbuild
 x doctor                                   # what it found; nothing here fails
 
+# the Turnip (Mesa) Vulkan driver + libadrenotools into the arm64 APK's
+# lib/arm64-v8a ("Turnip driver" below); skip it for a plain APK
+tools/android/fetch-turnip.sh
+
 # an APK (xbuild fetches its NDK sysroot and android.jar into ~/.cache/x)
 x build -p rustudio-android --platform android --arch arm64 --format apk
 x build -p rustudio-android --platform android --arch arm64 --format apk --release
@@ -81,6 +85,7 @@ xbuild quirks worth knowing (commit e67b501):
 | Back button | — | closes what is open on top (Escape), otherwise `moveTaskToBack` — the activity isn't destroyed (`src/android/lifecycle.rs`) |
 | Activity destroyed | — | `onDestroy` hook: close request, then `process::exit(0)`; `android_main` always leaves the process when the loop ends (`lifecycle.rs`) |
 | UI zoom | 1.0 of the display's scale | first run: the zoom that fits ~1100 points across (0.8 … 1.6 of the density), then View > Zoom In / Out as saved |
+| GPU driver | the system's | the device's Vulkan driver, or on Snapdragon phones the Turnip (Mesa) driver shipped in the APK, swapped in before wgpu starts (`src/android/turnip.rs`; "Turnip driver" below); OpenGL ES as the fallback either way |
 | Graphics quality | level 10 (Studio's defaults) | Automatic from level 3: the 3D view at 0.7 scale (0.5 while the camera moves, scaled up by EASU + RCAS) with 512² textures, 900 studs of view distance, the lite shader, no anisotropic filtering, no MSAA, one shadow cascade, no frame-rate cap (View > Graphics Settings, the 1–10 bar; "Graphics quality" below); saved with the layout |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
 | Crash reports | `~/.cache/rustudio/crash/` | `<cache>/rustudio/crash/` (same `src/crash.rs`: panic hook + signal handlers chain to debuggerd) |
@@ -359,8 +364,9 @@ second at most, 0 none) — and `RUSTUDIO_VIEW_REUSE` (0|1),
 `RUSTUDIO_NO_PERF_HINT` (no ADPF hint session for the frame thread;
 below), `RUSTUDIO_NO_PIPELINE_CACHE`, `RUSTUDIO_NO_PIPELINE_WARMUP`
 (below), `RUSTUDIO_ONE_SUBMIT` (0|1; below), `RUSTUDIO_GPU_BISECT` (1;
-below). A switch wins over the saved Graphics Settings choice for the
-run.
+below), `RUSTUDIO_TURNIP` (0|1|force), `RUSTUDIO_GPU_TURBO` (1),
+`RUSTUDIO_TU_DEBUG` (Turnip's flags; "Turnip driver" below). A switch
+wins over the saved Graphics Settings choice for the run.
 
 **One submit a frame** (`render.rs` `one_submit_wanted`,
 `submit_callback`; on by default on a phone, `RUSTUDIO_ONE_SUBMIT=0`
@@ -660,6 +666,101 @@ for small screens (every panel open at once is most of the CPU time on a
 phone). The next device run's perf lines at each level against the ones
 above are what sizes the tables' next step (their numbers are estimates
 until then).
+
+## Turnip driver (Snapdragon): `src/android/turnip.rs`
+
+The arm64 APK carries Mesa's open-source Adreno Vulkan driver, **Turnip**
+(`libvulkan_freedreno.so`, [nihui's Android
+builds](https://github.com/nihui/mesa-turnip-android-driver), MIT), and
+**libadrenotools** ([TouseefX's
+libadrenotools-native](https://github.com/TouseefX/libadrenotools-native),
+a fork of bylaws/libadrenotools for apps without Java of their own,
+BSD-2-Clause; the shadowhook / bytehook libraries inside are ByteDance's,
+MIT). On a Snapdragon phone the editor swaps Turnip in for the vendor's
+driver at start. The device's own driver spent most of the 3D view's
+frame waiting (the "Frame time on a phone" measurements: ~60 ms of GPU
+time for a baseplate of 12 triangles, a wait rather than drawing); Turnip
+is the driver the emulators on Android reach for because its submit and
+present paths don't.
+
+**How the swap works.** `tools/android/fetch-turnip.sh` (run by the
+workflow for the arm64 APK; a manual run can point `turnip_zip` /
+`adrenotools_zip` at other zips or turn `turnip` off) puts the libraries
+into `crates/rustudio-android/libs/arm64-v8a/`, which `manifest.yaml`
+lists as xbuild `runtime_libs`, so they land in the APK's `lib/arm64-v8a`
+and, since xbuild stores libraries compressed and the manifest doesn't
+say `extractNativeLibs=false`, the installer unpacks them into the app's
+native library folder (`ApplicationInfo.nativeLibraryDir`) as real
+files. That folder is where libadrenotools must find its hook libraries
+and the driver. At start, in `android_main` before eframe exists —
+before wgpu's one `dlopen("libvulkan.so")` and while the launch screen is
+up — `turnip::activate()`:
+
+1. Decides whether the device qualifies: arm64-v8a; `/dev/kgsl-3d0`
+   present (Qualcomm's GPU kernel driver, what Turnip's KGSL backend
+   opens) or `ro.soc.manufacturer` / `ro.hardware` naming Qualcomm; an
+   Adreno 6xx or newer per `/sys/class/kgsl/kgsl-3d0/gpu_model`; Android
+   12+ (API 31, the fork's floor); the files in the APK. Anything else
+   keeps the device's driver, with one `turnip: not used — …` line in
+   logcat.
+2. `dlopen`s `libadrenotools.so` from the native library folder and calls
+   its `JNI_OnLoad` with the process's JavaVM — the fork's own
+   initialisation, the one `System.loadLibrary` would run — right there,
+   so it is done when the call returns (the fork also starts a fallback
+   thread for native loads; a `call_once` inside makes the two one). The
+   fork opens a private copy of the system's `libvulkan.so` in a linker
+   namespace of its own, with a hook that makes that copy load
+   `libvulkan_freedreno.so` instead of `vulkan.adreno.so`, then patches
+   the system loader's `vkGetInstanceProcAddr` / `vkGetDeviceProcAddr`
+   in place (shadowhook) to answer from the private copy. It also sets
+   `MESA_SHADER_CACHE_DIR` under the app's cache folder and a `TU_DEBUG`
+   of its choosing.
+3. Probes: a Vulkan instance through `libvulkan.so` the way ash makes
+   one, the first physical device's name and `VK_KHR_driver_properties`
+   (`turnip: probe: Turnip Adreno (TM) 650 — turnip Mesa 26.3.0 …`), then
+   destroys it. The driver stays loaded for wgpu's instance.
+
+wgpu needs no change for this: ash gets `vkGetInstanceProcAddr` by
+`dlsym` from the system loader and every other entry point through it,
+so after the patch every instance, device and swapchain is Turnip's,
+with the system loader's own swapchain code on top (Mesa's Android builds
+leave window surfaces to the loader, as the vendor driver does). The
+perf line's adapter name says which driver drew (`GPU Turnip Adreno (TM)
+650 (Vulkan, turnip Mesa 26.3.0 …)`), as does View > Graphics Settings >
+GPU Driver.
+
+**Switches.** Graphics Settings > GPU Driver has the checkbox (a marker
+file `files/turnip/off`; takes effect at the next start). From adb:
+`RUSTUDIO_TURNIP=0` keeps the device's driver, `=1` ignores the window's
+choice and the failed-start marker, `=force` also skips the device checks
+(for a Snapdragon the properties don't name). `RUSTUDIO_GPU_TURBO=1`
+asks libadrenotools for the GPU's top clocks (`adrenotools_set_turbo`, a
+KGSL property; thermal limits still apply; works with either driver).
+`RUSTUDIO_TU_DEBUG=sysmem` (or `gmem`, `nobin`, `forcebin`, `noubwc`,
+`nolrz`, …, comma-separated) hands Turnip its debug options for a run.
+
+**When it goes wrong.** A `pending` marker is written before the swap
+and removed after the editor's second frame (`turnip::mark_healthy`); a
+start that dies in between leaves it, and the next start turns it into
+`failed`, keeps the device's driver and says so in logcat and in the
+window ("Try again" clears it; so does `RUSTUDIO_TURNIP=1`). When
+libadrenotools' initialisation fails without crashing (the driver file
+missing, the hook not taking: its own lines are under the logcat tag
+`AdrenoToolsPatch`), the probe finds the Adreno driver still answering,
+which is logged as `turnip: not active — …` and the start goes on with
+it. A probe that fails outright leaves the marker, so a loader left in a
+bad state costs one start, not every one. OpenGL ES remains wgpu's
+fallback in every case. Known limits: Turnip builds come per Mesa
+release and a device's Vulkan loader must accept the driver's
+`VK_ANDROID_native_buffer` version (Android 14–16 take any; nihui's
+builds target API 26+); Adreno 5xx and older have no Turnip; a 16 KB
+page-size device (Android 15+, some Pixels) needs libraries aligned for
+it, which these prebuilt ones may not be — the loader then refuses them
+and the device's driver stays.
+
+`adb shell setprop debug.rustudio.env "RUSTUDIO_TURNIP=0"` is the quick
+A/B against the vendor's driver; the `perf:` lines (`RUSTUDIO_PERF_LOG=1`)
+name the adapter in their first line.
 
 ## Device-run notes (first APKs)
 
