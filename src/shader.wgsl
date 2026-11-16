@@ -789,6 +789,7 @@ fn local_pbr(world: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rough: f32,
     var result: LocalPbr;
     result.diffuse = vec3<f32>(0.0);
     result.specular = vec3<f32>(0.0);
+    if (u32(g.params.x) == 0u) { return result; }
     if (g.sun_color.w > 0.5 || g.env_spec.z <= 0.5) {
         result.diffuse = local_lights(world, n);
         return result;
@@ -1312,7 +1313,12 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
         }
         c = light * albedo;
         if (!is_glass) {
-            c += env_reflect(reflect(-v, n), rough, sv, reflective) * fe * sS + sun_spec;
+            // (no environment specular — Voxel lighting, or faded out with
+            // distance: no cube reads for a term that is nought)
+            if (sS > 0.0) {
+                c += env_reflect(reflect(-v, n), rough, sv, reflective) * fe * sS;
+            }
+            c += sun_spec;
         } else {
             // GlassFS.3: premultiplied base plus tinted outdoor reflection
             // at grazing angles. Environment BRDF and sun are additive;
@@ -2033,31 +2039,24 @@ fn vs_line(v: LineIn) -> LineOut {
     return o;
 }
 
-struct LineFrag {
-    @location(0) color: vec4<f32>,
-    @builtin(frag_depth) depth: f32,
-};
-
 // Flags in the vertex alpha (viewport.rs): a ≥ 2 = no distance fade (a
-// WireframeHandleAdornment), a ≥ 4 = always on top (drawn at the nearest
-// depth, reverse-Z 1.0).
+// WireframeHandleAdornment), a ≥ 4 = always on top. The on-top lines are
+// drawn by their own pipeline with no depth test (render.rs LinesOnTop;
+// it sorts them after the others), so no fragment writes its depth: a
+// shader that does costs a tiling GPU the early depth test.
 @fragment
-fn fs_line(in: LineOut) -> LineFrag {
-    var o: LineFrag;
+fn fs_line(in: LineOut) -> @location(0) vec4<f32> {
     var a = in.color.a;
-    o.depth = in.clip.z;
     var fade = 1.0;
     if (a >= 3.5) {
         a = a - 4.0;
-        o.depth = 1.0;
     } else if (a >= 1.5) {
         a = a - 2.0;
     } else {
         let d = length(in.world - g.cam_pos.xyz);
         fade = 1.0 - clamp((d - 80.0) / 260.0, 0.0, 1.0);
     }
-    o.color = vec4<f32>(sq(in.color.rgb), a * fade);
-    return o;
+    return vec4<f32>(sq(in.color.rgb), a * fade);
 }
 
 // ------------------------------------------------------- final image

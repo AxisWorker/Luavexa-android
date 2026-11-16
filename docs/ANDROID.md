@@ -81,7 +81,7 @@ xbuild quirks worth knowing (commit e67b501):
 | Back button | — | closes what is open on top (Escape), otherwise `moveTaskToBack` — the activity isn't destroyed (`src/android/lifecycle.rs`) |
 | Activity destroyed | — | `onDestroy` hook: close request, then `process::exit(0)`; `android_main` always leaves the process when the loop ends (`lifecycle.rs`) |
 | UI zoom | 1.0 of the display's scale | first run: the zoom that fits ~1100 points across (0.8 … 1.6 of the density), then View > Zoom In / Out as saved |
-| Graphics quality | level 10 (Studio's defaults) | Automatic from level 3: the 3D view at 0.7 scale (0.5 while the camera moves, scaled up by EASU + RCAS) with 512² textures, 900 studs of view distance, the lite shader, 2× anisotropy, no MSAA, one shadow cascade, no frame-rate cap (View > Graphics Settings, the 1–10 bar; "Graphics quality" below); saved with the layout |
+| Graphics quality | level 10 (Studio's defaults) | Automatic from level 3: the 3D view at 0.7 scale (0.5 while the camera moves, scaled up by EASU + RCAS) with 512² textures, 900 studs of view distance, the lite shader, no anisotropic filtering, no MSAA, one shadow cascade, no frame-rate cap (View > Graphics Settings, the 1–10 bar; "Graphics quality" below); saved with the layout |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
 | Crash reports | `~/.cache/rustudio/crash/` | `<cache>/rustudio/crash/` (same `src/crash.rs`: panic hook + signal handlers chain to debuggerd) |
 | Studio content download | ureq + rustls (ring) | the same; started only when ConnectivityManager reports a validated network |
@@ -267,7 +267,7 @@ the app removes the content with its data; `adb install -r` keeps it.
 Every few seconds the editor logs a line like
 
 ```
-perf: 136 frames in 5.0 s: 36.9 ms apart (p95 72.3, worst 89), 120 back to back 33.4 ms apart = 6.4 ms CPU + 27.0 ms GPU/display wait, 16 after a pause; editor 5.2 ms + egui 1.2 ms on the CPU; 3D GPU 9.8 ms per drawn frame = shadows 3.1 + scene 4.2 + ssao/bloom/dof 1.5 + post 1.0 (68 measured); window 1550x720 px at 1.40 px/pt, 3D view 816x310 px (scale 0.70, AO off, shadow maps x0.50), 3D frames drawn 68 / shown again 68; sections (ms/frame): dock_panels 4.3, viewport 3.4, vp_render 3.0, vpr_scene 1.1, vpr_submit 0.8, vpr_cull 0.6; frames asked by: app.rs:2531 x120, viewport.rs:2113 x16
+perf: 136 frames in 5.0 s: 36.9 ms apart (p95 72.3, worst 89), 120 back to back 33.4 ms apart = 6.4 ms CPU + 27.0 ms GPU/display wait, 16 after a pause; editor 5.2 ms + egui 1.2 ms on the CPU; 3D GPU 9.8 ms per drawn frame = shadows 3.1 + probe 0.0 + scene 4.2 + see-through 0.0 + ssao 1.1 + bloom/dof 0.4 + post 1.0 (68 measured); window 1550x720 px at 1.40 px/pt, 3D view 816x310 px (scale 0.70, AO off, shadow maps x0.50), 3D frames drawn 68 / shown again 68; sections (ms/frame): dock_panels 4.3, viewport 3.4, vp_render 3.0, vpr_scene 1.1, vpr_submit 0.8, vpr_cull 0.6; frames asked by: app.rs:2531 x120, viewport.rs:2113 x16
 ```
 
 (`src/perf_log.rs`; `adb logcat -s rustudio`, or `RUSTUDIO_PERF_LOG=1` on
@@ -282,9 +282,21 @@ still editor at 5 frames a second is not slow, it is idle. "editor" is
 "wait" what is left of a back-to-back interval (the GPU, the display's
 pacing). "3D GPU" is the renderer's own GPU time by timestamp
 queries (`render::GpuTimer`, where the device has them), per frame drawn
-afresh and by section; what the wait holds beyond it is egui's own GPU
-pass and vsync. The sections are the editor's own (`bench::scope`); the
-`vpr_*` ones split a 3D frame's CPU time (`vp_render`) into the
+afresh and by section — the shadow maps, the environment probe's faces,
+the scene pass (sky, parts, decals, terrain, lines), the see-through
+passes (water, glass, see-through parts; only when the scene splits),
+SSAO, clouds + bloom + DoF, post (tone map, EASU, RCAS); every mark sits
+between two passes, since a tiling GPU's timestamp inside a pass reads as
+the whole pass; what the wait holds beyond it is egui's own GPU pass and
+vsync. Where "scene" alone is most of the frame for a few parts (a
+baseplate at 60+ ms), the span is not the drawing: `RUSTUDIO_GPU_BISECT=1`
+(below) says what it is. The sections are the editor's own (`bench::scope`); the
+`vp_*` ones split the viewport panel's CPU time (`viewport`) into the
+input and camera (`vp_input`), the scene sync (`vp_scene_sync`), the
+hover pick (`vp_pick`), the draw lists (`vp_sync_draws`), terrain, the
+grid and the settings (`vp_prepare`), the frame's lighting (`lighting`),
+the 3D frame (`vp_render`) and what follows it — the GUIs, the HUD, the
+world GUI pass (`vp_after`); the `vpr_*` ones split the 3D frame into the
 visibility and draw lists (`vpr_cull`), the passes' encoding
 (`vpr_shadows`, `vpr_scene`, `vpr_post`) and the driver taking the frame
 (`vpr_submit`). "frames asked by" names the `request_repaint` call sites
@@ -346,8 +358,35 @@ second at most, 0 none) — and `RUSTUDIO_VIEW_REUSE` (0|1),
 `vsync`, `novsync`; a mode the surface lacks falls back to FIFO),
 `RUSTUDIO_NO_PERF_HINT` (no ADPF hint session for the frame thread;
 below), `RUSTUDIO_NO_PIPELINE_CACHE`, `RUSTUDIO_NO_PIPELINE_WARMUP`
-(below). A switch wins over the saved Graphics Settings choice for the
+(below), `RUSTUDIO_ONE_SUBMIT` (0|1; below), `RUSTUDIO_GPU_BISECT` (1;
+below). A switch wins over the saved Graphics Settings choice for the
 run.
+
+**One submit a frame** (`render.rs` `one_submit_wanted`,
+`submit_callback`; on by default on a phone, `RUSTUDIO_ONE_SUBMIT=0`
+off, `=1` on anywhere): the 3D frame's commands are not submitted by the
+renderer but handed to egui's own submit of the same frame through a
+paint callback (`egui_wgpu::CallbackTrait::prepare`; egui puts them in
+front of its pass), so a frame is one `vkQueueSubmit` instead of two —
+on a tiling GPU every submit ends in a flush of the tiles and an idle
+gap before the next, and the driver's own work per submit is not small.
+Anything that must draw over the frame or read it first (world GUIs and
+effects, a screenshot) submits the kept frame itself (`flush_deferred`).
+
+**GPU bisection** (`render.rs` `bisect`, with the perf log):
+`RUSTUDIO_GPU_BISECT=1` draws the 3D view with one thing left out, a
+different one with each perf line (so 5 s each, in a cycle of 11; the
+line's "GPU bisect step n" names it): everything; no lines; no sky; no
+parts; the scene pass empty; no scene pass; no post passes; nothing
+encoded but the timestamps; everything then the CPU waiting for the GPU
+(`vpr_gpu_sync` in the sections: the frame's wall time on the GPU); the
+frame submitted the other way (its own submit on a phone, egui's
+elsewhere); no 3D frame at all. Keep the camera moving so frames are
+drawn (a still view is shown again, not drawn), and read the "3D GPU"
+figures against the steps: a step that drops "scene" names the cost; a
+"scene" that stays at 60 ms with nothing encoded is not the GPU's work
+but a wait the timestamps straddle (the display's pacing, the driver's),
+and the "no 3D frame" step's interval is the editor's own.
 
 ### Graphics quality (`src/quality.rs`, `src/graphics_settings.rs`)
 
@@ -469,10 +508,10 @@ What the renderer does with the settings (`render.rs`):
   of the build key: a change rebuilds the pipelines.
 - **Texture filtering** (`RenderSettings::anisotropy`, `repeat_sampler`,
   `WaterPass::new`): the part textures', material maps' and water
-  normals' samplers take the level's anisotropic taps — 2 to level 7
-  (Studio's own default is `mech::TEXTURE_ANISOTROPY` = 8), 8 at the
-  top; a phone GPU's anisotropic filtering costs a tap per sample per
-  degree, and at 0.5 scale no one tells. A change remakes the samplers and
+  normals' samplers take the level's anisotropic taps — none at levels
+  1–3, 2 to level 7 (Studio's own default is `mech::TEXTURE_ANISOTROPY`
+  = 8), 8 at the top; a phone GPU's anisotropic filtering costs a tap
+  per sample per degree, and at 0.5 scale no one tells. A change remakes the samplers and
   the part textures' bind groups (the key holds it).
 - **Play's frame-rate cap** (`RustudioApp::cap_frame_rate`,
   `RenderSettings::fps_cap`; none at any level, `RUSTUDIO_FPS_CAP` or the

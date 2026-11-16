@@ -1791,9 +1791,9 @@
    "name": "texture anisotropy by quality level",
    "group": "performance",
    "value": [
-    2,
-    2,
-    2,
+    1,
+    1,
+    1,
     2,
     2,
     2,
@@ -1804,7 +1804,7 @@
    ],
    "unit": "taps",
    "estimated": true,
-   "source": "the part texture, material map and water normal samplers' anisotropic taps per level (Studio's default 8 is the top); a phone GPU pays a tap per sample per degree"
+   "source": "the part texture, material map and water normal samplers' anisotropic taps per level (Studio's default 8 is the top; none at the phone levels 1-3, drawn at half scale); a phone GPU pays a tap per sample per degree"
   },
   {
    "name": "lite shader bits by quality level",

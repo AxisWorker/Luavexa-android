@@ -458,6 +458,9 @@ impl Editor {
             // game's mouse: mouse_lock::game_pointer, and the icon drawn
             // there). Nothing moves a Locked cursor: a position sent then is a
             // Wayland hint that Hyprland jumps the cursor to on release.
+            // (not on Android: no cursor to pin, and winit would log
+            // "CursorPosition not supported" every frame)
+            #[cfg(not(target_os = "android"))]
             if let Some(at) = crate::mouse_lock::hold_at(g.start, g.confined) {
                 ctx.send_viewport_cmd(V::CursorPosition(at));
             }
@@ -2109,6 +2112,9 @@ impl Editor {
         let ctx = ui.ctx().clone();
         let context_menu_open = resp.context_menu_opened();
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
+        // (the perf log's sections: a frame's CPU time in the viewport
+        // outside the 3D frame itself, `vp_render`)
+        let vp_input = crate::bench::scope("vp_input");
 
         if !self.is_playing() && self.cam.advance_view(dt) { ctx.request_repaint(); }
 
@@ -2243,11 +2249,13 @@ impl Editor {
             self.fly_held = 0.0;
         }
 
+        drop(vp_input);
         // ---------------------------------------------------------- render
         {
             let _s = crate::bench::scope("vp_scene_sync");
             self.scene.sync(&mut self.doc);
         }
+        let vp_pick = crate::bench::scope("vp_pick");
         let pointer = resp.hover_pos();
         let handles = self.handles(rect);
         let hover_handle = if self.drag.is_none() {
@@ -2284,11 +2292,13 @@ impl Editor {
         } else {
             None
         };
+        drop(vp_pick);
 
         {
             let _s = crate::bench::scope("vp_sync_draws");
             self.sync_draws();
         }
+        let vp_prepare = crate::bench::scope("vp_prepare");
         if std::mem::take(&mut self.scene.terrain_dirty) {
             self.sync_terrain();
         }
@@ -2351,6 +2361,7 @@ impl Editor {
             }
             None => rect,
         };
+        drop(vp_prepare);
         let (globals, lights, shadows, sun_cascades) = {
             let _l = crate::bench::scope("lighting");
             self.frame_lighting(rrect)
@@ -2420,9 +2431,15 @@ impl Editor {
             _ => None,
         };
         drop(vp_render);
+        let _vp_after = crate::bench::scope("vp_after");
         let painter = ui.painter_at(rect);
         // The 3D view behind the GUI (UIBlur samples it).
         crate::gui::share().scene = tex.map(|id| (id, rect));
+        // A 3D frame kept for egui's submit (render.rs `one_submit`): the
+        // callback hands it over, in front of the pass that shows it.
+        if let Some(cb) = self.renderer.as_ref().and_then(|r| r.submit_callback(rect)) {
+            painter.add(cb);
+        }
         match tex {
             Some(id) => {
                 painter.image(

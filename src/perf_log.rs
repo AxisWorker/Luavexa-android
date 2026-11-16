@@ -57,13 +57,26 @@ pub struct PerfLog {
     /// (ms, calls) per section over the period.
     sections: Vec<(&'static str, f64, u64)>,
     /// The renderer's GPU totals at the last line (render::GpuTimer).
-    gpu_last: ([f64; 5], u32),
+    gpu_last: ([f64; GPU_SECTIONS + 1], u32),
     /// Who asked for the frames: (file, line) of the `request_repaint`
     /// calls of the frame before each, with how many frames each asked
     /// for; `unasked` the frames nobody asked for (input, the first ones).
     causes: Vec<((&'static str, u32), u32)>,
     unasked: u32,
     said_device: bool,
+}
+
+/// The GPU timer's sections (render::GpuTimer::SECTIONS).
+const GPU_SECTIONS: usize = crate::render::GpuTimer::SECTIONS;
+
+/// How many perf lines have been said: the GPU bisection (render.rs
+/// `bisect`) changes what it leaves out of the scene with each line, so
+/// every line reports one configuration.
+static PERIODS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The perf lines said so far.
+pub fn periods() -> u32 {
+    PERIODS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether the log is wanted: always on a phone, by request elsewhere.
@@ -107,7 +120,7 @@ impl PerfLog {
         work_ms: f32,
         cpu_ms: Option<f32>,
         back_to_back: bool,
-        gpu: Option<([f64; 5], u32)>,
+        gpu: Option<([f64; GPU_SECTIONS + 1], u32)>,
         extra: impl FnOnce() -> String,
         device: impl FnOnce() -> Option<String>,
     ) {
@@ -187,11 +200,13 @@ impl PerfLog {
                 if k == 0 {
                     "3D GPU: no frame measured".to_string()
                 } else {
-                    let per: Vec<f64> = (0..5).map(|i| (sum[i] - last_sum[i]) / k as f64).collect();
-                    format!(
-                        "3D GPU {:.1} ms per drawn frame = shadows {:.1} + scene {:.1} + ssao/bloom/dof {:.1} + post {:.1} ({k} measured)",
-                        per[4], per[0], per[1], per[2], per[3]
-                    )
+                    let per: Vec<f64> = (0..=GPU_SECTIONS).map(|i| (sum[i] - last_sum[i]) / k as f64).collect();
+                    let parts: Vec<String> = crate::render::GpuTimer::NAMES
+                        .iter()
+                        .zip(&per)
+                        .map(|(name, ms)| format!("{name} {ms:.1}"))
+                        .collect();
+                    format!("3D GPU {:.1} ms per drawn frame = {} ({k} measured)", per[GPU_SECTIONS], parts.join(" + "))
                 }
             }
         };
@@ -215,6 +230,7 @@ impl PerfLog {
             if top.is_empty() { "-".to_string() } else { top.join(", ") },
             if asked.is_empty() { "-".to_string() } else { asked.join(", ") },
         ));
+        PERIODS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.since = Some(now);
         self.intervals.clear();
         self.work.clear();

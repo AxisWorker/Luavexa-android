@@ -994,11 +994,72 @@ struct SsaoTargets {
     bgs: [wgpu::BindGroup; 3],
 }
 
+/// `RUSTUDIO_GPU_BISECT=1` (with the perf log): the 3D frame drawn with
+/// one thing left out, a different one with every perf line (5 s each,
+/// perf_log::periods), the line naming it — to find what a frame's GPU
+/// time goes to on a device without a GPU profiler (docs/ANDROID.md
+/// "Graphics quality"). The steps, in order:
+///
+/// 0. everything (the reference);
+/// 1. no lines (the grid, selection boxes, handles);
+/// 2. no sky;
+/// 3. no parts (nor decals, terrain or see-through parts);
+/// 4. the scene pass empty (its clear and store alone);
+/// 5. no scene pass at all (post shows the last scene);
+/// 6. no post passes (the 3D view keeps its last image);
+/// 7. nothing encoded but the timestamps (the submit alone);
+/// 8. everything, submitted by the renderer itself, then the CPU waits
+///    for the GPU to finish the frame (`device.poll`, timed: section
+///    `vpr_gpu_sync`) — whether the timestamps' span is wall time;
+/// 9. everything, the frame submitted the other way (`one_submit_wanted`:
+///    with egui's where the renderer submits its own, its own where one
+///    submit a frame is the default — a phone);
+/// 10. no 3D frame at all (the view shows its last image): the editor's
+///     frame interval without the 3D work.
+///
+/// Off, every step reads as 0.
+pub mod bisect {
+    pub const STEPS: [&str; 11] = [
+        "everything",
+        "no lines",
+        "no sky",
+        "no parts",
+        "empty scene pass",
+        "no scene pass",
+        "no post",
+        "nothing encoded",
+        "GPU sync after submit",
+        "the other submit mode",
+        "no 3D frame",
+    ];
+
+    /// Whether the bisection is on (RUSTUDIO_GPU_BISECT set, not 0).
+    pub fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("RUSTUDIO_GPU_BISECT").is_some_and(|v| v != "0"))
+    }
+
+    /// The step in force this period (0 when off).
+    pub fn step() -> usize {
+        if on() {
+            crate::perf_log::periods() as usize % STEPS.len()
+        } else {
+            0
+        }
+    }
+
+    /// The step's name, for the perf line (None when off).
+    pub fn name() -> Option<&'static str> {
+        on().then(|| STEPS[step()])
+    }
+}
+
 /// GPU time of a drawn frame's sections, by timestamp queries (when the
 /// device has them — lib.rs `wgpu_options` asks while the perf log is on;
 /// src/perf_log.rs reads the totals): the sun's and the lights' shadow
-/// maps, the scene passes, SSAO + bloom + DoF, post. The readings come
-/// back a frame or two later.
+/// maps, the probe's faces, the scene pass, the see-through passes,
+/// SSAO, clouds + bloom + DoF, post (`NAMES`). The readings come back a
+/// frame or two later.
 pub struct GpuTimer {
     set: wgpu::QuerySet,
     resolve: wgpu::Buffer,
@@ -1007,16 +1068,28 @@ pub struct GpuTimer {
     ring: Vec<(wgpu::Buffer, std::sync::Arc<std::sync::atomic::AtomicU8>)>,
     slot: Option<usize>,
     period_ns: f32,
-    /// Milliseconds summed over the frames read so far: shadows, scene,
-    /// SSAO + bloom + DoF, post, whole; and how many frames.
-    sum: [f64; 5],
+    /// Milliseconds summed over the frames read so far, a section per
+    /// pair of marks (`SECTIONS`), then the whole frame; and how many frames.
+    sum: [f64; GpuTimer::SECTIONS + 1],
     frames: u32,
     /// The last frame read, whole (ms): a few frames behind the one drawn.
     last_ms: Option<f32>,
 }
 
 impl GpuTimer {
-    const MARKS: u32 = 5;
+    /// The marks render() writes, each between two passes (never inside
+    /// one: on a tiling GPU a timestamp inside a pass reads as the whole
+    /// pass): 0 the start, 1 after the sun's cascades and the light
+    /// shadows, 2 after the environment probe's faces, 3 after the scene
+    /// pass (sky, parts, decals, terrain, lines), 4 after the see-through
+    /// passes (water, glass, see-through parts: only when the scene
+    /// splits), 5 after SSAO, 6 after clouds, bloom and DoF, 7 after the
+    /// post passes (tone map, EASU, RCAS).
+    const MARKS: u32 = 8;
+    /// The sections between the marks, in order.
+    pub const SECTIONS: usize = 7;
+    /// Their names, for the perf line.
+    pub const NAMES: [&'static str; GpuTimer::SECTIONS] = ["shadows", "probe", "scene", "see-through", "ssao", "bloom/dof", "post"];
 
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
         let want = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
@@ -1046,7 +1119,7 @@ impl GpuTimer {
                 (buf, std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)))
             })
             .collect();
-        Some(GpuTimer { set, resolve, ring, slot: None, period_ns: queue.get_timestamp_period(), sum: [0.0; 5], frames: 0, last_ms: None })
+        Some(GpuTimer { set, resolve, ring, slot: None, period_ns: queue.get_timestamp_period(), sum: [0.0; GpuTimer::SECTIONS + 1], frames: 0, last_ms: None })
     }
 
     /// Timestamp `i` at this point of the encoder's work.
@@ -1087,13 +1160,13 @@ impl GpuTimer {
                         let t: Vec<u64> = data.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
                         if t.len() >= Self::MARKS as usize {
                             let ms = |a: u64, b: u64| b.saturating_sub(a) as f64 * period / 1e6;
-                            self.sum[0] += ms(t[0], t[1]);
-                            self.sum[1] += ms(t[1], t[2]);
-                            self.sum[2] += ms(t[2], t[3]);
-                            self.sum[3] += ms(t[3], t[4]);
-                            self.sum[4] += ms(t[0], t[4]);
+                            for i in 0..Self::SECTIONS {
+                                self.sum[i] += ms(t[i], t[i + 1]);
+                            }
+                            let last = Self::MARKS as usize - 1;
+                            self.sum[Self::SECTIONS] += ms(t[0], t[last]);
                             self.frames += 1;
-                            self.last_ms = Some(ms(t[0], t[4]) as f32);
+                            self.last_ms = Some(ms(t[0], t[last]) as f32);
                         }
                     }
                     buf.unmap();
@@ -1105,8 +1178,8 @@ impl GpuTimer {
         }
     }
 
-    /// The sums so far (ms per section) and the frames in them.
-    pub fn totals(&self) -> ([f64; 5], u32) {
+    /// The sums so far (ms per section, then the whole) and the frames in them.
+    pub fn totals(&self) -> ([f64; GpuTimer::SECTIONS + 1], u32) {
         (self.sum, self.frames)
     }
 
@@ -1132,6 +1205,9 @@ pub enum Pipe {
     GlassCulled,
     Overlay,
     Lines,
+    /// Lines drawn over everything (vertex alpha ≥ 4: handles, the
+    /// selection's), with no depth test.
+    LinesOnTop,
     Water,
     Terrain,
     Shadow,
@@ -1158,7 +1234,7 @@ pub enum Pipe {
 }
 
 impl Pipe {
-    const COUNT: usize = 30 + NEAR_PASSES;
+    const COUNT: usize = 31 + NEAR_PASSES;
 
     fn index(self) -> usize {
         match self {
@@ -1192,7 +1268,8 @@ impl Pipe {
             Pipe::Post => 27,
             Pipe::Easu => 28,
             Pipe::Rcas => 29,
-            Pipe::Near(i) => 30 + i.min(NEAR_PASSES - 1),
+            Pipe::LinesOnTop => 30,
+            Pipe::Near(i) => 31 + i.min(NEAR_PASSES - 1),
         }
     }
 
@@ -1207,6 +1284,7 @@ impl Pipe {
             Pipe::Easu,
             Pipe::Rcas,
             Pipe::Lines,
+            Pipe::LinesOnTop,
             Pipe::Shadow,
             Pipe::Transparent,
             Pipe::TransparentCulled,
@@ -1439,7 +1517,8 @@ impl PipeFactory {
             Pipe::GlassCulled => make("glass-composite-culled", "vs_part", "fs_part", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None),
             // Hover highlight: the same geometry again, on top of itself.
             Pipe::Overlay => make("parts-overlay", "vs_part", "fs_part", &parts, T::TriangleList, None, false, C::GreaterEqual, premul),
-            Pipe::Lines => make("lines", "vs_line", "fs_line", &[Some(line_layout)], T::LineList, None, false, C::GreaterEqual, Some(wgpu::BlendState::ALPHA_BLENDING)),
+            Pipe::Lines => make("lines", "vs_line", "fs_line", &[Some(line_layout.clone())], T::LineList, None, false, C::GreaterEqual, Some(wgpu::BlendState::ALPHA_BLENDING)),
+            Pipe::LinesOnTop => make("lines-on-top", "vs_line", "fs_line", &[Some(line_layout)], T::LineList, None, false, C::Always, Some(wgpu::BlendState::ALPHA_BLENDING)),
             // Terrain water (water.rs): its own depth attachment, the scene's format.
             Pipe::Water => device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("water"),
@@ -1697,6 +1776,32 @@ pub struct Renderer {
     water_drawn: bool,
     /// GPU time per section, when the device can tell (the perf log).
     gpu_timer: Option<GpuTimer>,
+    /// A frame's commands kept for egui's submit (`one_submit_wanted`,
+    /// `submit_callback`), until submitted by it or `flush_deferred`.
+    deferred: std::sync::Arc<std::sync::Mutex<Option<wgpu::CommandBuffer>>>,
+    /// A frame was encoded whose `after_submit` has not run yet.
+    post_submit_pending: bool,
+}
+
+/// The paint callback that hands a kept frame to egui's submit
+/// (`Renderer::submit_callback`): `prepare` returns the commands, egui
+/// submits them in front of its own; `paint` has nothing to draw (the
+/// view's image is painted as usual).
+struct SubmitDeferred(std::sync::Arc<std::sync::Mutex<Option<wgpu::CommandBuffer>>>);
+
+impl egui_wgpu::CallbackTrait for SubmitDeferred {
+    fn prepare(
+        &self,
+        _device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        _screen: &egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        _resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().collect()
+    }
+
+    fn paint(&self, _info: egui::PaintCallbackInfo, _pass: &mut wgpu::RenderPass<'static>, _resources: &egui_wgpu::CallbackResources) {}
 }
 
 impl Renderer {
@@ -2278,6 +2383,8 @@ impl Renderer {
             generation: 0,
             water_drawn: false,
             gpu_timer: GpuTimer::new(device, queue),
+            deferred: Default::default(),
+            post_submit_pending: false,
         };
         r.add_texture(device, queue, 1, 1, &[255, 255, 255, 255]);
         r.warm_pipelines();
@@ -2485,6 +2592,7 @@ impl Renderer {
     /// pixels. Waits for the GPU; for tests.
     pub fn read_frame(&self, rs: &egui_wgpu::RenderState) -> Option<(u32, u32, Vec<u8>)> {
         let target = self.target.as_ref()?;
+        self.flush_deferred(&rs.queue);
         let [w, h] = target.size;
         let row = (w * 4).div_ceil(256) * 256;
         let buf = rs.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2550,6 +2658,7 @@ impl Renderer {
         if self.scene_format != wgpu::TextureFormat::Rgba16Float {
             return None; // (the readers expect half floats: HDR settings only)
         }
+        self.flush_deferred(&rs.queue);
         {
             if let Ok(path) = std::env::var("RUSTUDIO_DUMP_HDR") {
                 let half = [(target.size[0] >> 1).max(1), (target.size[1] >> 1).max(1)];
@@ -3519,6 +3628,11 @@ impl Renderer {
         tone_curve: Option<[f32; 5]>,
     ) -> bool {
         let Some(t) = self.target.as_ref() else { return false };
+        // (drawn over this frame's scene: a frame kept for egui's submit
+        // goes first)
+        if !batches.iter().all(|b| b.indices.is_empty()) || fx.is_some_and(|f| !f.draws.is_empty()) {
+            self.flush_deferred(&rs.queue);
+        }
         let (scene_format, samples) = (self.scene_format, self.samples);
         let pass = self
             .world_gui
@@ -3558,13 +3672,23 @@ impl Renderer {
     /// the pipelines they can use are compiled (`Pipes`).
     pub fn describe(&self) -> String {
         let wanted = Pipe::all().into_iter().filter(|p| p.wanted(&self.settings)).count();
-        format!("{}; pipelines {} of {} built", self.settings.describe(self.scene_format), self.pipes.ready(), wanted)
+        let mut out = format!("{}; pipelines {} of {} built", self.settings.describe(self.scene_format), self.pipes.ready(), wanted);
+        if let Some(t) = self.gpu_timer.as_ref() {
+            out.push_str(&format!("; GPU timer tick {:.2} ns", t.period_ns));
+        }
+        if self.defers(bisect::step()) {
+            out.push_str("; one submit a frame");
+        }
+        if let Some(name) = bisect::name() {
+            out.push_str(&format!("; GPU bisect step {}: {name}", bisect::step()));
+        }
+        out
     }
 
-    /// GPU milliseconds summed over the frames measured so far (shadows,
-    /// scene, SSAO + bloom + DoF, post, whole) and their count; None when
-    /// the device has no timestamp queries (see [`GpuTimer`]).
-    pub fn gpu_totals(&self) -> Option<([f64; 5], u32)> {
+    /// GPU milliseconds summed over the frames measured so far (a value
+    /// per section, `GpuTimer::NAMES`, then the whole) and their count;
+    /// None when the device has no timestamp queries (see [`GpuTimer`]).
+    pub fn gpu_totals(&self) -> Option<([f64; GpuTimer::SECTIONS + 1], u32)> {
         self.gpu_timer.as_ref().map(|t| t.totals())
     }
 
@@ -3654,9 +3778,75 @@ impl Renderer {
         }
     }
 
+    /// Whether this frame's commands wait for egui's submit (one
+    /// vkQueueSubmit a frame instead of two: on a tiling GPU every submit
+    /// ends in a flush and an idle gap). `RUSTUDIO_ONE_SUBMIT=0|1`
+    /// decides; otherwise on a phone — and the bisection's step 9 takes
+    /// the other way.
+    fn one_submit_wanted(&self, bisect: usize) -> bool {
+        static WANT: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+        let want = *WANT.get_or_init(|| std::env::var_os("RUSTUDIO_ONE_SUBMIT").map(|v| v != "0"));
+        let default = want.unwrap_or(cfg!(target_os = "android"));
+        if bisect == 9 {
+            !default
+        } else {
+            default
+        }
+    }
+
+    /// Whether this frame's commands are kept for egui's submit: the
+    /// bisection's step 8 submits them itself, to wait for the GPU.
+    fn defers(&self, bisect: usize) -> bool {
+        self.one_submit_wanted(bisect) && bisect != 8
+    }
+
+    /// Submits a frame kept for egui's submit, if one is still waiting
+    /// (the view was not painted after all, or something else must draw
+    /// over it first). In order: nothing else was submitted in between
+    /// that this frame should come after.
+    pub fn flush_deferred(&self, queue: &wgpu::Queue) {
+        let buffer = self.deferred.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(buffer) = buffer {
+            let _submit = crate::bench::scope("vpr_submit");
+            queue.submit([buffer]);
+        }
+    }
+
+    /// The work that follows a frame's submit (readbacks asked for, the
+    /// timer's readings taken in): once per frame, after it was really
+    /// submitted — right away, or on the next frame for one handed to egui.
+    fn after_submit(&mut self, device: &wgpu::Device) {
+        if !self.post_submit_pending {
+            return;
+        }
+        if self.deferred.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            return;
+        }
+        self.post_submit_pending = false;
+        if let Some(c) = self.clouds.as_mut() {
+            c.after_submit();
+        }
+        if let Some(t) = self.gpu_timer.as_mut() {
+            t.after_submit(device);
+        }
+    }
+
+    /// For the frame kept for egui's submit: a paint callback whose
+    /// `prepare` hands egui the frame's commands, which egui submits in
+    /// front of its own (egui_wgpu::winit::Painter: one submit). Added to
+    /// the painter before the view's image (viewport.rs); None when no
+    /// frame waits.
+    pub fn submit_callback(&self, rect: egui::Rect) -> Option<egui::Shape> {
+        if self.deferred.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+            return None;
+        }
+        Some(egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(rect, SubmitDeferred(self.deferred.clone()))))
+    }
+
     fn finish_again(&self, rs: &egui_wgpu::RenderState) {
         let _b = crate::bench::scope("fx_post_again");
         let Some(target) = self.target.as_ref() else { return };
+        self.flush_deferred(&rs.queue);
         let mut encoder = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("effects post") });
         self.encode_bloom(&mut encoder, target, self.post_bloom_size);
         self.encode_dof(&mut encoder, target, self.post_dof, self.post_dof_near);
@@ -3696,6 +3886,15 @@ impl Renderer {
         self.ensure_target(rs, size, out);
         let device = &rs.device;
         let queue = &rs.queue;
+        // A frame handed to egui's submit that nothing submitted (the view
+        // was not painted) goes first; then the work that follows a submit.
+        self.flush_deferred(queue);
+        self.after_submit(device);
+        let bisect = bisect::step();
+        if bisect == 10 {
+            // No 3D frame: the view keeps its last image.
+            return self.texture_id;
+        }
         // cam_pos.w is unused by the camera math. Keep material animation
         // continuous across scene rebuilds, independently of lighting time.
         let mut globals = frame.globals;
@@ -3960,8 +4159,22 @@ impl Renderer {
                 self.line_cap * std::mem::size_of::<LineVertex>(),
             );
         }
-        if !frame.lines.is_empty() {
-            queue.write_buffer(&self.line_buf, 0, bytemuck::cast_slice(frame.lines));
+        // The lines drawn on top of everything (vertex alpha ≥ 4, see
+        // fs_line) go last, for their own pipeline (LinesOnTop): the
+        // first `line_split` vertices are depth tested, the rest not.
+        let line_count = (frame.lines.len() / 2 * 2) as u32;
+        let mut line_split = line_count;
+        if line_count > 0 {
+            let on_top = |pair: &[LineVertex]| pair[0].color[3] >= 3.5;
+            if frame.lines.chunks_exact(2).any(on_top) {
+                let (tested, top): (Vec<&[LineVertex]>, Vec<&[LineVertex]>) =
+                    frame.lines.chunks_exact(2).partition(|pair| !on_top(pair));
+                line_split = tested.len() as u32 * 2;
+                let sorted: Vec<LineVertex> = tested.into_iter().chain(top).flatten().copied().collect();
+                queue.write_buffer(&self.line_buf, 0, bytemuck::cast_slice(&sorted));
+            } else {
+                queue.write_buffer(&self.line_buf, 0, bytemuck::cast_slice(&frame.lines[..line_count as usize]));
+            }
         }
 
         let n_lights = frame.lights.len().min(crate::mech::MAX_LIGHTS);
@@ -4328,6 +4541,9 @@ impl Renderer {
                 }
             }
         }
+        if let Some(t) = &self.gpu_timer {
+            t.mark(&mut encoder, 2);
+        }
         // Decals, then see-through parts back to front, then the hover overlay.
         let see_through = |pass: &mut wgpu::RenderPass, calls: &mut usize| {
             pass.set_bind_group(2, &target.glass_bg, &[]);
@@ -4398,12 +4614,18 @@ impl Renderer {
             })
             .forget_lifetime()
         };
-        {
+        // The GPU bisection's steps (`bisect`): what this frame leaves out.
+        let no_lines = matches!(bisect, 1 | 4 | 7);
+        let no_sky = matches!(bisect, 2 | 4 | 7);
+        let no_parts = matches!(bisect, 3 | 4 | 5 | 7);
+        let no_scene_pass = matches!(bisect, 5 | 7);
+        let no_post = matches!(bisect, 6 | 7);
+        if !no_scene_pass {
             let mut pass = scene_pass(&mut encoder, "viewport", true, !split);
             pass.set_bind_group(2, &target.glass_bg, &[]);
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_bind_group(1, &self.textures[0], &[]);
-            if frame.sky {
+            if frame.sky && !no_sky {
                 pass.set_pipeline(self.pipe(Pipe::Sky));
                 pass.draw(0..3, 0..1);
             }
@@ -4415,12 +4637,12 @@ impl Renderer {
             };
 
             pass.set_vertex_buffer(1, self.static_buf.slice(..));
-            for r in static_ranges.iter().filter(|r| r.0 == Pass::Opaque) {
+            for r in static_ranges.iter().filter(|r| r.0 == Pass::Opaque && !no_parts) {
                 pass.set_pipeline(opaque_pipe(r.1));
                 draw(&mut pass, r.1, r.2..r.3, &mut calls);
             }
             pass.set_vertex_buffer(1, self.instance_buf.slice(..));
-            for r in &opaque_runs {
+            for r in opaque_runs.iter().filter(|_| !no_parts) {
                 pass.set_pipeline(opaque_pipe(r.0));
                 draw(&mut pass, r.0, r.1..r.2, &mut calls);
             }
@@ -4429,11 +4651,11 @@ impl Renderer {
             // the invisible host never enters this pass. Keep the ordinary
             // sorted color pass for layer order and semitransparent edges.
             pass.set_pipeline(self.pipe(Pipe::DecalDepth));
-            for r in surface_decal_runs.iter().chain(&blend_runs) {
+            for r in surface_decal_runs.iter().chain(&blend_runs).filter(|_| !no_parts) {
                 draw(&mut pass, r.0, r.1..r.2, &mut calls);
             }
             // Terrain chunks in view.
-            if !self.terrain_chunks.is_empty() {
+            if !self.terrain_chunks.is_empty() && !no_parts {
                 pass.set_pipeline(self.pipe(Pipe::Terrain));
                 pass.set_bind_group(1, &self.terrain_bg, &[]);
                 for c in self.terrain_chunks.values().chain(self.terrain_grass.values()) {
@@ -4449,7 +4671,7 @@ impl Renderer {
                 }
                 pass.set_bind_group(1, &self.textures[0], &[]);
             }
-            if !surface_decal_runs.is_empty() {
+            if !surface_decal_runs.is_empty() && !no_parts {
                 pass.set_pipeline(self.pipe(Pipe::Transparent));
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                 for r in &surface_decal_runs {
@@ -4458,17 +4680,30 @@ impl Renderer {
                 pass.set_bind_group(1, &self.textures[0], &[]);
             }
 
-            if !frame.lines.is_empty() {
+            // Lines: the depth-tested ones, then the ones on top of
+            // everything (their own pipeline, instead of a fragment shader
+            // writing its depth, which costs a tiling GPU the early depth
+            // test for every draw after it).
+            if line_count > 0 && !no_lines {
                 pass.set_bind_group(1, &self.textures[0], &[]);
-                pass.set_pipeline(self.pipe(Pipe::Lines));
                 pass.set_vertex_buffer(0, self.line_buf.slice(..));
-                pass.draw(0..frame.lines.len() as u32, 0..1);
+                if line_split > 0 {
+                    pass.set_pipeline(self.pipe(Pipe::Lines));
+                    pass.draw(0..line_split, 0..1);
+                }
+                if line_split < line_count {
+                    pass.set_pipeline(self.pipe(Pipe::LinesOnTop));
+                    pass.draw(line_split..line_count, 0..1);
+                }
             }
-            if !split {
+            if !split && !no_parts {
                 see_through(&mut pass, &mut calls);
             }
         }
-        if split {
+        if let Some(t) = &self.gpu_timer {
+            t.mark(&mut encoder, 3);
+        }
+        if split && !no_parts {
             let u = self.water.uniforms(&frame.water, target.size);
             queue.write_buffer(&self.water.buf, 0, bytemuck::bytes_of(&u));
             encoder.copy_texture_to_texture(
@@ -4529,12 +4764,12 @@ impl Renderer {
         // encoded-scene reads (shader.wgsl ssao_scene); nothing after it
         // reads the copy otherwise (clouds take their own), so it is only
         // made when SSAO is on.
+        if let Some(t) = &self.gpu_timer {
+            t.mark(&mut encoder, 4);
+        }
         if ssao && target.ssao.is_some() {
             encoder.copy_texture_to_texture(target.hdr.as_image_copy(), target.scene_copy.as_image_copy(),
                 wgpu::Extent3d { width: target.size[0], height: target.size[1], depth_or_array_layers: 1 });
-        }
-        if let Some(t) = &self.gpu_timer {
-            t.mark(&mut encoder, 2);
         }
         // Bloom: bright pass, blur across, blur down (half resolution).
         // SSAO, then its multiply into the scene.
@@ -4572,33 +4807,49 @@ impl Renderer {
                 pass.draw(0..3, 0..1);
             }
         }
+        if let Some(t) = &self.gpu_timer {
+            t.mark(&mut encoder, 5);
+        }
         // Terrain.Clouds over the sky (Studio composes them after SSAO).
         if let Some(c) = self.clouds.as_mut() {
             encoder.copy_texture_to_texture(target.hdr.as_image_copy(), target.scene_copy.as_image_copy(),
                 wgpu::Extent3d { width: target.size[0], height: target.size[1], depth_or_array_layers: 1 });
             c.composite(device, &mut encoder, &self.globals_bg, &target.hdr_view, &target.scene_copy_view, &target.depth);
         }
-        self.encode_bloom(&mut encoder, target, globals.bloom[1]);
-        self.encode_dof(&mut encoder, target, self.post_dof, self.post_dof_near);
-        if let Some(t) = &self.gpu_timer {
-            t.mark(&mut encoder, 3);
+        if !no_post {
+            self.encode_bloom(&mut encoder, target, globals.bloom[1]);
+            self.encode_dof(&mut encoder, target, self.post_dof, self.post_dof_near);
         }
-        self.encode_post(&mut encoder, target);
+        if let Some(t) = &self.gpu_timer {
+            t.mark(&mut encoder, 6);
+        }
+        if !no_post {
+            self.encode_post(&mut encoder, target);
+        }
         self.probe.flush(queue);
         if let Some(t) = self.gpu_timer.as_mut() {
-            t.mark(&mut encoder, 4);
+            t.mark(&mut encoder, 7);
             t.resolve(&mut encoder);
         }
         drop(section);
-        {
-            let _submit = crate::bench::scope("vpr_submit");
-            queue.submit([encoder.finish()]);
-        }
-        if let Some(c) = self.clouds.as_mut() {
-            c.after_submit();
-        }
-        if let Some(t) = self.gpu_timer.as_mut() {
-            t.after_submit(device);
+        // The frame's commands: submitted now, or kept for egui's submit of
+        // this same frame (one vkQueueSubmit a frame: `one_submit`), which
+        // `submit_callback` puts them in front of.
+        let buffer = encoder.finish();
+        self.post_submit_pending = true;
+        if self.defers(bisect) {
+            *self.deferred.lock().unwrap_or_else(|e| e.into_inner()) = Some(buffer);
+        } else {
+            {
+                let _submit = crate::bench::scope("vpr_submit");
+                queue.submit([buffer]);
+            }
+            if bisect == 8 {
+                // The CPU waits for the GPU to finish the frame: its wall time.
+                let _sync = crate::bench::scope("vpr_gpu_sync");
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            }
+            self.after_submit(device);
         }
         self.stats = stats;
         crate::runtime::domains::services::perf::end_frame(svc_t0.elapsed().as_secs_f64(), 0.0);
