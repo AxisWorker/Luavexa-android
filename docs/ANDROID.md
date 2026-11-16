@@ -783,8 +783,37 @@ choice and the failed-start marker, `=force` also skips the device checks
 (for a Snapdragon the properties don't name). `RUSTUDIO_GPU_TURBO=1`
 asks libadrenotools for the GPU's top clocks (`adrenotools_set_turbo`, a
 KGSL property; thermal limits still apply; works with either driver).
-`RUSTUDIO_TU_DEBUG=sysmem` (or `gmem`, `nobin`, `forcebin`, `noubwc`,
-`nolrz`, …, comma-separated) hands Turnip its debug options for a run.
+
+*Turnip's own switches* (Mesa's `TU_DEBUG` options) are under the same
+heading while Turnip is active, for when something draws wrong with it —
+the emulator panels' "driver settings": **LRZ off** (`nolrz`), **LRZ fast
+clear off** (`nolrzfc`), **Binning off** (`nobin`), **Tiled rendering
+off** (`sysmem`), **Flush caches after every draw** (`flushall`), and,
+at the next start, **Passes through dynamic rendering** (`dynamic`, on by
+default: libadrenotools' own setting) and **Bandwidth compression off**
+(`noubwc`). They are kept in `files/turnip/debug` (comma-separated flag
+names), which is handed to the driver as `TU_DEBUG_FILE`: Mesa reads it
+at start-up and watches it (inotify), so a flag of its runtime set
+(`tu_runtime_debug_flags` in `src/freedreno/vulkan/tu_util.cc`: the five
+live ones above, also `gmem`, `forcebin`, `syncdraw`, …) changes the
+running driver the moment the box is ticked — the renderer needs no
+restart, and a chunk that was missing comes back (or doesn't) on the
+spot. The file persists, so a fix found this way stays; "Default" writes
+`dynamic` back. The start-time `TU_DEBUG` is `turnip::TU_DEBUG_BASE`
+(the fork's list less `dynamic`; the names Mesa doesn't know are
+harmless), and `RUSTUDIO_TU_DEBUG=<flags>` replaces it for a run (the
+file's flags still add to it). A flag in `TU_DEBUG` can't be turned off
+at runtime (Mesa warns so in logcat). The fork's constructor sets more
+of Mesa's environment than `TU_DEBUG` (its `global_atomic_init`): among
+it `MESA_VK_WSI_PRESENT_MODE=mailbox`, which makes Mesa's WSI present in
+mailbox mode whatever the swapchain asks for — so under Turnip
+`RUSTUDIO_PRESENT_MODE` and wgpu's FIFO default don't apply, and frames
+are rendered unthrottled and dropped rather than paced (the 120 fps
+measured below is the panel's rate); `tu_override_uncached_as_cache_coherent=true`
+(a driconf option: write-combined host-visible memory is served from the
+cached-coherent type where the KGSL kernel grants IO-coherent memory, a
+no-op elsewhere); `MESA_SHADER_CACHE_MAX_SIZE=4G`; and
+`TU_OVERRIDE_HEAP_SIZE` at 40 % of RAM. Left as they are for now.
 
 **When it goes wrong.** A `pending` marker is written before the swap
 and removed after the editor's second frame (`turnip::mark_healthy`); a
@@ -810,6 +839,35 @@ and the device's driver stays.
 `adb shell setprop debug.rustudio.env "RUSTUDIO_TURNIP=0"` is the quick
 A/B against the vendor's driver; the `perf:` lines (`RUSTUDIO_PERF_LOG=1`)
 name the adapter in their first line.
+
+*Something draws wrong* (geometry missing, flickering, a pass's result
+stale) — in this order, each a minute: (1) is it the driver? logcat
+(`adb logcat -s rustudio AdrenoToolsPatch mesa`) for `graphics quality
+(automatic): …` lines while it happens — Automatic quality stepping down
+shortens the view distance (500–900 studs at levels 1–3,
+`QUALITY_VIEW_DISTANCE`), and parts and terrain chunks wholly beyond it
+aren't drawn on either driver; a fixed level in the window, or
+`RUSTUDIO_VIEW_DISTANCE=0`, tells. (2) `RUSTUDIO_TURNIP=0`: the same on
+the vendor's driver means the renderer, not Turnip. (3) Turnip's
+switches, top down, one at a time, watching the scene: LRZ off fixing it
+points at the depth pre-pass (then `nolrzfc` alone, to narrow it),
+Binning off at the visibility stream, Tiled rendering off at tile loads /
+stores / resolves (a `LoadOp::Load` on an attachment that was
+`StoreOp::Discard`ed shows here), Flush caches at a barrier or cache
+hazard. (4) `dynamic` off and a restart: wgpu-hal 30 drives classic
+`VkRenderPass`es, which the fork's `dynamic` routes through Mesa's
+dynamic-rendering emulation (`vk_common_CmdBeginRenderPass2`), a path
+Turnip's own render-pass code doesn't take. Report the flag that fixed
+it: a switch is a workaround, the renderer side (pass order, a depth
+state, a buffer written while in flight) is the fix.
+
+**Measured.** Galaxy S20 Ultra (Snapdragon 865, Adreno 650, Android 12 /
+API 31, 120 Hz panel), release APK, the baseplate: the vendor's Vulkan
+driver (build of 10/2021) held ~30 fps with 35–49 ms of each frame spent
+in the present wait; Turnip (Mesa 26.3.0) on the same build runs it at a
+steady 120 fps. The first run with the `from_raw` hand-over logged
+`turnip: wgpu: Turnip Adreno (TM) 650 — turnip Mesa driver …` and no
+`AdrenoVK-0` line, as expected.
 
 ## Device-run notes (first APKs)
 

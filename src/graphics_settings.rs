@@ -232,6 +232,34 @@ fn gpu_driver_section(ui: &mut egui::Ui) {
     } else if on != st.active {
         ui.small(RichText::new("Takes effect at the next start.").weak());
     }
+    if st.active {
+        turnip_switches(ui);
+    }
+}
+
+/// Turnip's own switches (`TU_DEBUG` options), for when something draws
+/// wrong with it: the live ones change the running driver as the box is
+/// ticked (Mesa watches the file they are kept in), the others at the
+/// next start. The choice stays until "Default".
+#[cfg(target_os = "android")]
+fn turnip_switches(ui: &mut egui::Ui) {
+    use crate::android::turnip;
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Turnip switches").strong());
+        if !turnip::debug_flags_default() && ui.small_button("Default").clicked() {
+            turnip::reset_debug_flags();
+        }
+    });
+    ui.small(RichText::new("For missing or flickering geometry: try them top down, one at a time. The ones marked take effect at the next start.").weak());
+    let flags = turnip::debug_flags();
+    for s in turnip::SWITCHES {
+        let mut on = flags.iter().any(|f| f == s.flag);
+        let label = if s.live { s.name.to_string() } else { format!("{} (next start)", s.name) };
+        if ui.checkbox(&mut on, label).on_hover_text(format!("{}\nTU_DEBUG={}", s.hint, s.flag)).changed() {
+            turnip::set_debug_flag(s.flag, on);
+        }
+    }
 }
 
 const ONOFF: &[(bool, &str)] = &[(false, "Off"), (true, "On")];

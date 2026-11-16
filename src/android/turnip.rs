@@ -52,8 +52,13 @@
 //! choice and the marker; `RUSTUDIO_TURNIP=force` also skips the device
 //! checks. `RUSTUDIO_GPU_TURBO=1` asks libadrenotools for the GPU's top
 //! clocks (`adrenotools_set_turbo`; thermal limits still apply);
-//! `RUSTUDIO_TU_DEBUG=<flags>` hands Turnip its `TU_DEBUG` options
-//! (`sysmem`, `gmem`, `nobin`, `noubwc`, `nolrz`, …).
+//! Turnip's own switches (`TU_DEBUG`): Graphics Settings > GPU driver
+//! lists the useful ones ([`SWITCHES`]: LRZ, binning, tiled rendering,
+//! …) and keeps them in `files/turnip/debug`, which the driver watches
+//! (Mesa's `TU_DEBUG_FILE`: the ones Mesa can change while running change
+//! at once, the others at the next start); `RUSTUDIO_TU_DEBUG=<flags>`
+//! replaces the start-time set the fork's constructor would leave
+//! ([`TU_DEBUG_BASE`]).
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
@@ -174,6 +179,95 @@ pub fn mark_healthy() {
             log::info!("turnip: first frames drawn, the driver swap is marked good");
         }
     });
+}
+
+// ---------------------------------------------------------------- switches
+
+/// The `TU_DEBUG` libadrenotools' constructor sets (one list for Adreno
+/// 5xx to 8xx) less `dynamic`, which the switches file owns below; the
+/// names Mesa 26.3 doesn't know (`noconform`, `noflushall`, `deck_emu`)
+/// do nothing there and stay for builds of Turnip that might know them
+/// (`TURNIP_ZIP_URL`). `RUSTUDIO_TU_DEBUG` replaces the whole list.
+pub const TU_DEBUG_BASE: &str = "noconform,hiprio,noflushall,deck_emu";
+
+/// One of Turnip's `TU_DEBUG` options the window offers (Graphics
+/// Settings > GPU driver). `live`: Mesa applies a change while running
+/// (its `TU_DEBUG_FILE` watch); the others take effect at the next start.
+pub struct Switch {
+    pub flag: &'static str,
+    pub name: &'static str,
+    pub hint: &'static str,
+    pub live: bool,
+}
+
+/// The switches, the likeliest fixes for missing or flickering geometry
+/// first (Mesa docs/drivers/freedreno.rst; the runtime set is
+/// `tu_runtime_debug_flags` in src/freedreno/vulkan/tu_util.cc).
+pub const SWITCHES: &[Switch] = &[
+    Switch { flag: "nolrz", name: "LRZ off", hint: "No low-resolution depth buffer (Turnip's early rejection of hidden pixels). The first thing to try when parts of the scene go missing or flicker; costs some speed in dense scenes.", live: true },
+    Switch { flag: "nolrzfc", name: "LRZ fast clear off", hint: "Keeps LRZ but clears it the slow way (a known trouble spot on some Adreno 6xx).", live: true },
+    Switch { flag: "nobin", name: "Binning off", hint: "No visibility pre-pass over the screen's tiles: every draw is rasterised in every tile it might touch.", live: true },
+    Switch { flag: "sysmem", name: "Tiled rendering off", hint: "Render passes draw straight to memory instead of tile by tile: slower, fewer moving parts (no tile loads, stores, resolves).", live: true },
+    Switch { flag: "flushall", name: "Flush caches after every draw", hint: "Slow. Tells a cache or synchronisation bug (fixed by this) from the rest (not).", live: true },
+    Switch { flag: "dynamic", name: "Passes through dynamic rendering", hint: "libadrenotools' default: Turnip runs the renderer's (classic Vulkan) render passes through Mesa's dynamic-rendering path. Off: Turnip's own render pass code.", live: false },
+    Switch { flag: "noubwc", name: "Bandwidth compression off", hint: "No UBWC on textures and render targets.", live: false },
+];
+
+/// The switches on by default: the fork's `dynamic` (the first device
+/// runs were with it).
+pub const DEFAULT_SWITCHES: &[&str] = &["dynamic"];
+
+/// Mesa's `TU_DEBUG_FILE`: the options on, comma-separated, in the app's
+/// files folder. Readable and writable from a shell too
+/// (`run-as <package> cat files/turnip/debug`).
+pub fn debug_file() -> PathBuf {
+    dir().join("debug")
+}
+
+static FLAGS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+fn parse_flags(s: &str) -> Vec<String> {
+    s.split(|c: char| c == ',' || c.is_whitespace()).filter(|f| !f.is_empty()).map(str::to_string).collect()
+}
+
+/// The options in the file (read once; this module's writes keep it).
+pub fn debug_flags() -> Vec<String> {
+    let mut g = FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(|| std::fs::read_to_string(debug_file()).map(|s| parse_flags(&s)).unwrap_or_default()).clone()
+}
+
+/// The file holds exactly the defaults.
+pub fn debug_flags_default() -> bool {
+    let mut a = debug_flags();
+    a.sort();
+    let mut d: Vec<String> = DEFAULT_SWITCHES.iter().map(|s| s.to_string()).collect();
+    d.sort();
+    a == d
+}
+
+/// One option on or off (the window's checkbox), written at once: a live
+/// one is in effect a moment later.
+pub fn set_debug_flag(flag: &str, on: bool) {
+    let mut flags = debug_flags();
+    flags.retain(|f| f != flag);
+    if on {
+        flags.push(flag.to_string());
+    }
+    write_debug_flags(flags);
+}
+
+pub fn reset_debug_flags() {
+    write_debug_flags(DEFAULT_SWITCHES.iter().map(|s| s.to_string()).collect());
+}
+
+fn write_debug_flags(flags: Vec<String>) {
+    let _ = std::fs::create_dir_all(dir());
+    // One open, write and close: Mesa's watch fires on the close.
+    if let Err(e) = std::fs::write(debug_file(), format!("{}\n", flags.join(","))) {
+        log::warn!("turnip: writing {}: {e}", debug_file().display());
+    }
+    log::info!("turnip: switches (TU_DEBUG_FILE): {}", if flags.is_empty() { "none".to_string() } else { flags.join(",") });
+    *FLAGS.lock().unwrap_or_else(|e| e.into_inner()) = Some(flags);
 }
 
 /// What the device is, as far as the swap cares.
@@ -492,19 +586,24 @@ fn try_activate() -> Result<Status, Status> {
     // editor has drawn its first frames (mark_healthy).
     let _ = std::fs::write(markers.join("pending"), format!("{:?}", std::time::SystemTime::now()));
 
-    // Turnip's debug / tuning switches, read when the driver initialises
-    // (libadrenotools' own constructor sets a TU_DEBUG of its choosing, so
-    // ours goes in again after the load, before the initialisation).
-    let tu_debug = std::env::var("RUSTUDIO_TU_DEBUG").ok().filter(|v| !v.trim().is_empty());
+    // Turnip's switches, read when the driver initialises: the start-time
+    // TU_DEBUG (libadrenotools' constructor sets one of its own at the
+    // load below, so ours goes in again after it) and the switches file
+    // the window edits (TU_DEBUG_FILE; made with the defaults the first
+    // time, so that its content is the whole of it).
+    if !debug_file().exists() {
+        reset_debug_flags();
+    }
+    let tu_debug = std::env::var("RUSTUDIO_TU_DEBUG").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).unwrap_or_else(|| TU_DEBUG_BASE.to_string());
+    let switches_file = debug_file();
     let set_tu_debug = || {
-        if let Some(v) = &tu_debug {
-            // SAFETY: before any wgpu thread exists; android_main is the
-            // only thread reading the environment at this point.
-            #[allow(unused_unsafe)]
-            unsafe {
-                std::env::set_var("TU_DEBUG", v.trim())
-            };
-        }
+        // SAFETY: before any wgpu thread exists; android_main is the only
+        // thread reading the environment at this point.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("TU_DEBUG", &tu_debug);
+            std::env::set_var("TU_DEBUG_FILE", &switches_file);
+        };
     };
     set_tu_debug();
 
@@ -519,6 +618,8 @@ fn try_activate() -> Result<Status, Status> {
     }
     SHIM_LOADED.store(true, std::sync::atomic::Ordering::Relaxed);
     set_tu_debug();
+    let switches = debug_flags();
+    log::info!("turnip: TU_DEBUG={tu_debug}; switches ({}): {}", switches_file.display(), if switches.is_empty() { "none".to_string() } else { switches.join(",") });
 
     // The fork's own initialisation, the way System.loadLibrary would run
     // it, but here and now: it resolves nativeLibraryDir and the cache
