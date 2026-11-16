@@ -52,14 +52,14 @@ on:
         default: true
         type: boolean
       turnip_zip:
-        description: "Turnip driver zip URL (libvulkan_freedreno.so inside); empty = the pinned nihui/mesa-turnip-android-driver release"
+        description: "Turnip driver zip URL (libvulkan_freedreno.so inside; nihui/mesa-turnip-android-driver release)"
         required: false
-        default: ""
+        default: "https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.0/mesa-turnip-android-26.3.0.zip"
         type: string
       adrenotools_zip:
-        description: "libadrenotools zip URL (libadrenotools.so + hook libraries inside); empty = the pinned TouseefX/libadrenotools-native release"
+        description: "libadrenotools zip URL (libadrenotools.so + hook libraries inside; TouseefX/libadrenotools-native release)"
         required: false
-        default: ""
+        default: "https://github.com/TouseefX/libadrenotools-native/releases/download/V0.7/libadrenotools-arm64-v8a.zip"
         type: string
 
 concurrency:
@@ -71,6 +71,12 @@ env:
   # xbuild at this commit (crates.io's 0.2.0 from 2022 predates the
   # manifest.yaml format and NDK downloads used here).
   XBUILD_REV: e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1
+  # The Turnip (Mesa) Vulkan driver and libadrenotools that go into the
+  # arm64 APK's lib/arm64-v8a (push / PR builds; a manual run's inputs
+  # above can name others). tools/android/fetch-turnip.sh checks these two
+  # against pinned SHA-256 sums; docs/ANDROID.md "Turnip driver".
+  TURNIP_ZIP_URL: https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.0/mesa-turnip-android-26.3.0.zip
+  ADRENOTOOLS_ZIP_URL: https://github.com/TouseefX/libadrenotools-native/releases/download/V0.7/libadrenotools-arm64-v8a.zip
 
 jobs:
   apk:
@@ -146,13 +152,13 @@ jobs:
       - name: Turnip driver + libadrenotools (arm64-v8a)
         if: matrix.arch == 'arm64' && github.event.inputs.turnip != 'false'
         env:
-          TURNIP_ZIP: ${{ github.event.inputs.turnip_zip }}
-          ADRENOTOOLS_ZIP: ${{ github.event.inputs.adrenotools_zip }}
+          # A manual run's inputs, else the pinned releases (env above).
+          TURNIP_ZIP: ${{ github.event.inputs.turnip_zip || env.TURNIP_ZIP_URL }}
+          ADRENOTOOLS_ZIP: ${{ github.event.inputs.adrenotools_zip || env.ADRENOTOOLS_ZIP_URL }}
         run: |
           set -euo pipefail
-          # An empty override means the pinned default.
-          [ -n "${TURNIP_ZIP:-}" ] || unset TURNIP_ZIP
-          [ -n "${ADRENOTOOLS_ZIP:-}" ] || unset ADRENOTOOLS_ZIP
+          echo "Turnip driver: $TURNIP_ZIP"
+          echo "libadrenotools: $ADRENOTOOLS_ZIP"
           bash tools/android/fetch-turnip.sh
 
       - name: Build APK

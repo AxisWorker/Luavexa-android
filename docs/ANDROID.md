@@ -683,6 +683,23 @@ time for a baseplate of 12 triangles, a wait rather than drawing); Turnip
 is the driver the emulators on Android reach for because its submit and
 present paths don't.
 
+**Where the files come from.** The pinned downloads (SHA-256 checked by
+the script; `android.yml`'s `TURNIP_ZIP_URL` / `ADRENOTOOLS_ZIP_URL` and
+the manual run's `turnip_zip` / `adrenotools_zip` inputs name the same
+two):
+
+- libadrenotools: <https://github.com/TouseefX/libadrenotools-native/releases/download/V0.7/libadrenotools-arm64-v8a.zip>
+  (`libadrenotools.so`, `libhook_impl.so`, `libmain_hook.so`,
+  `libfile_redirect_hook.so`, `libgsl_alloc_hook.so`, `libshadowhook.so`,
+  `libshadowhook_nothing.so`, `libbytehook.so`)
+- Turnip driver: <https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.0/mesa-turnip-android-26.3.0.zip>
+  (`libvulkan_freedreno.so`, Mesa 26.3.0, Adreno 6xx/7xx/8xx)
+
+Another build goes in with `TURNIP_ZIP=<url or file>` /
+`ADRENOTOOLS_ZIP=<url or file>` (a `*_SHA256` beside it is checked when
+given), or by dropping the `.so` files into
+`crates/rustudio-android/libs/arm64-v8a/` by hand (kept unless `FORCE=1`).
+
 **How the swap works.** `tools/android/fetch-turnip.sh` (run by the
 workflow for the arm64 APK; a manual run can point `turnip_zip` /
 `adrenotools_zip` at other zips or turn `turnip` off) puts the libraries

@@ -6,12 +6,14 @@
 # "Turnip driver"). Run before `x build` — the Android workflow does; a
 # build without these files is a normal APK that keeps the device's driver.
 #
-# Sources (both prebuilt, neither is built here):
+# Sources (both prebuilt, neither is built here; the pinned downloads):
 #   * libadrenotools-native: TouseefX's fork of bylaws/libadrenotools
 #     (BSD-2-Clause; libshadowhook / libbytehook inside are ByteDance's,
-#     MIT) — libadrenotools.so and its hook libraries.
+#     MIT) — libadrenotools.so and its hook libraries:
+#     https://github.com/TouseefX/libadrenotools-native/releases/download/V0.7/libadrenotools-arm64-v8a.zip
 #   * mesa-turnip-android-driver: nihui's Mesa builds for Android
-#     (Mesa: MIT) — libvulkan_freedreno.so.
+#     (Mesa: MIT) — libvulkan_freedreno.so:
+#     https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.0/mesa-turnip-android-26.3.0.zip
 #
 # Overrides, for a newer build or one of your own:
 #   ADRENOTOOLS_ZIP=<url or local .zip>   TURNIP_ZIP=<url or local .zip>
