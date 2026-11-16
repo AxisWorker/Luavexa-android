@@ -82,11 +82,10 @@ pub enum Action {
 impl Updater {
     pub fn start() -> Self {
         let stage = Arc::new(Mutex::new(Stage::Checking));
+        // RUSTUDIO_NO_UPDATE_CHECK / RUSTUDIO_UI_SHOTS, or the rustudio option.
         // An Android APK is installed by the system: nothing here could put
         // a release in place, so the phone never asks.
-        let off = std::env::var_os("RUSTUDIO_NO_UPDATE_CHECK").is_some()
-            || std::env::var_os("RUSTUDIO_UI_SHOTS").is_some()
-            || cfg!(target_os = "android");
+        let off = !crate::rustudio_settings::update_check() || cfg!(target_os = "android");
         if off {
             *stage.lock().unwrap() = Stage::Current;
         } else {

@@ -237,6 +237,38 @@ impl Default for Graphics {
     }
 }
 
+/// The sample counts the device multisamples the renderer's textures at
+/// (the scene's colour and depth, the see-through copy, the highlight
+/// masks). WebGPU, as Vulkan, promises 1 and 4 only: llvmpipe and some
+/// Malis have no 2x, which levels 5–7 ask for (`mech::QUALITY_MSAA`); a
+/// texture made at a count the device lacks is a validation error, so the
+/// renderer fits the settings to this first (`RenderSettings::fitted`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsaaSupport {
+    pub x2: bool,
+    pub x4: bool,
+}
+
+impl MsaaSupport {
+    /// Every count (where no adapter is at hand: tests).
+    pub const ALL: Self = Self { x2: true, x4: true };
+
+    /// What `adapter` has for all of `formats`.
+    pub fn of(adapter: &wgpu::Adapter, formats: &[wgpu::TextureFormat]) -> Self {
+        let ok = |n: u32| formats.iter().all(|f| adapter.get_texture_format_features(*f).flags.sample_count_supported(n));
+        Self { x2: ok(2), x4: ok(4) }
+    }
+
+    /// `msaa`, or the nearest count below it the device has (1 always).
+    pub fn fit(self, msaa: u32) -> u32 {
+        match msaa {
+            4 if self.x4 => 4,
+            4 | 2 if self.x2 => 2,
+            _ => 1,
+        }
+    }
+}
+
 /// What the renderer draws and with what. Fields marked (rebuild) change
 /// the pipelines or the render targets: the renderer remakes them when
 /// one changes (`Renderer::set_settings`); (textures) remakes the material
@@ -527,6 +559,13 @@ impl RenderSettings {
         self.upscale && (self.render_scale < 1.0 || self.motion_scale < 1.0)
     }
 
+    /// `self` at the multisampling `support` has: the levels' 2x where the
+    /// device has none (`MsaaSupport`) becomes 1x, a 4x it lacks the 2x.
+    pub fn fitted(mut self, support: MsaaSupport) -> Self {
+        self.msaa = support.fit(self.msaa);
+        self
+    }
+
     /// The scene's colour format on `device`: Rgba16Float for HDR, else
     /// Rg11b10Ufloat where the device renders to it (wgpu's
     /// RG11B10UFLOAT_RENDERABLE: every Vulkan phone GPU of the last
@@ -744,6 +783,22 @@ mod tests {
         let s = RenderSettings::level(LEVELS).with_overrides(&Overrides { lite: Some(true), fps_cap: Some(30), anisotropy: Some(2), ..Default::default() });
         assert_eq!((s.lite, s.fps_cap, s.anisotropy), (LITE_PHONE, 30, 2));
         assert_eq!(RenderSettings::level(1).with_overrides(&Overrides { lite: Some(false), ..Default::default() }).lite, 0);
+    }
+
+    #[test]
+    fn msaa_fits_what_the_device_has() {
+        let all = MsaaSupport::ALL;
+        assert_eq!((all.fit(1), all.fit(2), all.fit(4)), (1, 2, 4));
+        // (llvmpipe, some Malis: 1 and 4 only — the levels' 2x becomes 1x)
+        let no2 = MsaaSupport { x2: false, x4: true };
+        assert_eq!((no2.fit(1), no2.fit(2), no2.fit(4)), (1, 1, 4));
+        let no4 = MsaaSupport { x2: true, x4: false };
+        assert_eq!((no4.fit(2), no4.fit(4)), (2, 2));
+        let none = MsaaSupport { x2: false, x4: false };
+        assert_eq!((none.fit(2), none.fit(4)), (1, 1));
+        let fitted = RenderSettings::level(6).fitted(no2);
+        assert_eq!((RenderSettings::level(6).msaa, fitted.msaa), (2, 1));
+        assert_ne!(fitted.build_key(), RenderSettings::level(6).build_key(), "the key follows the count in force");
     }
 
     #[test]

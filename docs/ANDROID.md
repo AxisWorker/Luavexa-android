@@ -104,6 +104,8 @@ Gated with `#[cfg(not(target_os = "android"))]` (would not compile):
 | Item | Reason | Android replacement |
 |---|---|---|
 | `rfd` (Cargo.toml) and the rfd code in `src/file_dialog.rs` | rfd 0.15 has no Android backend | `file_dialog::Request` + `android::storage::Picker` |
+| the rfd dialogs plugins open (`src/plugin_host/prompts.rs`: PromptImportFile, ImportFbxRig, PromptSaveSelection, ExportPlace / ExportSelection; 0.2.0) | as above | the same `Request`, drawn as the in-app picker by `prompts::ui` each frame (one file per prompt; the harness's `plugin-prompt:` answers work unchanged) |
+| the `xdg-open` / `open` / `cmd start` spawns in `src/toolbox/ui.rs::open_url` and `src/plugin_store/ui.rs::open_plugins_folder` (0.2.0) | no such programs in an app sandbox | an ACTION_VIEW Intent (`android::jni::open_url`); the Plugins folder's path is reported in the Plugins panel instead of opened |
 | `libc::getloadavg` in `src/platform.rs::load_average` | Bionic has it only from API 29; the symbol is absent from the libc crate's Android bindings | returns "?" |
 | `eframe` features `wayland`, `x11` | desktop window systems | `android-native-activity` (target-specific dependency tables in Cargo.toml) |
 
@@ -434,10 +436,15 @@ Studio levels per bar step), set from either side.
 | Depth of field | off | off | off | off | off | off | off | on | on | on |
 | Clouds, environment probe | off | off | off | off | on | on | on | on | on | on |
 
-(Rg11b10Ufloat where the device renders to it, else Rgba16Float. Roblox's
-own levels for the view distance: about 500 studs at Level01, 100000 at
-Level21; the rest of the table is an estimate until the next device run
-measures it.)
+(Rg11b10Ufloat where the device renders to it, else Rgba16Float. The MSAA
+row is what a level asks for: Vulkan and WebGPU promise 1 and 4 samples
+only, and a device without 2× — llvmpipe, some Malis — gets the nearest
+count it has (`quality::MsaaSupport`, `Renderer::msaa_support_of`,
+`RenderSettings::fitted`: 2× → off, a missing 4× → 2×); a texture asked
+for at a count the device lacks is otherwise a validation error, which is
+a crash. Roblox's own levels for the view distance: about 500 studs at
+Level01, 100000 at Level21; the rest of the table is an estimate until
+the next device run measures it.)
 
 **Automatic** (`quality::Auto`; Studio's QualityLevel.Automatic) watches
 the frames the 3D view draws back to back (frames shown again from the
@@ -546,7 +553,17 @@ What the renderer does with the settings (`render.rs`):
   constant `SUN_CASCADES` hands the rest to the voxel sun); without MSAA
   the scene is drawn straight into the resolved texture (`MSAA_SAMPLES`
   1; `render::msaa_wgsl` turns the shaders' multisampled depth reads
-  into plain ones).
+  into plain ones). 0.2.0's see-through encoded blend (upstream
+  `SeeThrough`) is part of this: its five encoded part pipelines and the
+  encode / decode passes are `Pipe` variants (`Pipe::encoded`,
+  `Pipe::SeeEncode` / `SeeDecode`) built per level and sample count;
+  `Target` carries the encoded copy of the scene at the scene's sample
+  count — always Rgba16Float, since the "covered" marker is its alpha and
+  the 32-bit scene format of levels 1–4 has none — and without MSAA the
+  encode reads the scene texture itself. 0.2.0's ViewportFrame targets
+  (`src/vf_render.rs`) and highlight masks (`src/highlight.rs`) follow
+  the level's sample count and format the same way (no multisampled
+  texture and no resolve at 1 sample).
 - **Pipelines compiled when first needed** (`Pipes`, `Renderer::pipe`),
   the first frame's set in the background right after the shader module
   (`warm_pipelines`; `RUSTUDIO_NO_PIPELINE_WARMUP=1` leaves it all to
@@ -712,13 +729,25 @@ files. That folder is where libadrenotools must find its hook libraries
 and the driver. At start, in `android_main` before eframe exists — while
 the launch screen is up — `turnip::activate()`:
 
-1. Decides whether the device qualifies: arm64-v8a; `/dev/kgsl-3d0`
-   present (Qualcomm's GPU kernel driver, what Turnip's KGSL backend
-   opens) or `ro.soc.manufacturer` / `ro.hardware` naming Qualcomm; an
-   Adreno 6xx or newer per `/sys/class/kgsl/kgsl-3d0/gpu_model`; Android
-   12+ (API 31, the fork's floor); the files in the APK. Anything else
-   keeps the device's driver, with one `turnip: not used — …` line in
-   logcat.
+1. Decides whether the device qualifies — Adreno only, 650 and up, not
+   HyperOS: arm64-v8a; `ro.hardware.vulkan` / `ro.hardware.egl` not
+   naming another maker's GPU (a Mali, PowerVR, Xclipse, … is out at
+   once: Turnip drives Adreno and nothing else); `/dev/kgsl-3d0` present
+   (Qualcomm's GPU kernel driver, what Turnip's KGSL backend opens) or
+   `ro.soc.manufacturer` / `ro.hardware` naming Qualcomm; an Adreno 650
+   or newer (`turnip::ADRENO_MIN`) per `/sys/class/kgsl/kgsl-3d0/gpu_model`,
+   or per `ro.soc.model` for the Snapdragons listed in
+   `Device::adreno_model` when that node isn't readable — an unknown
+   model is out, as are the 610–644 and everything older; not Xiaomi's
+   HyperOS (`ro.mi.os.version.name` / `.code`): libadrenotools' loader
+   hook mostly doesn't find the Vulkan driver paths it expects there, so
+   those Snapdragons keep their driver (MIUI proper isn't excluded; the
+   log names both); Android 12+ (API 31, the fork's floor); the files in
+   the APK. Anything else keeps the device's driver, with one `turnip:
+   not used — …` line in logcat (`turnip: device: …` before it lists
+   everything the decision read), and the window doesn't offer the
+   switch. `RUSTUDIO_TURNIP=force` skips the GPU, model, HyperOS and
+   Android-version checks for a run.
 2. `dlopen`s `libadrenotools.so` from the native library folder and calls
    its `JNI_OnLoad` with the process's JavaVM — the fork's own
    initialisation, the one `System.loadLibrary` would run — right there,

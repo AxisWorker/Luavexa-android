@@ -40,17 +40,25 @@
 //! pre-built wgpu objects; the fork's patch stays in place but nothing
 //! here depends on it.
 //!
-//! Only on Snapdragon: Turnip drives Adreno GPUs through Qualcomm's KGSL
-//! kernel driver, so the device must have `/dev/kgsl-3d0` (or name
-//! Qualcomm as its SoC maker in the system properties) and an Adreno 6xx
-//! or newer; every other device keeps its driver. The swap is also skipped
-//! on other ABIs than arm64-v8a, below Android 12 (the fork's floor), when
-//! the files aren't in the APK, when turned off (Graphics Settings > GPU
-//! driver, or `RUSTUDIO_TURNIP=0`), and after a start that didn't get to
-//! its first frames with Turnip (a marker file this module keeps; the
-//! window offers "Try again"). `RUSTUDIO_TURNIP=1` overrides the window's
-//! choice and the marker; `RUSTUDIO_TURNIP=force` also skips the device
-//! checks. `RUSTUDIO_GPU_TURBO=1` asks libadrenotools for the GPU's top
+//! Only Adreno 650 and up, on Snapdragon, not on HyperOS: Turnip drives
+//! Adreno GPUs through Qualcomm's KGSL kernel driver and nothing else
+//! (a Mali, PowerVR or Xclipse named by `ro.hardware.vulkan` /
+//! `ro.hardware.egl` is out at once), the device must have
+//! `/dev/kgsl-3d0` (or name Qualcomm as its SoC maker in the system
+//! properties), its Adreno must be a 650 or newer per
+//! `/sys/class/kgsl/kgsl-3d0/gpu_model` (or `ro.soc.model` for the SoCs
+//! listed in [`Device::adreno_model`]; an unknown model is out), and
+//! Xiaomi's HyperOS (`ro.mi.os.version.name`) is out — libadrenotools'
+//! loader hook mostly doesn't find the Vulkan driver paths it expects
+//! there. Every other device keeps its driver and the window doesn't
+//! offer the switch. The swap is also skipped on other ABIs than
+//! arm64-v8a, below Android 12 (the fork's floor), when the files aren't
+//! in the APK, when turned off (Graphics Settings > GPU driver, or
+//! `RUSTUDIO_TURNIP=0`), and after a start that didn't get to its first
+//! frames with Turnip (a marker file this module keeps; the window
+//! offers "Try again"). `RUSTUDIO_TURNIP=1` overrides the window's choice
+//! and the marker; `RUSTUDIO_TURNIP=force` also skips the device checks
+//! (the GPU, model, HyperOS and Android version ones). `RUSTUDIO_GPU_TURBO=1` asks libadrenotools for the GPU's top
 //! clocks (`adrenotools_set_turbo`; thermal limits still apply);
 //! Turnip's own switches (`TU_DEBUG`): Graphics Settings > GPU driver
 //! lists the useful ones ([`SWITCHES`]: LRZ, binning, tiled rendering,
@@ -72,8 +80,8 @@ use ash::vk;
 pub struct Status {
     /// Turnip answers this process's Vulkan calls.
     pub active: bool,
-    /// The device qualifies (arm64 Snapdragon on Android 12+, files in the
-    /// APK): the window offers the switch only then.
+    /// The device qualifies (arm64, Adreno 650+, not HyperOS, Android 12+,
+    /// files in the APK): the window offers the switch only then.
     pub available: bool,
     /// What happened, or why nothing did (one line).
     pub note: String,
@@ -281,15 +289,30 @@ fn write_debug_flags(flags: Vec<String>) {
 struct Device {
     /// Qualcomm's GPU kernel driver node, what Turnip's KGSL backend opens.
     kgsl: bool,
-    /// ro.soc.manufacturer (API 31+: "QTI" / "Qualcomm"), ro.hardware
-    /// ("qcom"), ro.board.platform ("kona", "lahaina", …), for the log and
-    /// as the second opinion.
+    /// ro.soc.manufacturer (API 31+: "QTI" / "Qualcomm"), ro.soc.model
+    /// ("SM8250"), ro.hardware ("qcom"), ro.board.platform ("kona",
+    /// "lahaina", …), for the log and as the second opinion.
     soc: String,
+    soc_model: String,
     hardware: String,
     platform: String,
-    /// /sys/class/kgsl/kgsl-3d0/gpu_model ("Adreno650"), "" when unreadable.
+    /// ro.hardware.egl / ro.hardware.vulkan: the GPU driver's family name
+    /// ("adreno", "mali", "powervr", "xclipse", …), "" when unset.
+    egl: String,
+    vulkan: String,
+    /// /sys/class/kgsl/kgsl-3d0/gpu_model ("Adreno650v3"), "" when unreadable.
     gpu: String,
+    /// Xiaomi's HyperOS: ro.mi.os.version.name ("OS1.0", "OS2.0.1"), ""
+    /// elsewhere; ro.miui.ui.version.name (MIUI, which HyperOS also sets)
+    /// for the log.
+    hyperos: String,
+    miui: String,
 }
+
+/// The Adreno models Turnip is let drive here: 650 and up (the 6xx below
+/// it — 610 to 644 — and every older generation keep the vendor's
+/// driver). Snapdragon 865's Adreno 650 is the measured one.
+const ADRENO_MIN: u32 = 650;
 
 impl Device {
     fn read() -> Self {
@@ -297,11 +320,19 @@ impl Device {
         Device {
             kgsl: Path::new("/dev/kgsl-3d0").exists(),
             soc: prop("ro.soc.manufacturer"),
+            soc_model: prop("ro.soc.model"),
             hardware: prop("ro.hardware"),
             platform: prop("ro.board.platform"),
+            egl: prop("ro.hardware.egl"),
+            vulkan: prop("ro.hardware.vulkan"),
             gpu: std::fs::read_to_string("/sys/class/kgsl/kgsl-3d0/gpu_model")
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default(),
+            hyperos: {
+                let name = prop("ro.mi.os.version.name");
+                if name.is_empty() { prop("ro.mi.os.version.code") } else { name }
+            },
+            miui: prop("ro.miui.ui.version.name"),
         }
     }
 
@@ -310,21 +341,58 @@ impl Device {
         self.kgsl || soc.contains("qualcomm") || soc == "qti" || self.hardware.to_ascii_lowercase().starts_with("qcom")
     }
 
-    /// The Adreno generation's first digit (6 for an Adreno 650), 0 when
-    /// unknown.
-    fn adreno_generation(&self) -> u32 {
-        let digits: String = self.gpu.chars().filter(|c| c.is_ascii_digit()).collect();
-        digits.chars().next().and_then(|c| c.to_digit(10)).unwrap_or(0)
+    /// The GPU family another maker's, as the driver properties name it
+    /// (Mali, PowerVR, Samsung's Xclipse, …): Turnip is Adreno's driver
+    /// and nothing else's. Some("mali") etc.; None when they name Adreno
+    /// or nothing.
+    fn other_gpu(&self) -> Option<String> {
+        for v in [&self.vulkan, &self.egl] {
+            let v = v.trim().to_ascii_lowercase();
+            if v.is_empty() || v.contains("adreno") {
+                continue;
+            }
+            return Some(v);
+        }
+        None
+    }
+
+    /// The Adreno model (650 for "Adreno650v3" or "Adreno (TM) 650"),
+    /// from the KGSL node; when that isn't readable, from the SoC model
+    /// for the SoCs known here; 0 when unknown.
+    fn adreno_model(&self) -> u32 {
+        let digits: String = self.gpu.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<u32>() {
+            if (500..1000).contains(&n) {
+                return n;
+            }
+        }
+        // ro.soc.model (API 31+) for the Snapdragons with an Adreno 650 or
+        // newer: 865/870 (650), 888 (660), 8 Gen 1 / 8+ Gen 1 (730),
+        // 8 Gen 2 (740), 8s Gen 3 (735), 8 Gen 3 (750), 8 Elite (830),
+        // 7+ Gen 2 (725), 7 Gen 3 (720), 7s Gen 2 / 6 Gen 1 / 7s Gen 3
+        // (710), 7 Gen 4 (722).
+        const SOCS: &[(&str, u32)] = &[
+            ("SM8250", 650), ("SM8350", 660), ("SM8450", 730), ("SM8475", 730), ("SM8550", 740),
+            ("SM8635", 735), ("SM8650", 750), ("SM8750", 830),
+            ("SM7475", 725), ("SM7550", 720), ("SM7435", 710), ("SM6450", 710), ("SM7635", 710), ("SM7675", 722),
+        ];
+        let model = self.soc_model.trim().to_ascii_uppercase();
+        SOCS.iter().find(|(m, _)| *m == model).map_or(0, |(_, a)| *a)
     }
 
     fn describe(&self) -> String {
         format!(
-            "kgsl {}, soc {:?}, hardware {:?}, platform {:?}, gpu {:?}",
+            "kgsl {}, soc {:?} {:?}, hardware {:?}, platform {:?}, gpu {:?}, egl {:?}, vulkan {:?}{}{}",
             if self.kgsl { "present" } else { "absent" },
             self.soc,
+            self.soc_model,
             self.hardware,
             self.platform,
-            self.gpu
+            self.gpu,
+            self.egl,
+            self.vulkan,
+            if self.hyperos.is_empty() { String::new() } else { format!(", HyperOS {}", self.hyperos) },
+            if self.miui.is_empty() { String::new() } else { format!(", MIUI {}", self.miui) },
         )
     }
 }
@@ -551,15 +619,26 @@ fn try_activate() -> Result<Status, Status> {
     let dev = Device::read();
     log::info!("turnip: device: {}; Android API {sdk}", dev.describe());
     if mode != Mode::Force {
+        // Adreno only, 650 and up, on a stock-enough Android: everything
+        // else keeps the vendor's driver (RUSTUDIO_TURNIP=force tries anyway).
+        if let Some(gpu) = dev.other_gpu() {
+            return Err(skip(format!("{gpu} GPU: Turnip drives Adreno GPUs only; the device keeps its own driver"), false));
+        }
         if !dev.qualcomm() {
             return Err(skip("not a Snapdragon (no /dev/kgsl-3d0, no Qualcomm SoC in the properties): the device keeps its own driver", false));
         }
-        let gen = dev.adreno_generation();
-        if gen != 0 && gen < 6 {
-            return Err(skip(format!("{}: Turnip supports Adreno 6xx and newer", dev.gpu), false));
+        let model = dev.adreno_model();
+        if model == 0 {
+            return Err(skip(format!("Adreno model unknown (gpu {:?}, soc {:?}): only Adreno {ADRENO_MIN} and newer are tried", dev.gpu, dev.soc_model), false));
+        }
+        if model < ADRENO_MIN {
+            return Err(skip(format!("Adreno {model}: only Adreno {ADRENO_MIN} and newer are tried; the device keeps its own driver"), false));
+        }
+        if !dev.hyperos.is_empty() {
+            return Err(skip(format!("HyperOS {}: libadrenotools' loader hook mostly doesn't find the Vulkan driver paths it expects there; the device keeps its own driver", dev.hyperos), false));
         }
         if sdk < 31 {
-            return Err(skip(format!("Android API {sdk}: libadrenotools-native wants Android 12 (API 31) or newer; RUSTUDIO_TURNIP=force tries anyway"), false));
+            return Err(skip(format!("Android API {sdk}: libadrenotools-native wants Android 12 (API 31) or newer"), false));
         }
     }
     let lib_dir = match native_lib_dir() {

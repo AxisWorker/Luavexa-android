@@ -32,6 +32,8 @@ pub enum Purpose {
     InsertModel,
     /// The selection when the dialog opened.
     SaveSelection(Vec<Ref>),
+    /// Plugins > Save as Local Plugin: the selection when the dialog opened.
+    SaveLocalPlugin(Vec<Ref>),
     /// Save as Project Folder: the "Create in" folder.
     ProjectParent,
     /// Terrain Editor > Import: a heightmap (true) or colormap image.
@@ -75,8 +77,6 @@ impl Request {
         self
     }
 
-    /// (Part of the rfd-shaped builder; no caller sets one yet.)
-    #[allow(dead_code)]
     pub fn set_title(mut self, title: &str) -> Self {
         self.title = Some(title.to_string());
         self
@@ -94,7 +94,7 @@ impl Request {
     }
 
     #[cfg(not(target_os = "android"))]
-    fn into_rfd(self) -> rfd::AsyncFileDialog {
+    pub(crate) fn into_rfd(self) -> rfd::AsyncFileDialog {
         let mut d = rfd::AsyncFileDialog::new();
         if let Some(t) = &self.title {
             d = d.set_title(t);
