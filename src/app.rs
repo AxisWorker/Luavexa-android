@@ -743,6 +743,12 @@ impl RustudioApp {
             log::error!("{line}");
             ed.error(line);
         }
+        // A place the activity was started for but left alone (the last
+        // start ended while opening it: android/storage.rs).
+        #[cfg(target_os = "android")]
+        for line in crate::android::storage::take_notices() {
+            ed.error(line);
+        }
         if ed.render_state.is_none() && !ed.harness.no_render {
             ed.error("No wgpu renderer available; the 3D viewport is disabled.");
         }
@@ -1195,6 +1201,9 @@ impl Editor {
     }
 
     pub fn open_path(&mut self, path: PathBuf) {
+        // (the start counts as settled 20 s after this: android/storage.rs)
+        #[cfg(target_os = "android")]
+        crate::android::storage::opening(&path);
         // File > Recent remembers what a person opens (not test runs).
         let harness = self.harness.screenshot.is_some()
             || self.harness.selftest.is_some()
@@ -2538,6 +2547,16 @@ impl RustudioApp {
         #[cfg(target_os = "macos")]
         for p in crate::macos::take_opened() {
             ed.request(PendingAction::Open(Some(p)));
+        }
+        // Files handed over by a file manager while the editor runs (a
+        // second activity's VIEW intent: src/android/intent.rs), and the
+        // opening marker of src/android/storage.rs once the start settled.
+        #[cfg(target_os = "android")]
+        {
+            for p in crate::android::storage::take_opened() {
+                ed.request(PendingAction::Open(Some(p)));
+            }
+            crate::android::storage::settle();
         }
         // The first frames after the activity's surface came up are drawn
         // whatever the event loop says: a redraw request that arrives while

@@ -37,12 +37,29 @@ static ORIGINAL_LOW_MEMORY: Mutex<Option<unsafe extern "C" fn(*mut ndk_sys::ANat
 static LOW_MEMORY: AtomicBool = AtomicBool::new(false);
 /// `run_native` has returned.
 pub static LOOP_DONE: AtomicBool = AtomicBool::new(false);
+/// [`hook`] ran: the process has its activity, the one the editor's loop
+/// belongs to. Any activity created after that is a second one
+/// (src/android/intent.rs).
+static LOOP_OWNED: AtomicBool = AtomicBool::new(false);
 /// How long the hook gives the loop to close on its own.
 const GRACE: Duration = Duration::from_millis(1500);
 
 /// Keeps the context the hook will close.
 pub fn note_context(ctx: &egui::Context) {
     *CTX.lock().unwrap() = Some(ctx.clone());
+}
+
+/// Whether an activity already owns the editor's loop in this process.
+pub fn loop_owned() -> bool {
+    LOOP_OWNED.load(Ordering::SeqCst)
+}
+
+/// Asks the editor's loop for a frame (a file was queued for it while it
+/// may be paused in the background).
+pub fn wake() {
+    if let Some(ctx) = CTX.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        ctx.request_repaint();
+    }
 }
 
 /// Puts [`on_destroy`] in front of the glue's `onDestroy` callback. Called
@@ -80,6 +97,7 @@ pub unsafe fn hook(activity: *mut std::ffi::c_void) {
         *ORIGINAL_LOW_MEMORY.lock().unwrap() = (*callbacks).onLowMemory;
         (*callbacks).onLowMemory = Some(on_low_memory);
     }
+    LOOP_OWNED.store(true, Ordering::SeqCst);
     log::info!("destroy hook installed");
 }
 

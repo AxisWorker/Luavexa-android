@@ -8,7 +8,10 @@
 //! `AndroidApp` handle) and then wraps the activity's `onDestroy`
 //! (`rustudio::android::lifecycle`), which needs the `ANativeActivity`
 //! itself: `AndroidApp` only gives out the Java `Activity` reference.
-//! Everything after that is `rustudio::android::run`.
+//! Everything after that is `rustudio::android::run`. An activity created
+//! while that one runs (a VIEW intent from a file manager: a new instance
+//! per intent) never reaches the glue: `rustudio::android::intent` hands
+//! its file to the running editor and finishes it.
 //!
 //! On every other target this crate is empty (see Cargo.toml).
 
@@ -35,6 +38,9 @@ pub unsafe extern "C" fn rustudio_on_create(activity: *mut c_void, saved_state: 
     // filled `activity->callbacks` when it returns, and no callback can
     // run before this returns (they share the main thread).
     unsafe {
+        if rustudio::android::intent::second_activity(activity) {
+            return;
+        }
         ANativeActivity_onCreate(activity, saved_state, saved_state_size);
         rustudio::android::lifecycle::hook(activity);
     }

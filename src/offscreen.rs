@@ -150,7 +150,11 @@ pub fn run(
             v.monitor_size = Some(egui::vec2(size[0] as f32, size[1] as f32));
         }
         app.raw_input_hook(&ctx, &mut raw);
-        let out = ctx.run_ui(raw, |ui| app.frame(ui));
+        let mut out = ctx.run_ui(raw, |ui| app.frame(ui));
+        // (epaint's debug builds assert that a TexturesDelta was handled
+        // before it is dropped: applied below where there is a GPU, and
+        // there is nothing to apply it to without one)
+        let mut textures_delta = std::mem::take(&mut out.textures_delta);
         let mut close = false;
         let mut shots = Vec::new();
         for (_, v) in out.viewport_output.iter() {
@@ -167,7 +171,7 @@ pub fn run(
             let jobs = ctx.tessellate(out.shapes, ppp);
             let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: size, pixels_per_point: ppp };
             let mut renderer = rs.renderer.write();
-            for (id, deltas) in &out.textures_delta.set {
+            for (id, deltas) in &textures_delta.set {
                 for delta in deltas {
                     renderer.update_texture(&rs.device, &rs.queue, *id, delta);
                 }
@@ -191,7 +195,7 @@ pub fn run(
                 renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
             }
             crate::gpu_timing::submit(&rs.device, &rs.queue, "gpu: egui (offscreen)", extra.into_iter().chain([enc.finish()]));
-            for id in &out.textures_delta.free {
+            for id in &textures_delta.free {
                 renderer.free_texture(id);
             }
             drop(renderer);
@@ -218,6 +222,7 @@ pub fn run(
                 });
             }
         }
+        textures_delta.clear();
         if close {
             app.on_exit();
             return 0;

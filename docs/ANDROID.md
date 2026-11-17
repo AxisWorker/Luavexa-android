@@ -83,7 +83,8 @@ xbuild quirks worth knowing (commit e67b501):
 | Clipboard | egui-winit (arboard) | egui's copies mirrored to `ClipboardManager` after each frame, pastes read from it (`src/android/clipboard.rs`) |
 | Browser links (`platform::open_url`) | `ctx.open_url` (webbrowser) | `ACTION_VIEW` Intent from the activity (`jni::open_url`); eframe's `links` feature isn't built for Android |
 | Back button | — | closes what is open on top (Escape), otherwise `moveTaskToBack` — the activity isn't destroyed (`src/android/lifecycle.rs`) |
-| Activity destroyed | — | `onDestroy` hook: close request, then `process::exit(0)`; `android_main` always leaves the process when the loop ends (`lifecycle.rs`) |
+| Activity destroyed | — | `onDestroy` hook: close request, then `process::exit(0)`; `android_main` always leaves the process when the loop ends (`lifecycle.rs`): status 0 for a close, 2 for an eframe error, 101 for a panic (named in logcat with its crash report) |
+| "Open with rustudio" while it runs | Finder's hand-over (`macos::take_opened`) | a second instance of the activity per VIEW intent (`launchMode` `standard`), caught at the library's entry point: its file is copied in and queued for the editor's next frame, the editor's task comes to the front, the new activity finishes unseen (`src/android/intent.rs`). A place the last start died within 20 s of opening by itself isn't opened again by itself (`state/opening`, `storage.rs`) |
 | UI zoom | 1.0 of the display's scale | first run: the zoom that fits ~1100 points across (0.8 … 1.6 of the density), then View > Zoom In / Out as saved |
 | GPU driver | the system's | the device's Vulkan driver, or on Snapdragon phones the Turnip (Mesa) driver shipped in the APK, swapped in before wgpu starts (`src/android/turnip.rs`; "Turnip driver" below); OpenGL ES as the fallback either way |
 | Graphics quality | level 10 (Studio's defaults) | Automatic from level 3: the 3D view at 0.7 scale (0.5 while the camera moves, scaled up by EASU + RCAS) with 512² textures, 900 studs of view distance, the lite shader, no anisotropic filtering, no MSAA, one shadow cascade, no frame-rate cap (View > Graphics Settings, the 1–10 bar; "Graphics quality" below); saved with the layout |
@@ -1139,6 +1140,55 @@ also echoed to logcat at the next start.
 - **Nothing in a game answered a finger (its own thumbstick, jump button
   and touch buttons did nothing).** The game saw a mouse and keyboard
   (see "Fingers in Play": fingers reach the game as touch now).
+- **"Crashes" that `dumpsys activity exit-info` lists as `reason=1
+  (EXIT_SELF) status=0` in the foreground (`importance=100`), several
+  in a few minutes, after a place was opened from a Files app.** Two
+  things, both of which made a process end by itself with a clean
+  status:
+  1. *A second activity.* The editor's activity had xbuild's default
+     `launchMode` (`singleTop`); a VIEW intent from a file manager while
+     rustudio ran (its task in the background, or the intent without
+     `FLAG_ACTIVITY_NEW_TASK`) made Android create a second instance of
+     the activity in the same process. `NativeActivity` ran the
+     library's entry point for it, the glue started a second
+     `android_main`, and `eframe::run_native` failed there (one winit
+     event loop per process), after which `android::run` left the whole
+     process — editor, place and all. `src/android/intent.rs` now: an
+     activity after the first never reaches the glue; its file is
+     copied in and queued for the editor's next frame
+     (`storage::take_opened`, `PendingAction::Open`, the same path as
+     macOS's Finder hand-over), the editor's task is moved to the front
+     (`ActivityManager.moveTaskToFront`, REORDER_TASKS in
+     manifest.yaml) and the activity finishes inside its `onCreate`,
+     unseen. `launchMode` is `standard` on purpose: a new instance per
+     intent is the one way a VIEW intent reaches native code without a
+     Java class (`onNewIntent` isn't passed on, and `singleTop` /
+     `singleTask` would swallow the intent in it). `android::run` also
+     refuses to run twice (returns, which finishes that activity only).
+  2. *The same place at every launch.* The activity's VIEW intent is
+     delivered again whenever its task comes back after the process
+     died (a tap on the icon brings the task back; Android recreates
+     the activity with its original intent), so a place that brought
+     the app down came back at once, and the Imported folder got a
+     "name (2)", "name (3)" copy each time. `storage::launch_file`
+     writes `state/opening` (the file) before an automatic open and
+     `storage::settle` removes it 20 s later; at a start that finds the
+     marker naming the same file, the file is left alone and Output
+     says so (File ▸ Open Recent opens it on purpose). Imports are
+     compared byte for byte with the copies already there and reuse
+     them.
+  A Rust panic on the editor's thread read the same way: android-
+  activity's glue catches a panic out of `android_main`, logs it
+  (logcat, not under the rustudio tag) and finishes the Activity
+  gracefully, and the destroy hook then left the process with status 0.
+  `android::run` catches the panic itself now: the panic message and
+  the crash report's path go to logcat under `rustudio` at error level,
+  and the process leaves with status 101 (an eframe error: status 2).
+  The report (`crash::install`'s hook: message and backtrace) is echoed
+  to Output and logcat at the next start. So, after any exit the
+  exit-info calls `EXIT_SELF`: relaunch, then `adb logcat -d -s rustudio
+  RustStdoutStderr RustPanic | grep -B2 -A40 -iE "panic|second
+  activity|leaving the process"`.
 
 ## Later steps (in order)
 

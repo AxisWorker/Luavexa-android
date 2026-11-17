@@ -354,7 +354,8 @@ fn shorten(p: &Path) -> String {
 /// rustudio" in a file manager, a share sheet, a download notification):
 /// the Intent's data URI, copied into the app's folder when it is a
 /// `content:` URI (another app's document, readable only through its
-/// ContentResolver).
+/// ContentResolver) — unless the last start ended while opening that same
+/// file ([`skip_crashed`]).
 pub fn launch_file(_app: &super::AndroidApp) -> Option<PathBuf> {
     let uri = match super::jni::launch_intent_uri() {
         Ok(u) => u?,
@@ -364,11 +365,33 @@ pub fn launch_file(_app: &super::AndroidApp) -> Option<PathBuf> {
         }
     };
     log::info!("launch intent: {uri}");
-    import_uri(&uri)
+    let path = import_uri(&uri)?;
+    if skip_crashed(&path) {
+        return None;
+    }
+    opening_marker(Some(&path));
+    Some(path)
 }
 
-/// A local path for `uri`.
+/// A local path for `uri`, through the running activity.
 pub fn import_uri(uri: &str) -> Option<PathBuf> {
+    import_uri_with(uri, &|f| super::jni::with_activity(f))
+}
+
+/// [`import_uri`] through the Activity of a raw `ANativeActivity` (a
+/// second activity of the process: src/android/intent.rs).
+///
+/// # Safety
+/// `activity` must be the live `ANativeActivity`.
+pub unsafe fn import_uri_from(activity: *mut ndk_sys::ANativeActivity, uri: &str) -> Option<PathBuf> {
+    // SAFETY: the caller's live struct.
+    import_uri_with(uri, &|f| unsafe { super::jni::with_native_activity(activity, f) })
+}
+
+/// A JNI call made with some Activity: the name and the bytes of a URI.
+type Fetch<'a> = &'a mut dyn FnMut(&mut jni::Env, &jni::objects::JObject) -> jni::errors::Result<(Option<String>, Vec<u8>)>;
+
+fn import_uri_with(uri: &str, with: &dyn Fn(Fetch<'_>) -> super::jni::Result<(Option<String>, Vec<u8>)>) -> Option<PathBuf> {
     if let Some(rest) = uri.strip_prefix("file://") {
         let p = PathBuf::from(percent_decode(rest));
         return p.is_file().then_some(p);
@@ -376,24 +399,38 @@ pub fn import_uri(uri: &str) -> Option<PathBuf> {
     if !uri.starts_with("content://") {
         return None;
     }
-    let name = super::jni::content_display_name(uri)
-        .ok()
-        .flatten()
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| "place.rbxl".to_string());
-    let bytes = match super::jni::read_content_uri(uri) {
-        Ok(b) => b,
+    let (name, bytes) = match with(&mut |env, activity| {
+        // (a provider without a name column throws: the name is optional,
+        // the exception must not stand in the way of the read)
+        let name = super::jni::display_name(env, activity, uri).unwrap_or_else(|e| {
+            log::warn!("{uri}: no display name: {e}");
+            env.exception_clear();
+            None
+        });
+        let bytes = super::jni::content_bytes(env, activity, uri)?;
+        Ok((name, bytes))
+    }) {
+        Ok(x) => x,
         Err(e) => {
             log::error!("{uri}: {e}");
             return None;
         }
     };
+    let name = name.filter(|n| !n.is_empty()).unwrap_or_else(|| "place.rbxl".to_string());
     let dir = super::data_dir().join("Imported");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log::error!("{}: {e}", dir.display());
         return None;
     }
-    let path = unique_path(&dir.join(safe_name(&name)));
+    // The same file handed over again (the activity recreated with its
+    // VIEW intent, "Open with" twice) is the copy already made, not
+    // "name (2)": the copies are compared byte for byte.
+    let wanted = dir.join(safe_name(&name));
+    if let Some(same) = same_import(&wanted, &bytes) {
+        log::info!("{name} is already imported as {}", same.display());
+        return Some(same);
+    }
+    let path = unique_path(&wanted);
     match std::fs::write(&path, &bytes) {
         Ok(()) => {
             log::info!("imported {} bytes to {}", bytes.len(), path.display());
@@ -404,6 +441,113 @@ pub fn import_uri(uri: &str) -> Option<PathBuf> {
             None
         }
     }
+}
+
+/// Among `p` and its `p (n)` copies, the one holding exactly `bytes`.
+fn same_import(p: &Path, bytes: &[u8]) -> Option<PathBuf> {
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let dir = p.parent().unwrap_or(Path::new("."));
+    std::iter::once(p.to_path_buf())
+        .chain((2..100).map(|n| dir.join(format!("{stem} ({n}){ext}"))))
+        .take_while(|c| c.exists())
+        .find(|c| std::fs::metadata(c).is_ok_and(|m| m.len() == bytes.len() as u64) && std::fs::read(c).is_ok_and(|b| b == bytes))
+}
+
+// ------------------------------------------------------ opened while running
+
+/// Files handed over while the editor runs (a second activity's VIEW
+/// intent, src/android/intent.rs), for the editor's next frame.
+static OPENED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+pub fn push_opened(p: PathBuf) {
+    OPENED.lock().unwrap_or_else(|e| e.into_inner()).push(p);
+}
+
+/// The files pushed since the last call (the editor opens them).
+pub fn take_opened() -> Vec<PathBuf> {
+    std::mem::take(&mut *OPENED.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+// ------------------------------------------------------- the opening marker
+
+/// Lines for Output at start (what [`launch_file`] decided).
+static NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn take_notices() -> Vec<String> {
+    std::mem::take(&mut *NOTICES.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// The file an open is under way for, until the start has survived
+/// [`SETTLED`] past it.
+static OPENING: std::sync::Mutex<Option<(PathBuf, Instant)>> = std::sync::Mutex::new(None);
+/// A start that ran this long after opening a file counts as having
+/// opened it.
+const SETTLED: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// `state/opening`: the file the last automatic open was of, left behind
+/// when the process ended within [`SETTLED`] of it.
+fn marker_path() -> PathBuf {
+    super::state_dir().join("opening")
+}
+
+fn opening_marker(p: Option<&Path>) {
+    let m = marker_path();
+    match p {
+        Some(p) => {
+            let _ = std::fs::create_dir_all(super::state_dir());
+            if let Err(e) = std::fs::write(&m, p.to_string_lossy().as_bytes()) {
+                log::warn!("{}: {e}", m.display());
+            }
+            opening(p);
+        }
+        None => {
+            let _ = std::fs::remove_file(&m);
+        }
+    }
+}
+
+/// Whether the last start ended (a crash, a kill) within [`SETTLED`] of
+/// opening `p` by itself. The Activity's VIEW intent is delivered again
+/// each time its task comes back after the process died, so a place that
+/// brings the app down would otherwise bring it down at every launch,
+/// with nothing to be done about it on the device. The file is left alone
+/// then and Output says so; File ▸ Open Recent opens it on purpose, and
+/// once such a start has settled the marker is forgotten.
+fn skip_crashed(p: &Path) -> bool {
+    let Ok(last) = std::fs::read_to_string(marker_path()) else { return false };
+    if Path::new(last.trim()) != p {
+        return false;
+    }
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let line = format!(
+        "rustudio ended within {} s of opening {name} the last time, so it wasn't opened again by itself. \
+         File ▸ Open Recent opens it on purpose (adb logcat -s rustudio RustStdoutStderr tells what ended the last start).",
+        SETTLED.as_secs()
+    );
+    log::warn!("{line}");
+    NOTICES.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+    true
+}
+
+/// A file is being opened (the editor's `open_path`): the clock for
+/// [`settle`] starts (again).
+pub fn opening(p: &Path) {
+    *OPENING.lock().unwrap_or_else(|e| e.into_inner()) = Some((p.to_path_buf(), Instant::now()));
+}
+
+/// Once a frame: a start that has run [`SETTLED`] past its last open has
+/// opened that file for good; the marker it may have left goes.
+pub fn settle() {
+    let mut o = OPENING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((p, since)) = o.as_ref() else { return };
+    if since.elapsed() < SETTLED {
+        return;
+    }
+    if std::fs::read_to_string(marker_path()).is_ok_and(|last| Path::new(last.trim()) == p) {
+        opening_marker(None);
+    }
+    *o = None;
 }
 
 /// `name.ext`, else `name (2).ext`, … so an import never overwrites.

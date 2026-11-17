@@ -45,12 +45,56 @@ pub fn with_activity<T>(f: impl FnOnce(&mut Env, &JObject) -> jni::errors::Resul
     if raw.is_null() {
         return Err("the Activity is gone".into());
     }
+    // SAFETY: a valid global reference, held by AndroidApp for as long as
+    // `app()` hands it out.
+    unsafe { with_java_activity(raw, f) }
+}
+
+/// Runs `f` with the Java Activity `raw` refers to, on this thread.
+///
+/// # Safety
+/// `raw` must be a live JNI reference (global, or local to this thread) to
+/// an `android.app.Activity`; it is borrowed, never deleted.
+pub unsafe fn with_java_activity<T>(raw: jni::sys::jobject, f: impl FnOnce(&mut Env, &JObject) -> jni::errors::Result<T>) -> Result<T> {
     with_env(|env| {
-        // SAFETY: a valid global reference, held by AndroidApp for as long
-        // as `app()` hands it out; Cast never deletes it.
+        // SAFETY: the caller's live reference; Cast never deletes it.
         let activity = unsafe { env.as_cast_raw::<JObject>(&raw)? };
         f(env, &activity)
     })
+}
+
+/// Runs `f` with the Activity of a raw `ANativeActivity`: the one the
+/// framework passed to the library's entry point, before (or without)
+/// android-activity's `AndroidApp` for it (src/android/intent.rs). Its own
+/// JavaVM is used, so this works in a process where [`with_activity`]'s
+/// handle isn't there yet.
+///
+/// # Safety
+/// `activity` must be the live `ANativeActivity` (valid until its
+/// `onDestroy` returns).
+pub unsafe fn with_native_activity<T>(
+    activity: *mut ndk_sys::ANativeActivity,
+    f: impl FnOnce(&mut Env, &JObject) -> jni::errors::Result<T>,
+) -> Result<T> {
+    if activity.is_null() {
+        return Err("no ANativeActivity".into());
+    }
+    // SAFETY: the caller's live struct.
+    let (vm, clazz) = unsafe { ((*activity).vm, (*activity).clazz) };
+    if vm.is_null() || clazz.is_null() {
+        return Err("ANativeActivity without a JavaVM or an Activity".into());
+    }
+    // SAFETY: the JavaVM NativeActivity was created in; JavaVM::from_raw
+    // only stores the pointer.
+    let vm = unsafe { JavaVM::from_raw(vm.cast()) };
+    let clazz: jni::sys::jobject = clazz.cast();
+    vm.attach_current_thread(|env| {
+        // SAFETY: `clazz` is the framework's global reference to the
+        // Activity, live as long as the ANativeActivity is.
+        let activity = unsafe { env.as_cast_raw::<JObject>(&clazz)? };
+        f(env, &activity)
+    })
+    .map_err(|e: jni::errors::Error| e.to_string())
 }
 
 /// `Build.VERSION.SDK_INT`.
@@ -427,7 +471,12 @@ pub fn network_available() -> Option<bool> {
 /// `ContentResolver.openInputStream(Uri.parse(uri))` read to the end: a
 /// file the system picker or a share sheet handed over as a `content:` URI.
 pub fn read_content_uri(uri: &str) -> Result<Vec<u8>> {
-    with_activity(|env, activity| {
+    with_activity(|env, activity| content_bytes(env, activity, uri))
+}
+
+/// [`read_content_uri`] with the Activity at hand.
+pub fn content_bytes(env: &mut Env, activity: &JObject, uri: &str) -> jni::errors::Result<Vec<u8>> {
+    {
         let juri = env.new_string(uri)?;
         let uri = env
             .call_static_method(jni_str!("android/net/Uri"), jni_str!("parse"), jni_sig!("(Ljava/lang/String;)Landroid/net/Uri;"), &[JValue::Object(&juri)])?
@@ -460,13 +509,18 @@ pub fn read_content_uri(uri: &str) -> Result<Vec<u8>> {
         }
         env.call_method(&stream, jni_str!("close"), jni_sig!("()V"), &[])?;
         Ok(out)
-    })
+    }
 }
 
 /// The display name of a `content:` URI (`OpenableColumns.DISPLAY_NAME`
 /// through `ContentResolver.query`), for the file's extension.
 pub fn content_display_name(uri: &str) -> Result<Option<String>> {
-    with_activity(|env, activity| {
+    with_activity(|env, activity| display_name(env, activity, uri))
+}
+
+/// [`content_display_name`] with the Activity at hand.
+pub fn display_name(env: &mut Env, activity: &JObject, uri: &str) -> jni::errors::Result<Option<String>> {
+    {
         let juri = env.new_string(uri)?;
         let uri = env
             .call_static_method(jni_str!("android/net/Uri"), jni_str!("parse"), jni_sig!("(Ljava/lang/String;)Landroid/net/Uri;"), &[JValue::Object(&juri)])?
@@ -498,13 +552,18 @@ pub fn content_display_name(uri: &str) -> Result<Option<String>> {
         }
         env.call_method(&cursor, jni_str!("close"), jni_sig!("()V"), &[])?;
         Ok(name)
-    })
+    }
 }
 
 /// `Intent.getData().toString()` of the Intent this activity was started
 /// with (a VIEW of a place file), if any.
 pub fn launch_intent_uri() -> Result<Option<String>> {
-    with_activity(|env, activity| {
+    with_activity(intent_uri)
+}
+
+/// [`launch_intent_uri`] with the Activity at hand.
+pub fn intent_uri(env: &mut Env, activity: &JObject) -> jni::errors::Result<Option<String>> {
+    {
         let intent = env.call_method(activity, jni_str!("getIntent"), jni_sig!("()Landroid/content/Intent;"), &[])?.l()?;
         if intent.is_null() {
             return Ok(None);
@@ -516,7 +575,24 @@ pub fn launch_intent_uri() -> Result<Option<String>> {
         let s = env.call_method(&data, jni_str!("toString"), jni_sig!("()Ljava/lang/String;"), &[])?.l()?;
         let s = env.as_cast::<jni::objects::JString>(&s)?;
         Ok(Some((*s).to_string()))
-    })
+    }
+}
+
+/// `Activity.getTaskId()`.
+pub fn task_id(env: &mut Env, activity: &JObject) -> jni::errors::Result<i32> {
+    env.call_method(activity, jni_str!("getTaskId"), jni_sig!("()I"), &[])?.i()
+}
+
+/// `ActivityManager.moveTaskToFront(task, 0)` (REORDER_TASKS, a normal
+/// permission, in manifest.yaml): the task holding the editor comes to the
+/// front of the screen.
+pub fn move_task_to_front(env: &mut Env, activity: &JObject, task: i32) -> jni::errors::Result<()> {
+    let am = system_service(env, activity, "activity")?;
+    if am.is_null() {
+        return Err(jni::errors::Error::NullPtr("ActivityManager"));
+    }
+    env.call_method(&am, jni_str!("moveTaskToFront"), jni_sig!("(II)V"), &[JValue::Int(task), JValue::Int(0)])?;
+    Ok(())
 }
 
 // ---------------------------------------------------------- main thread

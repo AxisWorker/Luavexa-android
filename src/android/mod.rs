@@ -25,6 +25,7 @@
 
 mod assets;
 pub mod clipboard;
+pub mod intent;
 pub mod jni;
 pub mod keyboard;
 pub mod lifecycle;
@@ -200,7 +201,13 @@ pub fn run(app: AndroidApp) {
         AndroidApp::sdk_version(),
         crate::perf_log::build()
     );
-    let _ = APP.set(app.clone());
+    if APP.set(app.clone()).is_err() {
+        // (not expected: the entry point keeps any activity after the
+        // first away from the glue, intent.rs; returning finishes this one
+        // without touching the process)
+        log::error!("android_main ran again in this process: this activity is finished, the editor keeps running");
+        return;
+    }
     export_env();
     log::info!(
         "files {} / data {} / cache {}",
@@ -250,21 +257,50 @@ pub fn run(app: AndroidApp) {
         android_app: Some(app),
         ..Default::default()
     };
-    let result = eframe::run_native(
-        "rustudio",
-        options,
-        Box::new(move |cc| {
-            lifecycle::note_context(&cc.egui_ctx);
-            let mut app = crate::app::RustudioApp::new(cc, open, crate::app::Harness::interactive(), false);
-            touch::setup(&mut app, &cc.egui_ctx);
-            Ok(Box::new(app))
-        }),
-    );
-    if let Err(e) = result {
-        log::error!("eframe: {e}");
-    }
+    // A panic on the editor's thread is caught here, not left to
+    // android-activity's glue: the glue catches it too, but then finishes
+    // the Activity gracefully, so the process ended as `reason=1
+    // (EXIT_SELF) status=0` in `dumpsys activity exit-info` — a clean exit
+    // to every tool — with the panic only in logcat. Now the report
+    // (crash::install's hook wrote it) is named, the panic goes to logcat
+    // at error level under the rustudio tag, and the process leaves with
+    // status 101 (Rust's for a panic), so the exit-info tells a crash
+    // from a close.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eframe::run_native(
+            "rustudio",
+            options,
+            Box::new(move |cc| {
+                lifecycle::note_context(&cc.egui_ctx);
+                let mut app = crate::app::RustudioApp::new(cc, open, crate::app::Harness::interactive(), false);
+                touch::setup(&mut app, &cc.egui_ctx);
+                Ok(Box::new(app))
+            }),
+        )
+    }));
     perf_hint::stop();
     lifecycle::LOOP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            // (eframe gave up: a surface or device it couldn't make)
+            log::error!("eframe: {e}");
+            log::error!("rustudio: the editor's loop ended with an error, leaving the process");
+            std::process::exit(2);
+        }
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".into());
+            log::error!("rustudio: panic on the editor's thread: {msg}");
+            if let Some(p) = crate::crash::last_report() {
+                log::error!("rustudio: crash report {} (echoed to Output and logcat at the next start)", p.display());
+            }
+            std::process::exit(101);
+        }
+    }
     // The next launch gets a fresh process: the handles kept in this one's
     // statics (APP, the folders, the destroy hook's context) belong to this
     // activity, and android-activity may run android_main again in the same

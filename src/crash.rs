@@ -65,13 +65,25 @@ fn header(kind: &str) -> String {
     )
 }
 
+/// The report this process wrote (the panic hook's), if any.
+static LAST_REPORT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
 fn write_report(body: &str) -> Option<PathBuf> {
     let d = dir();
     std::fs::create_dir_all(&d).ok()?;
     let path = d.join(format!("{}-{}.txt", stamp(), std::process::id()));
     let mut f = std::fs::File::create(&path).ok()?;
     f.write_all(body.as_bytes()).ok()?;
+    if let Ok(mut l) = LAST_REPORT.lock() {
+        *l = Some(path.clone());
+    }
     Some(path)
+}
+
+/// The report this process's panic hook wrote, if a panic happened (the
+/// Android entry names it in logcat before leaving).
+pub fn last_report() -> Option<PathBuf> {
+    LAST_REPORT.lock().ok().and_then(|l| l.clone())
 }
 
 /// Install the panic hook and the fatal-signal handlers. Call first in main.

@@ -22,6 +22,10 @@ android:
       - name: android.permission.ACCESS_NETWORK_STATE
       # HapticService:SetMotor / HapticEffect:Play through Vibrator.
       - name: android.permission.VIBRATE
+      # ActivityManager.moveTaskToFront: a place opened from a file manager
+      # while the editor runs brings the editor's task to the front
+      # (src/android/intent.rs). A normal permission, granted at install.
+      - name: android.permission.REORDER_TASKS
       # The in-app file picker (src/android/storage.rs) listing shared
       # storage (Download, Documents, …) for places and models. NativeActivity
       # gets no onActivityResult, so the system document picker (Storage
@@ -68,6 +72,14 @@ android:
           # StarterGui.ScreenOrientation re-requests the orientation while
           # it plays (Activity.setRequestedOrientation, src/android/jni.rs).
           orientation: sensorLandscape
+          # A new instance for every intent (xbuild's default is singleTop):
+          # NativeActivity passes no onNewIntent on to native code, so a
+          # VIEW intent reaching a running instance would be lost. Each
+          # instance after the first is caught at the library's entry point
+          # (src/android/intent.rs): its file goes to the running editor and
+          # it finishes before it is shown, so there is never a second
+          # editor in the process.
+          launch_mode: standard
           # Every configuration change the activity can be told about
           # instead of being recreated for (xbuild's default list plus the
           # keyboard / touch screen, the SIM, colour mode and bold text):
