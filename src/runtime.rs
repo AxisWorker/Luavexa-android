@@ -2158,7 +2158,7 @@ fn prop_get_plain(
 }
 
 fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
-    let (old, descendants) = {
+    let (old, descendants, lost, snaps) = {
         let mut w = world(lua)?;
         let old = w
             .d()
@@ -2197,6 +2197,9 @@ fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
             }
         }
         let was_in = w.mode == RunMode::Edit && w.d().records_change(r);
+        let in_ws = |d: &Document, p: Ref| p.is_some() && d.workspace().is_some_and(|ws| p == ws || d.is_ancestor(ws, p));
+        let enters_ws = w.mode != RunMode::Edit && !in_ws(w.d(), old) && in_ws(w.d(), new_parent);
+        let lost = primary_parts_leaving(&w, r, old, new_parent);
         w.dm().dom.transfer_within(r, new_parent);
         if new_parent.is_none() {
             w.orphans.insert(r);
@@ -2229,9 +2232,151 @@ fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
         for d in &descendants {
             w.dirty.insert(*d);
         }
-        (old, descendants)
+        let snaps = if enters_ws { weld_snaps(w.d(), r) } else { Vec::new() };
+        (old, descendants, lost, snaps)
     };
+    for (model, pivot) in lost {
+        store_prop(lua, model, "PrimaryPart", Variant::Ref(Ref::none()))?;
+        store_prop(lua, model, "WorldPivotData", Variant::OptionalCFrame(Some(pivot.to_cframe())))?;
+    }
+    for (part, xf) in snaps {
+        store_prop(lua, part, "CFrame", Variant::CFrame(xf.to_cframe()))?;
+    }
     fire_parent_signals(lua, r, old, new_parent, descendants)
+}
+
+/// Parts of `r`'s tree that its saved WeldConstraints place as it enters the
+/// Workspace. A WeldConstraint keeps its offset (the hidden CFrame0 =
+/// Part0⁻¹ · Part1, saved and cloned with it) and the assembly is built from
+/// it: a part a script moved while the tree was out of the Workspace goes
+/// back where its weld holds it. A game's hand lantern clones
+/// its LanternAssets, sets every part's CFrame to the tool's Handle and only
+/// then parents it; in Roblox the lantern still comes out whole. Parts
+/// outside the tree stay put and the tree's parts are placed outward from
+/// them (else from the first weld's Part0).
+fn weld_snaps(d: &Document, r: Ref) -> Vec<(Ref, Xform)> {
+    let inside: HashSet<Ref> = std::iter::once(r).chain(d.dom.descendants_of(r).map(|i| i.referent())).collect();
+    let cf = |x: Ref| match d.prop(x, "CFrame") {
+        Some(Variant::CFrame(c)) => Some(Xform::from_cframe(&c)),
+        _ => None,
+    };
+    let part = |x: Option<Variant>| match x {
+        Some(Variant::Ref(p)) if p.is_some() && d.class_of(p).is_some_and(|c| doc::is_a(&c, "BasePart")) => Some(p),
+        _ => None,
+    };
+    // (Part0, Part1, Part0⁻¹ · Part1) for each saved, enabled weld.
+    let mut welds: Vec<(Ref, Ref, Xform)> = Vec::new();
+    for x in &inside {
+        let Some(i) = d.dom.get_by_ref(*x) else { continue };
+        if i.class != "WeldConstraint" || !crate::physics::joint_enabled(d, *x) {
+            continue;
+        }
+        let Some(Variant::CFrame(c0)) = d.prop(*x, "CFrame0") else { continue };
+        if let Some((p0, p1)) = crate::physics::joint_parts(d, *x) {
+            // (a weld to a part outside the Workspace holds nothing: a clone's weld to
+            // its template's part, still in ReplicatedStorage)
+            let live = |p: Ref| part(Some(Variant::Ref(p))).is_some() && d.workspace().is_some_and(|ws| d.is_ancestor(ws, p));
+            if p0 != p1 && live(p0) && live(p1) {
+                welds.push((p0, p1, Xform::from_cframe(&c0)));
+            }
+        }
+    }
+    if welds.is_empty() {
+        return Vec::new();
+    }
+    welds.sort_by_key(|(a, b, _)| (format!("{a:?}"), format!("{b:?}")));
+    let mut at: HashMap<Ref, Xform> = HashMap::new();
+    let mut queue: VecDeque<Ref> = VecDeque::new();
+    for (p0, p1, _) in &welds {
+        for p in [*p0, *p1] {
+            if !inside.contains(&p) && !at.contains_key(&p) {
+                if let Some(x) = cf(p) {
+                    at.insert(p, x);
+                    queue.push_back(p);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let inv = |x: &Xform| Xform { rot: x.rot.transpose(), pos: -(x.rot.transpose() * x.pos) };
+    loop {
+        while let Some(p) = queue.pop_front() {
+            let px = at[&p];
+            for (p0, p1, off) in &welds {
+                let (q, step) = if *p0 == p {
+                    (*p1, *off)
+                } else if *p1 == p {
+                    (*p0, inv(off))
+                } else {
+                    continue;
+                };
+                if at.contains_key(&q) {
+                    continue;
+                }
+                let want = compose(&px, &step);
+                at.insert(q, want);
+                queue.push_back(q);
+                if let Some(cur) = cf(q) {
+                    if (cur.pos - want.pos).length() > 1e-3 || !cur.rot.abs_diff_eq(want.rot, 1e-4) {
+                        out.push((q, want));
+                    }
+                }
+            }
+        }
+        // A tree of its own: placed from its first weld's Part0, which stays.
+        let Some(start) = welds.iter().map(|w| w.0).find(|p| !at.contains_key(p)) else { break };
+        let Some(x) = cf(start) else { break };
+        at.insert(start, x);
+        queue.push_back(start);
+    }
+    out
+}
+
+/// The Models (among `old` and its ancestors) whose PrimaryPart leaves them
+/// when `r` moves from `old` to `new_parent`, each with the pivot it had.
+/// Studio (checked in a Studio-11-15, execute_luau in Edit):
+/// destroying the PrimaryPart, or parenting it out of the model, sets
+/// Model.PrimaryPart to nil at once (the model in the DataModel or not), and
+/// the model's pivot stays where the part's pivot was: GetPivot and
+/// WorldPivot both read the old PrimaryPart.CFrame · PivotOffset after, so a
+/// later PivotTo measures from there. A game's teleport menu
+/// clones its sky box, destroys the box's Center (its PrimaryPart) and then
+/// PivotTo's the box onto the camera every frame.
+fn primary_parts_leaving(w: &World, r: Ref, old: Ref, new_parent: Ref) -> Vec<(Ref, Xform)> {
+    let d = w.d();
+    let mut out = Vec::new();
+    let mut cur = old;
+    while cur.is_some() {
+        let Some(i) = d.dom.get_by_ref(cur) else { break };
+        let pp = if doc::is_a(&i.class, "Model") {
+            match d.prop(cur, "PrimaryPart") {
+                Some(Variant::Ref(pp)) => pp,
+                _ => Ref::none(),
+            }
+        } else {
+            Ref::none()
+        };
+        {
+            if pp.is_some()
+                && (pp == r || d.is_ancestor(r, pp))
+                && !(new_parent == cur || d.is_ancestor(cur, new_parent))
+            {
+                let pivot = match d.prop(pp, "CFrame") {
+                    Some(Variant::CFrame(cf)) => {
+                        let off = match d.prop(pp, "PivotOffset") {
+                            Some(Variant::CFrame(o)) => Xform::from_cframe(&o),
+                            _ => Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY },
+                        };
+                        compose(&Xform::from_cframe(&cf), &off)
+                    }
+                    _ => model_pivot(w, cur),
+                };
+                out.push((cur, pivot));
+            }
+        }
+        cur = i.parent();
+    }
+    out
 }
 
 /// The signals of `r` having moved from `old` to `new_parent` (already done
@@ -2540,7 +2685,7 @@ fn fire_changed(lua: &Lua, r: Ref, key: &str) -> mlua::Result<()> {
 /// The change history's record of a script's property write: every
 /// property of `r` that differs from `before` (the written one and its
 /// twins).
-pub(crate) fn note_prop_changes(w: &mut World, r: Ref, before: &rbx_dom_weak::UstrMap<Variant>) {
+pub(crate) fn note_prop_changes(w: &mut World, r: Ref, before: &rbx_dom_weak::PropMap) {
     let Some(inst) = w.d().dom.get_by_ref(r) else { return };
     let mut changes = Vec::new();
     for (k, nv) in inst.properties.iter() {
@@ -3388,6 +3533,24 @@ fn pivot_to(lua: &Lua, r: Ref, target: Xform) -> mlua::Result<()> {
             "CFrame",
             Variant::CFrame(cf_mul(&delta, &xf).orthonormalized().to_cframe()),
         )?;
+    }
+    // Roblox: after PivotTo the model's pivot *is* the target (GetPivot
+    // returns it). With a PrimaryPart that follows from the part having
+    // moved; without one the pivot is the model's own WorldPivotData, so it
+    // moves too (a model that had none, pivoting on its parts' bounds, gets
+    // one). Left behind, every PivotTo measured its delta from the stale
+    // pivot: a game's teleport menu PivotTo's its sky box (a
+    // Model, no PrimaryPart) onto the camera every RenderStepped and the
+    // box ran off by the same offset each frame (-89600 studs in 6 s), so
+    // its Beam sky never showed.
+    let primary_moves = {
+        let w = world(lua)?;
+        let d = w.d();
+        matches!(d.prop(r, "PrimaryPart"), Some(Variant::Ref(pp))
+            if pp.is_some() && matches!(d.prop(pp, "CFrame"), Some(Variant::CFrame(_))))
+    };
+    if !primary_moves && doc::is_a(&class, "Model") {
+        store_prop(lua, r, "WorldPivotData", Variant::OptionalCFrame(Some(target.to_cframe())))?;
     }
     Ok(())
 }
@@ -4569,10 +4732,7 @@ impl Runtime {
                         let i = w.d().dom.get_by_ref(src).ok_or_else(|| rt_err("Argument 1 missing or nil"))?;
                         (i.name.clone(), i.properties.clone())
                     };
-                    let mut b = InstanceBuilder::new(class.as_str()).with_name(name);
-                    for (k, v) in props {
-                        b.add_property(k, v);
-                    }
+                    let b = InstanceBuilder::new(class.as_str()).with_name(name).with_prop_map(props);
                     let r = w.dm().dom.insert(Ref::none(), b);
                     w.structure_changed = true;
                     r
@@ -5151,6 +5311,28 @@ impl Runtime {
                 };
                 let v = lua_to_variant(&key, &value, ty, en.as_deref(), existing.as_ref())?;
                 store_prop(lua, inst.0, canon, v)
+            })?,
+        )?;
+        // The device's motion sensors (src/device_sensors.rs): nil where
+        // there are none, else the latest reading for UserInputService's
+        // GetDeviceAcceleration / GetDeviceGravity / GetDeviceRotation and
+        // the *Changed events (the library's __rs_sensor_frame).
+        g.set(
+            "__rs_device_sensors",
+            lua.create_function(|lua, ()| {
+                let Some(s) = crate::device_sensors::latest() else { return Ok(Value::Nil) };
+                let t = lua.create_table()?;
+                let v3 = |v: [f32; 3]| crate::ltypes::LVector3(Vec3::new(v[0], v[1], v[2])).into_value();
+                t.set("acceleration", v3(s.acceleration))?;
+                t.set("gravity", v3(s.gravity))?;
+                t.set("gyro", v3(s.gyro))?;
+                let q = glam::Quat::from_xyzw(s.rotation[0], s.rotation[1], s.rotation[2], s.rotation[3]).normalize();
+                let q = if q.is_finite() { q } else { glam::Quat::IDENTITY };
+                t.set("rotation", crate::ltypes::LCFrame(crate::math::Xform { pos: Vec3::ZERO, rot: glam::Mat3::from_quat(q) }))?;
+                t.set("acceleration_seq", s.acceleration_seq)?;
+                t.set("gravity_seq", s.gravity_seq)?;
+                t.set("rotation_seq", s.rotation_seq)?;
+                Ok(Value::Table(t))
             })?,
         )?;
         lua.load(include_str!("library.luau"))
@@ -6362,8 +6544,21 @@ impl Runtime {
                 }
             })
             .flatten();
+        let character = match (name, &v) {
+            ("Character", Variant::Ref(c)) if c.is_some() => Some(*c),
+            _ => None,
+        };
         if let Err(e) = store_prop(&self.lua, r, name, v) {
             report(&self.lua, &e);
+        }
+        // The LocalPlayer's Character set: the LocalScripts already in that
+        // model start now, as in Roblox (a server may stream the character
+        // in before it sets the property); ones that arrive later start as
+        // they arrive (set_parent).
+        if let (Some(c), Ok(mut w)) = (character, world(&self.lua)) {
+            if w.d().exists(c) {
+                w.queue_scripts(c);
+            }
         }
         if let (Some((old, new)), Ok(mut w)) = (health, world(&self.lua)) {
             if new != old {
@@ -6566,6 +6761,34 @@ mod tests {
             out[4].0 == Level::Error && out[4].1.contains("ServerScriptService.T:14: boom"),
             "{out:?}"
         );
+    }
+
+    /// Model pivots as a Studio gave them (2026-11-15, the same
+    /// script in execute_luau): a PrimaryPart destroyed or parented out of
+    /// its model is cleared at once and the pivot stays where the part's
+    /// was; PivotTo then moves the WorldPivot with the parts.
+    #[test]
+    fn pivot_follows_pivot_to_and_lost_primary_part() {
+        let out = run("local m = Instance.new(\"Model\")\n\
+            local c = Instance.new(\"Part\") c.Name = \"Center\" c.Anchored = true c.Position = Vector3.new(0, 900, 0) c.Parent = m\n\
+            local a = Instance.new(\"Part\") a.Anchored = true a.Position = Vector3.new(0, 900, 60) a.Parent = m\n\
+            m.PrimaryPart = c m.Parent = workspace\n\
+            local k = m:Clone() k.Parent = workspace\n\
+            k.Center:Destroy()\n\
+            print(\"A\", k.PrimaryPart, k:GetPivot().Position)\n\
+            k:PivotTo(CFrame.new(0, 400, 300))\n\
+            k:PivotTo(CFrame.new(10, 400, 300))\n\
+            print(\"B\", k:GetPivot().Position, k.Part.Position)\n\
+            local k2 = m:Clone() k2.Parent = workspace\n\
+            k2.Center.Parent = workspace\n\
+            print(\"C\", k2.PrimaryPart, k2:GetPivot().Position)\n\
+            local k3 = m:Clone() k3.Center:Destroy()\n\
+            print(\"D\", k3.PrimaryPart)\n");
+        let text: Vec<&str> = out.iter().map(|(_, s)| s.as_str()).collect();
+        assert!(text[0].starts_with("A nil 0, 900, 0"), "{text:?}");
+        assert!(text[1].starts_with("B 10, 400, 300 10, 400, 360"), "{text:?}");
+        assert!(text[2].starts_with("C nil 0, 900, 0"), "{text:?}");
+        assert!(text[3].starts_with("D nil"), "{text:?}");
     }
 
     /// An error lists its Luau frames the way Studio's Output does.
@@ -6943,6 +7166,47 @@ mod legacy_tests {
         assert!(out.iter().any(|(_, t)| t.starts_with("gui script ran")), "{out:?}");
     }
 
+    #[test]
+    fn replicated_character_starts_only_local_scripts_once_in_either_order() {
+        for character_first in [false, true] {
+            let mut d = Document::new_place();
+            let root = d.dom.root_ref();
+            let players = d.find_child(root, "Players").unwrap();
+            let player = d.dom.insert(players, InstanceBuilder::new("Player"));
+            let other = d.dom.insert(players, InstanceBuilder::new("Player"));
+            d.dom.get_by_ref_mut(players).unwrap().properties
+                .insert(ustr("LocalPlayer"), Variant::Ref(player));
+            let workspace = d.workspace().unwrap();
+            let character = d.dom.insert(workspace, InstanceBuilder::new("Model"));
+            let script_parent = if character_first { root } else { character };
+            let script = d.dom.insert(script_parent, InstanceBuilder::new("LocalScript")
+                .with_property("Source", "print('character script ran')".to_string()));
+            d.dom.insert(character, InstanceBuilder::new("LocalScript")
+                .with_property("Disabled", true)
+                .with_property("Source", "error('disabled character script ran')".to_string()));
+            let rt = Runtime::new().unwrap();
+            let mut w = World::new(d, RunMode::Play);
+            w.side = Side::Client;
+            rt.enter(w);
+            rt.bind_globals().unwrap();
+            rt.apply_prop(other, "Character", Variant::Ref(character));
+            assert!(world(&rt.lua).unwrap().to_start.is_empty());
+            rt.apply_prop(player, "Character", Variant::Ref(character));
+            if character_first {
+                rt.apply_parent(script, character);
+            }
+            // Repeated replication before dispatch must still execute once.
+            rt.apply_prop(player, "Character", Variant::Ref(character));
+            assert!(world(&rt.lua).unwrap().to_start.iter().all(|r| *r == script));
+            rt.dispatch();
+            rt.apply_prop(player, "Character", Variant::Ref(character));
+            rt.dispatch();
+            let out = rt.leave().output;
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert!(out[0].1.starts_with("character script ran"), "{out:?}");
+        }
+    }
+
     /// Round 26's library gaps from Place D's second admin script and Place B's
     /// an admin script, on the client: settings() refused to a game script,
     /// TextService filtering refused on the client, a CoreGuiType by name,
@@ -6983,6 +7247,105 @@ mod legacy_tests {
         assert!(has("filter false Must only be called from server scripts"), "{out:?}");
         assert!(has("coregui false false true"), "{out:?}");
         assert!(has("animator true"), "{out:?}");
+    }
+
+    /// Touch screens (src/play.rs's finger dispatch, src/library.luau's
+    /// `__rs_touch_event` / `__rs_touch_gesture`, src/domains/gui_input.luau's
+    /// Fingers): a finger's Begin / Change / End reaches a Touch
+    /// ContextActionService binding, UserInputService's InputBegan,
+    /// TouchStarted / TouchMoved / TouchEnded with ONE InputObject per
+    /// finger (the PlayerModule compares them by identity), and an input
+    /// action's TouchPosition binding (ViewportPosition while down, (-1, -1)
+    /// after); a Tap gesture reaches UserInputService.TouchTap.
+    #[test]
+    fn fingers_reach_the_scripts() {
+        let mut d = Document::new_place();
+        let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
+        let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
+        let src = r#"
+            local UIS = game:GetService("UserInputService")
+            local CAS = game:GetService("ContextActionService")
+            CAS:BindAction("T", function(name, state, io)
+                print("cas", state.Name, io.UserInputType.Name, io.Position.X, io.Position.Y)
+                return Enum.ContextActionResult.Pass
+            end, false, Enum.UserInputType.Touch)
+            local first
+            UIS.InputBegan:Connect(function(io, gpe) print("began", io.UserInputType.Name, tostring(gpe)) end)
+            UIS.TouchStarted:Connect(function(io, gpe) first = io; print("started", io.Position.X, io.Position.Y, tostring(gpe)) end)
+            UIS.TouchMoved:Connect(function(io, gpe) print("moved", tostring(io == first), io.Delta.X, io.Delta.Y) end)
+            UIS.TouchEnded:Connect(function(io, gpe) print("ended", tostring(io == first), io.UserInputState.Name) end)
+            UIS.TouchTap:Connect(function(pos, gpe) print("tap", #pos, pos[1].X, pos[1].Y, tostring(gpe)) end)
+            local ctx = Instance.new("InputContext")
+            ctx.Priority = 300
+            ctx.Parent = script
+            local act = Instance.new("InputAction")
+            act.Type = Enum.InputActionType.ViewportPosition
+            act.Parent = ctx
+            local b = Instance.new("InputBinding")
+            b.KeyCode = Enum.KeyCode.TouchPosition
+            b.Parent = act
+            act.StateChanged:Connect(function(p) print("stick", p.X, p.Y) end)
+            print("ready")
+        "#;
+        let s = d.dom.insert(
+            sps,
+            InstanceBuilder::new("LocalScript").with_name("T").with_property("Source", src.to_string()),
+        );
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(d, RunMode::Run);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        for _ in 0..3 {
+            rt.step(1.0 / 60.0);
+        }
+        let str = |x: &str| Value::String(rt.lua.create_string(x).unwrap());
+        let touch = |state: &str, x: f64, y: f64, dx: f64, dy: f64| {
+            let began_on = rt.lua.create_table().unwrap();
+            rt.spawn_global(
+                "__rs_touch_event",
+                vec![
+                    str(state),
+                    Value::Number(1.0),
+                    Value::Number(x),
+                    Value::Number(y),
+                    Value::Number(dx),
+                    Value::Number(dy),
+                    Value::Boolean(false),
+                    Value::Table(began_on),
+                ],
+            );
+            rt.step(1.0 / 60.0);
+        };
+        touch("Begin", 100.0, 200.0, 0.0, 0.0);
+        touch("Change", 110.0, 205.0, 10.0, 5.0);
+        touch("End", 110.0, 205.0, 0.0, 0.0);
+        let points = rt.lua.create_table().unwrap();
+        points.push(crate::ltypes::LVector2(glam::Vec2::new(110.0, 205.0))).unwrap();
+        rt.spawn_global(
+            "__rs_touch_gesture",
+            vec![str("Tap"), Value::Table(points), Value::Nil, Value::Nil, Value::Nil, Value::Nil, Value::Nil, Value::Boolean(false)],
+        );
+        for _ in 0..3 {
+            rt.step(1.0 / 60.0);
+        }
+        let out = rt.leave().output;
+        let has = |p: &str| out.iter().any(|(_, t)| t.starts_with(p));
+        assert!(has("ready"), "{out:?}");
+        assert!(has("cas Begin Touch 100 200"), "{out:?}");
+        assert!(has("cas End Touch 110 205"), "{out:?}");
+        assert!(has("began Touch false"), "{out:?}");
+        assert!(has("started 100 200 false"), "{out:?}");
+        assert!(has("moved true 10 5"), "{out:?}");
+        assert!(has("ended true End"), "{out:?}");
+        // (a ViewportPosition is in viewport coordinates: the GUI's + the
+        // 58 px top inset, which the DynamicThumbstick takes back)
+        assert!(has("stick 100 258"), "{out:?}");
+        assert!(has("stick 110 263"), "{out:?}");
+        assert!(has("stick -1 -1"), "{out:?}");
+        assert!(has("tap 1 110 205 false"), "{out:?}");
+        assert!(!out.iter().any(|(l, _)| *l == Level::Error), "{out:?}");
     }
 
     /// an admin script's client anti-tamper, condensed (Client.Core.Anti and

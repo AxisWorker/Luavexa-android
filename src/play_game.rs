@@ -48,6 +48,15 @@ struct Equipped {
     client_told: bool,
 }
 
+/// A Tool's handle: its child BasePart named "Handle" (Roblox's RequiresHandle part).
+/// (`Document::find_child` matches a class, and there is no class "Handle": every
+/// equipped tool had no handle here and was never put in the hand.)
+fn tool_handle(d: &Document, tool: Ref) -> Option<Ref> {
+    d.dom.get_by_ref(tool)?.children().iter().copied().find(|c| {
+        d.dom.get_by_ref(*c).is_some_and(|i| i.name == "Handle" && doc::is_a(&i.class, "BasePart"))
+    })
+}
+
 struct Walk {
     target: Vec3,
     since: f64,
@@ -75,10 +84,14 @@ pub struct Flash {
 pub struct GameState {
     pub input: PlayInput,
     pub(crate) last_pointer: Option<Pointer>,
-    hover_detector: Option<Ref>,
+    hover_detector: Option<(Ref, bool)>,
     /// Whether the cursor is over something clickable (hand cursor).
     pub clickable: bool,
     equipped: Option<Equipped>,
+    /// A Tool only the client has, equipped by a client script (client refs): Studio's
+    /// client welds it to its own character's hand and the server never hears of it
+    /// (a game's script hands out its tools that way).
+    client_tool: Option<Equipped>,
     /// Tools on the hotbar (server refs), in slot order.
     pub slots: Vec<Ref>,
     walks: HashMap<Ref, Walk>,
@@ -123,6 +136,15 @@ pub struct GameState {
     pub gui_layout: HashMap<Ref, crate::gui::GuiBox>,
     /// Mouse buttons for UserInputService: (button, down, gameProcessedEvent).
     pub uis_mouse: Vec<(u8, bool, bool)>,
+    /// The game's fingers since the last client tick (touch identity:
+    /// src/touch_input.rs `Zones::game`; the GUI had them first,
+    /// gui_input.rs `touch_input`), for UserInputService, the bound
+    /// actions and the input action system.
+    pub touches: Vec<crate::gui::TouchOut>,
+    /// Their gestures (src/touch_gestures.rs), for UserInputService.
+    pub touch_gestures: Vec<crate::touch_gestures::Gesture>,
+    /// The recognizer behind them.
+    pub gestures: crate::touch_gestures::Gestures,
     /// The in-game menu (Esc) is open: the game gets no keys.
     pub menu_open: bool,
     /// Menu opened (true) / closed (false) since the last client tick
@@ -213,6 +235,29 @@ pub fn mouse_input_object(
     }
 }
 
+/// A finger's InputObject (UserInputType.Touch): the same object for the
+/// finger's whole life (`__rs_touch_object`, src/library.luau), with its
+/// state, position and motion written for this event.
+pub fn touch_input_object(
+    lua: &mlua::Lua,
+    id: u64,
+    state: crate::gui::TouchState,
+    at: (f32, f32),
+    delta: (f32, f32),
+) -> mlua::Result<Value> {
+    match lua.globals().get::<mlua::Function>("__rs_touch_object") {
+        Ok(f) => f.call((
+            id as f64,
+            state.name(),
+            at.0 as f64,
+            at.1 as f64,
+            delta.0 as f64,
+            delta.1 as f64,
+        )),
+        Err(_) => mouse_input_object(lua, 0, state == crate::gui::TouchState::Begin, Some(at)),
+    }
+}
+
 /// Fires the viewport's GUI events on the client: clicks, hover, text,
 /// selection and scrolling.
 pub fn fire_gui_events(rt: &Runtime, events: Vec<crate::gui::GuiEvent>, gui_service: Option<Ref>) {
@@ -248,6 +293,16 @@ pub fn fire_gui_events(rt: &Runtime, events: Vec<crate::gui::GuiEvent>, gui_serv
                             x,
                             y,
                         } => mouse_input_object(lua, *button, *began, Some((*x, *y))).ok(),
+                        GuiArg::Touch { id, state, x, y, dx, dy } => {
+                            touch_input_object(lua, *id, *state, (*x, *y), (*dx, *dy)).ok()
+                        }
+                        GuiArg::Points(pts) => {
+                            let t = lua.create_table().ok()?;
+                            for (i, (x, y)) in pts.iter().enumerate() {
+                                t.set(i + 1, crate::ltypes::LVector2(glam::Vec2::new(*x, *y))).ok()?;
+                            }
+                            Some(Value::Table(t))
+                        }
                     })
                     .collect();
                 rt.fire(r, name, vals);
@@ -633,7 +688,40 @@ impl Editor {
     /// The ClickDetector a click on `part` reaches: one in the part or in a
     /// Model / folder above it (below Workspace).
     fn click_detector_for(&self, part: Ref) -> Option<Ref> {
-        let d = &self.doc;
+        click_detector_in(&self.doc, part)
+    }
+
+    /// A ClickDetector on a part only the client has (a client-cloned
+    /// island): the click and hover fire on the client alone, as in Roblox.
+    fn client_click_detector_for(&self, part: Ref) -> Option<Ref> {
+        let s = self.play.as_ref()?;
+        let cd = s.other_doc.as_ref()?;
+        let det = click_detector_in(cd, part)?;
+        let max = f32_prop(cd, det, "MaxActivationDistance", mech::CLICK_DISTANCE);
+        let at = self.character_pos();
+        let xf = crate::scene::xform_of(cd, part)?;
+        at.is_none_or(|at| (xf.pos - at).length() <= max).then_some(det)
+    }
+
+    /// The ClickDetector in reach that the mouse on `part` (a `side` ref)
+    /// reaches, with whether it lives on the client alone.
+    fn detector_under(&self, side: Side, part: Ref) -> Option<(Ref, bool)> {
+        match self.to_server(side, part) {
+            Some(sp) => self.click_detector_for(sp).filter(|d| self.in_reach(*d, sp)).map(|d| (d, false)),
+            None if side == Side::Client => self.client_click_detector_for(part).map(|d| (d, true)),
+            None => None,
+        }
+    }
+
+    fn fire_client_with_player(&mut self, det: Ref, event: &str) {
+        let Some(cp) = self.play.as_ref().and_then(|p| self.client_of(p.player)) else { return };
+        let ev = event.to_string();
+        self.with_side(Side::Client, |rt, _, _| rt.fire(det, &ev, vec![rt.inst(cp)]));
+    }
+}
+
+fn click_detector_in(d: &Document, part: Ref) -> Option<Ref> {
+    {
         let ws = d.workspace()?;
         let mut cur = part;
         while cur.is_some() && cur != ws {
@@ -650,7 +738,9 @@ impl Editor {
         }
         None
     }
+}
 
+impl Editor {
     fn character_pos(&self) -> Option<Vec3> {
         self.play
             .as_ref()?
@@ -721,19 +811,18 @@ impl Editor {
 
         // Hovering a ClickDetector.
         let pointer = self.play.as_ref().and_then(|s| s.game.last_pointer);
-        let hovered = pointer
-            .and_then(|p| p.hit.and_then(|(r, _)| self.to_server(p.side, r)))
-            .and_then(|part| {
-                self.click_detector_for(part)
-                    .filter(|d| self.in_reach(*d, part))
-            });
+        let hovered = pointer.and_then(|p| p.hit.and_then(|(r, _)| self.detector_under(p.side, r)));
         let before = self.play.as_ref().and_then(|s| s.game.hover_detector);
         if hovered != before {
-            if let Some(old) = before.filter(|d| self.doc.exists(*d)) {
-                self.fire_with_player(old, "MouseHoverLeave");
+            match before {
+                Some((old, false)) if self.doc.exists(old) => self.fire_with_player(old, "MouseHoverLeave"),
+                Some((old, true)) => self.fire_client_with_player(old, "MouseHoverLeave"),
+                _ => {}
             }
-            if let Some(new) = hovered {
-                self.fire_with_player(new, "MouseHoverEnter");
+            match hovered {
+                Some((new, false)) => self.fire_with_player(new, "MouseHoverEnter"),
+                Some((new, true)) => self.fire_client_with_player(new, "MouseHoverEnter"),
+                None => {}
             }
         }
         if let Some(s) = self.play.as_mut() {
@@ -744,21 +833,11 @@ impl Editor {
         // Clicks on ClickDetectors (fired on both sides with the player).
         let side = pointer.map(|p| p.side).unwrap_or(Side::Server);
         for (r, button) in input.clicks {
-            let Some(part) = self.to_server(side, r) else {
-                continue;
-            };
-            if let Some(det) = self
-                .click_detector_for(part)
-                .filter(|d| self.in_reach(*d, part))
-            {
-                self.fire_with_player(
-                    det,
-                    if button == 1 {
-                        "MouseClick"
-                    } else {
-                        "RightMouseClick"
-                    },
-                );
+            let ev = if button == 1 { "MouseClick" } else { "RightMouseClick" };
+            match self.detector_under(side, r) {
+                Some((det, false)) => self.fire_with_player(det, ev),
+                Some((det, true)) => self.fire_client_with_player(det, ev),
+                None => {}
             }
         }
 
@@ -792,10 +871,14 @@ impl Editor {
             .and_then(|s| s.client.as_ref())
             .and_then(|c| c.world.as_ref())
             .and_then(|w| w.input.mouse);
+        let client_tool = self.play.as_ref().and_then(|s| s.game.client_tool.as_ref().map(|e| e.tool));
         for (button, down) in input.buttons {
             if button == 1 {
                 if let Some(t) = equipped {
                     self.fire_both(t, if down { "Activated" } else { "Deactivated" });
+                }
+                if let Some(t) = client_tool {
+                    self.with_side(Side::Client, |rt, _, _| rt.fire(t, if down { "Activated" } else { "Deactivated" }, vec![]));
                 }
             }
             if let Some(m) = mouse {
@@ -963,6 +1046,16 @@ impl Editor {
             if !mine(h, self) {
                 continue;
             }
+            if side == Side::Client {
+                match tool {
+                    Some(t) if self.server_of(t).is_none() => {
+                        self.equip_client_tool(t);
+                        continue;
+                    }
+                    None => self.unequip_client_tool(true),
+                    _ => self.unequip_client_tool(true),
+                }
+            }
             let tool = match (side, tool) {
                 (Side::Client, Some(t)) => self.server_of(t),
                 (_, t) => t,
@@ -1068,11 +1161,7 @@ impl Editor {
         }
         self.unequip_tool();
         self.with_side(Side::Server, |rt, _, _| rt.apply_parent(tool, model));
-        let handle = self.doc.find_child(tool, "Handle").filter(|h| {
-            self.doc
-                .class_of(*h)
-                .is_some_and(|c| doc::is_a(&c, "BasePart"))
-        });
+        let handle = tool_handle(&self.doc, tool);
         let parts: Vec<Ref> = self
             .doc
             .dom
@@ -1103,6 +1192,182 @@ impl Editor {
         self.with_side(Side::Server, |rt, _, _| {
             rt.fire(tool, "Equipped", vec![Value::Nil])
         });
+    }
+
+    /// Equips a Tool only the client has (client ref): into the client's character, its
+    /// parts out of the client's world while they follow the hand (`client_tool_pose`).
+    fn equip_client_tool(&mut self, tool: Ref) {
+        let Some(model) = self.character_model().and_then(|m| self.client_of(m)) else { return };
+        self.unequip_tool();
+        self.unequip_client_tool(true);
+        let Some(s) = self.play.as_mut() else { return };
+        let Some(cd) = s.other_doc.as_ref() else { return };
+        if !cd.class_of(tool).is_some_and(|c| doc::is_a(&c, "BackpackItem")) {
+            return;
+        }
+        let parts: Vec<Ref> = cd.dom.descendants_of(tool).filter(|i| doc::is_a(&i.class, "BasePart")).map(|i| i.referent()).collect();
+        let handle = tool_handle(cd, tool);
+        let base = handle.and_then(|h| crate::scene::xform_of(cd, h));
+        let offsets: Vec<(Ref, Xform)> = match base {
+            Some(b) => parts
+                .iter()
+                .filter_map(|p| crate::scene::xform_of(cd, *p).map(|x| (*p, crate::ltypes::cf_mul(&crate::ltypes::cf_inv(&b), &x))))
+                .collect(),
+            None => Vec::new(),
+        };
+        let in_hand = cd.dom.get_by_ref(tool).map(|i| i.parent()) == Some(model);
+        s.client_sim.hold(&parts, true);
+        s.game.client_tool = Some(Equipped { tool, offsets, client_told: true });
+        let mouse = s.client.as_ref().and_then(|c| c.world.as_ref()).and_then(|w| w.input.mouse);
+        // In the hand before Equipped fires: Roblox has the grip made by then, so a script
+        // that reads Handle.CFrame there (a hanging lantern's, building on it) gets the hand.
+        self.place_client_tool_now();
+        self.with_side(Side::Client, |rt, _, _| {
+            if !in_hand {
+                rt.apply_parent(tool, model);
+            }
+            let m = mouse.map(|m| rt.inst(m)).unwrap_or(Value::Nil);
+            rt.fire(tool, "Equipped", vec![m]);
+        });
+    }
+
+    /// Lets go of the client-only Tool: back into the client's Backpack (`to_backpack`,
+    /// an UnequipTools) or left where a script put it.
+    fn unequip_client_tool(&mut self, to_backpack: bool) {
+        let Some(s) = self.play.as_mut() else { return };
+        let Some(e) = s.game.client_tool.take() else { return };
+        let parts: Vec<Ref> = e.offsets.iter().map(|(r, _)| *r).collect();
+        s.client_sim.hold(&parts, false);
+        s.client_sim.set_keep_awake(Vec::new());
+        let player = s.player;
+        let bp = self.client_of(player).and_then(|cp| self.play.as_ref()?.other_doc.as_ref()?.find_child(cp, "Backpack"));
+        let tool = e.tool;
+        self.with_side(Side::Client, |rt, _, _| {
+            if let (true, Some(bp)) = (to_backpack, bp) {
+                rt.apply_parent(tool, bp);
+            }
+            rt.fire(tool, "Unequipped", vec![]);
+        });
+    }
+
+    /// Writes the client-only Tool's parts at the hand now (from the server's pose of
+    /// the hand), between frames' body poses.
+    fn place_client_tool_now(&mut self) {
+        let Some(ch) = self.play.as_ref().and_then(|s| s.character.as_ref()) else { return };
+        let model = ch.model;
+        let d = &self.doc;
+        let Some(hand) = d.find_named(model, "RightHand").or_else(|| d.find_named(model, "Right Arm")) else { return };
+        let Some(hx) = crate::scene::xform_of(d, hand) else { return };
+        let posed = self.client_tool_pose(&[(hand, hx)]);
+        if let Some(cd) = self.play.as_mut().and_then(|s| s.other_doc.as_mut()) {
+            crate::rig::write_pose(cd, &posed, None);
+        }
+    }
+
+    /// Parts welded to the held client-only Tool's handle since it was equipped follow
+    /// the hand with it (one assembly with the character in Roblox): a hanging
+    /// lantern welds its Top to the Handle on Equipped and hangs the rest from Top on
+    /// ropes. Parts no longer in the tool are let go.
+    fn follow_client_tool_welds(&mut self) {
+        let Some(s) = self.play.as_mut() else { return };
+        let (Some(e), Some(cd)) = (s.game.client_tool.as_mut(), s.other_doc.as_ref()) else { return };
+        let Some(handle) = tool_handle(cd, e.tool) else { return };
+        let Some(hx) = crate::scene::xform_of(cd, handle) else { return };
+        let mut edges: Vec<(Ref, Ref)> = Vec::new();
+        let mut in_tool: HashSet<Ref> = HashSet::new();
+        for i in cd.dom.descendants_of(e.tool) {
+            let r = i.referent();
+            if doc::is_a(&i.class, "BasePart") {
+                in_tool.insert(r);
+            } else if crate::physics::is_rigid_joint(&i.class) && crate::physics::joint_enabled(cd, r) {
+                if let Some(ends) = crate::physics::joint_parts(cd, r) {
+                    edges.push(ends);
+                }
+            }
+        }
+        let mut reach: HashSet<Ref> = [handle].into_iter().collect();
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for (a, b) in &edges {
+                for (from, to) in [(a, b), (b, a)] {
+                    if reach.contains(from) && in_tool.contains(to) && reach.insert(*to) {
+                        grew = true;
+                    }
+                }
+            }
+        }
+        let known: HashSet<Ref> = e.offsets.iter().map(|(r, _)| *r).collect();
+        let inv = crate::ltypes::cf_inv(&hx);
+        let mut added = Vec::new();
+        for r in reach.iter().filter(|r| !known.contains(r)) {
+            if let Some(x) = crate::scene::xform_of(cd, *r) {
+                e.offsets.push((*r, crate::ltypes::cf_mul(&inv, &x)));
+                added.push(*r);
+            }
+        }
+        let gone: Vec<Ref> = e.offsets.iter().map(|(r, _)| *r).filter(|r| !in_tool.contains(r)).collect();
+        e.offsets.retain(|(r, _)| in_tool.contains(r));
+        let loose: Vec<Ref> = in_tool.iter().copied().filter(|r| !reach.contains(r)).collect();
+        s.client_sim.set_keep_awake(loose);
+        if !added.is_empty() {
+            s.client_sim.hold(&added, true);
+        }
+        if !gone.is_empty() {
+            s.client_sim.hold(&gone, false);
+        }
+    }
+
+    /// The character died or respawned: the client-only Tool it held is let go of.
+    pub(super) fn unequip_client_tool_dropped(&mut self) {
+        self.unequip_client_tool(false);
+    }
+
+    /// Once a frame: a client-only Tool a script moved out of the character (or
+    /// destroyed) isn't held any more.
+    pub(super) fn check_client_tool(&mut self) {
+        let Some(s) = self.play.as_ref() else { return };
+        let Some(e) = s.game.client_tool.as_ref() else { return };
+        let model = s.character.as_ref().filter(|c| !c.dead).and_then(|c| s.map.s2c.get(&c.model).copied());
+        let held = s.other_doc.as_ref().is_some_and(|cd| model.is_some_and(|m| cd.dom.get_by_ref(e.tool).map(|i| i.parent()) == Some(m)));
+        if !held {
+            self.unequip_client_tool(false);
+        } else {
+            self.follow_client_tool_welds();
+        }
+    }
+
+    /// The client-only Tool's parts (client refs) for this frame's body pose.
+    pub(super) fn client_tool_pose(&self, pose: &[(Ref, Xform)]) -> Vec<(Ref, Xform)> {
+        let Some(s) = self.play.as_ref() else { return Vec::new() };
+        let (Some(e), Some(cd)) = (s.game.client_tool.as_ref(), s.other_doc.as_ref()) else { return Vec::new() };
+        let grip = match cd.prop(e.tool, "Grip") {
+            Some(Variant::CFrame(cf)) => Xform::from_cframe(&cf),
+            _ => Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY },
+        };
+        let Some(hand) = self.grip_frame(pose) else { return Vec::new() };
+        use crate::ltypes::{cf_inv, cf_mul};
+        let handle_xf = cf_mul(&hand, &cf_inv(&grip));
+        e.offsets.iter().map(|(r, off)| (*r, cf_mul(&handle_xf, off))).collect()
+    }
+
+    /// The right hand's grip frame this frame (hand · RightGripAttachment, turned to point
+    /// forward when it is the identity), from the body pose.
+    fn grip_frame(&self, pose: &[(Ref, Xform)]) -> Option<Xform> {
+        let s = self.play.as_ref()?;
+        let ch = s.character.as_ref()?;
+        let d = &self.doc;
+        let hand = d.find_named(ch.model, "RightHand").or_else(|| d.find_named(ch.model, "Right Arm"))?;
+        let hand_xf = pose.iter().find(|(r, _)| *r == hand).map(|(_, x)| *x)?;
+        let att = d.find_named(hand, "RightGripAttachment").and_then(|a| match d.prop(a, "CFrame") {
+            Some(Variant::CFrame(cf)) => Some(Xform::from_cframe(&cf)),
+            _ => None,
+        });
+        let mut c0 = att.unwrap_or(Xform { pos: Vec3::new(0.0, -1.0, 0.0), rot: Mat3::IDENTITY });
+        if c0.rot.abs_diff_eq(Mat3::IDENTITY, 1e-4) {
+            c0.rot = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+        }
+        Some(crate::ltypes::cf_mul(&hand_xf, &c0))
     }
 
     /// Forgets the equipped tool without putting it back in the Backpack
@@ -1942,7 +2207,7 @@ impl Editor {
         // the held system cursor is.)
         let mut pointer = crate::mouse_lock::game_pointer(self.lock_center_held(), rect, resp.hover_pos()).map(|p| {
             let ray = self.cam.ray(rect, p);
-            let hit = self.pick_any(&ray).map(|(r, t)| (r, ray.at(t)));
+            let hit = self.mouse_pick(side, &ray).map(|(r, t)| (r, ray.at(t)));
             Pointer {
                 origin: ray.origin,
                 dir: ray.dir,
@@ -1952,15 +2217,40 @@ impl Editor {
                 side,
             }
         });
+        // The latest finger is where the game's mouse is while no mouse is
+        // there (touch identity; "Fingers in Play" below).
+        if pointer.is_none() {
+            let inset = self.gui.input_inset.unwrap_or(mech::GUI_TOP_INSET);
+            let touch_at = self
+                .play
+                .as_ref()
+                .and_then(|s| s.game.touches.last())
+                .map(|t| Pos2::new(rect.min.x + t.x, rect.min.y + t.y + inset))
+                .filter(|p| rect.contains(*p));
+            if let Some(p) = touch_at {
+                let ray = self.cam.ray(rect, p);
+                let hit = self.mouse_pick(side, &ray).map(|(r, t)| (r, ray.at(t)));
+                pointer = Some(Pointer {
+                    origin: ray.origin,
+                    dir: ray.dir,
+                    hit,
+                    xy: [p.x - rect.min.x, p.y - rect.min.y],
+                    view: [rect.width(), rect.height()],
+                    side,
+                });
+            }
+        }
         // Terrain under the mouse (Mouse.Hit / Mouse.Target), through the
         // shown side's query cache: the same surface Raycast meets.
         if let Some(p) = pointer.as_mut() {
             let (o, d) = (p.origin, p.dir);
+            self.server_front();
             let terrain = self
                 .with_side(side, |rt, _, _| {
                     crate::runtime::ext::mouse_terrain_hit(&rt.lua, o, d, crate::mech::MOUSE_RAY_LENGTH)
                 })
                 .flatten();
+            self.shown_front();
             if let Some((r, t)) = terrain {
                 if p.hit.is_none_or(|(_, at)| (at - o).length() > t) {
                     p.hit = Some((r, o + d * t));
@@ -1985,6 +2275,49 @@ impl Editor {
         }
         let mut buttons = Vec::new();
         let mut uis = Vec::new();
+        // Fingers in Play (touch identity, src/touch_input.rs `Zones::game`):
+        // the GUI had them (viewport.rs, `Gui::touch_input`); here their
+        // gestures (src/touch_gestures.rs) and the world: a tap the GUI
+        // didn't take is a click where it landed (ClickDetectors, the
+        // Mouse's Button1Down / Up, a Tool's Activated, as on Roblox's
+        // phones), and the latest finger is where the game's mouse is
+        // (Mouse.Hit / Target, UserInputService:GetMouseLocation()).
+        let touch_taps: Vec<(f32, f32)> = match self.play.as_mut() {
+            Some(s) if !s.game.touches.is_empty() || s.game.gestures.count() > 0 => {
+                let now = std::time::Instant::now();
+                let mut taps = Vec::new();
+                let touches = std::mem::take(&mut s.game.touches);
+                for t in &touches {
+                    for g in s.game.gestures.feed(t, now) {
+                        if let crate::touch_gestures::Gesture::TapInWorld { pos, processed_by_ui: false } = &g {
+                            taps.push(*pos);
+                        }
+                        s.game.touch_gestures.push(g);
+                    }
+                }
+                let ticked = s.game.gestures.tick(now);
+                s.game.touch_gestures.extend(ticked);
+                if !touches.is_empty() {
+                    s.game.last_activity = s.time;
+                }
+                s.game.touches = touches;
+                taps
+            }
+            _ => Vec::new(),
+        };
+        let inset = self.gui.input_inset.unwrap_or(mech::GUI_TOP_INSET);
+        for (x, y) in touch_taps {
+            let p = Pos2::new(rect.min.x + x, rect.min.y + y + inset);
+            if !rect.contains(p) {
+                continue;
+            }
+            let ray = self.cam.ray(rect, p);
+            if let Some((r, _)) = self.mouse_pick(side, &ray) {
+                clicks.push((r, 1));
+            }
+            buttons.push((1, true));
+            buttons.push((1, false));
+        }
         if resp.hovered() {
             ctx.input(|i| {
                 for e in &i.events {
@@ -2132,6 +2465,8 @@ impl Editor {
             let doc_dir = self.doc.path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
             let rects = self.gui.draw_hotbar(&ctx, &painter, &mut self.assets, doc_dir.as_deref(), rect, &info);
             for (n, r) in rects.into_iter().enumerate() {
+                // (fingers landing on a slot stay egui's: src/touch_input.rs)
+                self.touch.zones.ui.push(r);
                 let click = ui.interact(r, ui.id().with(("slot", n)), egui::Sense::click());
                 if click.clicked() {
                     slots.push(n);
@@ -2179,6 +2514,9 @@ impl Editor {
                 Pos2::new(rect.min.x + 10.0, rect.max.y - 38.0),
                 egui::vec2(320.0f32.min(rect.width() - 20.0), 26.0),
             ));
+            if s.game.chat_open || input_rect.is_some() {
+                self.touch.zones.ui.push(box_rect);
+            }
             if s.game.chat_open {
                 let hint = if input_rect.is_some() {
                     "To chat click here or press \"/\" key"
@@ -2232,10 +2570,28 @@ impl Editor {
         true
     }
 
-    /// The nearest part along a ray (any part, locked or not).
-    fn pick_any(&self, ray: &crate::math::Ray) -> Option<(Ref, f32)> {
-        // The player's own character and tool don't block the mouse.
-        let own: HashSet<Ref> = self
+    /// The part under the game's mouse: the shown side's world query, as
+    /// workspace:Raycast meets it; the drawn boxes only when that side has no
+    /// runtime.
+    fn mouse_pick(&mut self, side: Side, ray: &crate::math::Ray) -> Option<(Ref, f32)> {
+        let skip: Vec<Ref> = self.own_parts().into_iter().collect();
+        let (o, d) = (ray.origin, ray.dir);
+        // (with_side wants the server in front; the viewport has the shown side there)
+        self.server_front();
+        let hit = self.with_side(side, |rt, _, _| {
+            crate::runtime::ext::mouse_part_hit(&rt.lua, o, d, crate::mech::MOUSE_RAY_LENGTH, &skip)
+        });
+        self.shown_front();
+        match hit {
+            Some(hit) => hit,
+            None => self.pick_any(ray),
+        }
+    }
+
+    /// The player's own character and tool on the shown side (they don't
+    /// block the mouse).
+    fn own_parts(&self) -> HashSet<Ref> {
+        self
             .play
             .as_ref()
             .map(|s| match s.showing {
@@ -2247,7 +2603,12 @@ impl Editor {
                     .filter_map(|r| s.map.s2c.get(r).copied())
                     .collect(),
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// The nearest drawn part box along a ray (any part, locked or not).
+    fn pick_any(&self, ray: &crate::math::Ray) -> Option<(Ref, f32)> {
+        let own = self.own_parts();
         let mut best: Option<(f32, Ref)> = None;
         for (sp, b) in self.scene.parts.iter().zip(&self.scene.bounds) {
             let oc = b.truncate() - ray.origin;
@@ -2481,5 +2842,34 @@ impl GameState {
     /// (play_npc.rs walks it there).
     pub(crate) fn walk_target(&self, humanoid: Ref) -> Option<Vec3> {
         self.walks.get(&humanoid).map(|w| w.target)
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+
+    #[test]
+    fn tool_handle_accepts_named_base_part_children() {
+        for class in ["Part", "MeshPart", "UnionOperation"] {
+            let mut d = doc::Document::new_place();
+            let tool = d.dom.insert(d.dom.root_ref(), InstanceBuilder::new("Tool"));
+            let handle = d.dom.insert(tool, InstanceBuilder::new(class).with_name("Handle"));
+            assert_eq!(tool_handle(&d, tool), Some(handle), "{class}");
+        }
+    }
+
+    #[test]
+    fn tool_handle_ignores_wrong_names_classes_and_nested_parts() {
+        let mut d = doc::Document::new_place();
+        let tool = d.dom.insert(d.dom.root_ref(), InstanceBuilder::new("Tool"));
+        d.dom.insert(tool, InstanceBuilder::new("Part").with_name("handle"));
+        let folder = d.dom.insert(tool, InstanceBuilder::new("Folder").with_name("Handle"));
+        d.dom.insert(folder, InstanceBuilder::new("Part").with_name("Handle"));
+        assert_eq!(tool_handle(&d, tool), None);
+
+        let handle = d.dom.insert(tool, InstanceBuilder::new("Part").with_name("Handle"));
+        assert_eq!(tool_handle(&d, tool), Some(handle));
+        assert_eq!(tool_handle(&d, Ref::new()), None);
     }
 }

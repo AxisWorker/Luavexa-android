@@ -1634,8 +1634,10 @@ set["InputContext.Enabled"] = function(ctx, _, v)
 end
 local last_device = "Keyboard"
 local function binding_device(b)
+    if b.UIButton ~= nil or b.UIModifier ~= nil then return "Touch" end
     local k = b.KeyCode
-    if k ~= KEY_NONE and k.Name:find("^Button") or k.Name:find("^Thumbstick") or k.Name:find("^DPad") then return "Gamepad" end
+    if k ~= KEY_NONE and (k.Name:find("^Button") or k.Name:find("^Thumbstick") or k.Name:find("^DPad")) then return "Gamepad" end
+    if k ~= KEY_NONE and k.Name:find("^Touch") then return "Touch" end
     return "Keyboard"
 end
 get["InputAction.PreferredBinding"] = function(a)
@@ -1693,6 +1695,8 @@ end
 -- This frame's analog input per action (mouse motion, wheel): added to
 -- what its held keys give.
 local analog = setmetatable({}, { __mode = "k" })
+-- Whether a finger holds a Bool action (below, "Fingers").
+local touch_pressed
 -- Runs the input action system for one key / button; true when a Sink
 -- context took it.
 local function actions_input(key, down)
@@ -1721,7 +1725,11 @@ local function actions_input(key, down)
                 if uses then
                     took = true
                     if value ~= nil then
-                        if analog[a] ~= nil and a.Type ~= Enum.InputActionType.Bool then value += analog[a] end
+                        if a.Type == Enum.InputActionType.Bool then
+                            value = value or touch_pressed(a)
+                        elseif analog[a] ~= nil then
+                            value += analog[a]
+                        end
                         set_state(a, value)
                     end
                 end
@@ -1752,6 +1760,15 @@ end
 -- 0.5 a notch × Scale ÷ dt; the next frame the action is back at what its
 -- keys hold. MousePosition gives a ViewportPosition action the pointer.
 local frame_dt = 1 / 60
+-- A ViewportPosition action's value is in viewport coordinates (the top
+-- of the window is y = 0): the PlayerModule's DynamicThumbstick adds
+-- GuiService:GetInsetArea(Enum.ScreenInsets.None).Min to it to get the
+-- GUI-coordinate position it compares with AbsolutePositions, and that
+-- Min is (0, -58) in Studio's Play (GetInsetArea above).
+local function viewport_pos(x, y)
+    local inset = (G.is_client() and not G.is_edit()) and 58 or 0
+    return Vector2.new(x, y + inset)
+end
 local function analog_input(kind, x, y)
     local key = Enum.KeyCode[kind]
     for c in tracked.InputContext do
@@ -1762,7 +1779,7 @@ local function analog_input(kind, x, y)
                         if b:IsA("InputBinding") and b.Type ~= Enum.InputBindingType.Scriptable and b.KeyCode == key then
                             local t = a.Type
                             if kind == "MousePosition" then
-                                if t == Enum.InputActionType.ViewportPosition then set_state(a, Vector2.new(x, y)) end
+                                if t == Enum.InputActionType.ViewportPosition then set_state(a, viewport_pos(x, y)) end
                             elseif t == Enum.InputActionType.Direction2D then
                                 analog[a] = (analog[a] or Vector2.zero) + Vector2.new(x, y) * b.Vector2Scale * b.Scale / frame_dt
                                 set_state(a, keys_value(a) + analog[a])
@@ -1783,6 +1800,123 @@ local function analog_frame(dt)
     for a in analog do
         analog[a] = nil
         if a.Parent ~= nil then set_state(a, keys_value(a)) end
+    end
+end
+-- Fingers (touch screens: the engine's touch events, after the GUI had
+-- them; src/play_game.rs "Fingers in Play"). Enum.KeyCode.TouchPosition
+-- gives a ViewportPosition action the finger's position (Vector2(-1, -1)
+-- when none; InputBinding.PointerIndex picks which of the action's
+-- fingers) and a Bool action pressed while one of its fingers is down;
+-- TouchDelta gives a Direction2D action a lone finger's motion (pixels ×
+-- Vector2Scale × Scale ÷ dt, a rate like MouseDelta's); TouchPinch a
+-- Direction1D action the change of its first two fingers' distance
+-- (pixels × Scale ÷ dt). A binding's UIModifier limits it to fingers that
+-- landed on that GuiButton (the DynamicThumbstick's transparent frame,
+-- Active false so the GUI lets the finger through); a Bool binding's
+-- UIButton presses the action while a finger that landed on that button is
+-- down (TouchJump's jump button). Fingers the GUI took
+-- (gameProcessedEvent) only reach UIButton / UIModifier bindings. A finger
+-- is handed to the contexts by Priority when it lands; a Sink context
+-- keeps it from the ones below (the thumbstick's TransformerContext,
+-- priority 300 and Sink, keeps the stick finger from the camera's
+-- TouchDelta and CameraPanActiveAction in CameraContext, priority 100).
+local fingers = {}      -- id → { x, y, began_on = { [GuiButton] = true }, gpe, order, actions = { [action] = binding } }
+local finger_seq = 0
+local TOUCH_KEYS = { TouchPosition = true, TouchDelta = true, TouchPinch = true }
+local function finger_uses(b, f)
+    local uib = b.UIButton
+    if uib ~= nil then return f.began_on[uib] == true end
+    local k = b.KeyCode
+    if k == KEY_NONE or not TOUCH_KEYS[k.Name] then return false end
+    local uim = b.UIModifier
+    if uim ~= nil then return f.began_on[uim] == true end
+    return not f.gpe
+end
+local function assign_finger(f)
+    f.actions = {}
+    local ctxs = {}
+    for c in tracked.InputContext do
+        if c.Enabled and c:IsDescendantOf(game) then table.insert(ctxs, c) end
+    end
+    table.sort(ctxs, function(a, b) return a.Priority > b.Priority end)
+    for _, ctx in ctxs do
+        local took = false
+        for _, a in ctx:GetChildren() do
+            if a:IsA("InputAction") and a.Enabled then
+                for _, b in a:GetChildren() do
+                    if b:IsA("InputBinding") and b.Type ~= Enum.InputBindingType.Scriptable and finger_uses(b, f) then
+                        f.actions[a] = b
+                        took = true
+                        break
+                    end
+                end
+            end
+        end
+        if took and ctx.Sink then break end
+    end
+end
+-- The action's fingers, in landing order.
+local function action_fingers(a)
+    local list = {}
+    for _, f in fingers do
+        if f.actions[a] then table.insert(list, f) end
+    end
+    table.sort(list, function(p, q) return p.order < q.order end)
+    return list
+end
+touch_pressed = function(a)
+    for _, f in fingers do
+        if f.actions[a] then return true end
+    end
+    return false
+end
+local function touch_update(a, b, moved, dx, dy)
+    if not action_live(a) then return end
+    local t = a.Type
+    local list = action_fingers(a)
+    if t == Enum.InputActionType.Bool then
+        set_state(a, #list > 0 or binding_value(a, b) == true)
+    elseif t == Enum.InputActionType.ViewportPosition then
+        local f = list[(tonumber(b.PointerIndex) or 0) + 1]
+        set_state(a, f and viewport_pos(f.x, f.y) or Vector2.new(-1, -1))
+    elseif t == Enum.InputActionType.Direction2D and b.KeyCode == Enum.KeyCode.TouchDelta then
+        if moved and #list == 1 and list[1] == moved and (dx ~= 0 or dy ~= 0) then
+            analog[a] = (analog[a] or Vector2.zero) + Vector2.new(dx, dy) * b.Vector2Scale * b.Scale / frame_dt
+            set_state(a, keys_value(a) + analog[a])
+        end
+    elseif t == Enum.InputActionType.Direction1D and b.KeyCode == Enum.KeyCode.TouchPinch then
+        if moved and #list >= 2 and (moved == list[1] or moved == list[2]) then
+            local p, q = list[1], list[2]
+            local now = Vector2.new(p.x - q.x, p.y - q.y).Magnitude
+            local other = moved == p and q or p
+            local before = Vector2.new(moved.x - dx - other.x, moved.y - dy - other.y).Magnitude
+            local d = now - before
+            if d ~= 0 then
+                analog[a] = (analog[a] or 0) + d * b.Scale / frame_dt
+                set_state(a, keys_value(a) + analog[a])
+            end
+        end
+    end
+end
+local function touch_input(state, id, x, y, dx, dy, gpe, began_on)
+    if state == "Begin" then
+        finger_seq += 1
+        local f = { x = x, y = y, began_on = {}, gpe = gpe == true, order = finger_seq, actions = {} }
+        for _, btn in began_on or {} do f.began_on[btn] = true end
+        fingers[id] = f
+        assign_finger(f)
+        for a, b in f.actions do touch_update(a, b, nil, 0, 0) end
+    elseif state == "Change" then
+        local f = fingers[id]
+        if not f then return end
+        f.x, f.y = x, y
+        for a, b in f.actions do touch_update(a, b, f, dx, dy) end
+    else
+        local f = fingers[id]
+        if not f then return end
+        fingers[id] = nil
+        f.x, f.y = x, y
+        for a, b in f.actions do touch_update(a, b, nil, 0, 0) end
     end
 end
 local mouse_keys = { MouseButton1 = "MouseLeftButton", MouseButton2 = "MouseRightButton", MouseButton3 = "MouseMiddleButton" }
@@ -1841,6 +1975,15 @@ do
             local ok, err = pcall(on_input, state, uit, key, x, y, z, gpe, dx, dy)
             if not ok then log("error", "gui_input: " .. tostring(err)) end
             return inner(state, uit, key, x, y, z, dx, dy, gpe)
+        end
+    end
+    local touch_inner = __rs_touch_event
+    if touch_inner then
+        __rs_touch_event = function(state, id, x, y, dx, dy, gpe, began_on)
+            local ok, err = pcall(touch_input, state, id, x, y, dx, dy, gpe, began_on)
+            if not ok then log("error", "gui_input: " .. tostring(err)) end
+            last_device = "Touch"
+            return touch_inner(state, id, x, y, dx, dy, gpe, began_on)
         end
     end
     local frame_end = __rs_input_frame_end

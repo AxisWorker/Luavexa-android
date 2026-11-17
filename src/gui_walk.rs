@@ -100,6 +100,7 @@ pub(super) struct LocalHit {
     pub button: bool,
     pub textbox: bool,
     pub sink: bool,
+    pub active: bool,
     pub scrolling: bool,
     /// Draggable, or holds an enabled UIDragDetector.
     pub drag: bool,
@@ -1006,6 +1007,7 @@ impl Walk<'_, '_> {
             button: is_button,
             textbox,
             sink: is_button || textbox || boolp(d, r, "Active", false),
+            active: boolp(d, r, "Active", is_button),
             scrolling,
             drag: boolp(d, r, "Draggable", false)
                 || child_of_class(d, r, "UIDragDetector").is_some_and(|dd| boolp(d, dd, "Enabled", true)),

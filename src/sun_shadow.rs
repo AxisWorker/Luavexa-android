@@ -41,20 +41,36 @@ pub fn set_texel_scale(scale: f32) {
     SCALE.store(scale.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// `v` texels at [`texel_scale`], rounded down to a multiple of 16 (so
-/// the scaled tiles still pack without overlapping), at least 16.
+/// `v` texels at `scale`, rounded down to a multiple of 16 (so the scaled
+/// tiles still pack without overlapping), at least 16.
+fn scaled_at(v: u32, scale: f32) -> u32 {
+    (((v as f32 * scale).floor() as u32) & !15).max(16)
+}
+
+/// `v` texels at [`texel_scale`].
 fn scaled(v: u32) -> u32 {
-    (((v as f32 * texel_scale()).floor() as u32) & !15).max(16)
+    scaled_at(v, texel_scale())
+}
+
+/// Texels across each cascade's tile at `scale`.
+fn tiles_at(scale: f32) -> [u32; CASCADES] {
+    mech::SUN_CASCADE_TILES.map(|t| scaled_at(t, scale))
 }
 
 /// Texels across each cascade's tile.
 pub fn tiles() -> [u32; CASCADES] {
-    mech::SUN_CASCADE_TILES.map(scaled)
+    tiles_at(texel_scale())
+}
+
+/// Each tile's corner in the atlas at `scale` (a corner at 0 stays there:
+/// `scaled_at`'s floor of 16 is for the tiles).
+fn origins_at(scale: f32) -> [[u32; 2]; CASCADES] {
+    mech::SUN_CASCADE_ORIGINS.map(|o| o.map(|v| if v == 0 { 0 } else { scaled_at(v, scale) }))
 }
 
 /// Each tile's corner in the atlas.
 pub fn origins() -> [[u32; 2]; CASCADES] {
-    mech::SUN_CASCADE_ORIGINS.map(|o| o.map(scaled))
+    origins_at(texel_scale())
 }
 
 /// The atlas: what the scaled tiles reach (Studio's 3200 × 2048 at scale 1).
@@ -190,11 +206,16 @@ fn light_basis(travel: Vec3) -> (Vec3, Vec3) {
 /// camera; the others snap to a grid of radius / 4 in light space,
 /// so they stay put while the camera moves a little.
 pub fn cascades(cam: Vec3, forward: Vec3, tan_half: [f32; 2], sun: Vec3, softness: f32) -> [Cascade; CASCADES] {
+    cascades_at(texel_scale(), cam, forward, tan_half, sun, softness)
+}
+
+/// `cascades` with the tiles at `scale` (the renderer's is [`texel_scale`]).
+fn cascades_at(scale: f32, cam: Vec3, forward: Vec3, tan_half: [f32; 2], sun: Vec3, softness: f32) -> [Cascade; CASCADES] {
     let travel = -sun.normalize_or(Vec3::Y);
     let (right, up) = light_basis(travel);
     let blur = softness * mech::SHADOW_SOFTNESS_BLUR[0] + mech::SHADOW_SOFTNESS_BLUR[1];
     let hyp = (tan_half[0] * tan_half[0] + tan_half[1] * tan_half[1]).sqrt();
-    let (origins, tiles) = (origins(), tiles());
+    let (origins, tiles) = (origins_at(scale), tiles_at(scale));
     std::array::from_fn(|i| {
         let (near, far) = (mech::SUN_CASCADE_SPLITS[i], mech::SUN_CASCADE_SPLITS[i + 1]);
         let to_far = far * hyp;
@@ -624,13 +645,17 @@ mod tests {
 
     #[test]
     fn at_full_scale_the_tiles_pack_studios_atlas() {
-        if texel_scale() != 1.0 {
-            return; // another test's renderer set a scale
+        assert_eq!(tiles_at(1.0), mech::SUN_CASCADE_TILES);
+        assert_eq!(origins_at(1.0), mech::SUN_CASCADE_ORIGINS);
+        // (half the texels: the corners at 0 stay, the tiles halve)
+        assert_eq!(tiles_at(0.5), [192, 384, 512, 1024]);
+        assert_eq!(origins_at(0.5), [[1408, 512], [1024, 512], [1024, 0], [0, 0]]);
+        if texel_scale() == 1.0 {
+            // (the atlas and depth map read the scale in force: another
+            // test's renderer may have set one)
+            assert_eq!(atlas(), mech::SUN_SHADOW_ATLAS);
+            assert_eq!(depth_texels(), mech::SHADOW_MAP_TEXELS);
         }
-        assert_eq!(tiles(), mech::SUN_CASCADE_TILES);
-        assert_eq!(origins(), mech::SUN_CASCADE_ORIGINS);
-        assert_eq!(atlas(), mech::SUN_SHADOW_ATLAS);
-        assert_eq!(depth_texels(), mech::SHADOW_MAP_TEXELS);
     }
 
     /// A running Studio (a test place, ShadowSoftness 0.2): Globals
@@ -644,7 +669,8 @@ mod tests {
         let tx = (1.13571f32 * 1.13571 - ty * ty).sqrt();
         let sun = Vec3::new(-0.474_896, 0.822_544, 0.312_882);
         let cam = Vec3::new(40.0, 150.0, 300.0);
-        let c = cascades(cam, Vec3::new(0.9, -0.3, 0.1).normalize(), [tx, ty], sun, 0.2);
+        // (Studio's tile sizes: the blur levels count texels)
+        let c = cascades_at(1.0, cam, Vec3::new(0.9, -0.3, 0.1).normalize(), [tx, ty], sun, 0.2);
         let want_r = [22.322, 50.716, 158.609, 681.042];
         let want_depth = [109.43, 166.22, 382.00, 1426.87];
         for i in 0..CASCADES {

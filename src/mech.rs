@@ -316,6 +316,12 @@ pub const TOUCH_STICK_RADIUS_POINTS: f32 = 56.0; // touch screens, Play: the mov
 pub const TOUCH_STICK_DEAD_POINTS: f32 = 10.0; // touch screens, Play: the stick does nothing inside this radius (estimated)
 pub const TOUCH_JUMP_SIZE_POINTS: f32 = 72.0; // touch screens, Play: the jump button's side (estimated; Roblox's is 70 × 70)
 pub const TOUCH_JUMP_MARGIN_POINTS: f32 = 28.0; // touch screens, Play: the jump button's distance from the view's bottom-right corner (estimated)
+pub const TOUCH_TAP_MS: u64 = 300; // the game's fingers: lifted within this of landing, and within TOUCH_TAP_SLOP_PX of where, a finger is a tap (UserInputService.TouchTap, TouchTapInWorld, GuiObject.TouchTap) (estimated; Android's tap timeout is 300 ms... iOS's about the same)
+pub const TOUCH_TAP_SLOP_PX: f32 = 12.0; // the game's fingers: a tap moves less than this (estimated; Roblox's own tap tolerance is about this)
+pub const TOUCH_LONG_PRESS_GAME_MS: u64 = 500; // the game's fingers: a finger still this long is a long press (UserInputService.TouchLongPress, state Begin; then Change as it moves, End at the lift) (estimated; iOS's UILongPressGestureRecognizer default, which Roblox's gestures follow)
+pub const TOUCH_PAN_SLOP_PX: f32 = 10.0; // the game's fingers: moved this far, a finger starts a pan (UserInputService.TouchPan) (estimated; iOS's pan recognizer starts at 10 pt)
+pub const TOUCH_SWIPE_MIN_PX_PER_S: f32 = 1000.0; // the game's fingers: a lift faster than this, after a pan, is a swipe (UserInputService.TouchSwipe) (estimated)
+pub const TOUCH_SWIPE_MIN_PX: f32 = 50.0; // the game's fingers: a swipe travels at least this far (estimated)
 pub const R15_HIP_HEIGHT: f32 = 2.0; // Humanoid.HipHeight of Studio's default R15 body (content/avatar/characterR15DynamicHeadV2.rbxm)
 #[cfg_attr(not(test), allow(dead_code))] // checked by rig::hip_tests
 pub const R15_PLAY_HIP_HEIGHT: f32 = 2.192423; // HipHeight of Studio's own Play character with default scales (tools/fidelity physics capture, control place); the body file's legs scaled to R15_DEFAULT_PART_SIZES give the same

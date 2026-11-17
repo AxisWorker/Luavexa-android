@@ -1090,6 +1090,7 @@ impl Gui {
                     button: h.button,
                     textbox: h.textbox,
                     sink: h.sink,
+                    active: h.active,
                     scrolling: h.scrolling,
                     drag: h.drag,
                     painted: h.painted,
@@ -1212,6 +1213,136 @@ impl Gui {
             self.events.push(GuiEvent::Fire(t.r, "MouseButton1Up", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
         }
         self.events.push(GuiEvent::Fire(t.r, "InputEnded", vec![GuiArg::Input { button: 1, began: false, x, y }]));
+    }
+
+    /// Fingers on the game's GUIs (the input layer's game fingers,
+    /// src/touch_input.rs; the mouse path in `input` never sees them).
+    /// Each finger is one InputObject (UserInputType.Touch) for its life:
+    /// what is under it hears InputBegan / InputChanged / InputEnded with
+    /// it and MouseEnter / MouseMoved / MouseLeave as it would the mouse;
+    /// a button it lands on MouseButton1Down, and the lift on that button
+    /// MouseButton1Up, MouseButton1Click and Activated (Roblox: Activated
+    /// only when the button is Active; an Active = false button clicks but
+    /// doesn't take the finger from the world or the input actions, which
+    /// the PlayerModule's thumbstick frame relies on). A quick, still
+    /// finger is a TouchTap on what it touched. Returns each event for
+    /// UserInputService and the input action system (play.rs), in order.
+    pub fn touch_input(&mut self, touches: &[GuiTouch], rect: Rect) -> Vec<TouchOut> {
+        use crate::gui::{TouchFinger, TouchState};
+        let inset = self.input_inset.unwrap_or(mech::GUI_TOP_INSET);
+        let gui_xy = |p: Pos2| (p.x - rect.left(), p.y - rect.top() - inset);
+        let mut out = Vec::with_capacity(touches.len());
+        for t in touches {
+            let (x, y) = gui_xy(t.pos);
+            let under: Vec<Hit> = self
+                .hits
+                .iter()
+                .filter(|h| point_in_quad(&h.quad, t.pos) && h.clip.is_none_or(|c| point_in_quad(&c, t.pos)))
+                .cloned()
+                .collect();
+            let now: HashSet<Ref> = under.iter().map(|h| h.r).collect();
+            let input = |state: TouchState, dx: f32, dy: f32| GuiArg::Touch { id: t.id, state, x, y, dx, dy };
+            match t.state {
+                TouchState::Begin => {
+                    let top = under.iter().rev().find(|h| h.textbox || h.active).cloned();
+                    // A finger anywhere else ends text editing.
+                    if let Some(f) = self.focus.filter(|f| top.as_ref().is_none_or(|t| t.r != *f)) {
+                        let mut sh = super::share();
+                        sh.focus_events.push((f, false, false, Some((1, x, y))));
+                        sh.focus = None;
+                        self.focus = None;
+                    }
+                    for h in &under {
+                        self.events.push(GuiEvent::Fire(h.r, "MouseEnter", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
+                        self.events.push(GuiEvent::Fire(h.r, "InputBegan", vec![input(TouchState::Begin, 0.0, 0.0)]));
+                    }
+                    let mut pressed = None;
+                    if let Some(top) = &top {
+                        if top.button {
+                            self.events.push(GuiEvent::Fire(top.r, "MouseButton1Down", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
+                            pressed = Some(top.r);
+                            super::share().pressed = Some(top.r);
+                        }
+                        if top.textbox && self.focus != Some(top.r) {
+                            self.focus = Some(top.r);
+                            let mut sh = super::share();
+                            sh.focus_events.push((top.r, true, false, Some((1, x, y))));
+                            sh.focus = Some(top.r);
+                        }
+                    }
+                    let began_on: Vec<Ref> = under.iter().filter(|h| h.button).map(|h| h.r).collect();
+                    let sunk = top.is_some();
+                    self.touch_fingers.insert(
+                        t.id,
+                        TouchFinger { x, y, start: (x, y), since: std::time::Instant::now(), sunk, pressed, under: now, began_on: began_on.clone() },
+                    );
+                    out.push(TouchOut { id: t.id, state: t.state, x, y, dx: 0.0, dy: 0.0, sunk, began_on });
+                }
+                TouchState::Change => {
+                    let Some(f) = self.touch_fingers.get_mut(&t.id) else { continue };
+                    let (dx, dy) = (x - f.x, y - f.y);
+                    f.x = x;
+                    f.y = y;
+                    for h in &under {
+                        if f.under.contains(&h.r) {
+                            self.events.push(GuiEvent::Fire(h.r, "MouseMoved", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
+                            self.events.push(GuiEvent::Fire(h.r, "InputChanged", vec![input(TouchState::Change, dx, dy)]));
+                        } else {
+                            self.events.push(GuiEvent::Fire(h.r, "MouseEnter", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
+                        }
+                    }
+                    for r in f.under.difference(&now) {
+                        self.events.push(GuiEvent::Fire(*r, "MouseLeave", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
+                    }
+                    f.under = now;
+                    let (sunk, began_on) = (f.sunk, f.began_on.clone());
+                    out.push(TouchOut { id: t.id, state: t.state, x, y, dx, dy, sunk, began_on });
+                }
+                TouchState::End | TouchState::Cancel => {
+                    let Some(f) = self.touch_fingers.remove(&t.id) else { continue };
+                    let (dx, dy) = (x - f.x, y - f.y);
+                    for h in &under {
+                        self.events.push(GuiEvent::Fire(h.r, "InputEnded", vec![input(t.state, dx, dy)]));
+                    }
+                    if let Some(pr) = f.pressed {
+                        if super::share().pressed == Some(pr) {
+                            super::share().pressed = None;
+                        }
+                        if t.state == TouchState::End {
+                            if let Some(h) = self.hits.iter().find(|h| h.r == pr && h.button).cloned() {
+                                self.events.push(GuiEvent::Fire(pr, "MouseButton1Up", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
+                                let top = under.iter().rev().find(|h| h.textbox || h.active);
+                                if top.is_some_and(|t| t.r == pr) {
+                                    self.events.push(GuiEvent::Fire(pr, "MouseButton1Click", vec![]));
+                                    if h.active {
+                                        self.events.push(GuiEvent::Fire(pr, "Activated", vec![input(TouchState::End, dx, dy), GuiArg::Num(1.0)]));
+                                    }
+                                    self.last_click = Some(pr);
+                                }
+                            }
+                        }
+                    }
+                    // A quick, still finger: GuiObject.TouchTap(touchPositions).
+                    let still = ((x - f.start.0).powi(2) + (y - f.start.1).powi(2)).sqrt() <= mech::TOUCH_TAP_SLOP_PX;
+                    if t.state == TouchState::End && still && f.since.elapsed() <= std::time::Duration::from_millis(mech::TOUCH_TAP_MS) {
+                        for h in &under {
+                            self.events.push(GuiEvent::Fire(h.r, "TouchTap", vec![GuiArg::Points(vec![(x, y)])]));
+                        }
+                    }
+                    for r in f.under.union(&now) {
+                        self.events.push(GuiEvent::Fire(*r, "MouseLeave", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
+                    }
+                    out.push(TouchOut { id: t.id, state: t.state, x, y, dx, dy, sunk: f.sunk, began_on: f.began_on });
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether a finger is on the GUI (the mouse path leaves the pressed
+    /// button to it then).
+    pub fn touch_down(&self) -> bool {
+        !self.touch_fingers.is_empty()
     }
 
     pub fn input(&mut self, ctx: &egui::Context, resp: &egui::Response, rect: Rect) -> bool {

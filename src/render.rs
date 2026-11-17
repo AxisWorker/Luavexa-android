@@ -1021,7 +1021,8 @@ impl MaterialArrays {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                // (COPY_SRC: growing the arrays copies the layers across)
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             })
         };
@@ -1059,10 +1060,35 @@ impl MaterialArrays {
     /// an array smaller than the packs (the texture quality setting) takes
     /// the chain from the level of its size.
     fn skipped_mips(&self) -> usize {
-        (crate::matpack::LAYER_SIZE / self.size.max(1)).max(1).trailing_zeros() as usize
+        skipped_mips(self.size)
     }
 
-    fn upload(&self, queue: &wgpu::Queue, layer: u32, maps: &crate::matpack::Maps) {
+    /// Copies `from`'s first `layers` layers into these arrays, every mip
+    /// these arrays have: from the same size whole, from larger arrays
+    /// (the texture quality setting went down) from the level of this size
+    /// on. Nothing from smaller arrays: their top levels aren't there.
+    fn copy_layers(&self, device: &wgpu::Device, queue: &wgpu::Queue, from: &MaterialArrays, layers: u32) {
+        if layers == 0 || from.size < self.size {
+            return;
+        }
+        let skip = skipped_mips(self.size) - skipped_mips(from.size);
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("material arrays grow") });
+        for (src, dst) in [(&from.albedo, &self.albedo), (&from.surface, &self.surface), (&from.emission, &self.emission)] {
+            for mip in 0..mip_levels(self.size, self.size) {
+                let side = (self.size >> mip).max(1);
+                let at = |texture, mip_level| wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                };
+                enc.copy_texture_to_texture(at(src, mip + skip as u32), at(dst, mip), wgpu::Extent3d { width: side, height: side, depth_or_array_layers: layers });
+            }
+        }
+        queue.submit(Some(enc.finish()));
+    }
+
+    fn upload(&self, queue: &wgpu::Queue, layer: u32, maps: &crate::matpack::Pixels) {
         let skip = self.skipped_mips();
         for (tex, data, channels) in [(&self.albedo, &maps.albedo, 4), (&self.surface, &maps.surface, 4), (&self.emission, &maps.emissive, 1)] {
             for (mip, (at, size)) in crate::matpack::mip_levels().into_iter().enumerate().skip(skip) {
@@ -1097,6 +1123,12 @@ impl MaterialArrays {
             }
         }
     }
+}
+
+/// Mip levels of a pack's chain (matpack::LAYER_SIZE² first) that arrays
+/// `size` across leave out.
+fn skipped_mips(size: u32) -> usize {
+    (crate::matpack::LAYER_SIZE / size.max(1)).max(1).trailing_zeros() as usize
 }
 
 struct Mesh {
@@ -2066,6 +2098,10 @@ pub struct Renderer {
     /// Material texture packs (matpack.rs): one array layer per pack,
     /// colour + height and normal + roughness + metalness.
     materials: MaterialArrays,
+    /// Material arrays being made at a larger texture size than
+    /// `materials` (`remake_materials`), and the layers still to upload.
+    materials_next: Option<MaterialArrays>,
+    materials_next_pending: Vec<u32>,
     /// Size of the loaded skybox faces (0 = none, draw the gradient).
     pub sky_size: u32,
     /// 1×1 black: the emissive mask of textures without one.
@@ -2719,6 +2755,8 @@ impl Renderer {
             studs_view,
             studs_sampler,
             materials,
+            materials_next: None,
+            materials_next_pending: Vec::new(),
             sky_size: 0,
             meshes,
             cull_alias: HashMap::new(),
@@ -3653,7 +3691,9 @@ impl Renderer {
     }
 
     /// The texture array layer of a material pack, uploading it (and
-    /// growing the arrays) the first time.
+    /// growing the arrays) the first time. -1 while its maps are not in
+    /// memory (released after another renderer's upload): they are asked
+    /// for, and `matpack::generation` changes when they are back.
     pub fn material_layer(
         &mut self,
         device: &wgpu::Device,
@@ -3663,34 +3703,121 @@ impl Renderer {
         if let Some(l) = self.materials.layers.get(&maps.pack) {
             return *l as i32;
         }
+        let Some(pixels) = maps.pixels() else {
+            crate::matpack::request_pixels(maps);
+            return -1;
+        };
         self.generation += 1;
         let layer = self.materials.cpu.len() as u32;
         self.materials.cpu.push(maps.clone());
         self.materials.layers.insert(maps.pack, layer);
-        if layer >= self.materials.capacity || self.materials.size != self.settings.texture_texels {
+        if layer >= self.materials.capacity || self.materials.size != self.texture_size() {
             let cap = (layer + 1).next_power_of_two().max(4).max(self.materials.capacity);
             self.remake_materials(device, queue, cap);
-        } else {
-            self.materials.upload(queue, layer, maps);
         }
+        self.materials.upload(queue, layer, &pixels);
+        // The arrays being filled at a larger size get it too (below).
+        if let Some(next) = self.materials_next.as_mut() {
+            next.cpu.push(maps.clone());
+            next.layers.insert(maps.pack, layer);
+            next.upload(queue, layer, &pixels);
+            self.materials_next_pending.retain(|&l| l != layer);
+        }
+        // On the GPU now: the 14 MB of maps go (see matpack::Maps).
+        maps.release_pixels();
         layer as i32
     }
 
+    /// The material arrays' side: the settings' texture quality
+    /// (`RenderSettings::texture_texels`), at most the packs' own size.
+    fn texture_size(&self) -> u32 {
+        self.settings.texture_texels.clamp(1, crate::matpack::LAYER_SIZE)
+    }
+
     /// New material arrays of `capacity` layers at the settings' texture
-    /// size (`RenderSettings::texture_texels`), the packs so far uploaded
-    /// again from their chains.
+    /// size. The layers so far are copied on the GPU (their maps are no
+    /// longer in memory): whole at the same size, from the matching level
+    /// down at a smaller one. Larger arrays can't be filled from the old
+    /// ones' levels: they are made aside (`materials_next`), every pack's
+    /// maps are asked for again, and they take over once every layer has
+    /// been uploaded (`materials_tick`); the old arrays draw meanwhile.
     fn remake_materials(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, capacity: u32) {
         self.generation = self.generation.wrapping_add(1);
-        let size = self.settings.texture_texels.clamp(1, crate::matpack::LAYER_SIZE);
+        let size = self.texture_size();
+        let capacity = capacity.max(1).max(self.materials.cpu.len() as u32);
+        let done = self.materials.cpu.len() as u32;
+        if size > self.materials.size && done > 0 {
+            // Growing: the arrays aside, at the new size.
+            let mut next = MaterialArrays::with_params(device, size, capacity, self.materials.params.clone());
+            next.layers = self.materials.layers.clone();
+            next.cpu = self.materials.cpu.clone();
+            for m in &next.cpu {
+                crate::matpack::request_pixels(m);
+            }
+            self.materials_next = Some(next);
+            self.materials_next_pending = (0..done).collect();
+            if done >= self.materials.capacity {
+                // (room for the layer being added, at the old size)
+                let old = std::mem::replace(&mut self.materials, MaterialArrays::new(device, 1, 1));
+                let mut grown = MaterialArrays::with_params(device, old.size, capacity, old.params.clone());
+                grown.layers = old.layers.clone();
+                grown.cpu = old.cpu.clone();
+                grown.copy_layers(device, queue, &old, done);
+                self.materials = grown;
+                self.rebind_globals(device);
+            }
+            return;
+        }
         let params = std::mem::take(&mut self.materials.params);
-        let mut made = MaterialArrays::with_params(device, size, capacity.max(1), params);
+        let mut made = MaterialArrays::with_params(device, size, capacity, params);
         made.layers = std::mem::take(&mut self.materials.layers);
         made.cpu = std::mem::take(&mut self.materials.cpu);
-        for (i, m) in made.cpu.iter().enumerate() {
-            made.upload(queue, i as u32, m);
-        }
+        made.copy_layers(device, queue, &self.materials, done);
         self.materials = made;
+        self.materials_next = None;
+        self.materials_next_pending.clear();
         self.rebind_globals(device);
+    }
+
+    /// Once a frame: the arrays being made at a larger size take the maps
+    /// that have come back, and take over when every layer has them.
+    fn materials_tick(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let size = self.texture_size();
+        let Some(next) = self.materials_next.as_mut() else { return };
+        if next.size != size {
+            // The setting moved again meanwhile: start over from the
+            // current arrays (a smaller size needs no maps at all).
+            self.materials_next = None;
+            self.materials_next_pending.clear();
+            if self.materials.size != size {
+                self.remake_materials(device, queue, self.materials.capacity);
+            }
+            return;
+        }
+        let mut pending = std::mem::take(&mut self.materials_next_pending);
+        pending.retain(|&layer| {
+            let Some(m) = next.cpu.get(layer as usize) else { return false };
+            match m.pixels() {
+                Some(pixels) => {
+                    next.upload(queue, layer, &pixels);
+                    m.release_pixels();
+                    false
+                }
+                None => {
+                    crate::matpack::request_pixels(m);
+                    true
+                }
+            }
+        });
+        self.materials_next_pending = pending;
+        if self.materials_next_pending.is_empty() {
+            let mut next = self.materials_next.take().expect("checked");
+            next.params = std::mem::take(&mut self.materials.params);
+            queue.write_buffer(&next.params_buf, 0, bytemuck::cast_slice(&next.params));
+            self.materials = next;
+            self.generation = self.generation.wrapping_add(1);
+            self.rebind_globals(device);
+        }
     }
 
     /// Studio's material constants for the parts drawn with material layer
@@ -4339,6 +4466,7 @@ impl Renderer {
         // was not painted) goes first; then the work that follows a submit.
         self.flush_deferred(queue);
         self.after_submit(device);
+        self.materials_tick(device, queue);
         let bisect = bisect::step();
         if bisect == 10 {
             // No 3D frame: the view keeps its last image.
@@ -5613,6 +5741,40 @@ impl Renderer {
         true
     }
 
+    /// Rewrites loaded mesh `index` whole from these arrays (the same
+    /// layout `add_mesh_projected` builds), in place. A skinning slot gets
+    /// its rest pose here and is queued for the compute pass again with the
+    /// palette it already holds. False when the sizes differ.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rewrite_mesh(
+        &mut self, queue: &wgpu::Queue, index: u32, positions: &[Vec3], normals: &[Vec3],
+        uvs: &[glam::Vec2], colors: &[glam::Vec4], projection: [f32; 4],
+    ) -> bool {
+        let Some(m) = self.meshes.get(index as usize + BUILTIN_MESHES) else { return false };
+        if m.count as usize != positions.len() || normals.len() != positions.len() {
+            return false;
+        }
+        let projection = if m.storage { [0.0; 4] } else { projection };
+        let verts: Vec<Vertex> = positions
+            .iter()
+            .zip(normals)
+            .enumerate()
+            .map(|(i, (p, n))| Vertex {
+                pos: p.to_array(),
+                normal: n.to_array(),
+                projection,
+                uv: uvs.get(i).map(|u| u.to_array()).unwrap_or([0.0, 0.0]),
+                color: colors.get(i).map(|c| c.to_array()).unwrap_or([0.0; 4]),
+            })
+            .collect();
+        queue.write_buffer(&m.vbuf, 0, bytemuck::cast_slice(&verts));
+        crate::bench::add("live_mesh_bytes", 0.0, (verts.len() * std::mem::size_of::<Vertex>()) as u64);
+        if m.storage {
+            self.skin.again(index);
+        }
+        true
+    }
+
     /// A skinned part's mesh slot deformed on the GPU (skin_gpu.rs): the
     /// slot `index` when it is one made for skinning with the same corner
     /// count, else a new one holding the mesh at rest (uvs, colours); then
@@ -6353,7 +6515,16 @@ fn mip_chain(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
     static TH: OnceLock<[f32; 255]> = OnceLock::new();
     let th = TH.get_or_init(|| std::array::from_fn(|i| ((i as f32 + 0.5) / 255.0).powf(2.2)));
     let to_srgb = |v: f32| th.partition_point(|&t| t <= v) as u8;
-    let mut out = rgba.to_vec();
+    // (exactly the chain's size: growing a Vec of level 0 by doubling held
+    // half as much again as the chain needs)
+    let mut total = rgba.len();
+    let (mut cw, mut ch) = (w, h);
+    while cw > 1 || ch > 1 {
+        (cw, ch) = ((cw / 2).max(1), (ch / 2).max(1));
+        total += (cw * ch * 4) as usize;
+    }
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(rgba);
     let (mut cw, mut ch) = (w, h);
     let mut prev = rgba.to_vec();
     while cw > 1 || ch > 1 {

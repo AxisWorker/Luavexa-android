@@ -2586,6 +2586,15 @@ fn terrain_tri_index(lua: &Lua, key: [i32; 3], tris: &[([Vec3; 3], [u8; 3])]) ->
 
 /// Terrain under a ray for the play mouse (Mouse.Hit / Mouse.Target):
 /// (terrain, distance). Water counts, as for Raycast.
+/// The part under the game's mouse: the shown side's Raycast (true shapes, so
+/// a union's doorway or a mesh's gaps let the ray through; invisible parts
+/// still catch it, as Roblox's Mouse does), passing `skip` (the player's own
+/// character and held tool).
+pub fn mouse_part_hit(lua: &Lua, origin: Vec3, dir: Vec3, len: f32, skip: &[Ref]) -> Option<(Ref, f32)> {
+    let filter = Filter { list: skip.iter().copied().collect(), ..Filter::none() };
+    cast(lua, origin, dir.normalize_or_zero() * len, &filter).ok().flatten().map(|(r, _, _, t)| (r, t))
+}
+
 pub fn mouse_terrain_hit(lua: &Lua, origin: Vec3, dir: Vec3, len: f32) -> Option<(Ref, f32)> {
     terrain_hit(lua, origin, dir, len, false).ok().flatten().map(|(r, _, _, t, _)| (r, t))
 }
@@ -3882,23 +3891,23 @@ fn enum_item(lua: &Lua, en: &str, item: &str) -> mlua::Result<Value> {
 }
 
 /// Client device and engine state the default player scripts read: a
-/// desktop with keyboard and mouse, no touch, gamepad or VR (Studio's Play).
+/// desktop with keyboard and mouse, no touch, gamepad or VR (Studio's
+/// Play); a touch screen (Android, `touch_input::game_touch`) with touch
+/// and no mouse or keyboard, PreferredInput Touch, and the device's
+/// accelerometer and gyroscope (the PlayerModule then shows its own
+/// thumbstick and jump button: src/play_game.rs "Fingers in Play").
 fn device_prop(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option<Value>> {
     let b = |v: bool| Ok(Some(Value::Boolean(v)));
+    let touch = crate::touch_input::game_touch();
     match (class, key) {
-        (
-            "UserInputService",
-            "TouchEnabled"
-            | "GamepadEnabled"
-            | "VREnabled"
-            | "AccelerometerEnabled"
-            | "GyroscopeEnabled"
-            | "OnScreenKeyboardVisible"
-            | "ModalEnabled",
-        ) => b(false),
-        ("UserInputService", "KeyboardEnabled" | "MouseEnabled") => b(true),
+        ("UserInputService", "GamepadEnabled" | "VREnabled" | "OnScreenKeyboardVisible") => b(false),
+        ("UserInputService", "TouchEnabled") => b(touch),
+        ("UserInputService", "ModalEnabled") => stored_or(lua, r, key, |_| Ok(Value::Boolean(false))),
+        ("UserInputService", "AccelerometerEnabled") => b(crate::device_sensors::available().0),
+        ("UserInputService", "GyroscopeEnabled") => b(crate::device_sensors::available().1),
+        ("UserInputService", "KeyboardEnabled" | "MouseEnabled") => b(!touch),
         ("UserInputService", "PreferredInput") => {
-            Ok(Some(enum_item(lua, "PreferredInput", "KeyboardAndMouse")?))
+            Ok(Some(enum_item(lua, "PreferredInput", if touch { "Touch" } else { "KeyboardAndMouse" })?))
         }
         ("UserInputService", "MouseBehavior") => {
             stored_or(lua, r, key, |l| enum_item(l, "MouseBehavior", "Default"))

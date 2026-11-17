@@ -942,6 +942,74 @@ function __rs_input_event(state, uit, key, x, y, z, dx, dy, gpe)
     return sunk
 end
 function __rs_input_frame_end() mouse_delta = Vector2.zero end
+-- Fingers (UserInputType.Touch; touch screens, src/play_game.rs "Fingers
+-- in Play"): one InputObject per finger for its life, as Roblox's (the
+-- PlayerModule keys tables by them), its Position the finger's in GUI
+-- coordinates and its Delta the motion since its last event. The engine
+-- asks for it for the GUI's InputBegan / InputChanged / InputEnded first,
+-- then calls __rs_touch_event for the finger's event: the bound actions
+-- (ContextActionService, Enum.UserInputType.Touch bindings; not for a
+-- finger the GUI took), then UserInputService's InputBegan / InputChanged
+-- / InputEnded and TouchStarted / TouchMoved / TouchEnded, with
+-- gameProcessedEvent. `began_on` lists the GuiButtons under the finger
+-- when it landed (the input action system's UIButton / UIModifier,
+-- domains/gui_input.luau).
+local touch_objects = {}
+function __rs_touch_object(finger, state, x, y, dx, dy)
+    local io = touch_objects[finger]
+    if not io then
+        io = new_input_object({ UserInputType = Enum.UserInputType.Touch, KeyCode = keycode_unknown })
+        touch_objects[finger] = io
+    end
+    io.UserInputState = Enum.UserInputState[state]
+    io.Position = Vector3.new(x, y, 0)
+    io.Delta = Vector3.new(dx, dy, 0)
+    return io
+end
+function __rs_touch_event(state, finger, x, y, dx, dy, gpe, began_on)
+    local io = __rs_touch_object(finger, state, x, y, dx, dy)
+    local uis = game:GetService("UserInputService")
+    local sunk = false
+    if not gpe then sunk = run_actions(io, io.UserInputState) end
+    if last_input_type ~= "Touch" then
+        last_input_type = "Touch"
+        fire(uis, "LastInputTypeChanged", Enum.UserInputType.Touch)
+    end
+    local over = state == "End" or state == "Cancel"
+    -- (gameProcessedEvent is also true for an input a bound action sank:
+    -- the old PlayerModule's CameraInput leaves the thumbstick's finger
+    -- alone that way)
+    local processed = gpe == true or sunk
+    fire(uis, state == "Begin" and "InputBegan" or over and "InputEnded" or "InputChanged", io, processed)
+    fire(uis, state == "Begin" and "TouchStarted" or over and "TouchEnded" or "TouchMoved", io, processed)
+    if over then touch_objects[finger] = nil end
+    return sunk
+end
+-- The fingers' gestures (src/touch_gestures.rs): UserInputService's
+-- TouchTap(touchPositions, gpe), TouchTapInWorld(position, processedByUI),
+-- TouchLongPress(touchPositions, state, gpe), TouchPan(touchPositions,
+-- totalTranslation, velocity, state, gpe), TouchPinch(touchPositions,
+-- scale, velocity, state, gpe), TouchRotate(touchPositions, rotation,
+-- velocity, state, gpe), TouchSwipe(swipeDirection, numberOfTouches, gpe).
+function __rs_touch_gesture(kind, positions, a, b, c, d, state, gpe)
+    local uis = game:GetService("UserInputService")
+    gpe = gpe or false
+    if kind == "Tap" then
+        fire(uis, "TouchTap", positions, gpe)
+    elseif kind == "TapInWorld" then
+        fire(uis, "TouchTapInWorld", positions[1] or Vector2.zero, gpe)
+    elseif kind == "LongPress" then
+        fire(uis, "TouchLongPress", positions, Enum.UserInputState[state], gpe)
+    elseif kind == "Pan" then
+        fire(uis, "TouchPan", positions, Vector2.new(a, b), Vector2.new(c, d), Enum.UserInputState[state], gpe)
+    elseif kind == "Pinch" then
+        fire(uis, "TouchPinch", positions, a, b, Enum.UserInputState[state], gpe)
+    elseif kind == "Rotate" then
+        fire(uis, "TouchRotate", positions, a, b, Enum.UserInputState[state], gpe)
+    elseif kind == "Swipe" then
+        fire(uis, "TouchSwipe", Enum.SwipeDirection[state], a, gpe)
+    end
+end
 function M.GetLastInputType(self) return Enum.UserInputType[last_input_type] end
 -- The game window gaining / losing focus (UserInputService.WindowFocused /
 -- WindowFocusReleased), sent by the play session when it changes.
@@ -960,8 +1028,75 @@ function M.GamepadSupports() return false end
 function M.IsNavigationGamepad() return false end
 function M.GetStringForKeyCode(self, k) return typeof(k) == "EnumItem" and k.Name or "" end
 function M.GetImageForKeyCode() return "" end
-function M.GetDeviceRotation() return Vector3.zero, CFrame.new() end
-function M.GetDeviceGravity() return nil end
+-- The device's motion sensors (src/device_sensors.rs; Android's): one
+-- InputObject each, as Roblox's (UserInputType Accelerometer / Gyro;
+-- Position the acceleration or gravity in g, the rotation's Euler angles
+-- with the gyroscope's rates as Delta), the *Changed events once per new
+-- sample (__rs_sensor_frame, each client frame).
+local sensor_objects = {}
+local sensor_seqs = {}
+local function sensor_object(kind, uit)
+    local io = sensor_objects[kind]
+    if not io then
+        io = new_input_object({ UserInputType = Enum.UserInputType[uit], UserInputState = Enum.UserInputState.Change, KeyCode = keycode_unknown })
+        sensor_objects[kind] = io
+    end
+    return io
+end
+local function sensors()
+    -- (a GetDevice* call is the sign a script wants them: AccelerometerEnabled
+    -- read, src/device_sensors.rs starts them)
+    local uis = game:GetService("UserInputService")
+    local _ = uis.AccelerometerEnabled
+    return __rs_device_sensors and __rs_device_sensors() or nil
+end
+local function sensor_values(s)
+    local acc = sensor_object("acceleration", "Accelerometer")
+    acc.Position = s.acceleration
+    local grav = sensor_object("gravity", "Accelerometer")
+    grav.Position = s.gravity
+    local rot = sensor_object("rotation", "Gyro")
+    local rx, ry, rz = s.rotation:ToEulerAnglesXYZ()
+    rot.Position = Vector3.new(rx, ry, rz)
+    rot.Delta = s.gyro
+    return acc, grav, rot
+end
+function M.GetDeviceAcceleration()
+    local s = sensors()
+    if not s then return sensor_object("acceleration", "Accelerometer") end
+    local acc = sensor_values(s)
+    return acc
+end
+function M.GetDeviceGravity()
+    local s = sensors()
+    if not s then return sensor_object("gravity", "Accelerometer") end
+    local _, grav = sensor_values(s)
+    return grav
+end
+function M.GetDeviceRotation()
+    local s = sensors()
+    if not s then return sensor_object("rotation", "Gyro"), CFrame.new() end
+    local _, _, rot = sensor_values(s)
+    return rot, s.rotation
+end
+function __rs_sensor_frame()
+    local s = __rs_device_sensors and __rs_device_sensors() or nil
+    if not s then return end
+    local acc, grav, rot = sensor_values(s)
+    local uis = game:GetService("UserInputService")
+    if sensor_seqs.acceleration ~= s.acceleration_seq then
+        sensor_seqs.acceleration = s.acceleration_seq
+        fire(uis, "DeviceAccelerationChanged", acc)
+    end
+    if sensor_seqs.gravity ~= s.gravity_seq then
+        sensor_seqs.gravity = s.gravity_seq
+        fire(uis, "DeviceGravityChanged", grav)
+    end
+    if sensor_seqs.rotation ~= s.rotation_seq then
+        sensor_seqs.rotation = s.rotation_seq
+        fire(uis, "DeviceRotationChanged", rot, s.rotation)
+    end
+end
 
 ------------------------------------------------- VRService / GuiService
 function M.GetUserCFrame() return CFrame.new() end

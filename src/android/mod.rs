@@ -29,6 +29,7 @@ pub mod jni;
 pub mod keyboard;
 pub mod lifecycle;
 mod logcat;
+pub mod memory;
 pub mod perf_hint;
 pub mod sensors;
 pub mod storage;

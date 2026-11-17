@@ -191,12 +191,23 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
                     w(b"rustudio crashed: fatal signal ");
                     w(sig_name(sig));
                     w(b"\n\n");
-                    libc::alarm(5);
-                    // Not async-signal-safe; we are dying anyway.
-                    let body = format!("{}backtrace:\n{}\n", header("signal"), Backtrace::force_capture());
-                    w(body.as_bytes());
+                    // On Android the backtrace is debuggerd's: the handler
+                    // before this one writes the tombstone (`adb logcat -b
+                    // crash`: the signal, the abort message, every thread's
+                    // stack, the maps) out of process. Capturing one here
+                    // under the alarm has ended runs that were out of
+                    // memory with SIGALRM instead, and no tombstone.
+                    #[cfg(target_os = "android")]
                     libc::close(fd);
-                    libc::alarm(0);
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        libc::alarm(5);
+                        // Not async-signal-safe; we are dying anyway.
+                        let body = format!("{}backtrace:\n{}\n", header("signal"), Backtrace::force_capture());
+                        w(body.as_bytes());
+                        libc::close(fd);
+                        libc::alarm(0);
+                    }
                 }
             }
         }

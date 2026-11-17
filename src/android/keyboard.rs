@@ -23,14 +23,27 @@
 //! nothing runs. egui keeps the last safe-area inset it was given, so the
 //! inset is set every frame, zero included.
 //!
-//! The readings are not followed blindly, or the layout flaps. The keyboard
-//! is shown and hidden by egui-winit alone, from egui's IME output: up
-//! while a text field has the focus, and hidden and shown again at once
-//! whenever egui counts an IME interruption — which every `request_focus`
-//! is, including the one egui's own `TextEdit` makes for a tap that moves
-//! the caret, and the focus moving from one field to the next. Each such
-//! blink, and the keyboard's own slide in and out, reads as 0 for a few
-//! polls. So while a text field keeps the focus:
+//! The keyboard is shown and hidden from here ([`Keyboard::end_frame`]),
+//! not by egui-winit. egui-winit shows it while egui reports an IME field
+//! (`PlatformOutput::ime`: a focused `TextEdit`) and hides and shows it
+//! again whenever egui asks for an IME interruption, which every
+//! `request_focus` is — egui's own `TextEdit` makes one for the tap that
+//! focuses it and for every tap that moves its caret, so the keyboard
+//! opened, closed and opened again on each. Here the IME output is taken
+//! out of the frame's output at its end, so egui-winit never asks winit
+//! for the keyboard, and the activity is asked directly
+//! (`AndroidApp::show_soft_input` / `hide_soft_input`, what winit's
+//! `set_ime_allowed` does) when what wants it changes: a focused egui text
+//! field ([`focused_text`]) or a Roblox TextBox with the focus (the game's
+//! in Play, a plugin widget's: `gui::share().focus`), which egui-winit
+//! never showed it for. It is asked up at once and down once nothing has
+//! wanted it for [`HIDE_AFTER`] (a field losing the focus for a frame, or
+//! the focus moving from one field to the next, keeps it up, as Android
+//! keeps it between EditTexts).
+//!
+//! The readings are not followed blindly, or the layout flaps. The
+//! keyboard's own slide in and out reads as 0 for a few polls, as does the
+//! hide and show of a focus move. So while a text field keeps the focus:
 //!
 //! * the room is made as soon as a height is read (the keyboard slides in
 //!   after the focus; its final height is reported from the start);
@@ -38,14 +51,15 @@
 //!   field the keyboard was up for still focused, the user hid the keyboard
 //!   (Back, its own hide key) — which is invisible to the app otherwise,
 //!   and nothing would bring the keyboard back but another tap — so the
-//!   field's focus is released here: the edit ends (its text kept) as the
-//!   user meant, the room goes with it, and a tap starts it again;
+//!   field's focus is released here (a TextBox's: FocusLost): the edit
+//!   ends (its text kept) as the user meant, the room goes with it, and a
+//!   tap starts it again;
 //! * another height (the keyboard's suggestions strip or symbols page)
 //!   is taken once it has been read [`STEADY_READS`] times running.
 //!
 //! With no text field focused the first 0 reading takes the room away:
-//! egui-winit has hidden the keyboard. Each change is logged (`adb logcat
-//! -s rustudio`: "soft keyboard ...").
+//! the keyboard has been hidden. Each change is logged (`adb logcat -s
+//! rustudio`: "soft keyboard ...").
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -69,6 +83,9 @@ const STEADY_READS: u32 = 2;
 const GIVE_UP: Duration = Duration::from_secs(1);
 /// Points the panels keep however tall the keyboard is.
 const MIN_HEIGHT: f32 = 120.0;
+/// Nothing has wanted the keyboard this long: it is asked down. Longer
+/// than a field's focus is away between two frames or two fields.
+const HIDE_AFTER: Duration = Duration::from_millis(250);
 
 /// Set for the frame after the room for the keyboard changed (`reveal`).
 static CHANGED: AtomicBool = AtomicBool::new(false);
@@ -84,10 +101,57 @@ pub struct Keyboard {
     last_read: Option<(i32, u32)>,
     /// Since when the readings have been 0 while room is made.
     zero_since: Option<Instant>,
-    /// The text field the keyboard is up for.
-    up_for: Option<egui::Id>,
-    /// Since when a text field has had the focus (for the log's timings).
+    /// What the keyboard is up for.
+    up_for: Option<Want>,
+    /// Since when something has wanted the keyboard (for the log's timings).
     focus_since: Option<Instant>,
+    /// The activity was last asked to show (true) or hide the keyboard.
+    shown: bool,
+    /// Since when nothing has wanted the keyboard, while `shown`.
+    unwanted_since: Option<Instant>,
+}
+
+/// What wants the soft keyboard.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Want {
+    /// A focused egui text field.
+    Field(egui::Id),
+    /// A Roblox TextBox with the focus: the game's in Play, a plugin
+    /// widget's (src/gui_input.rs `keyboard` types into it).
+    TextBox,
+}
+
+/// What wants the keyboard this frame, if anything. `textbox`: a Roblox
+/// TextBox has the focus (the caller knows which GUIs are live: the
+/// game's in Play, `Editor::gui.focus`; a plugin's,
+/// `PluginUi::has_text_focus`).
+pub fn wanted(ctx: &egui::Context, textbox: bool) -> Option<Want> {
+    if let Some(id) = focused_text(ctx) {
+        return Some(Want::Field(id));
+    }
+    textbox.then_some(Want::TextBox)
+}
+
+/// Releases a focused TextBox as a click elsewhere would: the scripts fire
+/// FocusLost (`focus_events`), the GUI stops typing into it (`focus_req`).
+fn release_textbox() {
+    for ch in 0..2u8 {
+        let _c = crate::gui::share_channel(ch);
+        let mut sh = crate::gui::share();
+        if let Some(f) = sh.focus.take() {
+            sh.focus_events.push((f, false, false, None));
+            sh.focus_req.push(None);
+        }
+    }
+}
+
+/// Asks the activity for the keyboard (what winit's `set_ime_allowed` does).
+fn soft_input(show: bool) {
+    match super::app() {
+        Some(app) if show => app.show_soft_input(true),
+        Some(app) => app.hide_soft_input(true),
+        None => log::warn!("soft keyboard: no activity to ask"),
+    }
 }
 
 /// The focused widget when it is a text field (egui keeps a
@@ -124,13 +188,13 @@ pub fn reveal_cursor(ui: &egui::Ui, out: &egui::text_edit::TextEditOutput) {
 impl Keyboard {
     /// In `App::raw_input_hook`: reads the keyboard's height when it may
     /// have changed and hands it to egui as the bottom safe-area inset.
-    pub fn before_frame(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+    pub fn before_frame(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput, textbox: bool) {
         CHANGED.store(false, Ordering::Relaxed);
-        let focused = focused_text(ctx);
-        let watching = focused.is_some() || self.height_px > 0 || self.last_read.is_some_and(|(h, _)| h > 0);
+        let want = wanted(ctx, textbox);
+        let watching = want.is_some() || self.height_px > 0 || self.last_read.is_some_and(|(h, _)| h > 0);
         if watching {
             let now = Instant::now();
-            match focused {
+            match want {
                 Some(_) if self.focus_since.is_none() => self.focus_since = Some(now),
                 None => self.focus_since = None,
                 _ => {}
@@ -143,7 +207,7 @@ impl Keyboard {
             // The keyboard slides in after the focus (and out after it):
             // keep looking while it matters, input or none.
             ctx.request_repaint_after(POLL);
-            self.follow(ctx, focused, now);
+            self.follow(ctx, want, now);
         } else {
             self.polled = None;
             self.asked = None;
@@ -183,13 +247,13 @@ impl Keyboard {
     }
 
     /// Turns the readings into the room made (the module comment).
-    fn follow(&mut self, ctx: &egui::Context, focused: Option<egui::Id>, now: Instant) {
+    fn follow(&mut self, ctx: &egui::Context, want: Option<Want>, now: Instant) {
         let Some((read, runs)) = self.last_read else { return };
         let since_focus = || self.focus_since.map_or(0, |t| now.duration_since(t).as_millis());
         if read > 0 {
             self.zero_since = None;
-            if focused.is_some() {
-                self.up_for = focused;
+            if want.is_some() {
+                self.up_for = want;
             }
             if self.height_px == 0 {
                 log::info!("soft keyboard up: {read} px, {} ms after the focus", since_focus());
@@ -204,8 +268,8 @@ impl Keyboard {
         if self.height_px == 0 {
             return;
         }
-        let Some(id) = focused else {
-            log::info!("soft keyboard down: no text field focused");
+        let Some(want) = want else {
+            log::info!("soft keyboard down: nothing to type into");
             self.up_for = None;
             self.zero_since = None;
             self.set_height(0);
@@ -213,19 +277,60 @@ impl Keyboard {
         };
         let since = *self.zero_since.get_or_insert(now);
         if now.duration_since(since) < HIDDEN_FOR {
-            // A blink (an IME interruption, a focus move) or the slide out
-            // of a keyboard the user is hiding: the room stays meanwhile.
+            // The hide and show of a focus move, or the slide out of a
+            // keyboard the user is hiding: the room stays meanwhile.
             return;
         }
         log::info!(
-            "soft keyboard hidden by the user ({} ms down{}): the text field's focus released",
+            "soft keyboard hidden by the user ({} ms down{}): {}",
             now.duration_since(since).as_millis(),
-            if self.up_for == Some(id) { "" } else { ", after the focus moved to another field" }
+            if self.up_for == Some(want) { "" } else { ", after the focus moved to another field" },
+            match want {
+                Want::Field(_) => "the text field's focus released",
+                Want::TextBox => "the TextBox's focus released",
+            }
         );
-        ctx.memory_mut(|m| m.surrender_focus(id));
+        match want {
+            Want::Field(id) => ctx.memory_mut(|m| m.surrender_focus(id)),
+            Want::TextBox => release_textbox(),
+        }
         self.up_for = None;
         self.zero_since = None;
         self.set_height(0);
+    }
+
+    /// At the end of the frame: keeps egui's IME output from egui-winit
+    /// and asks the activity for the keyboard when what wants it changes
+    /// (the module comment).
+    pub fn end_frame(&mut self, ctx: &egui::Context, textbox: bool) {
+        ctx.output_mut(|o| o.ime = None);
+        let want = wanted(ctx, textbox);
+        let now = Instant::now();
+        match (want, self.shown) {
+            (Some(w), false) => {
+                self.shown = true;
+                self.unwanted_since = None;
+                log::info!("soft keyboard asked up for {}", match w {
+                    Want::Field(_) => "a text field",
+                    Want::TextBox => "a TextBox",
+                });
+                soft_input(true);
+            }
+            (Some(_), true) => self.unwanted_since = None,
+            (None, true) => {
+                let since = *self.unwanted_since.get_or_insert(now);
+                let for_ms = now.duration_since(since);
+                if for_ms >= HIDE_AFTER {
+                    self.shown = false;
+                    self.unwanted_since = None;
+                    log::info!("soft keyboard asked down: nothing to type into for {} ms", for_ms.as_millis());
+                    soft_input(false);
+                } else {
+                    ctx.request_repaint_after(HIDE_AFTER - for_ms);
+                }
+            }
+            (None, false) => {}
+        }
     }
 
     fn set_height(&mut self, px: i32) {

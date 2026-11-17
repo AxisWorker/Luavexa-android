@@ -738,6 +738,9 @@ impl RustudioApp {
             doc::db().classes.len()
         ));
         for line in crate::crash::unseen_reports() {
+            // (and in logcat, where a device run is read)
+            #[cfg(target_os = "android")]
+            log::error!("{line}");
             ed.error(line);
         }
         if ed.render_state.is_none() && !ed.harness.no_render {
@@ -1059,6 +1062,14 @@ impl Editor {
     /// run's comparison wins over the saved choices).
     pub fn render_settings(&self) -> crate::quality::RenderSettings {
         self.graphics.settings()
+    }
+
+    /// A Roblox TextBox has the keyboard: the game's in Play, or a plugin
+    /// GUI's (a widget's, CoreGui's). The soft keyboard comes up for it
+    /// (src/android/keyboard.rs).
+    #[cfg(target_os = "android")]
+    pub fn textbox_focused(&self) -> bool {
+        (self.play.is_some() && self.gui.focus.is_some()) || self.plugin_ui.has_text_focus()
     }
 
     /// Chooses the graphics level (`Some(1..=10)`) or Automatic (`None`,
@@ -2447,6 +2458,9 @@ impl eframe::App for RustudioApp {
         if let Some(s) = self.layout.as_mut() {
             s.save(&self.dock, &self.panels, &self.ed);
         }
+        // Going to the background: the free heap pages go back now, so the
+        // process is judged (and kept) by what it really holds.
+        crate::heap::trim();
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         // Fingers: scroll / tap / hold / look, before egui sees them; a
@@ -2465,7 +2479,8 @@ impl eframe::App for RustudioApp {
             // its text)
             crate::android::clipboard::before_frame(raw);
             self.text_menu.before_frame(raw);
-            self.keyboard.before_frame(_ctx, raw);
+            let textbox = self.ed.textbox_focused();
+            self.keyboard.before_frame(_ctx, raw, textbox);
             crate::android::lifecycle::back_pressed(_ctx, raw);
         }
         // A scripted run's window on Windows sits on the real desktop: the
@@ -2594,6 +2609,9 @@ impl RustudioApp {
             let (pending, loaded) = ed.textures.counts();
             crate::load_trace::assets(ed.meshes.count(), pending, loaded);
         }
+        // (the memory a load's decodes and downloads freed goes back to the
+        // system once it settles: src/heap.rs)
+        crate::heap::settle(ed.textures.counts().0 > 0 || !done.is_empty());
         if !done.is_empty() {
             ed.meshes.retry(&done);
             ed.textures.retry(&done);
@@ -2900,6 +2918,26 @@ impl RustudioApp {
         ed.cloud_windows(&ctx);
         self.watchdog.stage("dock UI", "harness and screenshot readback");
         self.finish_frame(&ctx, frame_start, dt);
+        // The soft keyboard follows what there is to type into; egui-winit
+        // gets no IME output (src/android/keyboard.rs).
+        #[cfg(target_os = "android")]
+        {
+            let textbox = self.ed.textbox_focused();
+            self.keyboard.end_frame(&ctx, textbox);
+        }
+        // The memory, as it grows (src/android/memory.rs).
+        #[cfg(target_os = "android")]
+        {
+            let doing = match (&self.ed.doc.path, self.ed.play.is_some()) {
+                (Some(p), playing) => format!(
+                    "{} {}",
+                    if playing { "playing" } else { "editing" },
+                    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                ),
+                (None, _) => String::new(),
+            };
+            crate::android::memory::tick(&doing);
+        }
     }
 }
 
@@ -3220,9 +3258,39 @@ impl Editor {
             "plugins": self.plugins.result_json(),
             "plugin_toolbars": self.plugin_ui_json(),
             "toolbox": self.toolbox.result_json(),
-            "process": {"cpu_s": cpu_s, "peak_rss_mb": peak_rss_mb},
+            "process": {"cpu_s": cpu_s, "peak_rss_mb": peak_rss_mb, "rss_mb": current_rss_mb()},
             "output": output,
         })
+    }
+}
+
+/// This process's resident memory now (MB; NaN where not supported).
+fn current_rss_mb() -> f64 {
+    #[cfg(target_os = "linux")]
+    {
+        let pages = std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1)?.parse::<f64>().ok());
+        // SAFETY: sysconf only reads a system constant.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as f64;
+        pages.map_or(f64::NAN, |p| p * page / (1024.0 * 1024.0))
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a zeroed counters struct with its size set, as the API asks.
+        let mut m: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        m.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut m, m.cb) } != 0 {
+            m.WorkingSetSize as f64 / (1024.0 * 1024.0)
+        } else {
+            f64::NAN
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        f64::NAN
     }
 }
 
@@ -3596,6 +3664,21 @@ impl HarnessAction {
 
     /// `--ldrag X1,Y1>X2,Y2@S`: left-drag in the 3D view (view coordinates):
     /// press at S, move in 10 steps over 0.5 s, let go at S + 0.6.
+    /// `--lhold X,Y@S:HOLD`: the left button pressed at X,Y at S, let go at S + HOLD
+    /// (a game's press-and-hold, e.g. carrying a grabbed part).
+    pub fn parse_lhold(s: &str) -> Option<Vec<(f32, HarnessAction)>> {
+        let (xy, when) = s.split_once('@')?;
+        let (at, hold) = when.split_once(':')?;
+        let (at, hold): (f32, f32) = (at.trim().parse().ok()?, hold.trim().parse().ok()?);
+        let (x, y) = xy.split_once(',')?;
+        let (x, y): (f32, f32) = (x.trim().parse().ok()?, y.trim().parse().ok()?);
+        Some(vec![
+            (at - 0.2, HarnessAction::PointerAt(x, y)),
+            (at, HarnessAction::LeftButton(x, y, true)),
+            (at + hold, HarnessAction::LeftButton(x, y, false)),
+        ])
+    }
+
     pub fn parse_ldrag(s: &str) -> Option<Vec<(f32, HarnessAction)>> {
         let (what, at) = s.split_once('@')?;
         let at: f32 = at.trim().parse().ok()?;

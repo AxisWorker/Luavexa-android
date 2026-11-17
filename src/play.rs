@@ -188,6 +188,11 @@ pub struct PlaySession {
     client_joints: crate::client_joints::ClientJoints,
     /// The client DataModel's own simulation (src/physics_client.rs).
     client_sim: crate::physics::client::ClientSim,
+    /// Touch changes between the client world's parts (client refs), fired on
+    /// the client in its next script phase: Studio fires Touched where the
+    /// part is simulated, so a LocalScript's clones (a pot lid and
+    /// ingredients) touch on their client.
+    client_touches: Vec<(Ref, Ref, bool)>,
     /// Humanoid state transitions so far (shown in Output, read by the self-test).
     pub state_log: Vec<String>,
     /// Clicks, chat, tools, sounds and other in-game interaction.
@@ -658,6 +663,7 @@ impl Editor {
             memstats_worst: 0.0,
             client_joints: Default::default(),
             client_sim: Default::default(),
+            client_touches: Vec::new(),
             state_log: Vec::new(),
             game: Default::default(),
             mouse_delta: glam::Vec2::ZERO,
@@ -1974,6 +1980,7 @@ impl Editor {
         }
         // The tool it held goes with it (it isn't put back in the Backpack).
         self.drop_equipped();
+        self.unequip_client_tool_dropped();
         // Roblox destroys the old character (Destroying on it and all it
         // holds; a no-op when a script destroyed it already).
         if let Some(old) = self.play.as_mut().and_then(|s| s.character.take()) {
@@ -2565,21 +2572,26 @@ impl Editor {
         drop(sc);
         // Touch events (CanTouch parts only).
         let sc = crate::bench::scope("p3b_touch_prep");
-        let can_touch =
-            |doc: &Document, r: Ref| !matches!(doc.prop(r, "CanTouch"), Some(Variant::Bool(false)));
+        // (A part only the client has, met by its character (physics_client_link.rs),
+        // is read from the client's document.)
+        let client_doc = self.play.as_ref().and_then(|s| s.other_doc.as_ref());
+        let can_touch = |doc: &Document, r: Ref| {
+            let v = doc.prop(r, "CanTouch").or_else(|| {
+                doc.dom.get_by_ref(r).is_none().then(|| client_doc.and_then(|cd| cd.prop(r, "CanTouch"))).flatten()
+            });
+            !matches!(v, Some(Variant::Bool(false)))
+        };
         let part_touches: Vec<(Ref, Ref, bool)> = result
             .touches
             .iter()
             .copied()
             .filter(|(a, b, _)| can_touch(&self.doc, *a) && can_touch(&self.doc, *b))
             .collect();
+        let char_now: HashSet<Ref> = char_touches.into_iter().filter(|r| can_touch(&self.doc, *r)).collect();
         let (char_began, char_ended): (Vec<Ref>, Vec<Ref>) =
             match self.play.as_mut().and_then(|s| s.character.as_mut()) {
                 Some(ch) if char_part.is_some() => {
-                    let now: HashSet<Ref> = char_touches
-                        .into_iter()
-                        .filter(|r| can_touch(&self.doc, *r))
-                        .collect();
+                    let now = char_now;
                     let b = now.difference(&ch.touching).copied().collect();
                     let e = ch.touching.difference(&now).copied().collect();
                     ch.touching = now;
@@ -2587,6 +2599,13 @@ impl Editor {
                 }
                 _ => (Vec::new(), Vec::new()),
             };
+        // The character's touches of parts only its client has: they fire there.
+        let client_only: HashSet<Ref> = char_began
+            .iter()
+            .chain(char_ended.iter())
+            .copied()
+            .filter(|r| self.doc.dom.get_by_ref(*r).is_none())
+            .collect();
         let velocities = self
             .play
             .as_ref()
@@ -2654,8 +2673,8 @@ impl Editor {
         // 4. Server scripts.
         let fire_touches = |rt: &Runtime, map: Option<&HashMap<Ref, Ref>>| {
             let m = |r: Ref| match map {
-                Some(m) => m.get(&r).copied(),
-                None => Some(r),
+                Some(m) => m.get(&r).copied().or_else(|| client_only.contains(&r).then_some(r)),
+                None => (!client_only.contains(&r)).then_some(r),
             };
             for (a, b, started) in &part_touches {
                 let ev = if *started { "Touched" } else { "TouchEnded" };
@@ -2836,6 +2855,12 @@ impl Editor {
                 None => (None, None),
             };
             self.game_client_inputs();
+            self.check_client_tool();
+            let client_touches = self
+                .play
+                .as_mut()
+                .map(|s| std::mem::take(&mut s.client_touches))
+                .unwrap_or_default();
             let humanoid_client = humanoid_server.and_then(|h| map_s2c.get(&h).copied());
             let client_states: HashMap<Ref, String> = state_names
                 .iter()
@@ -2852,6 +2877,11 @@ impl Editor {
                     ),
                     None => Default::default(),
                 };
+            // The game's fingers and their gestures (touch screens).
+            let (touches, touch_gestures) = match self.play.as_mut() {
+                Some(s) => (std::mem::take(&mut s.game.touches), std::mem::take(&mut s.game.touch_gestures)),
+                None => Default::default(),
+            };
             let gui_service = self
                 .play
                 .as_ref()
@@ -2987,6 +3017,10 @@ impl Editor {
                     );
                 };
                 rt.spawn_global("__rs_input_frame_end", vec![Value::Number(dt as f64)]);
+                // The device's motion sensors' new samples (touch screens).
+                if crate::touch_input::game_touch() {
+                    rt.spawn_global("__rs_sensor_frame", vec![]);
+                }
                 // A press reaches UserInputService.InputBegan before the GUI's
                 // MouseButton1Down / Up / Click / Activated, even when press and
                 // release land in the same frame (the harness's --click).
@@ -3008,6 +3042,71 @@ impl Editor {
                 };
                 mouse_buttons(true);
                 game::fire_gui_events(rt, gui_events, gui_service);
+                // Fingers, after the GUI's events for them: the input action
+                // system and the bound actions, then UserInputService's
+                // InputBegan / TouchStarted … (src/library.luau
+                // `__rs_touch_event`); then the gestures.
+                for t in &touches {
+                    let s = |x: &str| Value::String(rt.lua.create_string(x).expect("lua string"));
+                    let began_on = rt.lua.create_table().expect("lua table");
+                    for r in &t.began_on {
+                        let _ = began_on.push(rt.inst(*r));
+                    }
+                    rt.spawn_global(
+                        "__rs_touch_event",
+                        vec![
+                            s(t.state.name()),
+                            Value::Number(t.id as f64),
+                            Value::Number(t.x as f64),
+                            Value::Number(t.y as f64),
+                            Value::Number(t.dx as f64),
+                            Value::Number(t.dy as f64),
+                            Value::Boolean(t.sunk),
+                            Value::Table(began_on),
+                        ],
+                    );
+                }
+                for g in &touch_gestures {
+                    use crate::touch_gestures::Gesture;
+                    let s = |x: &str| Value::String(rt.lua.create_string(x).expect("lua string"));
+                    let points = |pts: &[(f32, f32)]| {
+                        let t = rt.lua.create_table().expect("lua table");
+                        for (x, y) in pts {
+                            let _ = t.push(crate::ltypes::LVector2(glam::Vec2::new(*x, *y)));
+                        }
+                        Value::Table(t)
+                    };
+                    let n = |v: f32| Value::Number(v as f64);
+                    let args = match g {
+                        Gesture::Tap { positions, gpe } => vec![s("Tap"), points(positions), Value::Nil, Value::Nil, Value::Nil, Value::Nil, Value::Nil, Value::Boolean(*gpe)],
+                        Gesture::TapInWorld { pos, processed_by_ui } => {
+                            vec![s("TapInWorld"), points(&[*pos]), Value::Nil, Value::Nil, Value::Nil, Value::Nil, Value::Nil, Value::Boolean(*processed_by_ui)]
+                        }
+                        Gesture::LongPress { positions, state, gpe } => {
+                            vec![s("LongPress"), points(positions), Value::Nil, Value::Nil, Value::Nil, Value::Nil, s(state.name()), Value::Boolean(*gpe)]
+                        }
+                        Gesture::Pan { positions, translation, velocity, state, gpe } => vec![
+                            s("Pan"),
+                            points(positions),
+                            n(translation.0),
+                            n(translation.1),
+                            n(velocity.0),
+                            n(velocity.1),
+                            s(state.name()),
+                            Value::Boolean(*gpe),
+                        ],
+                        Gesture::Pinch { positions, scale, velocity, state, gpe } => {
+                            vec![s("Pinch"), points(positions), n(*scale), n(*velocity), Value::Nil, Value::Nil, s(state.name()), Value::Boolean(*gpe)]
+                        }
+                        Gesture::Rotate { positions, rotation, velocity, state, gpe } => {
+                            vec![s("Rotate"), points(positions), n(*rotation), n(*velocity), Value::Nil, Value::Nil, s(state.name()), Value::Boolean(*gpe)]
+                        }
+                        Gesture::Swipe { direction, touches, gpe } => {
+                            vec![s("Swipe"), Value::Nil, Value::Number(*touches as f64), Value::Nil, Value::Nil, Value::Nil, s(direction.name()), Value::Boolean(*gpe)]
+                        }
+                    };
+                    rt.spawn_global("__rs_touch_gesture", args);
+                }
                 game::step_smooth_scrolls(rt, dt);
                 if let Some(on) = window_focus_change {
                     rt.spawn_global("__rs_window_focus", vec![Value::Boolean(on)]);
@@ -3035,6 +3134,16 @@ impl Editor {
                 // Button releases after the GUI's events (Up / Click / Activated).
                 mouse_buttons(false);
                 fire_touches(rt, Some(&map_s2c));
+                for (a, b, started) in &client_touches {
+                    let (ev, twin) = if *started { ("Touched", "LocalSimulationTouched") } else { ("TouchEnded", "StoppedTouching") };
+                    rt.fire(*a, ev, vec![rt.inst(*b)]);
+                    rt.fire(*b, ev, vec![rt.inst(*a)]);
+                    if *started {
+                        crate::rig::fire_humanoid_touched(rt, *a, *b);
+                    }
+                    rt.fire(*a, twin, vec![rt.inst(*b)]);
+                    rt.fire(*b, twin, vec![rt.inst(*a)]);
+                }
                 fire_humanoid(rt, humanoid_client, seat_server.and_then(|s| map_s2c.get(&s).copied()), true);
                 fire_npcs(rt, Some(&map_s2c));
                 if let Some(mut w) = rt.world_mut() {
@@ -3192,6 +3301,9 @@ impl Editor {
                         let motion = s.client_sim.link_motion();
                         s.physics.link_note_motion(&motion, dt);
                     }
+                    let can_touch = |r: Ref| !matches!(cd.prop(r, "CanTouch"), Some(Variant::Bool(false)));
+                    s.client_touches
+                        .extend(out.touches.into_iter().filter(|(a, b, _)| can_touch(*a) && can_touch(*b)));
                     for r in out.fallen {
                         cd.dom.transfer_within(r, Ref::none());
                         cd.mark_tree(r);

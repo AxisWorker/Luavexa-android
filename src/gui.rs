@@ -187,9 +187,88 @@ pub enum GuiArg {
         x: f32,
         y: f32,
     },
+    /// A finger's InputObject (UserInputType.Touch; one object per finger
+    /// for its whole life, `__rs_touch_object`): the finger, its state,
+    /// position and motion since its last event.
+    Touch {
+        id: u64,
+        state: TouchState,
+        x: f32,
+        y: f32,
+        dx: f32,
+        dy: f32,
+    },
+    /// A list of Vector2 (GuiObject.TouchTap's touch positions).
+    Points(Vec<(f32, f32)>),
     #[allow(dead_code)]
     Bool(bool),
     Num(f64),
+}
+
+/// A finger's UserInputState.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchState {
+    Begin,
+    Change,
+    End,
+    Cancel,
+}
+
+impl TouchState {
+    pub fn name(self) -> &'static str {
+        match self {
+            TouchState::Begin => "Begin",
+            TouchState::Change => "Change",
+            TouchState::End => "End",
+            TouchState::Cancel => "Cancel",
+        }
+    }
+}
+
+/// A finger on the game view, as the input layer reports it (window
+/// coordinates, points).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GuiTouch {
+    pub id: u64,
+    pub state: TouchState,
+    pub pos: Pos2,
+}
+
+/// A finger's event after the GUI had it, for UserInputService and the
+/// input action system (play.rs): GUI coordinates (below the top inset,
+/// as InputObject.Position), the motion since the finger's last event,
+/// whether the GUI took it (`gameProcessedEvent`: an Active object or a
+/// text box under it when it landed) and the GuiButtons it landed on
+/// (InputBinding.UIButton / UIModifier).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TouchOut {
+    pub id: u64,
+    pub state: TouchState,
+    pub x: f32,
+    pub y: f32,
+    pub dx: f32,
+    pub dy: f32,
+    pub sunk: bool,
+    pub began_on: Vec<Ref>,
+}
+
+/// What the GUI keeps about a finger between its events.
+#[derive(Debug, Clone)]
+struct TouchFinger {
+    /// Last position (GUI coordinates).
+    x: f32,
+    y: f32,
+    /// Where and when it landed (a tap is a quick lift near there).
+    start: (f32, f32),
+    since: std::time::Instant,
+    /// An Active object or a text box took it when it landed.
+    sunk: bool,
+    /// The button it pressed (the top sinking object, when a button).
+    pressed: Option<Ref>,
+    /// Objects under it (MouseEnter / MouseLeave).
+    under: HashSet<Ref>,
+    /// The GuiButtons under it when it landed.
+    began_on: Vec<Ref>,
 }
 
 /// An interactive object, in screen space, in draw order.
@@ -202,6 +281,10 @@ struct Hit {
     textbox: bool,
     /// Sinks clicks (Active, buttons, text boxes).
     sink: bool,
+    /// GuiObject.Active (buttons default to true): a finger on it is the
+    /// GUI's (`gameProcessedEvent`); a button with it off still clicks but
+    /// lets the finger through, as Roblox's thumbstick frame relies on.
+    active: bool,
     scrolling: bool,
     drag: bool,
     painted: bool,
@@ -261,6 +344,8 @@ pub struct Gui {
     pressed: Option<(Ref, u8)>,
     /// The object being dragged with the left button.
     dragging: Option<Ref>,
+    /// Fingers on the GUI (`touch_input`), by the input layer's id.
+    touch_fingers: HashMap<u64, TouchFinger>,
     /// ParticleEmitter2D particles (gui_fx.rs).
     p2d: HashMap<Ref, fx::Emitter>,
     p2d_clock: Option<std::time::Instant>,
@@ -810,7 +895,10 @@ fn point_in_quad(q: &[Pos2; 4], p: Pos2) -> bool {
             return false;
         }
     }
-    true
+    // A point in line with every edge only happens for a quad with no area
+    // (a zero-size GuiObject, such as legacy chat's MessageMode button),
+    // which takes no input in Roblox.
+    sign != 0.0
 }
 
 // ------------------------------------------------------------------ fonts
@@ -1649,6 +1737,42 @@ mod tests {
         ];
         assert!(point_in_quad(&q, Pos2::new(5.0, 5.0)));
         assert!(!point_in_quad(&q, Pos2::new(0.5, 0.5)));
+        // Keep edges and corners interactive, with either winding order.
+        for q in [q, [q[3], q[2], q[1], q[0]]] {
+            assert!(point_in_quad(&q, Pos2::new(2.5, 2.5)));
+            assert!(point_in_quad(&q, q[0]));
+            assert!(point_in_quad(&q, Pos2::new(5.0, 5.0)));
+        }
+    }
+
+    #[test]
+    fn point_in_zero_size_quad() {
+        // A zero-size object (all four corners at one point) is hit nowhere.
+        let p = Pos2::new(12.0, 147.3);
+        assert!(!point_in_quad(&[p; 4], Pos2::new(480.0, 300.0)));
+        assert!(!point_in_quad(&[p; 4], p));
+
+        // A single collapsed dimension is also noninteractive, even on the
+        // resulting line or its endpoints. Include rotated and reversed quads.
+        for end in [
+            Pos2::new(10.0, 0.0),
+            Pos2::new(0.0, 10.0),
+            Pos2::new(10.0, 10.0),
+        ] {
+            for q in [
+                [Pos2::ZERO, end, end, Pos2::ZERO],
+                [Pos2::ZERO, Pos2::ZERO, end, end],
+            ] {
+                for p in [
+                    Pos2::ZERO,
+                    end,
+                    Pos2::new(end.x * 0.5, end.y * 0.5),
+                    Pos2::new(20.0, 3.0),
+                ] {
+                    assert!(!point_in_quad(&q, p), "quad {q:?} accepted {p:?}");
+                }
+            }
+        }
     }
 }
 

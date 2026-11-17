@@ -663,6 +663,46 @@
    "source": "Play: distance from the view's bottom-right corner"
   },
   {
+   "name": "touch tap time",
+   "group": "controls",
+   "value": 300,
+   "unit": "ms",
+   "estimated": true,
+   "source": "the game's fingers: lifted within this of landing (and within the tap slop) a finger is a tap: UserInputService.TouchTap / TouchTapInWorld, GuiObject.TouchTap; Android's tap timeout is 300 ms"
+  },
+  {
+   "name": "touch tap slop",
+   "group": "controls",
+   "value": 12,
+   "unit": "px",
+   "estimated": true,
+   "source": "the game's fingers: a tap moves less than this"
+  },
+  {
+   "name": "touch long press (game)",
+   "group": "controls",
+   "value": 500,
+   "unit": "ms",
+   "estimated": true,
+   "source": "the game's fingers: a finger still this long is UserInputService.TouchLongPress (iOS's long-press recognizer default, which Roblox's gestures follow)"
+  },
+  {
+   "name": "touch pan slop",
+   "group": "controls",
+   "value": 10,
+   "unit": "px",
+   "estimated": true,
+   "source": "the game's fingers: moved this far, a finger starts UserInputService.TouchPan (iOS's pan recognizer starts at 10 pt)"
+  },
+  {
+   "name": "touch swipe speed",
+   "group": "controls",
+   "value": 1000,
+   "unit": "px/s",
+   "estimated": true,
+   "source": "the game's fingers: a pan lifted faster than this (and longer than 50 px) is UserInputService.TouchSwipe"
+  },
+  {
    "name": "game camera right-drag turn",
    "group": "camera",
    "value": 0.5,

@@ -146,7 +146,7 @@ provides or still has to.
 | `TouchStarted / TouchMoved / TouchEnded`, `TouchTap`, `TouchTapInWorld`, `TouchLongPress`, `TouchPan`, `TouchPinch`, `TouchRotate`, `TouchSwipe` | declared (`runtime_ext.rs` 116-154), never fired; `__rs_input_event` carries mouse/keyboard | **to do**: winit `Touch` events (egui `PointerButton` + `multi_touch`) → `InputObject` with `UserInputType.Touch` per finger id, gesture recognisers, `gameProcessedEvent` from egui's `wants_pointer_input` |
 | `GetDeviceAcceleration / GetDeviceGravity / GetDeviceRotation`, `DeviceAccelerationChanged / DeviceGravityChanged / DeviceRotationChanged` | zeros (`gui_input.luau` 299-307, `library.luau` 852) | `sensors.rs` (ASensorManager: linear acceleration, gravity, gyroscope, game rotation vector, 60 Hz on its own thread) — **wiring to Luau to do** (g units, CFrame from the quaternion) |
 | `UserInputService.ModalEnabled` | stored | **to do**: hides the default thumbstick / jump button once those exist |
-| `OnScreenKeyboardVisible / OnScreenKeyboardSize / OnScreenKeyboardPosition`, `TextBoxFocused / TextBoxFocusReleased` | focus events fire (`play_game.rs` 247); keyboard size zero | `jni::window_insets().ime_bottom` (API 30+), `AndroidApp::show_soft_input / hide_soft_input` on TextBox focus — **wiring to do** |
+| `OnScreenKeyboardVisible / OnScreenKeyboardSize / OnScreenKeyboardPosition`, `TextBoxFocused / TextBoxFocusReleased` | focus events fire (`play_game.rs` 247); keyboard size zero | the soft keyboard comes up for a focused TextBox and goes with its focus (`keyboard.rs` `end_frame`, `gui::share().focus`); the user hiding it releases the focus (FocusLost). `OnScreenKeyboardVisible / Size` from `Keyboard::height` — **to do** |
 | `HapticService.IsVibrationSupported / IsMotorSupported / SetMotor / GetMotor` | gamepad-only flags, in-memory motor table (`gui_input.luau` 1796-1845) | `jni::vibrator_info()` (hasVibrator, hasAmplitudeControl) and `jni::vibrate(ms, strength)` — **wiring to do**: `UserInputType.Touch` supported, `VibrationMotor.Large` (and `Small` when amplitude control exists) |
 | `HapticEffect:Play / Stop`, `HapticEffect.Type` presets | simulated durations (UIHover .035 s, UIClick .055, UINotification .4, GameplayCollision .3, GameplayExplosion .8) | `jni::vibrate_pattern` (VibrationEffect.createWaveform) — **mapping of each preset to do** |
 | `ContextActionService.BindAction(..., createTouchButton)`, `GetButton / SetTitle / SetImage / SetPosition` | bindings stored, priority dispatch (`library.luau` 671-767); buttons never drawn | **to do**: draw the buttons in the play viewport (`ContextActionGui` ScreenGui as Roblox does: 70×70 ImageButton, default positions right of the thumbstick), route taps to the bound function with `UserInputType.Touch` |
@@ -176,6 +176,19 @@ stream (dropping egui-winit's stand-in pointer events):
 | second finger on the 3D view | ends the first one's drag; `InputState::multi_touch` gives the viewport a pinch (zoom toward the fingers; in Play the game's wheel: `mech::PINCH_NOTCHES_PER_DOUBLING`) and a two-finger pan |
 | in Play, lands bottom-left / bottom-right of the view | the movement stick (W/A/S/D held by its deflection, drawn under the finger) / the jump button (Space) — `touch_input::play_zones`; released when Play stops or the window loses focus. A quick tap in the stick zone is still a tap (GUI buttons there keep working). Stick and jump fingers are kept out of egui's touch stream, so a look finger beside them is never read as a pinch |
 
+A lift leaves the pointer where it was for the rest of its frame: the
+`PointerGone` goes to egui at the start of the next one. egui clears
+`latest_pos` — what `Response::hover_pos` reads — at a `PointerGone` in
+the frame it comes, and the GUI input shared by the game's ScreenGuis in
+Play, the plugin widgets and plugins' CoreGui (`src/gui_input.rs`
+`input`) takes a press or a release only where the pointer hovers, so a
+tap whose press, release and `PointerGone` came in one frame was no click
+on any GuiButton: nothing in a plugin widget answered a tap, nor TopbarPlus
+icons or a game's own buttons in Play, while egui's own widgets (which
+use `interact_pos`) were fine. With the pointer gone a frame later the
+release lands, the GuiButton gets its MouseButton1Down / Up / Click /
+Activated, and the MouseLeave follows next frame.
+
 The viewport publishes where things are each frame (`Zones`: its rect,
 whether the game has the input, the stick and jump areas, a handle under
 the pointer) and draws the stick and button in Play (`Touch::paint`). The
@@ -183,8 +196,72 @@ chrome's egui settings for fingers are in `android::touch::setup`. The
 tuning numbers (hold 320 ms, long press 650 ms, slop 8 pt, fling, stick
 and button sizes) are `mech::TOUCH_*` with their rows in
 docs/MECHANICS.md ("Touch screens") and mechanics.json. The module has no
-Android dependency, so its twelve tests run on the desktop
+Android dependency, so its tests run on the desktop
 (`cargo test touch_input`).
+
+### Fingers in Play: the game's touch (`touch_input::game_touch`)
+
+The table above is the editor's reading of fingers. A game's scripts
+expect a touch screen's: `UserInputService.TouchEnabled`, `PreferredInput
+== Touch`, one `InputObject` per finger for its life (`UserInputType.Touch`,
+`Position` in GUI coordinates, `Delta` since its last event) through
+`InputBegan / Changed / Ended` and `TouchStarted / Moved / Ended`,
+ContextActionService bindings on `Enum.UserInputType.Touch`, the input
+action system's `TouchPosition / TouchDelta / TouchPinch` bindings with
+`UIButton` / `UIModifier`, GuiObject `InputBegan` with a Touch object
+and `TouchTap`, and the gestures (`TouchTap`, `TouchTapInWorld`,
+`TouchLongPress`, `TouchPan`, `TouchPinch`, `TouchRotate`, `TouchSwipe`).
+Both PlayerModules (the old `PlayerModule.module` and the input-action one
+in `PlayerScripts.rbxp`) draw their own thumbstick and jump button from
+those and nothing else, so while the game drives (Play, client, menu
+closed) on a touch screen the editor's stick and jump zones are off and
+fingers that land on the view go to the game raw:
+
+1. `touch_input::Touch::filter` keeps a finger that lands on the view
+   (outside `Zones::ui`: the hotbar slots and the chat box stay egui's)
+   out of egui's stream and queues it as a `GameTouch` (Begin / Change /
+   End / Cancel with its position); Play ending or the window losing
+   focus cancels them all.
+2. `viewport.rs` hands the frame's `GameTouch`es to `Gui::touch_input`
+   (`src/gui_input.rs`): hit-tests each against the game's ScreenGuis,
+   fires the GuiObjects' `MouseEnter / Moved / Leave`, `InputBegan /
+   Changed / Ended` (a `GuiArg::Touch` → the finger's InputObject),
+   `MouseButton1Down / Up / Click`, `Activated` (Active buttons only; an
+   `Active = false` button like the DynamicThumbstick's full-frame
+   UIModifier does not take the finger: `Hit.active`) and `TouchTap`, and
+   returns a `TouchOut` per finger: GUI coordinates, the delta, `sunk`
+   (an Active object or a TextBox under it when it landed) and
+   `began_on` (the GuiButtons under its landing point). With the game
+   menu open every finger is `sunk`.
+3. `play_game.rs game_viewport` runs the gestures over them
+   (`src/touch_gestures.rs`: tap, tap in world, long press, pan, pinch,
+   rotate, swipe; `mech::TOUCH_*`), makes an unprocessed tap in the world
+   the game's click (the Mouse's `Button1Down / Up`, ClickDetectors,
+   tools) and the latest finger the game's `Pointer` while no mouse is
+   there.
+4. `play.rs` dispatches each `TouchOut` to `__rs_touch_event` and each
+   gesture to `__rs_touch_gesture` (`src/library.luau`) after the GUI's
+   events: `domains/gui_input.luau` "Fingers" assigns the finger to the
+   input actions whose bindings use it (`UIButton`: landed on it;
+   `TouchPosition / TouchDelta / TouchPinch`, gated by `UIModifier` when
+   set, else only an unsunk finger; contexts by Priority, `Sink` stops)
+   — a ViewportPosition action reads the finger's viewport position
+   (+58 px: the PlayerModule adds `GetInsetArea(None).Min` back),
+   `TouchDelta` the lone finger's motion as a rate, `TouchPinch` the
+   first two fingers' distance change as a rate — then the library runs
+   the ContextActionService bindings and fires UserInputService's events
+   (`gameProcessedEvent` when the GUI or a bound action took it).
+
+`device_prop` (`src/runtime_ext.rs`) answers `TouchEnabled`,
+`TouchScreenEnabled`, `PreferredInput = Touch`, `MouseEnabled =
+KeyboardEnabled = false` on a touch screen and `AccelerometerEnabled /
+GyroscopeEnabled` from the device's sensors (`src/device_sensors.rs` over
+`src/android/sensors.rs`: `GetDeviceAcceleration / Gravity / Rotation`
+and the `Device*Changed` events, in g and as a CFrame, the sensors on
+from the first script that asks). `RUSTUDIO_TOUCH=0` (the
+`debug.rustudio.env` property) puts the editor's stick and jump back
+(the keyboard-and-mouse reading of fingers) on a device; `=1` turns the
+game's touch on on a desktop with a touch screen.
 
 ### Text: the soft keyboard, Cut / Copy / Paste
 
@@ -205,29 +282,36 @@ changes, the focused field's caret is scrolled into view
 (`keyboard::reveal_cursor`, from the Properties cells and the script
 editor: the field's `TextEditOutput` gives the caret's row).
 
-The keyboard is shown and hidden by egui-winit alone, from egui's IME
-output (up while a text field has the focus: `set_ime_allowed` →
-android-activity's `show_soft_input` / `hide_soft_input`); the user
-hiding it with Back or its own hide key is invisible to the app. Two
-things made that a loop on the first device runs. The Properties and
-Explorer edit fields asked egui for the focus every frame while an edit
-was open, and egui counts every `request_focus` — a field's own on a tap
-inside it too — as an IME interruption (`should_interrupt_composition`),
-which egui-winit answers with a hide and a show: the fields now ask only
-while they lack the focus and are not just back from losing it
-(`properties.rs`, `explorer.rs`, `account_ui.rs`). And every height
-reading was acted on at once: the zero read during a hide-and-show took
-the room away (a re-layout of every panel), the show put it back, and
-releasing the focus on a short zero re-showed the keyboard the next tap
-asked for. The readings now go through hysteresis (`Keyboard::follow`):
-the first height above zero is taken at once (`soft keyboard up: N px, M
-ms after the focus` in logcat), a different height only after two equal
-readings running, a zero while a field is focused is ignored for 600 ms —
-longer than a hide-and-show's two animations and than the hide and show
-of a focus move between fields — and only then releases the field's focus
-(`soft keyboard hidden by the user`): the edit ends with its text kept, as
-a click away ends it, and a tap on the field starts it again. A zero with
-nothing focused takes the room away at once.
+The keyboard is shown and hidden by `keyboard.rs` itself
+(`Keyboard::end_frame`), not by egui-winit. egui-winit shows it while
+egui reports an IME field (`PlatformOutput::ime`, a focused `TextEdit`:
+`set_ime_allowed` → android-activity's `show_soft_input` /
+`hide_soft_input`) and answers every IME interruption egui asks for with
+a hide and a show — and egui counts every `request_focus` as one, the one
+its own `TextEdit` makes for the tap that focuses it and for every tap
+that moves its caret included (`egui-winit` 0.36 `handle_platform_output`,
+`should_interrupt_composition`): the keyboard opened, closed and opened
+again on each tap into a field, whatever the editor's own fields did
+(they had already stopped asking for the focus every frame). So at the
+end of each frame the IME output is taken out of egui's platform output
+(egui-winit never asks winit for the keyboard) and the activity is asked
+directly, as winit would, when what wants the keyboard changes: a focused
+egui text field, or a Roblox TextBox with the focus — the game's in Play,
+a plugin widget's — which egui-winit never showed it for. Up at once
+(`soft keyboard asked up for a text field` / `a TextBox` in logcat), down
+once nothing has wanted it for 250 ms (`asked down`), so a field losing
+the focus for a frame or the focus moving between fields keeps it up, as
+Android keeps it between EditTexts. The user hiding it with Back or its
+own hide key is still invisible to the app except through the height
+readings, which go through hysteresis (`Keyboard::follow`): the first
+height above zero is taken at once (`soft keyboard up: N px, M ms after
+the focus`), a different height only after two equal readings running, a
+zero while a field is focused is ignored for 600 ms — longer than the
+hide and show of a focus move and than the slide out — and only then
+releases the focus (`soft keyboard hidden by the user`; a TextBox gets
+FocusLost): the edit ends with its text kept, as a click away ends it,
+and a tap on the field starts it again. A zero with nothing focused takes
+the room away at once.
 
 The soft keyboard has no Ctrl, egui's text fields have no menu of their
 own and egui-winit has no clipboard on Android, so a long press on a text
@@ -936,7 +1020,20 @@ rustudio` filtered to `soft keyboard` (each height change, the focus
 release), `clipboard` (each copy put on the system clipboard, each read
 and its length, or "no clip"), `text menu` (open, cut, copy, paste,
 select all), `graphics quality` (each level change with the settings in
-effect) and the perf lines (every 5 s).
+effect), `memory:` (the resident size each 256 MB it grows, with the
+place being opened: `src/android/memory.rs`) and the perf lines (every
+5 s). For a crash: `adb logcat -b crash -d` (debuggerd's tombstone: the
+signal, an abort's message — `memory allocation of N bytes failed` for
+one out of memory — and every thread's stack) and `adb shell dumpsys
+activity exit-info dev.rustudio.studio` (the reason and the memory at the
+end: `reason=2 (SIGNALED) status=6` is SIGABRT, `status=11` SIGSEGV,
+`reason=3 (LOW_MEMORY)` the system's killer). `src/crash.rs` no longer
+captures a backtrace in the fatal-signal handler on Android: it writes
+the note and hands the signal to debuggerd at once. The backtrace ran
+under a 5 s alarm and, in a process at several GB, the alarm won — the
+runs that opened a large place ended as `status=14` (SIGALRM) with no
+tombstone and the signal that ended them unknown. Last run's reports are
+also echoed to logcat at the next start.
 
 - **Black window at first start, until leaving and coming back.** winit
   0.30 drops `MainEvent::Destroy`, so whenever the system destroyed the
@@ -1025,17 +1122,34 @@ effect) and the perf lines (every 5 s).
   distance, which also drops far chunks — on either driver, logged as
   `graphics quality (automatic)`.
 
+- **Dead taps on GUI buttons, the keyboard flapping.** Not the Luau VM:
+  the lift's `PointerGone` in the same frame as the release (see
+  "Fingers"), and egui-winit's IME toggle (see "Text").
+- **Killed by the system (`reason=3 LOW_MEMORY`) with a big place open;
+  `memory allocation of N bytes failed`.** The resident size grew with
+  each place opened and never came back: a glibc-only `malloc_trim` in
+  `heap::trim`. On bionic it is `mallopt(M_PURGE)` now, run at the same
+  moments (a place closed, the materials rebuilt) and at two new ones:
+  the activity's `onLowMemory` (hooked in `lifecycle.rs`; `memory.rs`
+  warns in the Output with the resident size and what the device has
+  left) and the save when the app goes to the background. The first
+  `memory:` line of a run carries the device's totals
+  (`ActivityManager.MemoryInfo`: total, available, the low-memory
+  threshold) so a report tells a 4 GB phone from an 8 GB one.
+- **Nothing in a game answered a finger (its own thumbstick, jump button
+  and touch buttons did nothing).** The game saw a mouse and keyboard
+  (see "Fingers in Play": fingers reach the game as touch now).
+
 ## Later steps (in order)
 
-1. Touch for the game: `UserInputService` touch events and gestures
-   from the same finger stream (`touch_input.rs` already tells fingers
-   apart), `TouchEnabled` / `PreferredInput`, `ModalEnabled` hiding the
-   stick and button (they are the editor's own for now, holding keys).
-2. Device properties and sensors (the `device_prop()` table, the
-   `Device*Changed` events from `sensors::latest()` once per new sample).
+1. ~~Touch for the game~~ ("Fingers in Play"). Left: GuiObject's own
+   `TouchLongPress / Pan / Pinch / Rotate / Swipe`, `TouchDrag`.
+2. ~~Device properties and sensors~~ (`device_prop()`,
+   `src/device_sensors.rs`).
 3. Haptics (`HapticService`, `HapticEffect`) through `jni::vibrate*`.
-4. Insets, orientation, soft keyboard.
-5. `ContextActionService` touch buttons.
+4. Insets, orientation, soft keyboard for a game's TextBoxes
+   (`OnScreenKeyboardPosition / Size`).
+5. `ContextActionService` touch buttons (`createTouchButton`).
 
 Each step closes rows in docs/ENGINE-GAPS.md; the Creator Hub reference
 pages are the source of truth for every member name, argument and enum.

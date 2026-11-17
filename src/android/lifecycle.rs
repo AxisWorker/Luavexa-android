@@ -30,6 +30,11 @@ use std::time::{Duration, Instant};
 static CTX: Mutex<Option<egui::Context>> = Mutex::new(None);
 /// The glue's own `onDestroy`.
 static ORIGINAL: Mutex<Option<unsafe extern "C" fn(*mut ndk_sys::ANativeActivity)>> = Mutex::new(None);
+/// The glue's own `onLowMemory`.
+static ORIGINAL_LOW_MEMORY: Mutex<Option<unsafe extern "C" fn(*mut ndk_sys::ANativeActivity)>> = Mutex::new(None);
+/// The system said memory is short (`Activity.onLowMemory`) since the
+/// last [`take_low_memory`].
+static LOW_MEMORY: AtomicBool = AtomicBool::new(false);
 /// `run_native` has returned.
 pub static LOOP_DONE: AtomicBool = AtomicBool::new(false);
 /// How long the hook gives the loop to close on its own.
@@ -69,8 +74,28 @@ pub unsafe fn hook(activity: *mut std::ffi::c_void) {
         }
         *ORIGINAL.lock().unwrap() = original;
         (*callbacks).onDestroy = Some(on_destroy);
+        // The low-memory notice too: the glue turns it into an event winit
+        // reports as a memory warning, which eframe drops; the flag here
+        // reaches the editor's frame (src/android/memory.rs).
+        *ORIGINAL_LOW_MEMORY.lock().unwrap() = (*callbacks).onLowMemory;
+        (*callbacks).onLowMemory = Some(on_low_memory);
     }
     log::info!("destroy hook installed");
+}
+
+unsafe extern "C" fn on_low_memory(activity: *mut ndk_sys::ANativeActivity) {
+    LOW_MEMORY.store(true, Ordering::SeqCst);
+    let original = *ORIGINAL_LOW_MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(f) = original {
+        // SAFETY: the glue's own callback, with the activity it was
+        // registered for.
+        unsafe { f(activity) };
+    }
+}
+
+/// Whether the system sent a low-memory notice since the last call.
+pub fn take_low_memory() -> bool {
+    LOW_MEMORY.swap(false, Ordering::SeqCst)
 }
 
 unsafe extern "C" fn on_destroy(activity: *mut ndk_sys::ANativeActivity) {
