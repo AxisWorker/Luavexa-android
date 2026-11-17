@@ -3900,7 +3900,18 @@ fn device_prop(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option
     let b = |v: bool| Ok(Some(Value::Boolean(v)));
     let touch = crate::touch_input::game_touch();
     match (class, key) {
-        ("UserInputService", "GamepadEnabled" | "VREnabled" | "OnScreenKeyboardVisible") => b(false),
+        ("UserInputService", "GamepadEnabled" | "VREnabled") => b(false),
+        // The soft keyboard over the game's view (Android: a TextBox typed
+        // into; viewport.rs `keyboard_pan`), in the game's coordinates.
+        ("UserInputService", "OnScreenKeyboardVisible") => b(crate::touch_input::soft_keyboard().is_some()),
+        ("UserInputService", "OnScreenKeyboardPosition" | "OnScreenKeyboardSize") => {
+            let v = match (key, crate::touch_input::soft_keyboard()) {
+                ("OnScreenKeyboardPosition", Some(k)) => glam::Vec2::new(k.x, k.y),
+                ("OnScreenKeyboardSize", Some(k)) => glam::Vec2::new(k.w, k.h),
+                _ => glam::Vec2::ZERO,
+            };
+            Ok(Some(Value::UserData(lua.create_userdata(LVector2(v))?)))
+        }
         ("UserInputService", "TouchEnabled") => b(touch),
         ("UserInputService", "ModalEnabled") => stored_or(lua, r, key, |_| Ok(Value::Boolean(false))),
         ("UserInputService", "AccelerometerEnabled") => b(crate::device_sensors::available().0),

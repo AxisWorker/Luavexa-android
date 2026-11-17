@@ -309,6 +309,40 @@ pub fn run(app: AndroidApp) {
     std::process::exit(0);
 }
 
+/// GPU errors go to logcat instead of ending the process.
+///
+/// wgpu's answer to a validation error nobody catches is a panic on the
+/// thread that made the call (`wgpu_core.rs` "Handling wgpu errors as
+/// fatal by default") — in the editor loop that is the exit 101 the
+/// crash report names, for a frame that could have gone on without the
+/// one copy or draw the error refused. Here the device gets a handler:
+/// the error's text goes to logcat (`rustudio` tag; the first
+/// [`GPU_ERRORS_LOGGED`] in full, a count after that, so a per-frame
+/// error can't fill the log), [`gpu_errors`] counts them for the perf
+/// log, and the run goes on with the device's driver as it is. Device
+/// loss and out-of-memory are reported the same way; the frames after
+/// them show what they show (the renderer's own buffer and texture
+/// bounds are checked before the calls, render.rs `MaterialArrays`).
+pub fn install_gpu_error_handler(device: &egui_wgpu::wgpu::Device) {
+    device.on_uncaptured_error(std::sync::Arc::new(|e: egui_wgpu::wgpu::Error| {
+        let n = GPU_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= GPU_ERRORS_LOGGED {
+            log::error!("rustudio: wgpu error {n} (the frame goes on): {e}");
+        } else if n == GPU_ERRORS_LOGGED + 1 {
+            log::error!("rustudio: wgpu error {n}: {e} — further ones are counted, not logged");
+        }
+    }));
+}
+
+/// How many GPU errors' texts go to logcat in full.
+pub const GPU_ERRORS_LOGGED: usize = 20;
+static GPU_ERRORS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The GPU errors so far this run (`install_gpu_error_handler`).
+pub fn gpu_errors() -> usize {
+    GPU_ERRORS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Touch-first settings for the egui chrome: bigger hit targets, a wider
 /// click slop, and the device defaults for the UI zoom and the 3D view's
 /// render scale (both kept by the layout store once changed from View >

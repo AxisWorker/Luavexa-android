@@ -10,7 +10,15 @@
 //!
 //! * the editor's panels are laid out above it ([`Keyboard::shrink`] takes
 //!   that much off the root `Ui` in `App::ui`, so the dock, the 3D view and
-//!   the status bar move up as `adjustResize` would move an Android view);
+//!   the status bar move up as `adjustResize` would move an Android view)
+//!   — unless a game's TextBox is typed into: the keyboard then lies over
+//!   the window as it does over a phone's games, and the 3D view slides up
+//!   by what shows the box above it (`Editor::keyboard_pan` in
+//!   src/viewport.rs, from `Editor::keyboard_cover`; the panels above the
+//!   keyboard left a landscape phone a view a few lines tall, the box
+//!   squeezed or off it under the status bar). The game's scripts read
+//!   the keyboard's place as `UserInputService.OnScreenKeyboardVisible /
+//!   Position / Size`;
 //! * it is egui's bottom safe-area inset, so windows, menus and popups keep
 //!   to the area above it too ([`Keyboard::before_frame`]);
 //! * the frame the room changes, [`reveal`] is true: the field being typed

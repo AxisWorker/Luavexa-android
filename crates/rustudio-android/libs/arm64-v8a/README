@@ -1,4 +1,6 @@
 # xbuild's runtime_libs folder for arm64-v8a (crates/rustudio-android/manifest.yaml):
-# tools/android/fetch-turnip.sh puts libadrenotools.so, its hook libraries and
-# libvulkan_freedreno.so (the Turnip driver) here before `x build`. The .so
-# files are git-ignored; an empty folder builds a plain APK.
+# tools/android/fetch-turnip.sh puts libadrenotools.so, its hook libraries,
+# libvulkan_freedreno.so (the Turnip driver, for Adreno) and
+# libvulkan_panfrost.so (the PanVK driver, for Mali; PANVK=0 leaves it out)
+# here before `x build`. The .so files are git-ignored; an empty folder
+# builds a plain APK.

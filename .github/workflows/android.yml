@@ -57,9 +57,19 @@ on:
         default: "https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.0/mesa-turnip-android-26.3.0.zip"
         type: string
       adrenotools_zip:
-        description: "libadrenotools zip URL (libadrenotools.so + hook libraries inside; TouseefX/libadrenotools-native release)"
+        description: "libadrenotools zip URL (libadrenotools.so + hook libraries inside; a TouseefX/libadrenotools-native release or CI artifact via nightly.link)"
         required: false
-        default: "https://github.com/TouseefX/libadrenotools-native/releases/download/V0.7/libadrenotools-arm64-v8a.zip"
+        default: "https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44085827920/libadrenotools-arm64-v8a.zip"
+        type: string
+      panvk:
+        description: "Also ship the PanVK (Mesa) Vulkan driver for Mali GPUs (35 MB more APK; needs turnip on)"
+        required: false
+        default: true
+        type: boolean
+      panvk_so:
+        description: "PanVK driver URL (a bare .so built for Android on ARM's kbase; zenithblue-oss/panvk-kbase-android release)"
+        required: false
+        default: "https://github.com/zenithblue-oss/panvk-kbase-android/releases/download/panvk-kbase-v26.3.1/libvulkan_panfrost-android-aarch64.so"
         type: string
 
 concurrency:
@@ -71,12 +81,20 @@ env:
   # xbuild at this commit (crates.io's 0.2.0 from 2022 predates the
   # manifest.yaml format and NDK downloads used here).
   XBUILD_REV: e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1
-  # The Turnip (Mesa) Vulkan driver and libadrenotools that go into the
-  # arm64 APK's lib/arm64-v8a (push / PR builds; a manual run's inputs
-  # above can name others). tools/android/fetch-turnip.sh checks these two
-  # against pinned SHA-256 sums; docs/ANDROID.md "Turnip driver".
+  # The Mesa Vulkan drivers (Turnip for Adreno, PanVK for Mali) and
+  # libadrenotools that go into the arm64 APK's lib/arm64-v8a (push / PR
+  # builds; a manual run's inputs above can name others or leave them
+  # out). tools/android/fetch-turnip.sh checks these against pinned
+  # SHA-256 sums; docs/ANDROID.md "Turnip driver". The libadrenotools
+  # build is the fork's CI artifact of 2026-11-17 12:42 (commit 4d4d482:
+  # the driver.cpp rewrite — HyperOS' vendor Vulkan paths, its own
+  # initialisation switchable off, which the app does, a working PanVK
+  # path) through nightly.link; GitHub keeps
+  # artifacts for 90 days — a release of the fork replaces it then (the
+  # script's comments name the last one, V0.7).
   TURNIP_ZIP_URL: https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.0/mesa-turnip-android-26.3.0.zip
-  ADRENOTOOLS_ZIP_URL: https://github.com/TouseefX/libadrenotools-native/releases/download/V0.7/libadrenotools-arm64-v8a.zip
+  ADRENOTOOLS_ZIP_URL: https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44085827920/libadrenotools-arm64-v8a.zip
+  PANVK_SO_URL: https://github.com/zenithblue-oss/panvk-kbase-android/releases/download/panvk-kbase-v26.3.1/libvulkan_panfrost-android-aarch64.so
 
 jobs:
   apk:
@@ -143,22 +161,26 @@ jobs:
       - name: x doctor
         run: x doctor
 
-      # The arm64 APK carries the Turnip (Mesa) Vulkan driver and
-      # libadrenotools in lib/arm64-v8a (tools/android/fetch-turnip.sh →
-      # crates/rustudio-android/libs/arm64-v8a, manifest.yaml runtime_libs);
-      # the app swaps the driver in on Snapdragon devices at start
-      # (src/android/turnip.rs). Push / PR builds take the pinned releases;
-      # a manual run can point at other zips or leave the driver out.
-      - name: Turnip driver + libadrenotools (arm64-v8a)
+      # The arm64 APK carries the Mesa Vulkan drivers (Turnip for Adreno,
+      # PanVK for Mali) and libadrenotools in lib/arm64-v8a
+      # (tools/android/fetch-turnip.sh → crates/rustudio-android/libs/arm64-v8a,
+      # manifest.yaml runtime_libs); the app swaps the driver in on
+      # Snapdragon and kbase Mali devices at start (src/android/turnip.rs).
+      # Push / PR builds take the pinned releases; a manual run can point
+      # at other builds or leave the drivers out.
+      - name: Mesa drivers (Turnip, PanVK) + libadrenotools (arm64-v8a)
         if: matrix.arch == 'arm64' && github.event.inputs.turnip != 'false'
         env:
           # A manual run's inputs, else the pinned releases (env above).
           TURNIP_ZIP: ${{ github.event.inputs.turnip_zip || env.TURNIP_ZIP_URL }}
           ADRENOTOOLS_ZIP: ${{ github.event.inputs.adrenotools_zip || env.ADRENOTOOLS_ZIP_URL }}
+          PANVK_SO: ${{ github.event.inputs.panvk_so || env.PANVK_SO_URL }}
+          PANVK: ${{ github.event.inputs.panvk == 'false' && '0' || '1' }}
         run: |
           set -euo pipefail
           echo "Turnip driver: $TURNIP_ZIP"
           echo "libadrenotools: $ADRENOTOOLS_ZIP"
+          echo "PanVK driver: $PANVK_SO (PANVK=$PANVK)"
           bash tools/android/fetch-turnip.sh
 
       - name: Build APK

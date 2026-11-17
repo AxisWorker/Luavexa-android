@@ -589,6 +589,66 @@ mod gpu_tests {
             eprintln!("renderer built on {} ({:?}) at {name}", info.name, info.backend);
         }
     }
+
+    /// Material packs fill the texture arrays one layer at a time, the
+    /// arrays growing on the GPU as they go (`material_layer`,
+    /// `remake_materials`), and are copied across when the texture quality
+    /// changes: every copy and write within the arrays' layers, as wgpu
+    /// checks (a copy past them is a validation error, fatal by default:
+    /// the fourth material of a place closed the Android editor). Skipped
+    /// with a note where there is no GPU.
+    #[test]
+    fn material_arrays_grow_within_bounds_on_this_gpu() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+            eprintln!("no GPU adapter here: skipped");
+            return;
+        };
+        let info = adapter.get_info();
+        let mut limits = wgpu::Limits::default();
+        limits.max_sampled_textures_per_shader_stage = 24;
+        limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
+        let desc = wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() };
+        let (device, queue) = pollster::block_on(adapter.request_device(&desc))
+            .unwrap_or_else(|e| panic!("{} ({:?}) refused rustudio's limits: {e}", info.name, info.backend));
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        // A phone's starting level (512² arrays), then more materials than
+        // the arrays' first capacity, one per pack.
+        let settings = crate::quality::RenderSettings::level(crate::mech::QUALITY_DEFAULT_PHONE).normalized();
+        let mut r = Renderer::new(&device, &queue, None, Renderer::msaa_support_of(&adapter), settings);
+        let packs: Vec<_> = (1..=9u64).map(|p| crate::matpack::test_maps(p, [p as u8 * 20, 90, 60])).collect();
+        for (i, m) in packs[..6].iter().enumerate() {
+            assert_eq!(r.material_layer(&device, &queue, m), i as i32, "pack {}", m.pack);
+            assert_eq!(r.material_layer(&device, &queue, m), i as i32, "pack {} again", m.pack);
+            r.materials_tick(&device, &queue);
+        }
+        assert_eq!((r.materials.size, r.materials.cpu.len()), (512, 6));
+        assert!(r.materials.capacity >= 6);
+        // Larger arrays (the level went up): made aside, filled as the
+        // maps come back; new materials go to both.
+        let up = crate::quality::RenderSettings::level(crate::quality::LEVELS);
+        r.set_settings(&device, &queue, &up);
+        assert_eq!(r.texture_size(), 1024);
+        assert!(r.materials_next.is_some() && r.materials_next_pending.len() == 6);
+        assert_eq!(r.material_layer(&device, &queue, &packs[6]), 6);
+        assert_eq!(r.materials_next.as_ref().map(|n| n.cpu.len()), Some(7));
+        r.materials_tick(&device, &queue);
+        // Smaller arrays (the level went down): the layers copied from the
+        // matching level, then more materials.
+        let down = crate::quality::RenderSettings::level(1);
+        r.set_settings(&device, &queue, &down);
+        assert_eq!((r.materials.size, r.materials.cpu.len()), (256, 7));
+        assert!(r.materials_next.is_none());
+        for (i, m) in packs[7..].iter().enumerate() {
+            assert_eq!(r.material_layer(&device, &queue, m), 7 + i as i32);
+            r.materials_tick(&device, &queue);
+        }
+        assert_eq!(r.materials.cpu.len(), 9);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let err = pollster::block_on(scope.pop());
+        assert!(err.is_none(), "{} ({:?}): {err:?}", info.name, info.backend);
+        eprintln!("material arrays grew within bounds on {} ({:?})", info.name, info.backend);
+    }
 }
 
 #[cfg(test)]
@@ -1068,6 +1128,8 @@ impl MaterialArrays {
     /// (the texture quality setting went down) from the level of this size
     /// on. Nothing from smaller arrays: their top levels aren't there.
     fn copy_layers(&self, device: &wgpu::Device, queue: &wgpu::Queue, from: &MaterialArrays, layers: u32) {
+        // (a copy past either array's layers would be a fatal validation error)
+        let layers = layers.min(from.capacity).min(self.capacity);
         if layers == 0 || from.size < self.size {
             return;
         }
@@ -1089,6 +1151,11 @@ impl MaterialArrays {
     }
 
     fn upload(&self, queue: &wgpu::Queue, layer: u32, maps: &crate::matpack::Pixels) {
+        if layer >= self.capacity {
+            // (a write past the arrays' layers would be a fatal validation error)
+            eprintln!("rustudio: material layer {layer} past the arrays' {} layers: not uploaded", self.capacity);
+            return;
+        }
         let skip = self.skipped_mips();
         for (tex, data, channels) in [(&self.albedo, &maps.albedo, 4), (&self.surface, &maps.surface, 4), (&self.emission, &maps.emissive, 1)] {
             for (mip, (at, size)) in crate::matpack::mip_levels().into_iter().enumerate().skip(skip) {
@@ -3709,12 +3776,17 @@ impl Renderer {
         };
         self.generation += 1;
         let layer = self.materials.cpu.len() as u32;
-        self.materials.cpu.push(maps.clone());
-        self.materials.layers.insert(maps.pack, layer);
-        if layer >= self.materials.capacity || self.materials.size != self.texture_size() {
+        // Room for this layer first (the arrays remade copy the `layer`
+        // layers uploaded so far: this one isn't among them yet). Arrays
+        // already being made at the settings' size with room take it as
+        // they are.
+        let next_fits = self.materials_next.as_ref().is_some_and(|n| n.size == self.texture_size() && layer < n.capacity);
+        if layer >= self.materials.capacity || (self.materials.size != self.texture_size() && !next_fits) {
             let cap = (layer + 1).next_power_of_two().max(4).max(self.materials.capacity);
             self.remake_materials(device, queue, cap);
         }
+        self.materials.cpu.push(maps.clone());
+        self.materials.layers.insert(maps.pack, layer);
         self.materials.upload(queue, layer, &pixels);
         // The arrays being filled at a larger size get it too (below).
         if let Some(next) = self.materials_next.as_mut() {
@@ -3735,17 +3807,20 @@ impl Renderer {
     }
 
     /// New material arrays of `capacity` layers at the settings' texture
-    /// size. The layers so far are copied on the GPU (their maps are no
-    /// longer in memory): whole at the same size, from the matching level
-    /// down at a smaller one. Larger arrays can't be filled from the old
-    /// ones' levels: they are made aside (`materials_next`), every pack's
-    /// maps are asked for again, and they take over once every layer has
-    /// been uploaded (`materials_tick`); the old arrays draw meanwhile.
+    /// size. The layers so far (`materials.cpu`, every one uploaded) are
+    /// copied on the GPU (their maps are no longer in memory): whole at
+    /// the same size, from the matching level down at a smaller one.
+    /// Larger arrays can't be filled from the old ones' levels: they are
+    /// made aside (`materials_next`), every pack's maps are asked for
+    /// again, and they take over once every layer has been uploaded
+    /// (`materials_tick`); the old arrays draw meanwhile.
     fn remake_materials(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, capacity: u32) {
         self.generation = self.generation.wrapping_add(1);
         let size = self.texture_size();
-        let capacity = capacity.max(1).max(self.materials.cpu.len() as u32);
-        let done = self.materials.cpu.len() as u32;
+        // (never more layers than the old arrays have: a copy past their
+        // end is a wgpu validation error, which is fatal)
+        let done = (self.materials.cpu.len() as u32).min(self.materials.capacity);
+        let capacity = capacity.max(1).max(done);
         if size > self.materials.size && done > 0 {
             // Growing: the arrays aside, at the new size.
             let mut next = MaterialArrays::with_params(device, size, capacity, self.materials.params.clone());

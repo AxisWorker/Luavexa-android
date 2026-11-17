@@ -2545,8 +2545,60 @@ impl Editor {
         self.doc.record_props(label, changes);
     }
 
+    /// Android, a game TextBox typed into (app.rs sets `keyboard_cover`):
+    /// the soft keyboard lies over the window's bottom `keyboard_cover`
+    /// points, as it does over a phone's games, instead of the panels
+    /// ending above it (android/keyboard.rs `shrink`, which leaves a
+    /// landscape phone a view a few lines tall, the box typed into
+    /// squeezed or off it). The view and its GUIs slide up by what shows
+    /// the box above the keyboard (as Android pans a window to its focused
+    /// field), never past the box's own top edge leaving the view nor
+    /// further than the keyboard covers the view, and back when the
+    /// keyboard goes. Returns the rect to draw the view in: what slid
+    /// above the panel is clipped by the painter and the widget. The
+    /// keyboard's place over the view goes to the scripts
+    /// (`UserInputService.OnScreenKeyboardVisible / Position / Size`:
+    /// touch_input.rs `set_soft_keyboard`).
+    fn keyboard_pan(&mut self, ctx: &egui::Context, rect: Rect) -> Rect {
+        /// Points kept between the box and the keyboard's top edge, and the view's.
+        const MARGIN: f32 = 8.0;
+        let cover = self.keyboard_cover;
+        if cover <= 0.0 || self.play.is_none() || !rect.is_positive() {
+            self.view_pan = 0.0;
+            crate::touch_input::set_soft_keyboard(None);
+            return rect;
+        }
+        let keyboard_top = ctx.viewport_rect().max.y - cover;
+        // The view below the keyboard's top edge: the most it slides.
+        let covered = (rect.max.y - keyboard_top).max(0.0);
+        let inset = self.gui.input_inset.unwrap_or(mech::GUI_TOP_INSET);
+        let pan = match self.gui.focus.and_then(|f| self.gui.layout.get(&f)) {
+            Some(b) => {
+                // (the layout is relative to the view: the same for any slide)
+                let top = rect.min.y + inset + b.pos[1];
+                let bottom = top + b.size[1];
+                (bottom + MARGIN - keyboard_top).clamp(0.0, (top - MARGIN - rect.min.y).max(0.0)).min(covered)
+            }
+            // (a box not laid out yet: the slide stays as it was)
+            None => self.view_pan.clamp(0.0, covered),
+        };
+        self.view_pan = pan;
+        let rect = rect.translate(egui::vec2(0.0, -pan));
+        crate::touch_input::set_soft_keyboard(Some(crate::touch_input::SoftKeyboard {
+            x: 0.0,
+            y: keyboard_top - (rect.min.y + inset),
+            w: rect.width(),
+            h: cover,
+        }));
+        rect
+    }
+
     pub fn viewport_ui(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
+        // (a game TextBox typed into under the soft keyboard: the view slides up to show it)
+        let rect = self.keyboard_pan(ui.ctx(), rect);
+        // The part of the view on the panel (a slide takes the rest above it).
+        let visible = rect.intersect(ui.clip_rect());
         self.viewport_rect = rect;
         crate::grass_temporal::tick(&mut self.cam, ui.ctx());
         let selector = Self::view_selector_rect(rect);
@@ -2731,7 +2783,7 @@ impl Editor {
             // (game_viewport adds the editor's widgets over the view)
             let ui = if game { std::mem::take(&mut self.touch.zones.ui) } else { Vec::new() };
             self.touch.zones = crate::touch_input::Zones {
-                viewport: rect,
+                viewport: visible,
                 playing: driving,
                 game,
                 ui,

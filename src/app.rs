@@ -440,6 +440,14 @@ pub struct Editor {
     pub selector_cache: crate::viewport::SelectorCache,
     pub hover_outline_refs: (Option<(rbx_dom_weak::types::Ref, u64)>, Vec<rbx_dom_weak::types::Ref>),
     pub viewport_rect: egui::Rect,
+    /// Android: the points of the window's bottom the soft keyboard lies
+    /// over while a game TextBox is typed into (`RustudioApp::frame`; the
+    /// panels are not laid out above it then: `Editor::keyboard_pan`).
+    /// 0 otherwise, and on a desktop.
+    pub keyboard_cover: f32,
+    /// How far the 3D view, its GUIs with it, is slid up to show the
+    /// TextBox typed into above the soft keyboard (`keyboard_pan`).
+    pub view_pan: f32,
     pub frame_no: u64,
     pub harness: Harness,
     pub last_frame: Instant,
@@ -693,6 +701,8 @@ impl RustudioApp {
             selector_cache: Default::default(),
             selection_outline_refs: std::cell::RefCell::new((u64::MAX, Vec::new(), Vec::new())),
             viewport_rect: egui::Rect::NOTHING,
+            keyboard_cover: 0.0,
+            view_pan: 0.0,
             frame_no: 0,
             harness,
             last_frame: Instant::now(),
@@ -846,6 +856,12 @@ impl RustudioApp {
         ed.quality_studio_seen = ed.graphics.studio_level();
         crate::studio_settings::set_edit_quality_level(ed.quality_studio_seen);
         let settings = ed.render_settings();
+        // (a GPU validation error is a logcat line, not the end of the
+        // process: src/android/mod.rs install_gpu_error_handler)
+        #[cfg(target_os = "android")]
+        if let Some(rs) = ed.render_state.as_ref() {
+            crate::android::install_gpu_error_handler(&rs.device);
+        }
         ed.renderer = ed.render_state.as_ref().map(|rs| {
             if crate::perf_log::on() {
                 eprintln!("render settings: {}", settings.describe(settings.scene_format(&rs.device)));
@@ -2539,9 +2555,23 @@ impl RustudioApp {
         crate::sim_clock::advance();
         let ctx = ui.ctx().clone();
         self.watchdog.begin(ctx.input(|i| !i.viewport().minimized.unwrap_or(false)) && (self.ed.play.is_some() || self.ed.harness.screenshot.is_some()));
-        // The panels end above the soft keyboard while a field is typed in.
+        // The panels end above the soft keyboard while a field is typed in
+        // — except a game's TextBox: the keyboard then lies over the
+        // window, as it does over a phone's games (the panels laid out
+        // above it leave a landscape phone a view a few lines tall, the
+        // box typed into squeezed or off it, the status bar in its
+        // place), and the view slides up to show the box
+        // (Editor::keyboard_pan).
         #[cfg(target_os = "android")]
-        self.keyboard.shrink(ui);
+        {
+            let game_box = self.ed.play.is_some()
+                && self.ed.gui.focus.is_some()
+                && crate::android::keyboard::focused_text(&ctx).is_none();
+            self.ed.keyboard_cover = if game_box { self.keyboard.height(&ctx) } else { 0.0 };
+            if !game_box {
+                self.keyboard.shrink(ui);
+            }
+        }
         let ed = &mut self.ed;
         // Files opened from Finder (double-click, Open With, the Dock icon).
         #[cfg(target_os = "macos")]
@@ -3097,8 +3127,15 @@ impl RustudioApp {
                     let ppp = ctx.pixels_per_point();
                     let view = renderer.as_ref().and_then(|r| r.target_size()).unwrap_or([0, 0]);
                     let (drawn, reused) = view_reuse.take_counts();
+                    #[cfg(target_os = "android")]
+                    let gpu_errors = match crate::android::gpu_errors() {
+                        0 => String::new(),
+                        n => format!(", GPU errors {n}"),
+                    };
+                    #[cfg(not(target_os = "android"))]
+                    let gpu_errors = String::new();
                     format!(
-                        "window {}x{} px at {ppp:.2} px/pt, 3D view {}x{} px ({}), 3D frames drawn {drawn} / shown again {reused}",
+                        "window {}x{} px at {ppp:.2} px/pt, 3D view {}x{} px ({}), 3D frames drawn {drawn} / shown again {reused}{gpu_errors}",
                         (r.width() * ppp).round(),
                         (r.height() * ppp).round(),
                         view[0],

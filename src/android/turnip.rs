@@ -13,34 +13,66 @@
 //! the loader's own swapchain code on top (Mesa's Android builds leave
 //! window surfaces to the loader, as the vendor driver does). [`activate`]
 //! runs in `android_main` before eframe starts, while the launch screen
-//! is still up: it loads the shim, runs the fork's own initialisation
-//! (`JNI_OnLoad`: Mesa's environment, the shader cache folder, its hooks),
-//! opens a Turnip-backed loader of its own and probes it (which driver
-//! answers: the log, Graphics Settings > GPU driver, the perf line's
-//! adapter name). Then [`wgpu_setup`] builds wgpu's instance, adapter,
-//! device and queue on that loader — ash's `Entry::from_static_fn` on its
-//! `vkGetInstanceProcAddr`, the instance exactly as wgpu-hal's own
+//! is still up: it loads the shim with its own initialisation switched
+//! off (`ADRENOTOOLS_DISABLE=1`, below; its constructor's Mesa environment
+//! still goes in), opens a Turnip-backed loader of its own and probes it
+//! (which driver answers: the log, Graphics Settings > GPU driver, the
+//! perf line's adapter name). Then [`wgpu_setup`] builds wgpu's instance,
+//! adapter, device and queue on that loader — ash's `Entry::from_static_fn`
+//! on its `vkGetInstanceProcAddr`, the instance exactly as wgpu-hal's own
 //! `Instance::init` makes one, `wgpu_hal::vulkan::Instance::from_raw`,
 //! `wgpu::Instance::from_hal` — and `wgpu_options` hands them to eframe as
 //! `egui_wgpu::WgpuSetup::Existing`. wgpu itself is unchanged.
 //!
-//! Why not the fork's patch of the system loader. The fork also inline-hooks
-//! the system `libvulkan.so`'s `vkGetInstanceProcAddr` /
-//! `vkGetDeviceProcAddr` (shadowhook, shared mode) to answer from its
-//! private copy, so that a plain `dlopen("libvulkan.so")` — wgpu-hal's
-//! `ash::Entry::load()` — would land on Turnip. It doesn't hold: its proxy
-//! functions return without `SHADOWHOOK_POP_STACK`, so the per-thread
-//! frame shadowhook pushes for a call is never popped, and shadowhook
-//! takes every later call of the same function on that thread for a
-//! recursive one, which it sends to the original — i.e. only the first
-//! `vkGetInstanceProcAddr` call per thread reaches Turnip, every one after
-//! it reaches the vendor's loader (the first device run showed exactly
-//! this: the probe's instance was Turnip's, wgpu's right after it on the
-//! same thread was Adreno's). Hence the loader handle of our own and the
-//! pre-built wgpu objects; the fork's patch stays in place but nothing
-//! here depends on it.
+//! Why not the fork's patch of the system loader. Left to itself the fork
+//! initialises at load (`perform_init`, from `JNI_OnLoad` or a thread its
+//! constructor starts): it opens a hooked copy of the loader with the
+//! driver behind it and inline-hooks the system `libvulkan.so`'s
+//! `vkGetInstanceProcAddr` / `vkGetDeviceProcAddr` (shadowhook, shared
+//! mode) to answer from that copy, so that a plain `dlopen("libvulkan.so")`
+//! — wgpu-hal's `ash::Entry::load()` — lands on Turnip, while callers from
+//! the system's own libraries (hwui, WebView, …) are sent on to the
+//! vendor's loader. Its 4a084a5 build didn't hold (its proxies leaked
+//! shadowhook's per-thread frame, so only the first `vkGetInstanceProcAddr`
+//! call per thread reached Turnip and every later one the vendor's loader;
+//! the first device run showed exactly this: the probe's instance was
+//! Turnip's, wgpu's right after it on the same thread was Adreno's), and
+//! 4d4d482 (2026-11-17 12:42, the driver.cpp rewrite that hooks these two
+//! functions only, scopes the frames and bypasses system callers) needs a
+//! JavaVM, the Application context and a thread of its own to settle. A
+//! loader handle of our own and the pre-built wgpu objects need none of
+//! that, so the patch is switched off where the shim allows
+//! (`ADRENOTOOLS_DISABLE`, which 4d4d482 reads and 4a084a5 doesn't;
+//! [`Shim`] reads off the file which one is in the APK) and, with an
+//! older shim, run but not relied on (its hooks' leaked frame is settled
+//! for the ordinary start, `settle_system_loader`).
 //!
-//! Only Adreno 650 and up, on Snapdragon, not on HyperOS: Turnip drives
+//! PanVK for Mali. The same shim opens Mesa's PanVK driver
+//! (`libvulkan_panfrost.so`: zenithblue-oss's panvk-kbase-android build,
+//! Mesa 26.3 on ARM's kbase kernel driver, the one Android's Mali devices
+//! have; the fork's own `init_panvk_driver` opens the same file name) on
+//! devices whose GPU is a Mali (`ro.hardware.vulkan` / `ro.hardware.egl`
+//! "mali", or `/dev/mali0`) with the kbase node `/dev/mali0` and a
+//! Bifrost or newer core (`Mali-G…` per the kbase sysfs `gpuinfo`; the
+//! Midgard `Mali-T…` and Utgard `Mali-4xx` are out: PanVK has no code for
+//! them), the file in the APK (tools/android/fetch-turnip.sh `PANVK=1`,
+//! the default; 35 MB) and Android 12+. Everything else below —
+//! `adrenotools_open_libvulkan`, the probe, [`wgpu_setup`], the markers,
+//! the window's switch — is the same path with the other file name
+//! ([`Mesa`]). The shim's constructor tells a Mali the same way
+//! (`/dev/kgsl-3d0` first, then `/dev/mali0`, the properties, the kbase
+//! sysfs and the device tree) and sets PanVK's environment
+//! (`PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1`, which the driver wants before
+//! it enumerates a device, `PAN_MESA_DEBUG=kbase`, …; this module sets the
+//! first of its own too). With the older 4a084a5 shim, whose own
+//! initialisation can't be switched off, a device whose
+//! `/proc/device-tree/model` says "Mali" is kept on its driver: that
+//! build's PanVK path installs hooks that call a null Turnip pointer
+//! ([`Device::shim_would_misfire`]). No Mali device was at hand for this:
+//! the probe and the first-frames marker decide per device, as for Turnip.
+//!
+//! Only Adreno 650 and up, on Snapdragon (HyperOS with a new enough
+//! libadrenotools, below): Turnip drives
 //! Adreno GPUs through Qualcomm's KGSL kernel driver and nothing else
 //! (a Mali, PowerVR or Xclipse named by `ro.hardware.vulkan` /
 //! `ro.hardware.egl` is out at once), the device must have
@@ -48,9 +80,12 @@
 //! properties), its Adreno must be a 650 or newer per
 //! `/sys/class/kgsl/kgsl-3d0/gpu_model` (or `ro.soc.model` for the SoCs
 //! listed in [`Device::adreno_model`]; an unknown model is out), and
-//! Xiaomi's HyperOS (`ro.mi.os.version.name`) is out — libadrenotools'
-//! loader hook mostly doesn't find the Vulkan driver paths it expects
-//! there. Every other device keeps its driver and the window doesn't
+//! Xiaomi's HyperOS (`ro.mi.os.version.name`) is out unless the APK's
+//! libadrenotools is a build that looks for the system's Vulkan loader
+//! under the vendor paths HyperOS keeps it at (libadrenotools-native from
+//! 2026-11-17; [`Shim`] reads that off the file — the older builds found
+//! nothing to hook there). Every other
+//! device keeps its driver and the window doesn't
 //! offer the switch. The swap is also skipped on other ABIs than
 //! arm64-v8a, below Android 12 (the fork's floor), when the files aren't
 //! in the APK, when turned off (Graphics Settings > GPU driver, or
@@ -75,14 +110,52 @@ use std::time::Instant;
 
 use ash::vk;
 
+/// Which Mesa driver the device gets: Turnip on Adreno (Snapdragon),
+/// PanVK on Mali (module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mesa {
+    Turnip,
+    PanVk,
+}
+
+impl Mesa {
+    pub fn name(self) -> &'static str {
+        match self {
+            Mesa::Turnip => "Turnip",
+            Mesa::PanVk => "PanVK",
+        }
+    }
+
+    /// The driver's file in the APK's lib/arm64-v8a, the name the shim
+    /// opens (and the fork's own init_turnip_driver / init_panvk_driver do).
+    fn file(self) -> &'static str {
+        match self {
+            Mesa::Turnip => "libvulkan_freedreno.so",
+            Mesa::PanVk => "libvulkan_panfrost.so",
+        }
+    }
+
+    /// The GPUs it drives, for the window and the log.
+    pub fn gpus(self) -> &'static str {
+        match self {
+            Mesa::Turnip => "Adreno",
+            Mesa::PanVk => "Mali",
+        }
+    }
+}
+
 /// What [`activate`] decided, for the log and Graphics Settings.
 #[derive(Clone, Debug, Default)]
 pub struct Status {
-    /// Turnip answers this process's Vulkan calls.
+    /// The Mesa driver (Turnip or PanVK) answers this process's Vulkan calls.
     pub active: bool,
-    /// The device qualifies (arm64, Adreno 650+, not HyperOS, Android 12+,
-    /// files in the APK): the window offers the switch only then.
+    /// The device qualifies (arm64, Adreno 650+ or a kbase Mali, not an
+    /// old HyperOS, Android 12+, files in the APK): the window offers the
+    /// switch only then.
     pub available: bool,
+    /// The driver this device would get (`None`: no Mesa driver for it,
+    /// or no decision yet).
+    pub mesa: Option<Mesa>,
     /// What happened, or why nothing did (one line).
     pub note: String,
     /// The Vulkan device as the probe saw it after the swap ("Turnip
@@ -99,13 +172,13 @@ pub fn status() -> Status {
     STATUS.get().cloned().unwrap_or_default()
 }
 
-/// The Turnip-backed Vulkan loader [`activate`] opened for this process
+/// The Vulkan loader with the Mesa driver behind it that [`activate`] opened for this process
 /// (`adrenotools_open_libvulkan`): its `vkGetInstanceProcAddr`, from
 /// which [`wgpu_setup`] makes wgpu's instance. The loader stays loaded
 /// for the life of the process.
 static LOADER: OnceLock<vk::PFN_vkGetInstanceProcAddr> = OnceLock::new();
 
-/// ash's entry points on the Turnip-backed loader, when there is one.
+/// ash's entry points on that loader, when there is one.
 pub fn entry() -> Option<ash::Entry> {
     // SAFETY: a vkGetInstanceProcAddr dlsym'd from a loaded copy of
     // libvulkan.so that is never closed.
@@ -121,9 +194,10 @@ pub fn renderer() -> String {
     RENDERER.get().cloned().unwrap_or_default()
 }
 
-/// libadrenotools.so is loaded, so its patch of the system loader is (or
+/// libadrenotools' own initialisation ran (an older shim, without the
+/// `ADRENOTOOLS_DISABLE` switch), so its patch of the system loader is (or
 /// is about to be) in place.
-static SHIM_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SHIM_HOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// For the ordinary wgpu start after the fork's patch went in but Turnip
 /// isn't used: one pass of ash's loading through the system loader on
@@ -302,6 +376,15 @@ struct Device {
     vulkan: String,
     /// /sys/class/kgsl/kgsl-3d0/gpu_model ("Adreno650v3"), "" when unreadable.
     gpu: String,
+    /// ARM's kbase kernel driver's device node (Mali): what PanVK's
+    /// kbase build drives.
+    mali0: bool,
+    /// kbase's sysfs `gpuinfo` ("Mali-G52 MP2 r1p0 0x7402"), "" when none
+    /// is readable.
+    mali_gpu: String,
+    /// The device tree's model string (/proc/device-tree/model), for the
+    /// shim's own Mali test ([`Device::shim_would_misfire`]).
+    dt_model: String,
     /// Xiaomi's HyperOS: ro.mi.os.version.name ("OS1.0", "OS2.0.1"), ""
     /// elsewhere; ro.miui.ui.version.name (MIUI, which HyperOS also sets)
     /// for the log.
@@ -327,6 +410,13 @@ impl Device {
             vulkan: prop("ro.hardware.vulkan"),
             gpu: std::fs::read_to_string("/sys/class/kgsl/kgsl-3d0/gpu_model")
                 .map(|s| s.trim().to_string())
+                .unwrap_or_default(),
+            mali0: Path::new("/dev/mali0").exists(),
+            mali_gpu: mali_gpuinfo(),
+            dt_model: ["/proc/device-tree/model", "/sys/firmware/devicetree/base/model"]
+                .iter()
+                .find_map(|p| std::fs::read(p).ok())
+                .map(|b| String::from_utf8_lossy(&b).trim_matches(char::from(0)).trim().to_string())
                 .unwrap_or_default(),
             hyperos: {
                 let name = prop("ro.mi.os.version.name");
@@ -356,6 +446,43 @@ impl Device {
         None
     }
 
+    /// A Mali GPU: named by the driver properties, or kbase's node present.
+    fn mali(&self) -> bool {
+        self.mali0 || self.other_gpu().is_some_and(|g| g.contains("mali"))
+    }
+
+    /// The Mali core per kbase's `gpuinfo`: Some(true) for a Bifrost or
+    /// newer one ("Mali-G52", "Mali-G610", "Mali-G1-Ultra"), Some(false)
+    /// for a Midgard ("Mali-T830") or Utgard ("Mali-450") one, None when
+    /// nothing is readable.
+    fn mali_bifrost_or_newer(&self) -> Option<bool> {
+        let g = self.mali_gpu.trim();
+        if g.is_empty() {
+            return None;
+        }
+        let l = g.to_ascii_lowercase();
+        if l.starts_with("mali-g") || l.starts_with("mali g") {
+            return Some(true);
+        }
+        if l.starts_with("mali-t") || l.starts_with("mali t") || l.starts_with("mali-4") || l.starts_with("mali 4") {
+            return Some(false);
+        }
+        None
+    }
+
+    /// libadrenotools-native 4a084a5's own Mali test (`isMaliGpu`) reads
+    /// the KGSL model, then the device tree's model: a device whose tree
+    /// says "Mali" sends that build's `perform_init` down its PanVK path,
+    /// whose hooks of the system loader call through its Turnip pointer,
+    /// null then — a crash at the first `vkGetInstanceProcAddr` through
+    /// the system loader. Such a device is kept on its driver when the
+    /// APK's shim is one that initialises itself whatever the caller does
+    /// ([`Shim::opt_out`] false); 4d4d482 and newer are switched off
+    /// instead and have no such path anyway (PanVK shares Turnip's init).
+    fn shim_would_misfire(&self) -> bool {
+        self.gpu.is_empty() && self.dt_model.to_ascii_lowercase().contains("mali")
+    }
+
     /// The Adreno model (650 for "Adreno650v3" or "Adreno (TM) 650"),
     /// from the KGSL node; when that isn't readable, from the SoC model
     /// for the SoCs known here; 0 when unknown.
@@ -382,7 +509,7 @@ impl Device {
 
     fn describe(&self) -> String {
         format!(
-            "kgsl {}, soc {:?} {:?}, hardware {:?}, platform {:?}, gpu {:?}, egl {:?}, vulkan {:?}{}{}",
+            "kgsl {}, soc {:?} {:?}, hardware {:?}, platform {:?}, gpu {:?}, egl {:?}, vulkan {:?}, mali0 {}{}{}{}{}",
             if self.kgsl { "present" } else { "absent" },
             self.soc,
             self.soc_model,
@@ -391,10 +518,42 @@ impl Device {
             self.gpu,
             self.egl,
             self.vulkan,
+            if self.mali0 { "present" } else { "absent" },
+            if self.mali_gpu.is_empty() { String::new() } else { format!(", mali gpuinfo {:?}", self.mali_gpu) },
+            if self.dt_model.is_empty() { String::new() } else { format!(", device tree {:?}", self.dt_model) },
             if self.hyperos.is_empty() { String::new() } else { format!(", HyperOS {}", self.hyperos) },
             if self.miui.is_empty() { String::new() } else { format!(", MIUI {}", self.miui) },
         )
     }
+}
+
+/// kbase's `gpuinfo` under sysfs: `/sys/devices/platform/<addr>.mali/gpuinfo`
+/// on most devices (the node's name varies: "mali", "mali0", "<addr>.mali",
+/// "<addr>.gpu"), `/sys/bus/platform/drivers/mali/<addr>.mali/gpuinfo` and
+/// `/sys/module/mali_kbase/...` on some. The first one readable, "" when
+/// none is.
+fn mali_gpuinfo() -> String {
+    let mut found = String::new();
+    for dir in ["/sys/devices/platform", "/sys/bus/platform/drivers/mali", "/sys/bus/platform/devices"] {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+            if !(name.contains("mali") || name.ends_with(".gpu") || name == "gpu") {
+                continue;
+            }
+            if let Ok(s) = std::fs::read_to_string(e.path().join("gpuinfo")) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    found = s.to_string();
+                    break;
+                }
+            }
+        }
+        if !found.is_empty() {
+            break;
+        }
+    }
+    found
 }
 
 /// The folder the installer unpacked the APK's native libraries into
@@ -453,7 +612,7 @@ unsafe fn symbol<F: Copy>(handle: *mut c_void, name: &CStr) -> Result<F, String>
 ///
 /// # Safety
 /// `handle` must be the loaded `libadrenotools.so`.
-unsafe fn open_turnip_loader(handle: *mut c_void, lib_dir: &Path) -> Result<vk::PFN_vkGetInstanceProcAddr, String> {
+unsafe fn open_turnip_loader(handle: *mut c_void, lib_dir: &Path, mesa: Mesa) -> Result<vk::PFN_vkGetInstanceProcAddr, String> {
     // include/adrenotools/driver.h: dlopenMode, featureFlags, tmpLibDir
     // (unused from API 29 on), hookLibDir, customDriverDir, customDriverName,
     // fileRedirectDir, userMappingHandle.
@@ -466,13 +625,14 @@ unsafe fn open_turnip_loader(handle: *mut c_void, lib_dir: &Path) -> Result<vk::
     let tmp = c(tmp.to_string_lossy().into_owned())?;
     let hook_dir = c(lib_dir.to_string_lossy().into_owned())?;
     let driver_dir = c(format!("{}/", lib_dir.display()))?;
+    let driver_name = c(mesa.file().to_string())?;
     let loader = open(
         libc::RTLD_NOW | libc::RTLD_LOCAL,
         ADRENOTOOLS_DRIVER_CUSTOM,
         tmp.as_ptr(),
         hook_dir.as_ptr(),
         driver_dir.as_ptr(),
-        c"libvulkan_freedreno.so".as_ptr(),
+        driver_name.as_ptr(),
         std::ptr::null(),
         std::ptr::null_mut(),
     );
@@ -487,13 +647,14 @@ struct Probe {
     device: String,
     driver: String,
     api: u32,
-    turnip: bool,
+    /// The Mesa driver asked for (Turnip or PanVK) is the one answering.
+    mesa: bool,
 }
 
-/// A Vulkan instance on `entry` (the Turnip-backed loader, the one wgpu's
+/// A Vulkan instance on `entry` (the Mesa driver's loader, the one wgpu's
 /// instance is made on): whose driver is behind it. The instance is
 /// destroyed again; the driver it loaded stays in the process.
-fn probe(entry: &ash::Entry) -> Result<Probe, String> {
+fn probe(entry: &ash::Entry, mesa: Mesa) -> Result<Probe, String> {
     // SAFETY: each call below is made with valid arguments and the
     // instance is destroyed before the function returns.
     unsafe {
@@ -519,8 +680,14 @@ fn probe(entry: &ash::Entry) -> Result<Probe, String> {
             let mut driver = String::new();
             // VK_KHR_driver_properties is core in 1.2 (Turnip: 1.3+; the
             // Adreno driver on Android 13 phones: 1.1, which has no name
-            // for itself here).
-            if loader_version >= vk::API_VERSION_1_1 && props.api_version >= vk::API_VERSION_1_2 {
+            // for itself here) and an extension before it (PanVK on a
+            // Bifrost Mali: Vulkan 1.0/1.1 with the extension).
+            let has_driver_properties = props.api_version >= vk::API_VERSION_1_2
+                || instance
+                    .enumerate_device_extension_properties(pd)
+                    .map(|exts| exts.iter().any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == c"VK_KHR_driver_properties")))
+                    .unwrap_or(false);
+            if loader_version >= vk::API_VERSION_1_1 && has_driver_properties {
                 let mut dp = vk::PhysicalDeviceDriverProperties::default();
                 let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut dp);
                 instance.get_physical_device_properties2(pd, &mut p2);
@@ -538,8 +705,12 @@ fn probe(entry: &ash::Entry) -> Result<Probe, String> {
                     vk::api_version_patch(props.driver_version)
                 );
             }
-            let turnip = driver_id == vk::DriverId::MESA_TURNIP || device.starts_with("Turnip");
-            Ok(Probe { device, driver, api: props.api_version, turnip })
+            let is_mesa = match mesa {
+                Mesa::Turnip => driver_id == vk::DriverId::MESA_TURNIP || device.starts_with("Turnip"),
+                // (PanVK names its devices "Mali-G52 (Panfrost)" / "Mali-G610 (PanVK)")
+                Mesa::PanVk => driver_id == vk::DriverId::MESA_PANVK || driver.to_ascii_lowercase().contains("panvk") || device.to_ascii_lowercase().contains("panvk") || device.to_ascii_lowercase().contains("panfrost"),
+            };
+            Ok(Probe { device, driver, api: props.api_version, mesa: is_mesa })
         })();
         instance.destroy_instance(None);
         result
@@ -585,9 +756,10 @@ pub fn activate() {
     let took = started.elapsed();
     if status.active {
         log::info!(
-            "turnip: ACTIVE — {} ({}) answers Vulkan in place of the Adreno driver; {:.0} ms",
+            "turnip: ACTIVE — {} ({}) answers Vulkan in place of the device's {} driver; {:.0} ms",
             status.device,
             status.driver,
+            status.mesa.map_or("own", Mesa::gpus),
             took.as_secs_f64() * 1e3
         );
     } else if status.device.is_empty() {
@@ -595,14 +767,54 @@ pub fn activate() {
     } else {
         log::warn!("turnip: not active — {} (Vulkan answered with {} / {}); {:.0} ms", status.note, status.device, status.driver, took.as_secs_f64() * 1e3);
     }
-    if !status.active && SHIM_LOADED.load(std::sync::atomic::Ordering::Relaxed) {
+    if !status.active && SHIM_HOOKED.load(std::sync::atomic::Ordering::Relaxed) {
         settle_system_loader();
     }
     let _ = STATUS.set(status);
 }
 
 fn skip(note: impl Into<String>, available: bool) -> Status {
-    Status { active: false, available, note: note.into(), device: String::new(), driver: String::new() }
+    Status { active: false, available, mesa: None, note: note.into(), device: String::new(), driver: String::new() }
+}
+
+/// [`skip`] for a device that has a Mesa driver here (the window names it).
+fn skip_for(mesa: Mesa, note: impl Into<String>, available: bool) -> Status {
+    Status { mesa: Some(mesa), ..skip(note, available) }
+}
+
+/// What the libadrenotools.so in the APK can do, read off the file (the
+/// strings are plain in the binary, and nothing of the shim should run
+/// before the decision to use it is made).
+#[derive(Clone, Copy, Debug, Default)]
+struct Shim {
+    /// Looks for the system's Vulkan loader under the vendor paths too
+    /// (libadrenotools-native from 2026-11-17: `find_libvulkan_path`
+    /// probes /vendor/lib64, /odm/lib64, /product/lib64 after
+    /// /system/lib64; the older builds hard-code /system/lib64/libvulkan.so,
+    /// which HyperOS hasn't).
+    vendor_paths: bool,
+    /// Honours `ADRENOTOOLS_DISABLE=1`: no initialisation of its own — no
+    /// Turnip / PanVK load, no hooks on the system loader, no JavaVM
+    /// wanted; only `adrenotools_open_libvulkan` on request
+    /// (libadrenotools-native 4d4d482, 2026-11-17 12:42, the driver.cpp
+    /// rewrite; the older builds always run their `perform_init`).
+    opt_out: bool,
+}
+
+impl Shim {
+    fn read(shim: &std::path::Path) -> Self {
+        let bytes = match std::fs::read(shim) {
+            Ok(b) => b,
+            // A plain APK (no shim): the files check right after says so.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                log::warn!("turnip: {}: {e}", shim.display());
+                return Self::default();
+            }
+        };
+        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        Self { vendor_paths: has(b"/vendor/lib64/libvulkan.so"), opt_out: has(b"ADRENOTOOLS_DISABLE\0") }
+    }
 }
 
 /// Ok: a status to keep (active or not); Err: one that says why nothing
@@ -613,76 +825,130 @@ fn try_activate() -> Result<Status, Status> {
         return Err(skip("RUSTUDIO_TURNIP=0", true));
     }
     if cfg!(not(target_arch = "aarch64")) {
-        return Err(skip("Turnip ships for arm64-v8a only", false));
+        return Err(skip("the Mesa drivers (Turnip, PanVK) ship for arm64-v8a only", false));
     }
     let sdk = super::AndroidApp::sdk_version();
     let dev = Device::read();
     log::info!("turnip: device: {}; Android API {sdk}", dev.describe());
+    // Which Mesa driver this device gets: PanVK on a Mali, Turnip on an
+    // Adreno (RUSTUDIO_TURNIP=force takes the same choice without the
+    // checks below).
+    let mesa = if dev.mali() { Mesa::PanVk } else { Mesa::Turnip };
     if mode != Mode::Force {
-        // Adreno only, 650 and up, on a stock-enough Android: everything
-        // else keeps the vendor's driver (RUSTUDIO_TURNIP=force tries anyway).
-        if let Some(gpu) = dev.other_gpu() {
-            return Err(skip(format!("{gpu} GPU: Turnip drives Adreno GPUs only; the device keeps its own driver"), false));
-        }
-        if !dev.qualcomm() {
-            return Err(skip("not a Snapdragon (no /dev/kgsl-3d0, no Qualcomm SoC in the properties): the device keeps its own driver", false));
-        }
-        let model = dev.adreno_model();
-        if model == 0 {
-            return Err(skip(format!("Adreno model unknown (gpu {:?}, soc {:?}): only Adreno {ADRENO_MIN} and newer are tried", dev.gpu, dev.soc_model), false));
-        }
-        if model < ADRENO_MIN {
-            return Err(skip(format!("Adreno {model}: only Adreno {ADRENO_MIN} and newer are tried; the device keeps its own driver"), false));
-        }
-        if !dev.hyperos.is_empty() {
-            return Err(skip(format!("HyperOS {}: libadrenotools' loader hook mostly doesn't find the Vulkan driver paths it expects there; the device keeps its own driver", dev.hyperos), false));
+        match mesa {
+            Mesa::PanVk => {
+                // Mali with ARM's kbase kernel driver and a Bifrost or
+                // newer core (and, below, a shim that won't go down its own
+                // PanVK path).
+                if !dev.mali0 {
+                    return Err(skip_for(mesa, format!("{} GPU without /dev/mali0: PanVK's build here drives Mali GPUs through ARM's kbase kernel driver only; the device keeps its own driver", dev.other_gpu().unwrap_or_else(|| "Mali".into())), false));
+                }
+                match dev.mali_bifrost_or_newer() {
+                    Some(true) => {}
+                    Some(false) => return Err(skip_for(mesa, format!("{}: PanVK drives Bifrost (Mali-G31 and up) and newer Mali GPUs, not Midgard or Utgard ones; the device keeps its own driver", dev.mali_gpu), false)),
+                    None => log::info!("turnip: Mali core unknown (no kbase gpuinfo under sysfs): PanVK is tried; the probe and the first frames decide"),
+                }
+            }
+            Mesa::Turnip => {
+                // Adreno only, 650 and up, on a stock-enough Android:
+                // everything else keeps the vendor's driver.
+                if let Some(gpu) = dev.other_gpu() {
+                    return Err(skip(format!("{gpu} GPU: Turnip drives Adreno GPUs and PanVK Mali GPUs; nothing here for this one, the device keeps its own driver"), false));
+                }
+                if !dev.qualcomm() {
+                    return Err(skip("not a Snapdragon (no /dev/kgsl-3d0, no Qualcomm SoC in the properties) and not a Mali: the device keeps its own driver", false));
+                }
+                let model = dev.adreno_model();
+                if model == 0 {
+                    return Err(skip_for(mesa, format!("Adreno model unknown (gpu {:?}, soc {:?}): only Adreno {ADRENO_MIN} and newer are tried", dev.gpu, dev.soc_model), false));
+                }
+                if model < ADRENO_MIN {
+                    return Err(skip_for(mesa, format!("Adreno {model}: only Adreno {ADRENO_MIN} and newer are tried; the device keeps its own driver"), false));
+                }
+            }
         }
         if sdk < 31 {
-            return Err(skip(format!("Android API {sdk}: libadrenotools-native wants Android 12 (API 31) or newer"), false));
+            return Err(skip_for(mesa, format!("Android API {sdk}: libadrenotools-native wants Android 12 (API 31) or newer"), false));
         }
     }
+    let skip = |note: String, available: bool| skip_for(mesa, note, available);
     let lib_dir = match native_lib_dir() {
         Ok(d) => d,
         Err(e) => return Err(skip(e, false)),
     };
     let shim = lib_dir.join("libadrenotools.so");
-    let driver = lib_dir.join("libvulkan_freedreno.so");
-    for (what, p) in [("libadrenotools.so", &shim), ("libvulkan_freedreno.so (the Turnip driver)", &driver), ("libmain_hook.so", &lib_dir.join("libmain_hook.so"))] {
+    let shim_can = Shim::read(&shim);
+    if shim.exists() {
+        log::info!("turnip: libadrenotools in this APK: vendor loader paths {}, own initialisation {}", if shim_can.vendor_paths { "yes" } else { "no" }, if shim_can.opt_out { "switchable off (ADRENOTOOLS_DISABLE)" } else { "always on" });
+    }
+    if mode != Mode::Force && !dev.hyperos.is_empty() {
+        // Xiaomi's HyperOS keeps libvulkan.so under /vendor (or /odm,
+        // /product), not /system/lib64: libadrenotools-native builds before
+        // 2026-11-17 looked in /system/lib64 only and found nothing to hook,
+        // so HyperOS kept its driver. Newer builds probe the vendor paths
+        // (driver.cpp find_libvulkan_path); the shim in the APK says which
+        // it is.
+        if shim_can.vendor_paths {
+            log::info!("turnip: HyperOS {}: libadrenotools in this APK probes the vendor's Vulkan loader paths; trying {} (a start that doesn't reach its first frames turns it off)", dev.hyperos, mesa.name());
+        } else {
+            return Err(skip(format!("HyperOS {}: this APK's libadrenotools looks for the Vulkan loader in /system/lib64 only, which HyperOS doesn't have (a 2026-11-17 or newer libadrenotools-native build probes the vendor paths); the device keeps its own driver", dev.hyperos), false));
+        }
+    }
+    // An older shim initialises itself at load whatever the caller does
+    // (perform_init on its fallback thread): on a Mali device its own
+    // Mali test may send it down a PanVK path whose hooks of the system
+    // loader call a null pointer (4a084a5). A shim with the switch does
+    // nothing of its own here.
+    if mode != Mode::Force && mesa == Mesa::PanVk && !shim_can.opt_out && dev.shim_would_misfire() {
+        return Err(skip(format!("device tree model {:?} names a Mali: this APK's libadrenotools (a build without the ADRENOTOOLS_DISABLE switch) would take its own PanVK path at load, whose hooks call a null pointer; the device keeps its own driver", dev.dt_model), false));
+    }
+    let driver = lib_dir.join(mesa.file());
+    let driver_what = format!("{} (the {} driver)", mesa.file(), mesa.name());
+    for (what, p) in [("libadrenotools.so", &shim), (driver_what.as_str(), &driver), ("libmain_hook.so", &lib_dir.join("libmain_hook.so"))] {
         if !p.exists() {
-            return Err(skip(format!("{what} isn't in the APK ({}); tools/android/fetch-turnip.sh puts it in before the build", lib_dir.display()), false));
+            let how = match mesa {
+                Mesa::Turnip => "tools/android/fetch-turnip.sh puts it in before the build",
+                Mesa::PanVk => "tools/android/fetch-turnip.sh puts it in before the build unless PANVK=0 (the workflow's panvk input)",
+            };
+            return Err(skip(format!("{what} isn't in the APK ({}); {how}", lib_dir.display()), false));
         }
     }
     let markers = dir();
     let _ = std::fs::create_dir_all(&markers);
     if mode == Mode::Auto {
         if !wanted() {
-            return Err(skip("turned off in Graphics Settings > GPU driver", true));
+            return Err(skip("turned off in Graphics Settings > GPU driver".into(), true));
         }
         if markers.join("pending").exists() {
             // The last start never got to its first frames.
             let _ = std::fs::rename(markers.join("pending"), markers.join("failed"));
             let _ = std::fs::write(markers.join("failed"), b"");
-            log::warn!("turnip: the last start with Turnip didn't reach its first frames; keeping the device's driver until Graphics Settings > GPU driver > Try again (or RUSTUDIO_TURNIP=1)");
+            log::warn!("turnip: the last start with {} didn't reach its first frames; keeping the device's driver until Graphics Settings > GPU driver > Try again (or RUSTUDIO_TURNIP=1)", mesa.name());
         }
         if failed_last_time() {
-            return Err(skip("off since a start with Turnip didn't reach its first frames (Graphics Settings > GPU driver > Try again)", true));
+            return Err(skip(format!("off since a start with {} didn't reach its first frames (Graphics Settings > GPU driver > Try again)", mesa.name()), true));
         }
     }
-    // From here on a crash would be Turnip's: the marker stays until the
-    // editor has drawn its first frames (mark_healthy).
+    // From here on a crash would be the Mesa driver's: the marker stays
+    // until the editor has drawn its first frames (mark_healthy).
     let _ = std::fs::write(markers.join("pending"), format!("{:?}", std::time::SystemTime::now()));
 
     // Turnip's switches, read when the driver initialises: the start-time
     // TU_DEBUG (libadrenotools' constructor sets one of its own at the
     // load below, so ours goes in again after it) and the switches file
     // the window edits (TU_DEBUG_FILE; made with the defaults the first
-    // time, so that its content is the whole of it).
-    if !debug_file().exists() {
+    // time, so that its content is the whole of it). PanVK reads neither
+    // (its own switches are PANVK_DEBUG and PANVK_KBASE_*; the shim's
+    // constructor sets PAN_MESA_DEBUG=kbase besides, Mesa's GL side's).
+    if mesa == Mesa::Turnip && !debug_file().exists() {
         reset_debug_flags();
     }
     let tu_debug = std::env::var("RUSTUDIO_TU_DEBUG").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).unwrap_or_else(|| TU_DEBUG_BASE.to_string());
     let switches_file = debug_file();
     let set_tu_debug = || {
+        if mesa != Mesa::Turnip {
+            return;
+        }
         // SAFETY: before any wgpu thread exists; android_main is the only
         // thread reading the environment at this point.
         #[allow(unused_unsafe)]
@@ -693,51 +959,88 @@ fn try_activate() -> Result<Status, Status> {
     };
     set_tu_debug();
 
+    // The shim's own initialisation is left off where it can be
+    // (ADRENOTOOLS_DISABLE, read by its constructor and its JNI_OnLoad):
+    // this module opens the loader it wants itself, and nothing here goes
+    // through the system loader, so its hooks on that (and the JavaVM and
+    // Application context they need) have no work. PanVK's older builds
+    // enumerate no device without PAN_I_WANT_A_BROKEN_VULKAN_DRIVER (the
+    // shim's constructor sets it on a Mali; here too, in case its Mali
+    // test and ours differ).
+    // SAFETY: before any wgpu thread exists; android_main is the only
+    // thread reading the environment at this point.
+    #[allow(unused_unsafe)]
+    unsafe {
+        if shim_can.opt_out {
+            std::env::set_var("ADRENOTOOLS_DISABLE", "1");
+        }
+        if mesa == Mesa::PanVk && std::env::var_os("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER").is_none() {
+            std::env::set_var("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER", "1");
+        }
+    };
     let path = CString::new(shim.to_string_lossy().as_bytes()).map_err(|e| skip(e.to_string(), true))?;
     // SAFETY: dlopen of a library the APK ships; its constructor sets Mesa
-    // environment variables and starts a thread that waits for this dlopen
-    // to finish (libadrenotools-native src/driver.cpp).
+    // environment variables and (an older build, or without the switch
+    // above) starts a thread that waits for this dlopen to finish
+    // (libadrenotools-native src/driver.cpp).
     let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     if handle.is_null() {
         let _ = std::fs::remove_file(markers.join("pending"));
         return Err(skip(format!("dlopen {}: {}", shim.display(), dlerror()), true));
     }
-    SHIM_LOADED.store(true, std::sync::atomic::Ordering::Relaxed);
     set_tu_debug();
-    let switches = debug_flags();
-    log::info!("turnip: TU_DEBUG={tu_debug}; switches ({}): {}", switches_file.display(), if switches.is_empty() { "none".to_string() } else { switches.join(",") });
-
-    // The fork's own initialisation, the way System.loadLibrary would run
-    // it, but here and now: it resolves nativeLibraryDir and the cache
-    // folder through JNI, opens the hooked copy of libvulkan.so with the
-    // Turnip driver behind it, and patches the system loader's
-    // vkGetInstanceProcAddr / vkGetDeviceProcAddr. Its fallback thread
-    // does the same a moment later when nobody calls this; a std::call_once
-    // inside makes the two one, so by the time this returns the swap is
-    // done (or has failed, which its logcat lines say).
-    let vm = super::app().map(|a| a.vm_as_ptr()).unwrap_or(std::ptr::null_mut());
-    if vm.is_null() {
-        let _ = std::fs::remove_file(markers.join("pending"));
-        return Err(skip("no JavaVM for libadrenotools' initialisation", true));
-    }
-    type JniOnLoad = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
-    let on_load: JniOnLoad = match unsafe { symbol(handle, c"JNI_OnLoad") } {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_file(markers.join("pending"));
-            return Err(skip(format!("libadrenotools.so without an entry point: {e}"), true));
+    match mesa {
+        Mesa::Turnip => {
+            let switches = debug_flags();
+            log::info!("turnip: TU_DEBUG={tu_debug}; switches ({}): {}", switches_file.display(), if switches.is_empty() { "none".to_string() } else { switches.join(",") });
         }
-    };
-    let t = Instant::now();
-    // SAFETY: the library's JNI entry, given the process's JavaVM; it
-    // attaches this thread itself when it has to.
-    let jni_version = unsafe { on_load(vm, std::ptr::null_mut()) };
-    log::info!("turnip: libadrenotools initialised (JNI {:#x}) in {:.0} ms", jni_version, t.elapsed().as_secs_f64() * 1e3);
+        Mesa::PanVk => {
+            log::info!("turnip: PanVK: PANVK_DEBUG={:?}, PAN_MESA_DEBUG={:?}", std::env::var("PANVK_DEBUG").unwrap_or_default(), std::env::var("PAN_MESA_DEBUG").unwrap_or_default());
+        }
+    }
 
-    // Mesa's disk shader cache folder: the fork's initialisation sets it
-    // from the app's cache dir; should that have failed, the same here.
+    if shim_can.opt_out {
+        log::info!("turnip: libadrenotools' own initialisation left off (ADRENOTOOLS_DISABLE); its constructor's Mesa environment is in");
+    } else {
+        // An older shim: its own initialisation, the way System.loadLibrary
+        // would run it, but here and now: it resolves nativeLibraryDir and
+        // the cache folder through JNI, opens a hooked copy of libvulkan.so
+        // with the driver behind it, and patches the system loader's
+        // vkGetInstanceProcAddr / vkGetDeviceProcAddr. Its fallback thread
+        // does the same a moment later when nobody calls this; a
+        // std::call_once inside makes the two one, so by the time this
+        // returns its swap is done (or has failed, which its logcat lines
+        // say). Nothing here depends on that patch (module docs), but the
+        // fallback start has to settle the system loader after it
+        // (SHIM_HOOKED).
+        SHIM_HOOKED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let vm = super::app().map(|a| a.vm_as_ptr()).unwrap_or(std::ptr::null_mut());
+        if vm.is_null() {
+            let _ = std::fs::remove_file(markers.join("pending"));
+            return Err(skip("no JavaVM for libadrenotools' initialisation".into(), true));
+        }
+        type JniOnLoad = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+        let on_load: JniOnLoad = match unsafe { symbol(handle, c"JNI_OnLoad") } {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = std::fs::remove_file(markers.join("pending"));
+                return Err(skip(format!("libadrenotools.so without an entry point: {e}"), true));
+            }
+        };
+        let t = Instant::now();
+        // SAFETY: the library's JNI entry, given the process's JavaVM; it
+        // attaches this thread itself when it has to.
+        let jni_version = unsafe { on_load(vm, std::ptr::null_mut()) };
+        log::info!("turnip: libadrenotools initialised (JNI {:#x}) in {:.0} ms", jni_version, t.elapsed().as_secs_f64() * 1e3);
+    }
+
+    // Mesa's disk shader cache folder (the older shim's initialisation
+    // sets it from the app's cache dir; the newer one, left off, doesn't).
     if std::env::var_os("MESA_SHADER_CACHE_DIR").is_none() {
-        let d = super::cache_dir().join("turnip_shader_cache");
+        let d = super::cache_dir().join(match mesa {
+            Mesa::Turnip => "turnip_shader_cache",
+            Mesa::PanVk => "panvk_shader_cache",
+        });
         let _ = std::fs::create_dir_all(&d);
         // SAFETY: as for TU_DEBUG above.
         #[allow(unused_unsafe)]
@@ -746,35 +1049,37 @@ fn try_activate() -> Result<Status, Status> {
         };
     }
 
-    // A Turnip-backed loader of our own, for wgpu (the module docs on why
-    // the fork's patch of the system loader isn't relied on).
+    // A loader of our own with the Mesa driver behind it, for wgpu (the
+    // module docs on why the fork's patch of the system loader isn't
+    // relied on).
     let t = Instant::now();
     // SAFETY: `handle` is libadrenotools.so, loaded above.
-    let gipa = match unsafe { open_turnip_loader(handle, &lib_dir) } {
+    let gipa = match unsafe { open_turnip_loader(handle, &lib_dir, mesa) } {
         Ok(g) => g,
         Err(e) => {
             let _ = std::fs::remove_file(markers.join("pending"));
-            return Err(skip(format!("libadrenotools couldn't open a Turnip-backed loader: {e}; the device's driver is in use"), true));
+            return Err(skip(format!("libadrenotools couldn't open a {}-backed loader: {e}; the device's driver is in use", mesa.name()), true));
         }
     };
-    log::info!("turnip: Turnip-backed loader opened in {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+    log::info!("turnip: {}-backed loader opened in {:.0} ms", mesa.name(), t.elapsed().as_secs_f64() * 1e3);
     let _ = LOADER.set(gipa);
     let entry = entry().expect("set just above");
 
     // Which driver answers through it.
     let t = Instant::now();
-    let probe = probe(&entry);
+    let probe = probe(&entry, mesa);
     let probe_ms = t.elapsed().as_secs_f64() * 1e3;
     let mut status = match probe {
         Ok(p) => {
             log::info!("turnip: probe: {} — {} (Vulkan {}) in {probe_ms:.0} ms", p.device, p.driver, version(p.api));
             Status {
-                active: p.turnip,
+                active: p.mesa,
                 available: true,
-                note: if p.turnip {
-                    "Turnip answers this run's Vulkan calls".into()
+                mesa: Some(mesa),
+                note: if p.mesa {
+                    format!("{} answers this run's Vulkan calls", mesa.name())
                 } else {
-                    "libadrenotools' loader answered with the device's driver (Turnip didn't load; its logcat lines, tag AdrenoToolsPatch, say why)".into()
+                    format!("libadrenotools' loader answered with the device's driver ({} didn't load; its logcat lines, tag AdrenoToolsPatch, say why)", mesa.name())
                 },
                 device: p.device,
                 driver: p.driver,
@@ -783,8 +1088,8 @@ fn try_activate() -> Result<Status, Status> {
         Err(e) => {
             // The start goes on with the device's driver (wgpu makes its
             // own instance, and has OpenGL ES to fall back to).
-            log::error!("turnip: the Vulkan probe on the Turnip-backed loader failed: {e}");
-            Status { active: false, available: true, note: format!("Vulkan probe on the Turnip-backed loader failed: {e}; the device's driver is in use"), device: String::new(), driver: String::new() }
+            log::error!("turnip: the Vulkan probe on the {}-backed loader failed: {e}", mesa.name());
+            Status { active: false, available: true, mesa: Some(mesa), note: format!("Vulkan probe on the {}-backed loader failed: {e}; the device's driver is in use", mesa.name()), device: String::new(), driver: String::new() }
         }
     };
     if !status.active {
@@ -829,9 +1134,9 @@ pub fn wgpu_setup(template: &egui_wgpu::WgpuSetupCreateNew) -> Option<egui_wgpu:
             Some(setup)
         }
         Err(e) => {
-            log::error!("turnip: wgpu on the Turnip-backed loader failed, the device's driver is in use: {e}");
+            log::error!("turnip: wgpu on the Mesa driver's loader failed, the device's driver is in use: {e}");
             let _ = RENDERER.set(format!("the device's driver ({e})"));
-            // Nothing of Turnip's is in use: nothing to guard.
+            // Nothing of the Mesa driver's is in use: nothing to guard.
             let _ = std::fs::remove_file(dir().join("pending"));
             settle_system_loader();
             None
@@ -842,7 +1147,7 @@ pub fn wgpu_setup(template: &egui_wgpu::WgpuSetupCreateNew) -> Option<egui_wgpu:
 /// [`wgpu_setup`]'s work: the objects and a line saying what they are on.
 fn build_wgpu(template: &egui_wgpu::WgpuSetupCreateNew) -> Result<(egui_wgpu::WgpuSetupExisting, String), String> {
     use egui_wgpu::wgpu;
-    let entry = entry().ok_or("no Turnip-backed loader")?;
+    let entry = entry().ok_or("no loader with the Mesa driver")?;
     let desc = &template.instance_descriptor;
     // No validation layers in the APK, and debug utils would want a
     // messenger of ours: release behaviour either way.
@@ -877,7 +1182,7 @@ fn build_wgpu(template: &egui_wgpu::WgpuSetupCreateNew) -> Result<(egui_wgpu::Wg
     let adapter = block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN))
         .into_iter()
         .next()
-        .ok_or("the instance on the Turnip-backed loader has no adapter")?;
+        .ok_or("the instance on the Mesa driver's loader has no adapter")?;
     let info = adapter.get_info();
     let device_desc = (template.device_descriptor)(&adapter);
     let (device, queue) = block_on(adapter.request_device(&device_desc)).map_err(|e| format!("request_device on {}: {e}", info.name))?;

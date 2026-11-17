@@ -287,8 +287,8 @@ set["GuiService.SelectedObject"] = function(gs, _, v)
 end
 
 ------------------------------------------------------------ UserInputService
-get["UserInputService.OnScreenKeyboardPosition"] = function() return Vector2.zero end
-get["UserInputService.OnScreenKeyboardSize"] = function() return Vector2.zero end
+-- (OnScreenKeyboardVisible / Position / Size: runtime_ext.rs device_prop,
+-- from the viewport's soft keyboard on Android)
 get["UserInputService.UserHeadCFrame"] = function() return CFrame.new() end
 methods["UserInputService.GetUserCFrame"] = function(_, t)
     if typeof(t) ~= "EnumItem" then error("Unable to cast " .. typeof(t) .. " to token", 0) end
@@ -622,6 +622,13 @@ local function lose(box, enter, input)
     focused = nil
     set_cursor(box, -1)
     set_sel(box, -1)
+    -- A touch screen's Enter is the on-screen keyboard's return key
+    -- (Android: src/android/keyboard.rs): Roblox's client fires this
+    -- before FocusLost(enterPressed = true) there.
+    if enter == true then
+        local uis = svc("UserInputService")
+        if uis.TouchEnabled and not uis.KeyboardEnabled then fire(box, "ReturnPressedFromOnScreenKeyboard") end
+    end
     fire(box, "FocusLost", enter == true, input)
     if not in_widget(box) then fire(svc("UserInputService"), "TextBoxFocusReleased", box) end
 end

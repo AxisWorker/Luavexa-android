@@ -7348,6 +7348,70 @@ mod legacy_tests {
         assert!(!out.iter().any(|(l, _)| *l == Level::Error), "{out:?}");
     }
 
+    /// A game's TextBox under the soft keyboard (Android, viewport.rs
+    /// `keyboard_pan`): the keyboard's place reaches
+    /// UserInputService.OnScreenKeyboardVisible / Position / Size in the
+    /// game's coordinates, and a focus lost with Enter fires
+    /// ReturnPressedFromOnScreenKeyboard before FocusLost on a touch-only
+    /// device (as a phone's games see it; never on a desktop).
+    #[test]
+    fn soft_keyboard_reaches_the_scripts() {
+        crate::touch_input::TEST_GAME_TOUCH.with(|c| c.set(Some(true)));
+        let touch = crate::touch_input::game_touch();
+        assert!(touch);
+        let mut d = Document::new_place();
+        let sg = d.find_child(d.dom.root_ref(), "StarterGui").unwrap();
+        let gui = d.dom.insert(sg, InstanceBuilder::new("ScreenGui").with_name("G"));
+        d.dom.insert(gui, InstanceBuilder::new("TextBox").with_name("Box"));
+        let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
+        let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
+        let src = r#"
+            local UIS = game:GetService("UserInputService")
+            local box = game:GetService("StarterGui").G.Box
+            box.ReturnPressedFromOnScreenKeyboard:Connect(function() print("return") end)
+            box.FocusLost:Connect(function(enter) print("lost", tostring(enter)) end)
+            print("kb0", tostring(UIS.OnScreenKeyboardVisible), UIS.OnScreenKeyboardPosition.X, UIS.OnScreenKeyboardPosition.Y, UIS.OnScreenKeyboardSize.X, UIS.OnScreenKeyboardSize.Y)
+            -- (a frame in: the GUI domain has seen this DataModel by then,
+            -- as it has when a place's scripts start)
+            task.wait()
+            box:CaptureFocus()
+            print("focused", tostring(box:IsFocused()), tostring(UIS:GetFocusedTextBox() == box))
+            task.wait()
+            print("kb1", tostring(UIS.OnScreenKeyboardVisible), UIS.OnScreenKeyboardPosition.X, UIS.OnScreenKeyboardPosition.Y, UIS.OnScreenKeyboardSize.X, UIS.OnScreenKeyboardSize.Y)
+            box:ReleaseFocus(true)
+            print("done")
+        "#;
+        let s = d.dom.insert(
+            sps,
+            InstanceBuilder::new("LocalScript").with_name("T").with_property("Source", src.to_string()),
+        );
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(d, RunMode::Run);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        crate::touch_input::set_soft_keyboard(None);
+        rt.run_script(s);
+        // (what the viewport publishes while the keyboard is up: its place
+        // over the view, points from the view's top-left below the inset)
+        crate::touch_input::set_soft_keyboard(Some(crate::touch_input::SoftKeyboard { x: 0.0, y: 310.5, w: 800.0, h: 290.0 }));
+        for _ in 0..5 {
+            rt.step(1.0 / 60.0);
+        }
+        crate::touch_input::set_soft_keyboard(None);
+        let out = rt.leave().output;
+        let has = |p: &str| out.iter().any(|(_, t)| t.starts_with(p));
+        assert!(has("kb0 false 0 0 0 0"), "{out:?}");
+        assert!(has("focused true true"), "{out:?}");
+        assert!(has("kb1 true 0 310.5 800 290"), "{out:?}");
+        assert!(has("lost true"), "{out:?}");
+        assert!(has("done"), "{out:?}");
+        let at = |p: &str| out.iter().position(|(_, t)| t.starts_with(p)).unwrap();
+        assert!(at("return") < at("lost true"), "{out:?}");
+        assert!(!out.iter().any(|(l, _)| *l == Level::Error), "{out:?}");
+        crate::touch_input::TEST_GAME_TOUCH.with(|c| c.set(None));
+    }
+
     /// an admin script's client anti-tamper, condensed (Client.Core.Anti and
     /// Shared.Service ReadOnly): settings() refused inside a metamethod
     /// (rt0001 kicked every Play), Instance/Enum metamethods are unnamed C

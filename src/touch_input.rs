@@ -759,12 +759,51 @@ impl Touch {
 /// elsewhere with `RUSTUDIO_TOUCH=1` (a touch-screen laptop; the game then
 /// reports UserInputService.TouchEnabled and PreferredInput Touch too).
 pub fn game_touch() -> bool {
+    #[cfg(test)]
+    if let Some(v) = TEST_GAME_TOUCH.with(|c| c.get()) {
+        return v;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("RUSTUDIO_TOUCH").as_deref() {
         Ok("0") | Ok("off") | Ok("false") => false,
         Ok("1") | Ok("on") | Ok("true") => true,
         _ => cfg!(target_os = "android"),
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's answer for [`game_touch`] on its own thread (the process
+    /// setting is read once; runtime.rs `soft_keyboard_reaches_the_scripts`).
+    pub static TEST_GAME_TOUCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The soft keyboard over the game's view, for the scripts:
+/// `UserInputService.OnScreenKeyboardVisible / Position / Size`
+/// (runtime_ext.rs `device_prop`). In the game's coordinates (what
+/// `InputObject.Position` and `AbsolutePosition` use: points from the
+/// view's top-left, below the top inset), as Roblox's client reports
+/// them. Written each frame by the viewport (`Editor::keyboard_pan`) on
+/// Android while a game TextBox is typed into; `None` otherwise.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SoftKeyboard {
+    /// Its top-left corner.
+    pub x: f32,
+    pub y: f32,
+    /// Its size.
+    pub w: f32,
+    pub h: f32,
+}
+
+static SOFT_KEYBOARD: std::sync::Mutex<Option<SoftKeyboard>> = std::sync::Mutex::new(None);
+
+pub fn set_soft_keyboard(k: Option<SoftKeyboard>) {
+    *SOFT_KEYBOARD.lock().unwrap_or_else(|e| e.into_inner()) = k;
+}
+
+/// Where the soft keyboard lies over the game's view (`None`: it is down).
+pub fn soft_keyboard() -> Option<SoftKeyboard> {
+    *SOFT_KEYBOARD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Speed over the last ~100 ms of samples (points / s).

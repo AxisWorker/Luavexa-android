@@ -46,7 +46,9 @@ UserInputService (no sensors / VR / touch / on-screen keyboard)
   acceleration|gravity data on a device without a accelerometer.` /
   `…rotation data on a device without a gyroscope.` and return an
   InputObject (Accelerometer / Gyro, Change, zero) (+ identity CFrame).
-- OnScreenKeyboardPosition / Size 0,0; UserHeadCFrame / GetUserCFrame
+- OnScreenKeyboardPosition / Size 0,0 (Visible false; on Android, with a
+  TextBox typed into, the soft keyboard's place over the game's view:
+  docs/ANDROID.md "Text: the soft keyboard"); UserHeadCFrame / GetUserCFrame
   identity; CreateVirtualInput → typeof "Object", ClassName VirtualInput, no
   Name / Parent; SendMouseDelta with a free cursor → `VirtualInput::
   SendMouseDelta: cursor is not locked.`
@@ -195,4 +197,6 @@ Inspect menu (src/game_menu.rs)
   measured (gamepad / off-screen indicators).
 - Touch*, Device*Changed, UserCFrameChanged / Enabled, NavigationRequested,
   ReturnPressedFromOnScreenKeyboard: no such device here, so (as Studio
-  without one) never fired.
+  without one) never fired (Android fires the touch ones and, on a device
+  without a keyboard, ReturnPressedFromOnScreenKeyboard before FocusLost:
+  docs/ANDROID.md).

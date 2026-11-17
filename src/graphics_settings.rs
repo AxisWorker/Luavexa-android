@@ -198,8 +198,8 @@ impl Editor {
 }
 
 /// Android: which Vulkan driver this run has, and the switch for the
-/// Turnip (Mesa) driver the APK ships for Snapdragon devices
-/// (src/android/turnip.rs; takes effect at the next start).
+/// Mesa driver the APK ships for the device — Turnip on Snapdragon, PanVK
+/// on Mali (src/android/turnip.rs; takes effect at the next start).
 #[cfg(target_os = "android")]
 fn gpu_driver_section(ui: &mut egui::Ui) {
     use crate::android::turnip;
@@ -218,8 +218,13 @@ fn gpu_driver_section(ui: &mut egui::Ui) {
     if !(st.available || st.active) {
         return;
     }
+    let mesa = st.mesa.unwrap_or(turnip::Mesa::Turnip);
     let mut on = turnip::wanted();
-    if ui.checkbox(&mut on, "Turnip (Mesa) Vulkan driver").on_hover_text("Mesa's open-source Adreno driver in place of the phone's, from the next start on").changed() {
+    if ui
+        .checkbox(&mut on, format!("{} (Mesa) Vulkan driver", mesa.name()))
+        .on_hover_text(format!("Mesa's open-source {} driver in place of the phone's, from the next start on", mesa.gpus()))
+        .changed()
+    {
         turnip::set_wanted(on);
     }
     if turnip::failed_last_time() {
@@ -232,7 +237,9 @@ fn gpu_driver_section(ui: &mut egui::Ui) {
     } else if on != st.active {
         ui.small(RichText::new("Takes effect at the next start.").weak());
     }
-    if st.active {
+    // (TU_DEBUG is Turnip's; PanVK has switches of its own, PAN_MESA_DEBUG,
+    // none of which the window offers yet)
+    if st.active && mesa == turnip::Mesa::Turnip {
         turnip_switches(ui);
     }
 }

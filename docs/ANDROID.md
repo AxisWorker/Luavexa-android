@@ -147,7 +147,7 @@ provides or still has to.
 | `TouchStarted / TouchMoved / TouchEnded`, `TouchTap`, `TouchTapInWorld`, `TouchLongPress`, `TouchPan`, `TouchPinch`, `TouchRotate`, `TouchSwipe` | declared (`runtime_ext.rs` 116-154), never fired; `__rs_input_event` carries mouse/keyboard | **to do**: winit `Touch` events (egui `PointerButton` + `multi_touch`) → `InputObject` with `UserInputType.Touch` per finger id, gesture recognisers, `gameProcessedEvent` from egui's `wants_pointer_input` |
 | `GetDeviceAcceleration / GetDeviceGravity / GetDeviceRotation`, `DeviceAccelerationChanged / DeviceGravityChanged / DeviceRotationChanged` | zeros (`gui_input.luau` 299-307, `library.luau` 852) | `sensors.rs` (ASensorManager: linear acceleration, gravity, gyroscope, game rotation vector, 60 Hz on its own thread) — **wiring to Luau to do** (g units, CFrame from the quaternion) |
 | `UserInputService.ModalEnabled` | stored | **to do**: hides the default thumbstick / jump button once those exist |
-| `OnScreenKeyboardVisible / OnScreenKeyboardSize / OnScreenKeyboardPosition`, `TextBoxFocused / TextBoxFocusReleased` | focus events fire (`play_game.rs` 247); keyboard size zero | the soft keyboard comes up for a focused TextBox and goes with its focus (`keyboard.rs` `end_frame`, `gui::share().focus`); the user hiding it releases the focus (FocusLost). `OnScreenKeyboardVisible / Size` from `Keyboard::height` — **to do** |
+| `OnScreenKeyboardVisible / OnScreenKeyboardSize / OnScreenKeyboardPosition`, `TextBoxFocused / TextBoxFocusReleased`, `TextBox.ReturnPressedFromOnScreenKeyboard` | focus events fire (`play_game.rs` 247); keyboard size zero | the soft keyboard comes up for a focused TextBox and goes with its focus (`keyboard.rs` `end_frame`, `gui::share().focus`); the user hiding it releases the focus (FocusLost). While it is up for a game's TextBox it lies over the view, which slides up to show the box (`Editor::keyboard_pan`, src/viewport.rs), and `OnScreenKeyboardVisible / Position / Size` report it in the game's coordinates (`touch_input::soft_keyboard`, `runtime_ext.rs` `device_prop`); Enter on a touch screen fires `ReturnPressedFromOnScreenKeyboard` before `FocusLost` (gui_input.luau `lose`) |
 | `HapticService.IsVibrationSupported / IsMotorSupported / SetMotor / GetMotor` | gamepad-only flags, in-memory motor table (`gui_input.luau` 1796-1845) | `jni::vibrator_info()` (hasVibrator, hasAmplitudeControl) and `jni::vibrate(ms, strength)` — **wiring to do**: `UserInputType.Touch` supported, `VibrationMotor.Large` (and `Small` when amplitude control exists) |
 | `HapticEffect:Play / Stop`, `HapticEffect.Type` presets | simulated durations (UIHover .035 s, UIClick .055, UINotification .4, GameplayCollision .3, GameplayExplosion .8) | `jni::vibrate_pattern` (VibrationEffect.createWaveform) — **mapping of each preset to do** |
 | `ContextActionService.BindAction(..., createTouchButton)`, `GetButton / SetTitle / SetImage / SetPosition` | bindings stored, priority dispatch (`library.luau` 671-767); buttons never drawn | **to do**: draw the buttons in the play viewport (`ContextActionGui` ScreenGui as Roblox does: 70×70 ImageButton, default positions right of the thumbstick), route taps to the bound function with `UserInputType.Touch` |
@@ -282,6 +282,27 @@ down: egui keeps the last inset it was given). When the room is made or
 changes, the focused field's caret is scrolled into view
 (`keyboard::reveal_cursor`, from the Properties cells and the script
 editor: the field's `TextEditOutput` gives the caret's row).
+
+A game's TextBox (Play, `gui::share().focus`) is the exception: the
+panels are not moved for it. On a landscape phone the keyboard takes
+half the height and the menu, toolbars and status bar most of the rest,
+so the 3D view above them was a strip a few lines tall with the game's
+GUI squeezed into it and the box typed into off it, under the status
+bar. Instead the keyboard lies over the window, as it does over a
+phone's games, and `Editor::keyboard_pan` (src/viewport.rs) slides the
+3D view, its GUIs with it, up by what shows the box above the keyboard's
+top edge (as Android pans a window to its focused field: never past the
+box's own top edge leaving the view, never further than the keyboard
+covers the view), back when the keyboard goes. What slides above the
+view's panel is clipped; the fingers that land there are the toolbar's
+(`Zones::viewport` is the visible part). The game's scripts see the
+keyboard where Roblox's client reports it: `UserInputService.
+OnScreenKeyboardVisible / OnScreenKeyboardPosition / OnScreenKeyboardSize`
+in the game's coordinates (`touch_input::set_soft_keyboard`, read by
+`runtime_ext.rs` `device_prop`), and Enter from the touch screen fires
+`TextBox.ReturnPressedFromOnScreenKeyboard` before `FocusLost` (a
+runtime test drives both through the Lua side on the host:
+`runtime.rs soft_keyboard_reaches_the_scripts`).
 
 The keyboard is shown and hidden by `keyboard.rs` itself
 (`Keyboard::end_frame`), not by egui-winit. egui-winit shows it while
@@ -769,37 +790,83 @@ phone). The next device run's perf lines at each level against the ones
 above are what sizes the tables' next step (their numbers are estimates
 until then).
 
-## Turnip driver (Snapdragon): `src/android/turnip.rs`
+## Turnip driver (Snapdragon) and PanVK (Mali): `src/android/turnip.rs`
 
 The arm64 APK carries Mesa's open-source Adreno Vulkan driver, **Turnip**
 (`libvulkan_freedreno.so`, [nihui's Android
-builds](https://github.com/nihui/mesa-turnip-android-driver), MIT), and
+builds](https://github.com/nihui/mesa-turnip-android-driver), MIT), Mesa's
+Mali driver **PanVK** (`libvulkan_panfrost.so`, [zenithblue-oss's
+panvk-kbase-android](https://github.com/zenithblue-oss/panvk-kbase-android)
+build on ARM's kbase kernel driver, MIT; optional, 35 MB), and
 **libadrenotools** ([TouseefX's
 libadrenotools-native](https://github.com/TouseefX/libadrenotools-native),
 a fork of bylaws/libadrenotools for apps without Java of their own,
 BSD-2-Clause; the shadowhook / bytehook libraries inside are ByteDance's,
 MIT). On a Snapdragon phone the editor swaps Turnip in for the vendor's
-driver at start. The device's own driver spent most of the 3D view's
+driver at start, on a Mali phone PanVK (same path, other file: "PanVK"
+below). The device's own driver spent most of the 3D view's
 frame waiting (the "Frame time on a phone" measurements: ~60 ms of GPU
 time for a baseplate of 12 triangles, a wait rather than drawing); Turnip
 is the driver the emulators on Android reach for because its submit and
 present paths don't.
 
 **Where the files come from.** The pinned downloads (SHA-256 checked by
-the script; `android.yml`'s `TURNIP_ZIP_URL` / `ADRENOTOOLS_ZIP_URL` and
-the manual run's `turnip_zip` / `adrenotools_zip` inputs name the same
-two):
+the script; `android.yml`'s `TURNIP_ZIP_URL` / `ADRENOTOOLS_ZIP_URL` /
+`PANVK_SO_URL` and the manual run's `turnip_zip` / `adrenotools_zip` /
+`panvk_so` inputs name the same three):
 
-- libadrenotools: <https://github.com/TouseefX/libadrenotools-native/releases/download/V0.7/libadrenotools-arm64-v8a.zip>
+- libadrenotools: <https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44085827920/libadrenotools-arm64-v8a.zip>
   (`libadrenotools.so`, `libhook_impl.so`, `libmain_hook.so`,
   `libfile_redirect_hook.so`, `libgsl_alloc_hook.so`, `libshadowhook.so`,
-  `libshadowhook_nothing.so`, `libbytehook.so`)
+  `libshadowhook_nothing.so`, `libbytehook.so`) — the fork's CI build of
+  commit 4d4d482 (2026-11-17 12:42, "driver: fix initial", the
+  `driver.cpp` rewrite), which looks for the system's Vulkan loader
+  under the vendor paths too (`/system/lib64`, `/system/vendor/lib64`,
+  `/vendor/lib64`, `/odm/lib64`, `/product/lib64`, `/system_ext/lib64`:
+  what HyperOS devices need), lets its own initialisation be switched
+  off (`ADRENOTOOLS_DISABLE=1`, which rustudio sets before loading it;
+  with it on, the shim hooks only `vkGetInstanceProcAddr` /
+  `vkGetDeviceProcAddr` of the system loader and sends the system's own
+  callers — hwui, WebView, anything under `/system`, `/vendor`, `/apex`
+  — on to the vendor's driver), carries a working PanVK (Mali) path of
+  its own (`init_panvk_driver`, which opens the same
+  `libvulkan_panfrost.so` name and shares Turnip's init; rustudio opens
+  the file through `adrenotools_open_libvulkan` itself, "PanVK" below),
+  tells a Mali the way rustudio does (`/dev/kgsl-3d0` first, then
+  `/dev/mali0`, `ro.hardware.vulkan` / `egl`, the kbase sysfs, the
+  device tree) and defaults Mesa's own WSI to mailbox presentation
+  (`MESA_VK_WSI_PRESENT_MODE`; the Android swapchain is the system
+  loader's, so the editor's vsync is unchanged). Its other switches
+  (`ADRENOTOOLS_FORCE_DRIVER=turnip|panvk`, `ADRENOTOOLS_DRIVER_DIR`,
+  `ADRENOTOOLS_DRIVER_NAME`, `ADRENOTOOLS_HOOK_DIR`,
+  `ADRENOTOOLS_HOOK_SYSTEM`) only matter when its own initialisation
+  runs, which here it doesn't. GitHub keeps workflow artifacts for 90
+  days; after that, point `ADRENOTOOLS_ZIP` at a release of the fork
+  (V0.7,
+  <https://github.com/TouseefX/libadrenotools-native/releases/download/V0.7/libadrenotools-arm64-v8a.zip>,
+  is the last one; with it HyperOS keeps the device's driver, as below,
+  and its own initialisation, which has no off switch, is run by
+  rustudio and not relied on). The app reads which build it has off the
+  file (`turnip::Shim`: the `/vendor/lib64/libvulkan.so` and
+  `ADRENOTOOLS_DISABLE` strings) and logs it: `turnip: libadrenotools in
+  this APK: vendor loader paths yes, own initialisation switchable off
+  (ADRENOTOOLS_DISABLE)`.
 - Turnip driver: <https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.0/mesa-turnip-android-26.3.0.zip>
   (`libvulkan_freedreno.so`, Mesa 26.3.0, Adreno 6xx/7xx/8xx)
+- PanVK driver: <https://github.com/zenithblue-oss/panvk-kbase-android/releases/download/panvk-kbase-v26.3.1/libvulkan_panfrost-android-aarch64.so>
+  (one bare `.so`, 35 MB, put in as `libvulkan_panfrost.so`: Mesa
+  26.3.0-devel's PanVK built for Android as a Vulkan HAL module — it
+  exports `HMI`, which is how the loader's copy opens it — on ARM's
+  **kbase** kernel driver, the one Android's Mali devices ship, rather
+  than the mainline panfrost DRM driver; its device table runs from the
+  Bifrost Mali-G31/G52/G72/G76 through the Valhall G57/G77/G78/G610/G710
+  to the 5th-generation G720/G925). `PANVK=0` (the workflow's `panvk`
+  input off) leaves it out: a 35 MB smaller APK on which Mali devices
+  keep their driver.
 
 Another build goes in with `TURNIP_ZIP=<url or file>` /
-`ADRENOTOOLS_ZIP=<url or file>` (a `*_SHA256` beside it is checked when
-given), or by dropping the `.so` files into
+`ADRENOTOOLS_ZIP=<url or file>` / `PANVK_SO=<url or file>` (a `*_SHA256`
+beside it is checked when given), or by dropping the `.so` files into
 `crates/rustudio-android/libs/arm64-v8a/` by hand (kept unless `FORCE=1`).
 
 **How the swap works.** `tools/android/fetch-turnip.sh` (run by the
@@ -814,34 +881,51 @@ files. That folder is where libadrenotools must find its hook libraries
 and the driver. At start, in `android_main` before eframe exists — while
 the launch screen is up — `turnip::activate()`:
 
-1. Decides whether the device qualifies — Adreno only, 650 and up, not
-   HyperOS: arm64-v8a; `ro.hardware.vulkan` / `ro.hardware.egl` not
-   naming another maker's GPU (a Mali, PowerVR, Xclipse, … is out at
-   once: Turnip drives Adreno and nothing else); `/dev/kgsl-3d0` present
+1. Decides whether the device qualifies and which driver it gets
+   (`turnip::Mesa`: PanVK when `ro.hardware.vulkan` / `ro.hardware.egl`
+   say "mali" or `/dev/mali0` exists, Turnip otherwise). For Turnip —
+   Adreno only, 650 and up, not an old HyperOS: arm64-v8a;
+   `ro.hardware.vulkan` / `ro.hardware.egl` not
+   naming another maker's GPU (a PowerVR, Xclipse, … is out at
+   once: Turnip drives Adreno and PanVK Mali, nothing else); `/dev/kgsl-3d0` present
    (Qualcomm's GPU kernel driver, what Turnip's KGSL backend opens) or
    `ro.soc.manufacturer` / `ro.hardware` naming Qualcomm; an Adreno 650
    or newer (`turnip::ADRENO_MIN`) per `/sys/class/kgsl/kgsl-3d0/gpu_model`,
    or per `ro.soc.model` for the Snapdragons listed in
    `Device::adreno_model` when that node isn't readable — an unknown
-   model is out, as are the 610–644 and everything older; not Xiaomi's
-   HyperOS (`ro.mi.os.version.name` / `.code`): libadrenotools' loader
-   hook mostly doesn't find the Vulkan driver paths it expects there, so
-   those Snapdragons keep their driver (MIUI proper isn't excluded; the
-   log names both); Android 12+ (API 31, the fork's floor); the files in
-   the APK. Anything else keeps the device's driver, with one `turnip:
-   not used — …` line in logcat (`turnip: device: …` before it lists
-   everything the decision read), and the window doesn't offer the
+   model is out, as are the 610–644 and everything older; Xiaomi's
+   HyperOS (`ro.mi.os.version.name` / `.code`) only with a
+   libadrenotools build that looks for the system's Vulkan loader under
+   the vendor paths HyperOS keeps it at (`/vendor/lib64/libvulkan.so`,
+   …): `turnip::Shim` reads that off the shim file in the APK (the path
+   list is a plain string in the binary) —
+   with an older build those Snapdragons keep their driver, since its
+   hook found nothing under `/system/lib64` (MIUI proper isn't excluded;
+   the log names both); Android 12+ (API 31, the fork's floor); the
+   files in the APK. Anything else keeps the device's driver, with one
+   `turnip: not used — …` line in logcat (`turnip: device: …` before it
+   lists everything the decision read), and the window doesn't offer the
    switch. `RUSTUDIO_TURNIP=force` skips the GPU, model, HyperOS and
-   Android-version checks for a run.
-2. `dlopen`s `libadrenotools.so` from the native library folder and calls
-   its `JNI_OnLoad` with the process's JavaVM — the fork's own
-   initialisation, the one `System.loadLibrary` would run — right there,
-   so it is done when the call returns (the fork also starts a fallback
-   thread for native loads; a `call_once` inside makes the two one). It
-   sets Mesa's environment (`MESA_SHADER_CACHE_DIR` under the app's cache
-   folder, a `TU_DEBUG` of its choosing, …), opens a private copy of the
-   system's `libvulkan.so` with Turnip behind it and installs its hooks
-   on the system loader (see below for why those aren't relied on).
+   Android-version checks for a run (the driver is still the device's
+   kind: PanVK on a Mali, Turnip elsewhere). For PanVK the checks are
+   the Mali ones under "PanVK" below, then the same HyperOS, Android 12
+   and files-in-the-APK ones.
+2. Sets `ADRENOTOOLS_DISABLE=1` (and, for PanVK,
+   `PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1`) and `dlopen`s
+   `libadrenotools.so` from the native library folder. The shim's
+   constructor puts Mesa's environment in (`MESA_VK_WSI_PRESENT_MODE`,
+   `TU_*` defaults on an Adreno, `PAN_*` on a Mali, …; `setenv` without
+   overwrite, so the app's own `TU_DEBUG` stays) and, because of the
+   switch, does nothing else: no copy of the loader of its own, no hooks
+   on the system loader, no JavaVM wanted. `MESA_SHADER_CACHE_DIR` is set
+   here, under the app's cache folder (`turnip_shader_cache` /
+   `panvk_shader_cache`). With an older shim that has no such switch
+   (the fork's V0.7 or 4a084a5), its `JNI_OnLoad` is called with the
+   process's JavaVM right there, so its own initialisation — Mesa's
+   environment, a private copy of the system's `libvulkan.so` with the
+   driver behind it, its hooks on the system loader — is done when the
+   call returns (a `call_once` inside makes it and the fork's fallback
+   thread one); see below for why those hooks aren't relied on.
 3. Opens a Turnip-backed loader of its own through the fork's exported
    `adrenotools_open_libvulkan` (`RTLD_NOW | RTLD_LOCAL`,
    `ADRENOTOOLS_DRIVER_CUSTOM`, the native library folder as hook and
@@ -870,25 +954,33 @@ unchanged; window surfaces and swapchains come from the loader copy's
 own swapchain code (Mesa's Android builds leave them to the loader, as
 the vendor driver does).
 
-*Why not the fork's patch of the system loader.* libadrenotools-native
-also inline-hooks the system `libvulkan.so`'s `vkGetInstanceProcAddr` /
-`vkGetDeviceProcAddr` (shadowhook in shared mode) to answer from its
-private copy, so that a plain `dlopen("libvulkan.so")` — wgpu-hal's
+*Why not the fork's patch of the system loader.* Left to itself,
+libadrenotools-native inline-hooks the system `libvulkan.so`'s
+`vkGetInstanceProcAddr` / `vkGetDeviceProcAddr` (shadowhook in shared
+mode) to answer from a private copy of the loader with the driver behind
+it, so that a plain `dlopen("libvulkan.so")` — wgpu-hal's
 `ash::Entry::load()` — would land on Turnip without any of the above.
-The first device run showed it doesn't hold: the probe's instance was
+Its 4a084a5 build didn't hold: the first device run's probe instance was
 Turnip's, wgpu's instance made right after it on the same thread was
 the Adreno driver's (`AdrenoVK-0: Driver Path : /vendor/lib64/hw/vulkan.adreno.so`
-appeared between the two). The cause is in the fork's `src/driver.cpp`:
-its proxies (`hooked_vkGetInstanceProcAddr` → `g_turnip_gipa(...)`)
-return without `SHADOWHOOK_POP_STACK()`, so the per-thread frame
-shadowhook pushes for each call is never popped, and shadowhook's hub
-(`sh_hub_push_stack`: a frame with the same `orig_addr` already on the
-thread's stack = recursive call) sends every later call of the function
-on that thread to the original — only the first `vkGetInstanceProcAddr`
-call per thread ever reaches Turnip. (Upstream fix: end each proxy with
-`SHADOWHOOK_POP_STACK()`, or initialise shadowhook in unique mode.)
-rustudio therefore never goes through the patched system loader; the
-patch stays in place but nothing depends on it.
+appeared between the two) — its proxies (`hooked_vkGetInstanceProcAddr`
+→ `g_turnip_gipa(...)`) returned without `SHADOWHOOK_POP_STACK()`, so
+the per-thread frame shadowhook pushes for each call was never popped,
+and shadowhook's hub (`sh_hub_push_stack`: a frame with the same
+`orig_addr` already on the thread's stack = recursive call) sent every
+later call of the function on that thread to the original. The 4d4d482
+rewrite scopes the frames (`SHADOWHOOK_STACK_SCOPE()`), hooks these two
+functions only (hooking everything Vulkan was its earlier way and
+unsafe) and routes callers from the system's own libraries and UI
+threads back to the vendor's driver; but it needs the JavaVM, the
+Application context and a thread of its own to settle, and whether it
+is in place when wgpu loads is a race rustudio would have to wait out.
+The loader handle of rustudio's own and the pre-built wgpu objects need
+none of it, so the patch is switched off (`ADRENOTOOLS_DISABLE=1`) where
+the shim honours that, and with an older shim run but not relied on
+(its leaked frame is settled by `settle_system_loader` when the editor
+falls back to the device's driver, so that wgpu's own loading sees the
+vendor's loader uniformly).
 
 **Switches.** Graphics Settings > GPU Driver has the checkbox (a marker
 file `files/turnip/off`; takes effect at the next start). From adb:
@@ -1012,6 +1104,55 @@ cascades, SSAO, bloom, depth of field, clouds); a flat terrain at level
 full-resolution post passes, not the driver — and in Automatic mode
 (level 3 to start) the chunks beyond the level's view distance are
 expected to go (the "Something draws wrong" ladder above).
+
+**PanVK (Mali).** The same module, shim, loader, probe, markers and
+window switch with the other file: on a device whose GPU is a Mali
+(`ro.hardware.vulkan` / `ro.hardware.egl` "mali", or kbase's device
+node `/dev/mali0`) `turnip::Mesa::PanVk` is chosen and
+`adrenotools_open_libvulkan` is given `libvulkan_panfrost.so` (the name
+the fork's own `init_panvk_driver` opens). The checks before it:
+`/dev/mali0` must exist (the build here is PanVK on ARM's **kbase**
+kernel driver, the one Android's Mali devices have, not the mainline
+panfrost DRM driver; without the node PanVK has nothing to open); the
+core per kbase's sysfs `gpuinfo` (`/sys/devices/platform/<addr>.mali/gpuinfo`,
+"Mali-G52 MP2 r1p0 0x7402"; `turnip::mali_gpuinfo` looks under the
+usual nodes) must be a Bifrost or newer one (`Mali-G…`): the Midgard
+`Mali-T…` and Utgard `Mali-4xx` have no PanVK code and keep their
+driver, an unreadable `gpuinfo` lets the probe decide. With the pinned
+shim (4d4d482) that is all: its own initialisation is switched off
+(`ADRENOTOOLS_DISABLE=1`), its constructor sets PanVK's environment
+(`PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1`, which the driver wants before it
+enumerates a device — rustudio sets it too, in case the shim's Mali
+test and its own differ — `PAN_MESA_DEBUG=kbase` for Mesa's GL side,
+which nothing here loads, `PAN_VK_DEBUG=sync`, …), and rustudio's own
+PanVK-backed loader is what wgpu gets. With an older shim that has no
+off switch (V0.7, 4a084a5) one more check: the device tree's model
+string (`/proc/device-tree/model`) must not say "Mali"
+(`Device::shim_would_misfire`, applied only then) — that build's own
+initialisation (`perform_init`, run at the shim's load whether or not
+`JNI_OnLoad` is called, by its native-load fallback thread) tells a
+Mali from the KGSL node's model, which a Mali device hasn't, and falls
+back to that string; a Mali it recognises goes down its PanVK path,
+whose hooks of the system loader call through its Turnip function
+pointer, null then — a crash at the first `vkGetInstanceProcAddr` the
+system loader answers; on every other Mali device it runs its Turnip
+initialisation (a hooked loader copy with Turnip behind it, which finds
+no Adreno: zero devices, no crash — and the one call per thread its
+leaked shadowhook frame lets through to it is spent by
+`settle_system_loader` when the editor falls back, as on Adreno). Then
+the HyperOS, Android 12 and files-in-the-APK checks as for Turnip. No
+`TU_DEBUG` is set for PanVK (the switches section of the window is
+Turnip's; PanVK's own knobs are `PANVK_DEBUG` and this build's
+`PANVK_KBASE_*` / `PANVK_BC_*` — BC texture formats emulated, which a
+Mali hasn't), and the shader cache folder is `panvk_shader_cache`. The
+probe counts PanVK as answering when
+`VK_KHR_driver_properties` says `MESA_PANVK` or the names say "panvk" /
+"Panfrost" (`turnip: probe: Mali-G610 (PanVK) — panvk Mesa …`); the
+`pending` / `failed` markers and Graphics Settings > GPU Driver ("PanVK
+(Mesa) Vulkan driver") work as for Turnip. No Mali device was at hand
+for this: it is the untested half, gated to fail safe — a start that
+doesn't reach its second frame turns it off, and the device's driver is
+what the next start uses.
 
 ## Device-run notes (first APKs)
 
@@ -1189,6 +1330,33 @@ also echoed to logcat at the next start.
   exit-info calls `EXIT_SELF`: relaunch, then `adb logcat -d -s rustudio
   RustStdoutStderr RustPanic | grep -B2 -A40 -iE "panic|second
   activity|leaving the process"`.
+- **Status 101 a few minutes into a large place** (S20 Ultra, 11-17,
+  four times at ~500 MB pss, no memory pressure). Two things:
+  1. *Material textures.* The renderer keeps every material's three
+     maps in texture arrays (`render.rs MaterialArrays`: albedo,
+     surface, emission; `capacity` layers each) and grows them when a
+     place brings more materials than fit — the new arrays are made,
+     the old layers copied, the pending uploads written. Under the
+     phone's texture budget (`max_sampled_textures_per_shader_stage` 24
+     keeps the arrays few and the layer count small) a place with many
+     textured materials crossed the growth point while uploads for the
+     new layers were already queued: a write at a layer the array
+     didn't have yet, which is a wgpu validation error. Fixed: the
+     growth is made before a layer beyond the capacity is handed out,
+     the copy and the pending uploads are clamped to the capacity of
+     both arrays, and an upload at a layer the array hasn't drops with
+     a line in the log instead of reaching wgpu. A test grows the
+     arrays through their bounds on the host's GPU
+     (`material_arrays_grow_within_bounds_on_this_gpu`).
+  2. *wgpu's answer to such an error.* A validation error nobody
+     catches is a panic on the calling thread — the editor loop's, so
+     exit 101 for a frame that could have gone on without the one
+     write. On Android the device now has an uncaptured-error handler
+     (`android::install_gpu_error_handler`): the error's text goes to
+     logcat under `rustudio` (the first 20 in full, a count after that),
+     `perf: … GPU errors N` counts them when the perf log is on, and the
+     frame goes on. Desktop keeps wgpu's default (the panic names the
+     bug while developing).
 
 ## Later steps (in order)
 
@@ -1197,8 +1365,10 @@ also echoed to logcat at the next start.
 2. ~~Device properties and sensors~~ (`device_prop()`,
    `src/device_sensors.rs`).
 3. Haptics (`HapticService`, `HapticEffect`) through `jni::vibrate*`.
-4. Insets, orientation, soft keyboard for a game's TextBoxes
-   (`OnScreenKeyboardPosition / Size`).
+4. ~~Soft keyboard for a game's TextBoxes~~ (`OnScreenKeyboardVisible /
+   Position / Size`, `ReturnPressedFromOnScreenKeyboard`, the view
+   sliding up to the box: "Text: the soft keyboard"). Left: insets
+   (`GuiService.TopbarInset`, `ScreenInsets`), orientation.
 5. `ContextActionService` touch buttons (`createTouchButton`).
 
 Each step closes rows in docs/ENGINE-GAPS.md; the Creator Hub reference

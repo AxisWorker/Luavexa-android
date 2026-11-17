@@ -257,8 +257,6 @@ const LUA_PROPS: &[(&str, &str)] = &[
     ("GuiService", "ReducedMotionEnabled"),
     ("GuiService", "TopbarInset"),
     ("GuiService", "ViewportDisplaySize"),
-    ("UserInputService", "OnScreenKeyboardPosition"),
-    ("UserInputService", "OnScreenKeyboardSize"),
     ("UserInputService", "UserHeadCFrame"),
     ("GuiObject", "GuiState"),
     ("GuiObject", "InputSink"),

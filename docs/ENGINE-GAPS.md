@@ -343,7 +343,10 @@ camera 75 → 100 with the 2° tolerance unchanged.
    (`AccelerometerEnabled` / `GyroscopeEnabled`, `GetDeviceAcceleration /
    Gravity / Rotation`, `Device*Changed`). Still open: GuiObject
    `TouchLongPress / Pan / Pinch / Rotate / Swipe` (only
-   UserInputService's fire), `UserInputService.TouchDrag`,
-   `OnScreenKeyboardPosition / Size` for a game's TextBoxes, and the
+   UserInputService's fire), `UserInputService.TouchDrag`, and the
    gestures on a desktop (no finger reaches the game there: the editor's
-   mouse path stays).
+   mouse path stays). The soft keyboard over a game's TextBox:
+   `OnScreenKeyboardVisible / Position / Size` in the game's
+   coordinates and `TextBox.ReturnPressedFromOnScreenKeyboard`
+   (src/viewport.rs `keyboard_pan`, src/runtime_ext.rs `device_prop`;
+   zero and never on a desktop, as in Studio).
