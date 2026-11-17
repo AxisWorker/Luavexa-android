@@ -227,6 +227,16 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
   shapes (Place A's headroom probes rely on it: a turned brush's or a terrain
   chunk's box covers far more than the part). Now exact: box vs box by
   separating axes, box vs mesh triangles (src/query_shapes.rs).
+- **Invoke before the callback existed errored** ("OnInvoke is not set" /
+  "OnServerInvoke is not set"). Roblox holds the call: a BindableFunction's
+  `Invoke` yields until `OnInvoke` is set (and never resumes if it never
+  is), a RemoteFunction queues `InvokeServer` / `InvokeClient` until
+  `OnServerInvoke` / `OnClientInvoke` is assigned (both class pages). A
+  character's Controls LocalScript (LBG, Android) invoked a BindableFunction
+  40 ms before the 70k-line renderer LocalScript set its callback and died
+  at that line every spawn. Now every path waits a frame at a time
+  (src/runtime.rs PRELUDE `__rs_wait_callback`, INVOKE_PRELUDE
+  `__rs_serve_invoke`; test `invoke_waits_for_the_callback`).
 
 ## Coverage of Studio's API
 

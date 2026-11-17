@@ -4484,16 +4484,30 @@ function __rs_lua_methods.WaitForChild(self, name, timeout)
         end
     end
 end
+-- Invoke before the callback exists yields until it is set: a
+-- BindableFunction's Invoke "yields until the corresponding callback is
+-- found" (and never resumes if none is ever set), and a RemoteFunction
+-- queues invocations until OnServerInvoke / OnClientInvoke is assigned
+-- (both class pages). Erroring "OnInvoke is not set" instead broke every
+-- LocalScript that starts before the one that sets the callback (a
+-- character's Controls script invoking a RemoteFunction-style
+-- BindableFunction that a 70k-line renderer LocalScript sets up).
+local function __rs_wait_callback(self, key)
+    local cb = __rs_get_callback(self, key)
+    while not cb do
+        task.wait()
+        cb = __rs_get_callback(self, key)
+    end
+    return cb
+end
 function __rs_lua_methods.Invoke(self, ...)
     member(self, "BindableFunction", "Invoke")
-    local cb = __rs_get_callback(self, "OnInvoke")
-    if not cb then error("OnInvoke is not set", 2) end
+    local cb = __rs_wait_callback(self, "OnInvoke")
     return cb(...)
 end
 function __rs_lua_methods.InvokeServer(self, ...)
     member(self, "RemoteFunction", "InvokeServer")
-    local cb = __rs_get_callback(self, "OnServerInvoke")
-    if not cb then error("OnServerInvoke is not set", 2) end
+    local cb = __rs_wait_callback(self, "OnServerInvoke")
     return cb(game:GetService("Players").LocalPlayer, ...)
 end
 function __rs_lua_methods.InvokeClient(self, player, ...)
@@ -6255,7 +6269,10 @@ function __rs_lua_methods.InvokeServer(self, ...)
         return yield()
     end
     local cb = __rs_get_callback(self, "OnServerInvoke")
-    if not cb then error("OnServerInvoke is not set", 2) end
+    while not cb do
+        task.wait()
+        cb = __rs_get_callback(self, "OnServerInvoke")
+    end
     return cb(game:GetService("Players").LocalPlayer, ...)
 end
 function __rs_lua_methods.InvokeClient(self, player, ...)
@@ -6285,11 +6302,14 @@ function __rs_serve_client_invoke(remote, id, ...)
         __rs_invoke_reply(id, false, tostring(res[2]))
     end
 end
+-- Server side of InvokeServer: held until OnServerInvoke is set, as Roblox
+-- queues it (the client's call stays yielded meanwhile).
 function __rs_serve_invoke(remote, player, id, ...)
     local cb = __rs_get_callback(remote, "OnServerInvoke")
-    if not cb then
-        __rs_invoke_reply(id, false, "OnServerInvoke is not set")
-        return
+    while not cb do
+        task.wait()
+        if remote.Parent == nil then return end
+        cb = __rs_get_callback(remote, "OnServerInvoke")
     end
     local res = table.pack(pcall(cb, player, ...))
     if res[1] then
@@ -7410,6 +7430,55 @@ mod legacy_tests {
         assert!(at("return") < at("lost true"), "{out:?}");
         assert!(!out.iter().any(|(l, _)| *l == Level::Error), "{out:?}");
         crate::touch_input::TEST_GAME_TOUCH.with(|c| c.set(None));
+    }
+
+    /// BindableFunction:Invoke and RemoteFunction:InvokeServer before the
+    /// callback exists yield until it is set, as Roblox holds them (the
+    /// BindableFunction and RemoteFunction pages): a character's Controls
+    /// LocalScript invoked ClientInvoke 40 ms before the renderer
+    /// LocalScript set its OnInvoke and died with "OnInvoke is not set".
+    #[test]
+    fn invoke_waits_for_the_callback() {
+        let mut d = Document::new_place();
+        let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
+        let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
+        let src = r#"
+            local bf = Instance.new("BindableFunction")
+            local rf = Instance.new("RemoteFunction")
+            local got, ans
+            task.spawn(function() got = bf:Invoke(21) print("invoke returned", got) end)
+            task.spawn(function() ans = rf:InvokeServer("x") print("invoke server returned", ans) end)
+            print("pending", tostring(got), tostring(ans))
+            task.wait()
+            task.wait()
+            print("still pending", tostring(got), tostring(ans))
+            bf.OnInvoke = function(x) return x * 2 end
+            rf.OnServerInvoke = function(player, s) return s .. "!" end
+            task.wait()
+            task.wait()
+            print("done", tostring(got), tostring(ans))
+        "#;
+        let s = d.dom.insert(
+            sps,
+            InstanceBuilder::new("LocalScript").with_name("T").with_property("Source", src.to_string()),
+        );
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(d, RunMode::Run);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        for _ in 0..8 {
+            rt.step(1.0 / 60.0);
+        }
+        let out = rt.leave().output;
+        let has = |p: &str| out.iter().any(|(_, t)| t.starts_with(p));
+        assert!(has("pending nil nil"), "{out:?}");
+        assert!(has("still pending nil nil"), "{out:?}");
+        assert!(has("invoke returned 42"), "{out:?}");
+        assert!(has("invoke server returned x!"), "{out:?}");
+        assert!(has("done 42 x!"), "{out:?}");
+        assert!(!out.iter().any(|(l, _)| *l == Level::Error), "{out:?}");
     }
 
     /// an admin script's client anti-tamper, condensed (Client.Core.Anti and
