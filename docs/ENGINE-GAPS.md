@@ -237,6 +237,21 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
   at that line every spawn. Now every path waits a frame at a time
   (src/runtime.rs PRELUDE `__rs_wait_callback`, INVOKE_PRELUDE
   `__rs_serve_invoke`; test `invoke_waits_for_the_callback`).
+- **Studio 0.748's PlayerModule lost its InputContexts** (content
+  `version-8d7a1009c17e4ff8`, deployed 2025-11-16). `PlayerScripts.rbxp` now
+  points `PlayerModule.InputContexts` at a second project file
+  (`"$path": "InputContexts.rbxp"`, 4 InputContexts / 30 InputActions / 70
+  InputBindings) where 0.747 spelled the tree out inline; the Rojo-style
+  loader only followed `$path`s to `.lua` / `.luau` files and folders, so
+  the Folder came up empty. InputSetup warned "InputContexts not found" and
+  ControlModule, BaseCamera, CameraInput, MouseLockController, the
+  thumbsticks, ClickToMove and VehicleController all parked on
+  `WaitForChild("InputContexts")`: the character spawned, nothing walked or
+  looked, on every platform once the content updated. A `$path` ending in
+  `.rbxp` is now loaded as that project's `tree`, relative to its own file
+  (src/default_scripts.rs `project_tree` / `project_file`; test
+  `nested_project_file_is_its_tree`; a headless Play of the control place
+  with 0.748's content walks 31 studs on a 2 s W press again).
 
 ## Coverage of Studio's API
 

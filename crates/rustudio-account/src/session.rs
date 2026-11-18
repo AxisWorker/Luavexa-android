@@ -12,17 +12,18 @@
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use ureq::ResponseExt;
 use sha2::{Digest, Sha256};
 
+use crate::api::AssetDownloadError;
 use crate::{Error, Result};
 
 pub const AUTHENTICATED_URL: &str = "https://users.roblox.com/v1/users/authenticated";
 pub const MY_AVATAR_URL: &str = "https://avatar.roblox.com/v1/avatar";
 pub const MY_UNIVERSES_URL: &str = "https://develop.roblox.com/v1/user/universes";
-pub const UPLOAD_URL: &str = "https://data.roblox.com/Data/Upload.ashx";
 /// The Roblox place the editor has open (0: none), sent with asset requests.
 pub static PLACE_CONTEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -420,11 +421,16 @@ impl ProfileCache {
 /// HTTP agent for cookie calls: a browser-like user agent (Cloudflare in
 /// front of these hosts turns other clients away) and statuses as values.
 pub fn session_agent() -> ureq::Agent {
+    session_agent_with_timeout(None)
+}
+
+fn session_agent_with_timeout(timeout: Option<std::time::Duration>) -> ureq::Agent {
     // Redirects are reported, not followed: a cookie call that is sent to
     // a login page is a refusal, and a POST must not be replayed elsewhere.
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
+        .timeout_global(timeout)
         .user_agent(concat!(
             "Mozilla/5.0 (X11; Linux x86_64) rustudio/",
             env!("CARGO_PKG_VERSION")
@@ -583,6 +589,13 @@ impl Session {
         }
     }
 
+    /// Gives an owned session a deadline per HTTP request, keeping its
+    /// shared credential and rotation behavior.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.agent = session_agent_with_timeout(Some(timeout));
+        self
+    }
+
     /// A session that was not checked with Roblox, for talking to a local
     /// mock server (tests and the self-test's save checks). Never used for
     /// a real cookie: nothing about the profile is verified.
@@ -635,11 +648,15 @@ impl Session {
 
     /// GET with the session.
     pub fn get(&self, url: &str) -> Result<(u16, String)> {
-        let r = self
-            .agent
-            .get(url)
-            .header("Cookie", &self.held().header())
-            .call()?;
+        self.get_with_timeout(url, None)
+    }
+
+    pub(crate) fn get_with_timeout(&self, url: &str, timeout: Option<Duration>) -> Result<(u16, String)> {
+        let mut req = self.agent.get(url).header("Cookie", &self.held().header());
+        if let Some(timeout) = timeout {
+            req = req.config().timeout_global(Some(timeout)).build();
+        }
+        let r = req.call()?;
         self.apply_rotation(&r);
         text_of(r)
     }
@@ -670,6 +687,16 @@ impl Session {
 
     /// GET returning bytes (assets), gzip bodies inflated.
     fn get_bytes(&self, url: &str, with_cookie: bool) -> Result<(u16, Vec<u8>)> {
+        let response = self.get_bytes_response(url, with_cookie)?;
+        let status = response.status().as_u16();
+        Ok((status, Self::read_bytes(response)?))
+    }
+
+    fn get_bytes_response(
+        &self,
+        url: &str,
+        with_cookie: bool,
+    ) -> Result<ureq::http::Response<ureq::Body>> {
         let mut req = self.agent.get(url).header("Accept-Encoding", "gzip");
         if with_cookie {
             req = req.header("Cookie", &self.held().header());
@@ -678,11 +705,14 @@ impl Session {
                 req = req.header("Roblox-Place-Id", &place.to_string());
             }
         }
-        let mut r = req.call()?;
+        let r = req.call()?;
         if with_cookie {
             self.apply_rotation(&r);
         }
-        let status = r.status().as_u16();
+        Ok(r)
+    }
+
+    fn read_bytes(mut r: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         r.body_mut()
             .with_config()
@@ -694,7 +724,7 @@ impl Session {
             flate2::read::GzDecoder::new(&bytes[..]).read_to_end(&mut out)?;
             bytes = out;
         }
-        Ok((status, bytes))
+        Ok(bytes)
     }
 
     /// Engine data requests over the login session, preserving object metadata
@@ -806,6 +836,19 @@ impl Session {
     /// A state-changing request of any method (POST / PATCH / PUT / DELETE)
     /// with the CSRF dance of [`Session::post_csrf_with`].
     pub fn send_csrf(&self, method: &str, url: &str, content_type: &str, body: &[u8]) -> Result<(u16, String)> {
+        self.send_csrf_with_timeout(method, url, content_type, body, None)
+    }
+
+    /// The timeout covers the upload and its CSRF retries.
+    pub(crate) fn send_csrf_with_timeout(
+        &self,
+        method: &str,
+        url: &str,
+        content_type: &str,
+        body: &[u8],
+        timeout: Option<Duration>,
+    ) -> Result<(u16, String)> {
+        let started = Instant::now();
         for _ in 0..=CSRF_MAX_RETRIES {
             let token = self.csrf.lock().ok().and_then(|g| g.clone());
             let mut req = ureq::http::Request::builder()
@@ -816,7 +859,14 @@ impl Session {
             if let Some(t) = &token {
                 req = req.header("X-CSRF-TOKEN", t);
             }
-            let req = req.body(body).map_err(|_| Error::new("invalid HTTP request"))?;
+            let mut req = req.body(body).map_err(|_| Error::new("invalid HTTP request"))?;
+            if let Some(timeout) = timeout {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(Error::new("Request timed out"));
+                }
+                req = self.agent.configure_request(req).timeout_global(Some(remaining)).build();
+            }
             let r = self.agent.run(req)?;
             self.apply_rotation(&r);
             let fresh = r.headers().get("x-csrf-token").and_then(|v| v.to_str().ok()).map(str::to_string);
@@ -857,8 +907,17 @@ impl Session {
     /// served the same asset]. So a refusal asks the identity endpoint for
     /// the rotation once and retries.
     pub fn download_asset(&self, asset_id: u64, version: Option<u64>) -> Result<Vec<u8>> {
+        self.download_asset_typed(asset_id, version).map_err(Error::from)
+    }
+
+    /// Like [Self::download_asset], with HTTP retry information for scheduling.
+    pub fn download_asset_typed(
+        &self,
+        asset_id: u64,
+        version: Option<u64>,
+    ) -> std::result::Result<Vec<u8>, AssetDownloadError> {
         let first = self.download_asset_at(asset_id, version);
-        if let Err(e) = &first {
+        if let Err(AssetDownloadError::Other(e)) = &first {
             if e.0.contains("Authentication required") && self.refresh_cookie().unwrap_or(false) {
                 return self.download_asset_at(asset_id, version);
             }
@@ -878,7 +937,11 @@ impl Session {
     }
 
     /// One asset delivery attempt.
-    fn download_asset_at(&self, asset_id: u64, version: Option<u64>) -> Result<Vec<u8>> {
+    fn download_asset_at(
+        &self,
+        asset_id: u64,
+        version: Option<u64>,
+    ) -> std::result::Result<Vec<u8>, AssetDownloadError> {
         let url = match version {
             Some(v) => format!("{ASSET_V2_URL}/{asset_id}/version/{v}"),
             None => format!("{ASSET_V2_URL}/{asset_id}"),
@@ -891,8 +954,11 @@ impl Session {
         if place != 0 {
             req = req.header("Roblox-Place-Id", &place.to_string());
         }
-        let r = req.call()?;
+        let r = req.call().map_err(Error::from)?;
         self.apply_rotation(&r);
+        if let Some(error) = AssetDownloadError::transient_response(asset_id, "asset delivery", &r) {
+            return Err(error);
+        }
         let (status, text) = text_of(r)?;
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
             Error(format!(
@@ -904,15 +970,22 @@ impl Session {
                 .pointer("/errors/0/message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("no download location");
+            // v2 answers 200 with the refusal in the body (see `public_asset_typed`).
+            let http = if status == 200 { String::new() } else { format!(" (HTTP {status})") };
             return Err(Error(format!(
-                "asset {asset_id}: asset delivery: {why} (HTTP {status})"
-            )));
+                "asset {asset_id}: asset delivery: {why}{http}"
+            )).into());
         };
-        let (status, bytes) = self.get_bytes(location, false)?;
+        let response = self.get_bytes_response(location, false)?;
+        if let Some(error) = AssetDownloadError::transient_response(asset_id, "download", &response) {
+            return Err(error);
+        }
+        let status = response.status().as_u16();
+        let bytes = Self::read_bytes(response)?;
         if !(200..300).contains(&status) {
             return Err(Error(format!(
                 "asset {asset_id}: download returned HTTP {status}"
-            )));
+            )).into());
         }
         Ok(bytes)
     }
@@ -957,34 +1030,17 @@ impl Session {
         Ok(out)
     }
 
-    /// Uploads a place file as a new version of `place_id`:
-    /// `POST data.roblox.com/Data/Upload.ashx?assetid={placeId}` with the
-    /// session and the CSRF dance. Returns Roblox's reply text (the new
-    /// version's id).
+    /// Publishes a place and returns its confirmed revision number as text.
     pub fn upload_place(&self, place_id: u64, bytes: &[u8], is_xml: bool) -> Result<String> {
-        let url = format!("{UPLOAD_URL}?assetid={place_id}");
-        let ct = if is_xml {
-            "application/xml"
-        } else {
-            "application/octet-stream"
-        };
-        let (status, text) = self.post_csrf(&url, ct, bytes)?;
-        if !(200..300).contains(&status) {
-            let detail: String = text.chars().take(200).collect();
-            // A reply that echoes the cookie or names a secret cookie is not shown.
-            let detail = if self.held().appears_in(&detail)
-                || SECRET_COOKIES.iter().any(|c| detail.contains(c))
-            {
-                String::new()
-            } else {
-                detail
-            };
-            return Err(Error(format!(
-                "Upload.ashx answered HTTP {status}: {}",
-                detail.trim()
-            )));
-        }
-        Ok(text.trim().to_string())
+        crate::cloud::upload_place(
+            self,
+            &crate::Endpoints::default().apis,
+            place_id,
+            bytes,
+            is_xml,
+            crate::VersionType::Published,
+        )
+        .map(|version| version.to_string())
     }
 }
 
@@ -1154,19 +1210,6 @@ mod live {
                 ),
                 Err(e) => println!("asset {id}: {e}"),
             }
-        }
-        // CSRF: assetid 0 is no place, so nothing can be written.
-        match s.post_csrf(
-            &format!("{UPLOAD_URL}?assetid=0"),
-            "application/octet-stream",
-            b"",
-        ) {
-            Ok((st, t)) => println!(
-                "Upload.ashx assetid=0: HTTP {st}, token held {}, reply {:?}",
-                s.csrf_token_held(),
-                t.chars().take(300).collect::<String>()
-            ),
-            Err(e) => println!("upload probe: {e}"),
         }
     }
 }

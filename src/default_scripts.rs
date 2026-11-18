@@ -20,7 +20,9 @@
 //!   `InputContexts` folder of InputContext / InputAction / InputBinding
 //!   objects the modules read their input from), and
 //!   StarterPlayerScripts.`RbxCharacterSounds`. The tree is the install's
-//!   own project file, `ExtraContent/scripts/PlayerScripts/PlayerScripts.rbxp`.
+//!   own project file, `ExtraContent/scripts/PlayerScripts/PlayerScripts.rbxp`
+//!   (0.748 keeps the InputContexts tree in its own `InputContexts.rbxp`,
+//!   named as a `$path`).
 //! - The older layout (that property Disabled, an install without the
 //!   project file, or a place with its own PlayerModule / PlayerScriptsLoader
 //!   in StarterPlayerScripts): StarterPlayerScripts gets `PlayerScriptsLoader`
@@ -212,9 +214,13 @@ fn script_node(name: &str, class: &str, run_context: Option<u32>, source: String
 }
 
 /// A file or folder of the project as an instance: a folder with an
-/// `init*.lua` is that script with the rest as children, else a Folder.
+/// `init*.lua` is that script with the rest as children, else a Folder; a
+/// project file of its own (`.rbxp`) is its tree.
 fn path_node(p: &Path, name: &str) -> Option<Node> {
     if p.is_file() {
+        if p.extension().is_some_and(|e| e == "rbxp") {
+            return project_file(p, name);
+        }
         let (_, class, rc) = script_kind(p.file_name()?.to_str()?)?;
         return Some(script_node(name, class, rc, read(p)?));
     }
@@ -279,12 +285,30 @@ fn apply_project(node: &mut Node, j: &serde_json::Value, base: &Path) {
     }
 }
 
+/// A project file's tree (`instanceHierarchy.tree`).
+fn project_tree(p: &Path) -> Option<serde_json::Value> {
+    let json: serde_json::Value = serde_json::from_str(&read(p)?).ok()?;
+    json.get("instanceHierarchy")?.get("tree").cloned()
+}
+
+/// A project file named as another project's `$path` (Studio 0.748's
+/// PlayerScripts.rbxp has `InputContexts: { $path: "InputContexts.rbxp" }`
+/// where 0.747 wrote the InputContext / InputAction / InputBinding tree in
+/// place): its tree as the instance, `$path`s inside relative to its folder.
+/// Without this the PlayerModule had no InputContexts at all: its
+/// InputSetup warned "InputContexts not found", ControlModule waited on
+/// `StarterPlayer.PlayerModule:WaitForChild("InputContexts")` for ever, and
+/// the character stood where it spawned.
+fn project_file(p: &Path, name: &str) -> Option<Node> {
+    let tree = project_tree(p)?;
+    project_node(name, &tree, p.parent()?)
+}
+
 /// Studio's current player scripts: what PlayerScripts.rbxp puts under
 /// StarterPlayer (PlayerModule, StarterPlayerScripts' children).
 fn project_starter_player(root: &Path) -> Option<Node> {
     let base = root.join(PLAYER_SCRIPTS);
-    let json: serde_json::Value = serde_json::from_str(&read(&base.join("PlayerScripts.rbxp"))?).ok()?;
-    let tree = json.get("instanceHierarchy")?.get("tree")?;
+    let tree = project_tree(&base.join("PlayerScripts.rbxp"))?;
     let sp = project_node("StarterPlayer", tree.get("StarterPlayer")?, &base)?;
     sp.children.iter().any(|c| c.name == "PlayerModule").then_some(sp)
 }
@@ -428,6 +452,75 @@ pub fn insert_character_scripts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Studio 0.748's PlayerScripts.rbxp names InputContexts.rbxp as a
+    /// `$path` (0.747 wrote the tree in place): the folder comes through
+    /// with its contexts, actions and bindings, the rest as before.
+    #[test]
+    fn nested_project_file_is_its_tree() {
+        let dir = std::env::temp_dir().join(format!("rustudio-rbxp-{}", std::process::id()));
+        let ps = dir.join(PLAYER_SCRIPTS);
+        let pm = ps.join("StarterPlayer/PlayerModule");
+        std::fs::create_dir_all(&pm).unwrap();
+        std::fs::create_dir_all(ps.join("StarterPlayerScriptsCommon/RbxCharacterSounds")).unwrap();
+        let w = |p: PathBuf, s: &str| std::fs::write(p, s).unwrap();
+        w(pm.join("init.lua"), "return {}");
+        w(pm.join("InputSetup.server.lua"), "-- setup");
+        w(pm.join("PlayerScriptsLoader.client.lua"), "-- loader");
+        w(ps.join("StarterPlayerScriptsCommon/RbxCharacterSounds.lua"), "-- sounds");
+        w(ps.join("StarterPlayerScriptsCommon/RbxCharacterSounds/AtomicBinding.lua"), "return {}");
+        w(
+            ps.join("PlayerScripts.rbxp"),
+            r#"{ "instanceHierarchy": { "tree": { "$className": "DataModel",
+                "StarterPlayer": { "$path": "StarterPlayer",
+                    "StarterPlayerScripts": { "RbxCharacterSounds": { "$className": "LocalScript",
+                        "$path": "StarterPlayerScriptsCommon/RbxCharacterSounds.lua",
+                        "AtomicBinding": { "$path": "StarterPlayerScriptsCommon/RbxCharacterSounds/AtomicBinding.lua" } } },
+                    "PlayerModule": { "InputContexts": { "$className": "Folder", "$path": "InputContexts.rbxp" } } } } } }"#,
+        );
+        w(
+            ps.join("InputContexts.rbxp"),
+            r#"{ "instanceHierarchy": { "tree": { "$className": "Folder",
+                "CharacterContext": { "$className": "InputContext", "$properties": { "Priority": 150 },
+                    "MoveAction": { "$className": "InputAction", "$properties": { "Type": "Direction2D" },
+                        "KeyboardPrimaryBinding": { "$className": "InputBinding",
+                            "$properties": { "Up": "W", "Down": "S", "Left": "A", "Right": "D" } } },
+                    "JumpAction": { "$className": "InputAction",
+                        "KeyboardBinding": { "$className": "InputBinding", "$properties": { "KeyCode": "Space" } } } } } } }"#,
+        );
+        let sp = project_starter_player(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        fn child<'a>(n: &'a Node, name: &str) -> &'a Node {
+            n.children.iter().find(|c| c.name == name).unwrap_or_else(|| {
+                panic!("{} has no {name}: {:?}", n.name, n.children.iter().map(|c| &c.name).collect::<Vec<_>>())
+            })
+        }
+        let enum_of = |n: &Node, k: &str| match n.props.iter().find(|(p, _)| p == k) {
+            Some((_, Variant::Enum(e))) => Some(e.to_u32()),
+            _ => None,
+        };
+        let key = |name: &str| crate::ltypes::LEnumItem::from_name("KeyCode", name).map(|e| e.value);
+        let sounds = child(child(&sp, "StarterPlayerScripts"), "RbxCharacterSounds");
+        assert_eq!(sounds.class, "LocalScript");
+        assert_eq!(child(sounds, "AtomicBinding").class, "ModuleScript");
+        let pm = child(&sp, "PlayerModule");
+        assert_eq!(pm.class, "ModuleScript");
+        assert_eq!(enum_of(child(pm, "InputSetup"), "RunContext"), Some(1));
+        assert_eq!(enum_of(child(pm, "PlayerScriptsLoader"), "RunContext"), Some(2));
+        let ic = child(pm, "InputContexts");
+        assert_eq!(ic.class, "Folder");
+        let ctx = child(ic, "CharacterContext");
+        assert_eq!(ctx.class, "InputContext");
+        assert!(ctx.props.iter().any(|(k, _)| k == "Priority"), "{:?}", ctx.props);
+        let mv = child(ctx, "MoveAction");
+        assert_eq!(mv.class, "InputAction");
+        assert!(mv.props.iter().any(|(k, _)| k == "Type"), "{:?}", mv.props);
+        let kb = child(mv, "KeyboardPrimaryBinding");
+        assert_eq!(kb.class, "InputBinding");
+        assert_eq!(enum_of(kb, "Up"), key("W"));
+        assert_eq!(enum_of(kb, "Left"), key("A"));
+        assert_eq!(enum_of(child(child(ctx, "JumpAction"), "KeyboardBinding"), "KeyCode"), key("Space"));
+    }
 
     #[test]
     fn default_scripts_from_studio_folder() {

@@ -12,6 +12,8 @@ mod plugin_store;
 mod toolbox;
 mod ui_pointer;
 mod offscreen;
+#[cfg(not(target_os = "android"))]
+mod native_loop;
 mod sim_clock;
 mod bytecode_cache;
 mod heap;
@@ -1277,17 +1279,25 @@ pub fn desktop_main() -> eframe::Result<()> {
     // Files opened from Finder arrive as Apple Events, not argv.
     #[cfg(target_os = "macos")]
     macos::install_open_handler();
+    type Created = Result<Box<app::RustudioApp>, Box<dyn std::error::Error + Send + Sync>>;
+    let create = move |cc: &eframe::CreationContext<'_>| -> Created {
+        #[cfg(target_os = "macos")]
+        {
+            macos::install_menu();
+            macos::set_wake(&cc.egui_ctx);
+        }
+        Ok(Box::new(app::RustudioApp::new(cc, open, harness, demo)))
+    };
+    // The desktop's own winit loop keeps plugins ticking while the window
+    // is hidden (src/native_loop.rs); the Android entry point runs eframe
+    // with its AndroidApp (src/android/mod.rs), never this function.
+    #[cfg(not(target_os = "android"))]
+    let r = native_loop::run("rustudio", options, create);
+    #[cfg(target_os = "android")]
     let r = eframe::run_native(
         "rustudio",
         options,
-        Box::new(move |cc| {
-            #[cfg(target_os = "macos")]
-            {
-                macos::install_menu();
-                macos::set_wake(&cc.egui_ctx);
-            }
-            Ok(Box::new(app::RustudioApp::new(cc, open, harness, demo)))
-        }),
+        Box::new(move |cc| create(cc).map(|a| a as Box<dyn eframe::App>)),
     );
     // --fail-on-error (app::Editor::finish_run); a windowed test run's exit
     // status reaches the caller through the headless wrapper's status file.
