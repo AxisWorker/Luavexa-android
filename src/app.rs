@@ -2513,7 +2513,10 @@ impl eframe::App for RustudioApp {
             self.text_menu.before_frame(raw);
             let textbox = self.ed.textbox_focused();
             self.keyboard.before_frame(_ctx, raw, textbox);
-            crate::android::lifecycle::back_pressed(_ctx, raw);
+            let playing = self.ed.play_game_input();
+            crate::android::lifecycle::back_pressed(_ctx, raw, playing);
+            // The window back in focus: the system bars hidden again.
+            crate::android::system_bars::before_frame(raw);
         }
         // A scripted run's window on Windows sits on the real desktop: the
         // person's (or an idle session's) mouse pointer over it would hover

@@ -247,11 +247,68 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
   ControlModule, BaseCamera, CameraInput, MouseLockController, the
   thumbsticks, ClickToMove and VehicleController all parked on
   `WaitForChild("InputContexts")`: the character spawned, nothing walked or
-  looked, on every platform once the content updated. A `$path` ending in
-  `.rbxp` is now loaded as that project's `tree`, relative to its own file
-  (src/default_scripts.rs `project_tree` / `project_file`; test
-  `nested_project_file_is_its_tree`; a headless Play of the control place
-  with 0.748's content walks 31 studs on a 2 s W press again).
+  looked, on every platform once the content updated. Fixed upstream in
+  0.2.6 (`e3f06fd`, "Fixed Play controls and camera on fresh installs"):
+  a `$path` ending in `.rbxp` is loaded as that project's `tree`, relative
+  to its own file, `$properties` over an imported tree apply, and a missing
+  source is an error Play reports ("Could not load Studio PlayerModule for
+  Play: …") instead of a silent empty Folder (src/default_scripts.rs
+  `project_tree` / `project_node`; test
+  `project_imports_input_contexts_with_properties_and_rejects_missing_sources`).
+  The port's own fix of the same gap was dropped for upstream's.
+- **A new place got the Input Action System PlayerScripts.** Which player
+  scripts a place gets is `Workspace.PlayerScriptsUseInputActionSystem`
+  (Enum.RolloutState): the loader took the new layout
+  (`StarterPlayer.PlayerModule` + its own `PlayerScriptsLoader`, nothing
+  in `Player.PlayerScripts` but `RbxCharacterSounds`) for every place
+  whose flag wasn't Disabled — so for Default, every Baseplate — where
+  Roblox's rollout (phase 1, through 2026) resolves Default to Disabled:
+  the live client gives those places the classic `PlayerScriptsLoader` +
+  `PlayerModule` + `RbxCharacterSounds` in `Player.PlayerScripts`, and
+  games `require(LocalPlayer.PlayerScripts.PlayerModule):GetControls()`.
+  Now Default and Disabled are the classic layout, Enabled the Input
+  Action System one (`StarterPlayer.CreateDefaultPlayerModule` false
+  leaves its PlayerModule out), a fork in StarterPlayerScripts keeps the
+  classic layout around it as before, and
+  `mech::PLAYER_SCRIPTS_DEFAULT_IAS` is the one place to flip when
+  Roblox's phase 2 (early 2027) makes Default mean Enabled
+  (`input_action_system_on`; test
+  `player_scripts_layout_follows_the_rollout_flag`).
+- **UIListLayout's flex settings were ignored**: `Wraps`, `HorizontalFlex`
+  / `VerticalFlex` (UIFlexAlignment Fill / SpaceAround / SpaceBetween /
+  SpaceEvenly) and `ItemLineAlignment`. A wrapping list (90 of LBG's 250
+  lists: shop rows, the player list, title tiles) was drawn as one long
+  line running off its frame. Now a list breaks into lines at its parent's
+  extent along the fill direction (the lines stacked by the same Padding),
+  the flex alignments grow the items or spread them along a line and
+  spread the lines across, Automatic / Start / Center / End / Stretch set
+  the items within their line, and an AutomaticSize parent holds the
+  lines (src/gui_walk.rs `list_lines`; AbsoluteContentSize follows the
+  drawn boxes; test `list_wraps_and_flexes`). Not done: UIFlexItem Shrink
+  and a Fill line narrower than its items (nothing shrinks).
+- **UIShadow was not drawn** (138 in LBG: glows behind its result frames,
+  kill feed, close buttons). Now a Shape-mode shadow is drawn under its
+  object's background: the box (with its UICorner) moved by Offset, grown
+  by Spread, its edge softened over BlurRadius (scale of the shorter side),
+  in Color at 1 - Transparency; ShowBehindParent false leaves out the part
+  under the box (src/gui_fx.rs `shadow`; test `ui_shadow_under_the_box`).
+  Not done: Inset, Text mode, a UIGradient under the shadow.
+- **No top bar over the game**: the Roblox menu (Esc) and the chat (`/`)
+  had keys only, so a phone — no Esc, no `/` — never reached either, and a
+  Studio playtest's view lacked the bar Studio draws in the 58 px inset.
+  Now the CoreScripts' TopBar (Chrome layout, Constants.lua: 44 px
+  buttons, 16 in from the side, 12 apart) is drawn over the game view in
+  Play: the Roblox button opens and closes the menu, the unibar's chat
+  button opens the chat window with its box focused (hidden with
+  SetCoreGuiEnabled(Chat, false)). `StarterGui:SetCore("TopbarEnabled",
+  false)` hides the bar and `SetCore("ChatActive", open)` opens / closes
+  the chat, as the CoreScripts' registerSetCores does, and
+  `GetCore("TopbarEnabled")` reads it back (TopbarPlus's IconController
+  polls it; the other GetCore keys still return nil) (src/play_game.rs
+  `top_bar`, src/runtime_ext.rs; test `set_core_topbar_and_chat`). Not
+  done: the unibar's other icons (captures, emotes, leaderboard,
+  inventory), the health bar, notifications; a hidden bar keeps the 58 px
+  GuiInset (Roblox drops it to 0 — ScreenGuis then start at the top).
 
 ## Coverage of Studio's API
 

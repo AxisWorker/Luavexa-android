@@ -110,6 +110,9 @@ pub struct GameState {
     local_plays: u64,
     pub flashes: Vec<Flash>,
     pub chat_open: bool,
+    /// The chat box takes the keyboard next frame (the top bar's chat
+    /// button, SetCore("ChatActive", true)).
+    pub chat_focus: bool,
     /// Frames the playtest view had chat available but closed: where the
     /// old "Press / to chat" hint was drawn (the self-test checks none is).
     pub chat_ready_frames: u64,
@@ -1112,6 +1115,12 @@ impl Editor {
                         s.game.states_off.insert(state);
                     }
                 }
+            }
+        }
+        if let (Side::Client, Some(on)) = (side, reqs.chat_active) {
+            if let Some(s) = self.play.as_mut() {
+                s.game.chat_open = on;
+                s.game.chat_focus = on;
             }
         }
     }
@@ -2517,10 +2526,39 @@ impl Editor {
         if !menu {
             self.emote_wheel(ui, rect, &mut slots);
         }
+        // Roblox's top bar over the game (the CoreScripts' TopBar, drawn
+        // after the menu: its button closes an open menu too).
+        let topbar_on = self
+            .play
+            .as_ref()
+            .and_then(|s| s.client.as_ref())
+            .and_then(|c| c.world.as_ref())
+            .is_none_or(|w| !w.topbar_off);
+        let mut close_chat = false;
+        if topbar_on {
+            let (menu_tap, chat_tap) = self.top_bar(ui, rect, chat_on && !menu, chat_open_now, menu);
+            if menu_tap {
+                self.toggle_game_menu();
+            }
+            if chat_tap {
+                if chat_open_now {
+                    close_chat = true;
+                } else {
+                    open_chat = true;
+                }
+            }
+        }
         let mut sent: Option<String> = None;
         if let Some(s) = self.play.as_mut() {
             if open_chat {
                 s.game.chat_open = true;
+            }
+            if close_chat {
+                s.game.chat_open = false;
+                s.game.chat_text.clear();
+            }
+            if std::mem::take(&mut s.game.chat_focus) {
+                open_chat = true;
             }
             let box_rect = input_rect.unwrap_or(Rect::from_min_size(
                 Pos2::new(rect.min.x + 10.0, rect.max.y - 38.0),
@@ -2580,6 +2618,75 @@ impl Editor {
             }
         }
         true
+    }
+
+    /// Roblox's top bar over the game view (the CoreScripts' TopBar with
+    /// Chrome: Constants.lua — a 58 px bar, 44 px buttons, 16 px in from
+    /// the side, 12 px apart): the Roblox button (the menu) at the left
+    /// and, in the unibar's pill after it, the chat button while Roblox's
+    /// chat is on (SetCoreGuiEnabled). Taps on them never reach the game
+    /// (the touch layer keeps fingers landing on `Zones::ui` as egui's;
+    /// egui gives a click to the widget on top). Returns (menu tapped,
+    /// chat tapped). Studio's playtest draws the same bar; on a phone it
+    /// is the only way to the menu and the chat.
+    fn top_bar(&mut self, ui: &mut egui::Ui, rect: Rect, chat: bool, chat_open: bool, menu_open: bool) -> (bool, bool) {
+        const BAR_H: f32 = 58.0;
+        const BUTTON: f32 = 44.0;
+        const SIDE: f32 = 16.0;
+        const GAP: f32 = 12.0;
+        const ICON: f32 = 24.0;
+        let white = Color32::WHITE;
+        let painter = ui.painter_at(rect);
+        let y = rect.min.y + (BAR_H - BUTTON) * 0.5;
+        let menu_rect = Rect::from_min_size(Pos2::new(rect.min.x + SIDE, y), egui::vec2(BUTTON, BUTTON));
+        self.touch.zones.ui.push(menu_rect);
+        let menu_resp = ui.interact(menu_rect, ui.id().with("topbar_menu"), egui::Sense::click());
+        if menu_resp.hovered() || menu_open {
+            painter.rect_filled(menu_rect, BUTTON * 0.5, Color32::from_white_alpha(if menu_open { 40 } else { 24 }));
+        }
+        // Roblox's tilt icon: a square turned 20°, hollow (a thick outline).
+        let c = menu_rect.center();
+        let half = ICON * 0.5 * 0.72;
+        let rot = egui::emath::Rot2::from_angle(-20f32.to_radians());
+        let pts: Vec<Pos2> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+            .iter()
+            .map(|(x, y): &(f32, f32)| c + rot * egui::vec2(*x * half, *y * half))
+            .collect();
+        painter.add(egui::Shape::closed_line(pts, Stroke::new(ICON * 0.24, white)));
+        let mut chat_tap = false;
+        if chat {
+            // The unibar: a pill from ScreenSideOffset + TopBarPadding past
+            // the menu button, one 44 px button wide.
+            let pill = Rect::from_min_size(
+                Pos2::new(rect.min.x + SIDE + BUTTON + GAP + 2.0, y),
+                egui::vec2(BUTTON + 8.0, BUTTON),
+            );
+            self.touch.zones.ui.push(pill);
+            let resp = ui.interact(pill, ui.id().with("topbar_chat"), egui::Sense::click());
+            painter.rect_filled(pill, BUTTON * 0.5, Color32::from_rgba_unmultiplied(17, 18, 21, if resp.hovered() { 200 } else { 140 }));
+            // A speech bubble, filled while the chat is open.
+            let bc = pill.center() + egui::vec2(0.0, -1.5);
+            let bubble = Rect::from_center_size(bc, egui::vec2(ICON * 0.92, ICON * 0.7));
+            let tail = [
+                Pos2::new(bubble.left() + 5.0, bubble.bottom() - 1.0),
+                Pos2::new(bubble.left() + 5.0, bubble.bottom() + 5.0),
+                Pos2::new(bubble.left() + 11.0, bubble.bottom() - 1.0),
+            ];
+            if chat_open {
+                painter.rect_filled(bubble, 5.0, white);
+                painter.add(egui::Shape::convex_polygon(tail.to_vec(), white, Stroke::NONE));
+            } else {
+                painter.rect_stroke(bubble, 5.0, Stroke::new(2.0, white), egui::StrokeKind::Inside);
+                painter.add(egui::Shape::convex_polygon(tail.to_vec(), white, Stroke::NONE));
+                painter.add(egui::Shape::convex_polygon(
+                    vec![tail[0] + egui::vec2(2.0, -2.0), tail[0] + egui::vec2(2.0, 0.0), tail[2] + egui::vec2(-2.0, 0.0)],
+                    Color32::from_rgba_unmultiplied(17, 18, 21, 200),
+                    Stroke::NONE,
+                ));
+            }
+            chat_tap = resp.clicked();
+        }
+        (menu_resp.clicked(), chat_tap)
     }
 
     /// The part under the game's mouse: the shown side's world query, as

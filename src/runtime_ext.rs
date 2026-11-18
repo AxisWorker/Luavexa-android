@@ -40,6 +40,9 @@ pub struct Requests {
     pub sits: Vec<(Ref, Ref)>,
     /// Humanoid:SetStateEnabled: (humanoid, state name, enabled).
     pub state_enabled: Vec<(Ref, String, bool)>,
+    /// StarterGui:SetCore("ChatActive", open): the chat window and its
+    /// box open (focused) or close.
+    pub chat_active: Option<bool>,
 }
 
 /// What the play session tells scripts each frame.
@@ -47,8 +50,8 @@ pub struct Requests {
 pub struct Inputs {
     /// The in-game menu is open (GuiService.MenuIsOpen).
     pub menu_open: bool,
-    /// Gamepads plugged in (slots Gamepad1.. in order).
-    pub gamepads: usize,
+    /// Connected gamepad slots, from the least significant bit (Gamepad1).
+    pub gamepads: u8,
     /// Point and part under the cursor (client).
     pub mouse_hit: Option<Xform>,
     pub mouse_target: Option<Ref>,
@@ -4588,8 +4591,23 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
         | "ApplyAngularImpulse"
         | "ApplyDescription"
         | "ClearCharacterAppearance"
-        | "BindToClose"
-        | "SetCore" => none(),
+        | "BindToClose" => none(),
+        // StarterGui:SetCore: the CoreScripts' settings this engine draws —
+        // the top bar and the chat window (play_game.rs); the rest
+        // (notifications, the reset callback, …) are taken and dropped.
+        "SetCore" => {
+            if let Value::String(key) = arg(args, 1) {
+                let key = key.to_str().map(|s| s.to_string()).unwrap_or_default();
+                let on = matches!(arg(args, 2), Value::Boolean(true));
+                let mut w = world(lua)?;
+                match key.as_str() {
+                    "TopbarEnabled" => w.topbar_off = !on,
+                    "ChatActive" => w.requests.chat_active = Some(on),
+                    _ => {}
+                }
+            }
+            none()
+        }
         "GetModelCFrame" => {
             let xf = model_pivot(&*world(lua)?, this);
             one(cframe_value(lua, xf)?)
@@ -5394,7 +5412,18 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
         }
         "IsMouseButtonPressed" => one(Value::Boolean(false)),
         "GetKeysPressed" => one(Value::Table(lua.create_table()?)),
-        "GetCore" => one(Value::Nil),
+        "GetCore" => {
+            // TopbarEnabled reads back what SetCore set (TopbarPlus's
+            // IconController polls it); the other keys have no value here.
+            let key = match arg(args, 1) {
+                Value::String(k) => k.to_str().map(|s| s.to_string()).unwrap_or_default(),
+                _ => String::new(),
+            };
+            match key.as_str() {
+                "TopbarEnabled" => one(Value::Boolean(!world(lua)?.topbar_off)),
+                _ => one(Value::Nil),
+            }
+        }
         "TeleportAsync" => {
             world(lua)?.output.push((
                 Level::Warn,
@@ -5677,13 +5706,13 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             Some(i) => one(crate::ltypes::enum_value(lua, i)?),
             None => one(Value::Nil),
         },
-        // The pads the session sees (play.rs gamepad_devices).
+        // The slots assigned by the Play session.
         "GetConnectedGamepads" | "GetNavigationGamepads" => {
             let n = world(lua)?.input.gamepads;
             let t = lua.create_table()?;
-            for i in 0..n {
+            for i in (0..8).filter(|i| n & (1 << i) != 0) {
                 if let Some(e) = LEnumItem::from_name("UserInputType", &format!("Gamepad{}", i + 1)) {
-                    t.set(i + 1, crate::ltypes::enum_value(lua, e)?)?;
+                    t.push(crate::ltypes::enum_value(lua, e)?)?;
                 }
             }
             one(Value::Table(t))
@@ -5692,7 +5721,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             let n = world(lua)?.input.gamepads;
             let slot = opt_ud::<LEnumItem>(&arg(args, 1))
                 .and_then(|e| e.name.strip_prefix("Gamepad").and_then(|k| k.parse::<usize>().ok()));
-            one(Value::Boolean(slot.is_some_and(|k| k >= 1 && k <= n)))
+            one(Value::Boolean(slot.is_some_and(|k| (1..=8).contains(&k) && n & (1 << (k - 1)) != 0)))
         }
         "FillBlock" | "FillBall" | "FillCylinder" | "FillWedge" | "FillRegion" | "Clear"
         | "ReplaceMaterial" | "SetMaterialColor" | "GetMaterialColor" | "WriteVoxels" | "ReadVoxels"

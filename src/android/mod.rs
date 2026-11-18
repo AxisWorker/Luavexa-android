@@ -15,6 +15,9 @@
 //!   in `suspended()` and makes them again in `resumed()`, so the GPU
 //!   objects survive the activity going to the background; a rotation
 //!   arrives as a resize and the swapchain is reconfigured.
+//! * The window: the whole screen, the navigation and status bars hidden
+//!   until a swipe from the edge shows them for a moment
+//!   ([`system_bars`]).
 //! * The Roblox services with a device behind them ([`jni`]: Vibrator,
 //!   orientation, window insets, connectivity; [`sensors`]: accelerometer,
 //!   gyroscope, rotation; [`storage`]: files opened through the system
@@ -34,6 +37,7 @@ pub mod memory;
 pub mod perf_hint;
 pub mod sensors;
 pub mod storage;
+pub mod system_bars;
 pub mod text_menu;
 pub mod turnip;
 
@@ -209,6 +213,9 @@ pub fn run(app: AndroidApp) {
         return;
     }
     export_env();
+    // The navigation and status bars out of the way (immersive mode), on
+    // the main thread when it gets to it; the window grows to the screen.
+    system_bars::hide();
     log::info!(
         "files {} / data {} / cache {}",
         files_dir().display(),

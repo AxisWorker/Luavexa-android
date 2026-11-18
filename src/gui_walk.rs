@@ -287,70 +287,128 @@ impl Walk<'_, '_> {
                         content.width()
                     }
                     + pad[1] * dn.scale;
+                // The flex settings (list-flex-layouts): Wraps breaks the
+                // list into lines at the fill axis' extent; HorizontalFlex /
+                // VerticalFlex (UIFlexAlignment: None 0, Fill 1, SpaceAround
+                // 2, SpaceBetween 3, SpaceEvenly 4) grow the items or spread
+                // them along the fill axis, and spread the lines across it;
+                // ItemLineAlignment (Automatic 0, Start 1, Center 2, End 3,
+                // Stretch 4) sets the items within their line.
+                let wraps = boolp(d, lay, "Wraps", false);
+                let hflex = enum_u32(d.prop(lay, "HorizontalFlex")).unwrap_or(0);
+                let vflex = enum_u32(d.prop(lay, "VerticalFlex")).unwrap_or(0);
+                let (main_flex, cross_flex) = if vertical { (vflex, hflex) } else { (hflex, vflex) };
+                // Center 0, Left / Top 1, Right / Bottom 2 on each axis.
+                let (main_align, cross_align) = if vertical { (valign, halign) } else { (halign, valign) };
+                let line_align = match enum_u32(d.prop(lay, "ItemLineAlignment")).unwrap_or(0) {
+                    // Automatic: the alignment across the fill axis — and
+                    // Fill across stretches the items to their line.
+                    0 if cross_flex == 1 => 4,
+                    0 => match cross_align {
+                        0 => 2,
+                        2 => 3,
+                        _ => 1,
+                    },
+                    a => a,
+                };
+                let (room_main, room_cross) = if vertical {
+                    (content.height(), content.width())
+                } else {
+                    (content.width(), content.height())
+                };
                 let mut sizes: Vec<egui::Vec2> = order
                     .iter()
                     .map(|k| self.own_size(*k, content, dn.scale, 0))
                     .collect();
-                let mut total: f32 = sizes
-                    .iter()
-                    .map(|s| if vertical { s.y } else { s.x })
-                    .sum::<f32>()
-                    + gap * order.len().saturating_sub(1) as f32;
-                // UIFlexItem: Grow / Fill / Custom (GrowRatio) children share
-                // the room left on the fill axis by their ratio (Model
-                // Reflect's title label is Size (0, 28) and grows to the
-                // rest of its header row).
-                let room = if vertical { content.height() } else { content.width() } - total;
-                if room > 0.0 {
-                    let ratios: Vec<f32> = order.iter().map(|k| flex_grow(d, *k)).collect();
-                    let sum: f32 = ratios.iter().sum();
-                    if sum > 0.0 {
-                        for (s, r) in sizes.iter_mut().zip(&ratios) {
-                            let add = room * r / sum;
+                let ratios: Vec<f32> = order.iter().map(|k| flex_grow(d, *k)).collect();
+                let lines = list_lines(&sizes, vertical, wraps, room_main, gap);
+                // Across the fill axis: the lines, their gaps and the room
+                // left, shared by the lines (Fill), spread between them, or
+                // put before / after the block (the alignment).
+                let n_lines = lines.len() as f32;
+                let cross_total: f32 = lines.iter().map(|l| l.across).sum::<f32>()
+                    + gap * lines.len().saturating_sub(1) as f32;
+                let cross_room = room_cross - cross_total;
+                let (mut cross_at, cross_gap, line_grow) = match cross_flex {
+                    1 if cross_room > 0.0 => (0.0, gap, cross_room / n_lines),
+                    2 if cross_room > 0.0 => (cross_room / n_lines * 0.5, gap + cross_room / n_lines, 0.0),
+                    3 if cross_room > 0.0 && lines.len() > 1 => (0.0, gap + cross_room / (n_lines - 1.0), 0.0),
+                    4 if cross_room > 0.0 => (cross_room / (n_lines + 1.0), gap + cross_room / (n_lines + 1.0), 0.0),
+                    1..=4 => (0.0, gap, 0.0),
+                    _ => (
+                        match cross_align {
+                            0 => cross_room * 0.5,
+                            2 => cross_room,
+                            _ => 0.0,
+                        },
+                        gap,
+                        0.0,
+                    ),
+                };
+                for line in &lines {
+                    let line_across = line.across + line_grow;
+                    let idx = line.items.clone();
+                    let count = idx.len() as f32;
+                    // Along the fill axis: the room this line leaves goes to
+                    // the growing items (UIFlexItem Grow / Fill / Custom by
+                    // their ratio; with Fill, every item: Model Reflect's
+                    // title label is Size (0, 28) and grows to the rest of
+                    // its header row), or is spread as spacing.
+                    let room = room_main - line.along;
+                    let sum: f32 = idx.clone().map(|i| ratios[i]).sum();
+                    let (main_at, main_gap) = if room > 0.0 && (main_flex == 1 || sum > 0.0) {
+                        let r: Vec<f32> = idx.clone().map(|i| if sum > 0.0 { ratios[i] } else { 1.0 }).collect();
+                        let rsum: f32 = r.iter().sum();
+                        for (j, i) in idx.clone().enumerate() {
+                            let add = room * r[j] / rsum;
                             if vertical {
-                                s.y += add;
+                                sizes[i].y += add;
                             } else {
-                                s.x += add;
+                                sizes[i].x += add;
                             }
                         }
-                        total += room;
-                    }
-                }
-                let mut at = if vertical {
-                    content.top()
-                        + match valign {
-                            0 => (content.height() - total) * 0.5,
-                            2 => content.height() - total,
-                            _ => 0.0,
-                        }
-                } else {
-                    content.left()
-                        + match halign {
-                            0 => (content.width() - total) * 0.5,
-                            2 => content.width() - total,
-                            _ => 0.0,
-                        }
-                };
-                for (k, s) in order.iter().zip(sizes) {
-                    let r = if vertical {
-                        let x = content.left()
-                            + match halign {
-                                0 => (content.width() - s.x) * 0.5,
-                                2 => content.width() - s.x,
-                                _ => 0.0,
-                            };
-                        Rect::from_min_size(Pos2::new(x, at), s)
+                        (0.0, gap)
                     } else {
-                        let y = content.top()
-                            + match valign {
-                                0 => (content.height() - s.y) * 0.5,
-                                2 => content.height() - s.y,
-                                _ => 0.0,
-                            };
-                        Rect::from_min_size(Pos2::new(at, y), s)
+                        match main_flex {
+                            2 if room > 0.0 => (room / count * 0.5, gap + room / count),
+                            3 if room > 0.0 && count > 1.0 => (0.0, gap + room / (count - 1.0)),
+                            4 if room > 0.0 => (room / (count + 1.0), gap + room / (count + 1.0)),
+                            1..=4 => (0.0, gap),
+                            _ => (
+                                match main_align {
+                                    0 => room * 0.5,
+                                    2 => room,
+                                    _ => 0.0,
+                                },
+                                gap,
+                            ),
+                        }
                     };
-                    placed.insert(*k, r);
-                    at += if vertical { s.y } else { s.x } + gap;
+                    let mut at = main_at;
+                    for i in idx {
+                        let s = sizes[i];
+                        let (along, across) = if vertical { (s.y, s.x) } else { (s.x, s.y) };
+                        let (off, size) = match line_align {
+                            4 => (0.0, line_across),
+                            2 => ((line_across - across) * 0.5, across),
+                            3 => (line_across - across, across),
+                            _ => (0.0, across),
+                        };
+                        let r = if vertical {
+                            Rect::from_min_size(
+                                Pos2::new(content.left() + cross_at + off, content.top() + at),
+                                egui::vec2(size, along),
+                            )
+                        } else {
+                            Rect::from_min_size(
+                                Pos2::new(content.left() + at, content.top() + cross_at + off),
+                                egui::vec2(along, size),
+                            )
+                        };
+                        placed.insert(order[i], r);
+                        at += along + main_gap;
+                    }
+                    cross_at += line_across + cross_gap;
                 }
             }
         }
@@ -497,13 +555,17 @@ impl Walk<'_, '_> {
                 } else {
                     inner.width()
                 } + p[1] * scale;
-            let mut along = 0.0f32;
-            let mut across = 0.0f32;
-            for (i, k) in kids.iter().enumerate() {
-                let s = self.auto_child_size(*k, inner, scale, auto, depth + 1);
-                along += if vertical { s.y } else { s.x } + if i > 0 { gap } else { 0.0 };
-                across = across.max(if vertical { s.x } else { s.y });
-            }
+            let sizes: Vec<egui::Vec2> = kids
+                .iter()
+                .map(|k| self.auto_child_size(*k, inner, scale, auto, depth + 1))
+                .collect();
+            // A wrapping list breaks at the fill axis' extent — unless that
+            // axis is the one growing (nothing to wrap at: one line).
+            let main_auto = if vertical { auto & 2 != 0 } else { auto & 1 != 0 };
+            let room = if vertical { inner.height() } else { inner.width() };
+            let lines = list_lines(&sizes, vertical, boolp(d, lay, "Wraps", false) && !main_auto, room, gap);
+            let along = lines.iter().map(|l| l.along).fold(0.0f32, f32::max);
+            let across = lines.iter().map(|l| l.across).sum::<f32>() + gap * lines.len().saturating_sub(1) as f32;
             let e = if vertical {
                 egui::vec2(across, along)
             } else {
@@ -849,6 +911,8 @@ impl Walk<'_, '_> {
         if frame_style == 3 {
             corner = Some(8.0 * me.scale);
         }
+        // UIShadow: the box's drop shadow, under its background.
+        self.shadow(r, rect, corner.unwrap_or(0.0), &me);
         let gradient = child_of_class(d, r, "UIGradient");
         let is_button = doc::is_a(&class, "GuiButton");
         let mut bg_t = num(d, r, "BackgroundTransparency", 0.0);
@@ -1651,6 +1715,42 @@ fn flex_grow(d: &Document, k: Ref) -> f32 {
     }
 }
 
+/// A line of a UIListLayout: which of the (sorted) items it holds, and
+/// their extent along the fill axis (gaps included) and across it (the
+/// largest).
+pub(super) struct ListLine {
+    pub items: std::ops::Range<usize>,
+    pub along: f32,
+    pub across: f32,
+}
+
+/// The lines of a UIListLayout over `sizes` (the items in layout order):
+/// one, unless it `wraps` and they overflow `room` along the fill axis —
+/// then each line takes the items that fit, at least one (UIListLayout.Wraps).
+pub(super) fn list_lines(sizes: &[egui::Vec2], vertical: bool, wraps: bool, room: f32, gap: f32) -> Vec<ListLine> {
+    let along = |s: &egui::Vec2| if vertical { s.y } else { s.x };
+    let across = |s: &egui::Vec2| if vertical { s.x } else { s.y };
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let (mut a, mut c) = (0.0f32, 0.0f32);
+    for (i, s) in sizes.iter().enumerate() {
+        let add = along(s) + if i > start { gap } else { 0.0 };
+        if wraps && i > start && a + add > room + 1e-3 {
+            lines.push(ListLine { items: start..i, along: a, across: c });
+            start = i;
+            a = along(s);
+            c = across(s);
+        } else {
+            a += add;
+            c = c.max(across(s));
+        }
+    }
+    if !sizes.is_empty() {
+        lines.push(ListLine { items: start..sizes.len(), along: a, across: c });
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1751,6 +1851,118 @@ mod layout_tests {
             assert!((b(custom).size[0] - 160.0).abs() < 0.01 && (b(custom).pos[0] - 90.0).abs() < 0.01, "{:?}", b(custom).size);
             let l = b(label);
             assert!(l.size[0] <= 250.0 && l.size[0] > 200.0 && l.size[1] > 40.0, "wrapped at the parent's width: {:?}", l.size);
+        });
+        out.textures_delta.clear();
+    }
+
+    /// UIListLayout.Wraps: a horizontal list breaks into lines at its
+    /// parent's width (five 40 px tiles, 5 px apart, in 100 px: two, two,
+    /// one), the lines stacked by the same Padding; HorizontalFlex
+    /// SpaceBetween spreads each line's items to its ends and
+    /// ItemLineAlignment Stretch gives a short item its line's height. An
+    /// AutomaticSize Y holder of such a list is as tall as its lines
+    /// (LBG's 90 wrapping lists: shop rows and the player list).
+    #[test]
+    fn list_wraps_and_flexes() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let tile = |doc: &mut Document, parent: Ref, n: i32, h: i32| {
+            doc.dom.insert(parent, InstanceBuilder::new("Frame").with_property("LayoutOrder", n)
+                .with_property("Size", UDim2::new(UDim::new(0.0, 40), UDim::new(0.0, h))))
+        };
+        let wrap = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        doc.dom.insert(wrap, InstanceBuilder::new("UIListLayout")
+            .with_property("FillDirection", Enum::from_u32(0))
+            .with_property("Padding", UDim::new(0.0, 5))
+            .with_property("Wraps", true));
+        let tiles: Vec<Ref> = (0..5).map(|n| tile(&mut doc, wrap, n, 20)).collect();
+        let spread = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        doc.dom.insert(spread, InstanceBuilder::new("UIListLayout")
+            .with_property("FillDirection", Enum::from_u32(0))
+            .with_property("Padding", UDim::new(0.0, 5))
+            .with_property("Wraps", true)
+            .with_property("HorizontalFlex", Enum::from_u32(3))
+            .with_property("ItemLineAlignment", Enum::from_u32(4)));
+        let a = tile(&mut doc, spread, 0, 20);
+        let b = tile(&mut doc, spread, 1, 10);
+        let c = tile(&mut doc, spread, 2, 20);
+        let page = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let holder = doc.dom.insert(page, InstanceBuilder::new("Frame")
+            .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 0)))
+            .with_property("AutomaticSize", Enum::from_u32(2)));
+        doc.dom.insert(holder, InstanceBuilder::new("UIListLayout")
+            .with_property("FillDirection", Enum::from_u32(0))
+            .with_property("Padding", UDim::new(0.0, 5))
+            .with_property("Wraps", true));
+        for n in 0..5 {
+            tile(&mut doc, holder, n, 20);
+        }
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(100.0, 200.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
+            let dn = Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 };
+            walk.children(wrap, rect, dn);
+            walk.children(spread, rect, dn);
+            walk.children(page, rect, dn);
+            let b_ = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1.clone();
+            let at: Vec<[f32; 2]> = tiles.iter().map(|t| b_(*t).pos).collect();
+            assert_eq!(at, vec![[0.0, 0.0], [45.0, 0.0], [0.0, 25.0], [45.0, 25.0], [0.0, 50.0]], "wrapped lines");
+            // SpaceBetween: a (0) and b (60) at the line's ends, 15 px of
+            // room spread into the gap; c alone on the second line, at the
+            // start. Stretch: b is 20 tall like its line.
+            assert!((b_(a).pos[0] - 0.0).abs() < 0.01 && (b_(b).pos[0] - 60.0).abs() < 0.01, "{:?} {:?}", b_(a).pos, b_(b).pos);
+            assert!((b_(c).pos[0] - 0.0).abs() < 0.01 && (b_(c).pos[1] - 25.0).abs() < 0.01, "{:?}", b_(c).pos);
+            assert!((b_(b).size[1] - 20.0).abs() < 0.01, "stretched {:?}", b_(b).size);
+            let h = b_(holder);
+            assert!((h.size[0] - 100.0).abs() < 0.01 && (h.size[1] - 70.0).abs() < 0.01, "AutomaticSize Y holds the three lines: {:?}", h.size);
+        });
+        out.textures_delta.clear();
+    }
+
+    /// UIShadow: a drop shadow of the box — soft over BlurRadius (10 px:
+    /// from 5 px inside the box's edge to 5 px out), in its Color at
+    /// 1 - Transparency — drawn under the box's background (LBG's 138:
+    /// glows on its result frames and buttons).
+    #[test]
+    fn ui_shadow_under_the_box() {
+        use rbx_dom_weak::types::Color3;
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let page = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let frame = doc.dom.insert(page, InstanceBuilder::new("Frame")
+            .with_property("Position", UDim2::new(UDim::new(0.0, 50), UDim::new(0.0, 50)))
+            .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 50))));
+        doc.dom.insert(frame, InstanceBuilder::new("UIShadow")
+            .with_property("BlurRadius", UDim::new(0.0, 10))
+            .with_property("Color", Color3::new(1.0, 0.0, 0.0))
+            .with_property("Transparency", 0.5f32));
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 200.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
+            walk.children(page, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let bounds = |it: &Item| it.shape.visual_bounding_rect();
+            let shadow = walk.items.iter().find(|it| bounds(it).min.x < 46.0).expect("a shadow item");
+            let b = bounds(shadow);
+            assert!((b.min.x - 45.0).abs() < 0.5 && (b.max.x - 155.0).abs() < 0.5 && (b.min.y - 45.0).abs() < 0.5 && (b.max.y - 105.0).abs() < 0.5, "{b:?}");
+            let bg = walk.items.iter().find(|it| (bounds(it).min.x - 50.0).abs() < 0.01 && (bounds(it).max.x - 150.0).abs() < 0.01).expect("the background");
+            assert!(shadow.seq < bg.seq, "the shadow is under the box");
+            let Shape::Mesh(m) = &shadow.shape else { panic!("a mesh") };
+            assert!(m.vertices.iter().all(|v| v.color.g() == 0 && v.color.b() == 0), "red");
+            let a = m.vertices.iter().map(|v| v.color.a()).max().unwrap();
+            assert!((a as i32 - 128).abs() <= 2, "half transparent at the fullest: {a}");
+            assert!(m.vertices.iter().any(|v| v.color.a() == 0), "faded out at the edge");
         });
         out.textures_delta.clear();
     }

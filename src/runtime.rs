@@ -177,6 +177,9 @@ pub struct World {
     pub keys_down: HashSet<String>,
     /// Enum.CoreGuiType names turned off by StarterGui:SetCoreGuiEnabled.
     pub core_gui_off: HashSet<String>,
+    /// StarterGui:SetCore("TopbarEnabled", false) hid Roblox's top bar
+    /// (the menu button and the chat button over the game view).
+    pub topbar_off: bool,
     /// Current Enum.HumanoidStateType name per Humanoid (Humanoid:GetState).
     pub humanoid_states: HashMap<Ref, String>,
     /// Humanoid:SetStateEnabled(state, false) per Humanoid (state names).
@@ -605,6 +608,7 @@ impl World {
             load_character: Vec::new(),
             keys_down: HashSet::new(),
             core_gui_off: HashSet::new(),
+            topbar_off: false,
             humanoid_states: HashMap::new(),
             states_disabled: HashMap::new(),
             groups: crate::collision_groups::shared(),
@@ -6956,6 +6960,64 @@ mod tests {
     }
 
     #[test]
+    fn input_actions_keep_gamepad_sticks_and_other_held_bindings() {
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(Document::new_place(), RunMode::Play);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.lua.load(r#"
+            local ctx = Instance.new("InputContext", workspace)
+            ctx.Name = "TestInputContext"
+            local move = Instance.new("InputAction", ctx)
+            move.Name = "Move"
+            move.Type = Enum.InputActionType.Direction2D
+            local stick = Instance.new("InputBinding", move)
+            stick.KeyCode = Enum.KeyCode.Thumbstick1
+            stick.Deadzone = NumberRange.new(0, 1)
+            stick.ResponseCurve = 2
+            local keyboard = Instance.new("InputBinding", move)
+            keyboard.Up = Enum.KeyCode.W
+
+            local jump = Instance.new("InputAction", ctx)
+            jump.Name = "Jump"
+            local button = Instance.new("InputBinding", jump)
+            button.KeyCode = Enum.KeyCode.ButtonA
+        "#).exec().unwrap();
+        rt.step(1.0 / 60.0);
+        rt.lua.load(r#"
+            local move = workspace.TestInputContext.Move
+            local jump = workspace.TestInputContext.Jump
+            local presses, releases = 0, 0
+            jump.Pressed:Connect(function() presses += 1 end)
+            jump.Released:Connect(function() releases += 1 end)
+
+            local function input(state, device, key, x)
+                __rs_input_event(state, device, key, x or 0, 0, 0, 0, 0, false)
+            end
+            input("Change", "Gamepad1", "Thumbstick1", .5)
+            assert(move:GetState() == Vector2.new(.25, 0), tostring(move:GetState()))
+            __rs_input_frame_end(1/60)
+            input("Begin", "Keyboard", "W")
+            assert(move:GetState() == Vector2.new(.25, 1))
+            input("Change", "Gamepad1", "Thumbstick1", 0)
+            assert(move:GetState() == Vector2.new(0, 1))
+            input("End", "Keyboard", "W")
+            assert(move:GetState() == Vector2.zero)
+            input("Begin", "Gamepad1", "ButtonA")
+            input("Begin", "Gamepad2", "ButtonA")
+            input("End", "Gamepad1", "ButtonA")
+            assert(jump:GetState())
+            input("End", "Gamepad2", "ButtonA")
+            assert(not jump:GetState())
+            task.defer(function() assert(presses == 1 and releases == 1) end)
+        "#).exec().unwrap();
+        rt.step(1.0 / 60.0);
+        let out = rt.leave().output;
+        assert!(out.iter().all(|(level, _)| *level != Level::Error), "{out:?}");
+    }
+
+    #[test]
     fn render_callbacks_run_before_waiting_tasks_resume() {
         let rt = Runtime::new().unwrap();
         rt.enter(World::new(Document::new_place(), RunMode::Run));
@@ -7712,6 +7774,42 @@ mod legacy_tests {
         assert!(has("invoke server returned x!"), "{out:?}");
         assert!(has("done 42 x!"), "{out:?}");
         assert!(!out.iter().any(|(l, _)| *l == Level::Error), "{out:?}");
+    }
+
+    /// StarterGui:SetCore("TopbarEnabled" / "ChatActive"): the top bar
+    /// over the game hides, the chat window opens (play_game.rs draws
+    /// both); other SetCore keys are taken quietly, as before.
+    #[test]
+    fn set_core_topbar_and_chat() {
+        let mut d = Document::new_place();
+        let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
+        let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
+        let src = r#"
+            local sg = game:GetService("StarterGui")
+            assert(sg:GetCore("TopbarEnabled") == true, "topbar on at first")
+            sg:SetCore("TopbarEnabled", false)
+            assert(sg:GetCore("TopbarEnabled") == false, "GetCore reads SetCore back")
+            sg:SetCore("ChatActive", true)
+            sg:SetCore("ResetButtonCallback", false)
+            sg:SetCore("SendNotification", { Title = "t", Text = "x" })
+            print("set")
+        "#;
+        let s = d.dom.insert(
+            sps,
+            InstanceBuilder::new("LocalScript").with_name("T").with_property("Source", src.to_string()),
+        );
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(d, RunMode::Run);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        rt.step(1.0 / 60.0);
+        let w = rt.leave();
+        assert!(w.output.iter().any(|(_, t)| t.starts_with("set")), "{:?}", w.output);
+        assert!(!w.output.iter().any(|(l, _)| *l == Level::Error), "{:?}", w.output);
+        assert!(w.topbar_off);
+        assert_eq!(w.requests.chat_active, Some(true));
     }
 
     /// an admin script's client anti-tamper, condensed (Client.Core.Anti and

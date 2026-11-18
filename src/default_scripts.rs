@@ -11,26 +11,42 @@
 //! (`~/.local/share/rustudio/studio`, see studio_content.rs), else
 //! `~/.local/share/rustudio/studio`.
 //!
-//! - Studio's current layout (checked in Vinegar's Studio 0.747 at Play:
-//!   checks/humanoid-physics/feel/studio-0.747-starterplayer-tree.txt), used
-//!   unless Workspace.PlayerScriptsUseInputActionSystem is Disabled:
-//!   `StarterPlayer.PlayerModule` (ModuleScript tree with CameraModule,
-//!   ControlModule, PlayerModuleInternal …, the Scripts PlayerScriptsLoader
-//!   (RunContext Client) and InputSetup (RunContext Server), and the
-//!   `InputContexts` folder of InputContext / InputAction / InputBinding
-//!   objects the modules read their input from), and
+//! Which player scripts a place gets is `Workspace.PlayerScriptsUseInput-
+//! ActionSystem` (Enum.RolloutState Default / Disabled / Enabled), read as
+//! Roblox's client reads it today (`input_action_system_on`):
+//!
+//! - Enabled — the Input Action System layout (checked in Vinegar's Studio
+//!   0.747 at Play: checks/humanoid-physics/feel/studio-0.747-starterplayer-
+//!   tree.txt): `StarterPlayer.PlayerModule` (ModuleScript tree with
+//!   CameraModule, ControlModule, PlayerModuleInternal …, the Scripts
+//!   PlayerScriptsLoader (RunContext Client) and InputSetup (RunContext
+//!   Server), and the `InputContexts` folder of InputContext / InputAction /
+//!   InputBinding objects the modules read their input from), and
 //!   StarterPlayerScripts.`RbxCharacterSounds`. The tree is the install's
-//!   own project file, `ExtraContent/scripts/PlayerScripts/PlayerScripts.rbxp`
-//!   (0.748 keeps the InputContexts tree in its own `InputContexts.rbxp`,
-//!   named as a `$path`).
-//! - The older layout (that property Disabled, an install without the
-//!   project file, or a place with its own PlayerModule / PlayerScriptsLoader
-//!   in StarterPlayerScripts): StarterPlayerScripts gets `PlayerScriptsLoader`
+//!   own project file, `ExtraContent/scripts/PlayerScripts/PlayerScripts.rbxp`.
+//!   Studio 0.748 and later reference an external `InputContexts.rbxp` subtree.
+//!   `StarterPlayer.CreateDefaultPlayerModule` false (a forked module) leaves
+//!   the PlayerModule out.
+//! - Default and Disabled — the classic layout, the one every place without
+//!   the opt-in gets in Roblox's client: the rollout's phase 1 (through
+//!   2026; phase 2 — Default meaning Enabled — early 2027; devforum "Input
+//!   Action System: PlayerScripts rollout", t/4678416) resolves Default to
+//!   Disabled, so a live Baseplate's
+//!   `Player.PlayerScripts` holds `PlayerScriptsLoader`, `PlayerModule` and
+//!   `RbxCharacterSounds`, and games `require(PlayerScripts.PlayerModule)
+//!   :GetControls()`. StarterPlayerScripts gets `PlayerScriptsLoader`
 //!   (LocalScript), `PlayerModule` (ModuleScript tree: CameraModule,
-//!   ControlModule, CommonUtils) and `RbxCharacterSounds` (LocalScript +
-//!   AtomicBinding), from
+//!   ControlModule, CommonUtils — `OldPlayerScripts.rbxp`'s tree) and
+//!   `RbxCharacterSounds` (LocalScript + AtomicBinding), from
 //!   `ExtraContent/scripts/PlayerScripts/StarterPlayerScripts` and
-//!   `StarterPlayerScriptsCommon`.
+//!   `StarterPlayerScriptsCommon`; the client copies them into
+//!   `Player.PlayerScripts` at join (play.rs). The same layout serves an
+//!   install without the project file and a place with its own PlayerModule
+//!   / PlayerScriptsLoader in StarterPlayerScripts (its own win, the loader
+//!   is added). `mech::PLAYER_SCRIPTS_DEFAULT_IAS` is where Default flips
+//!   when Roblox's phase 2 comes (the 0.747 Studio capture above is of the
+//!   Enabled layout; what a published place's players get is the rollout's
+//!   reading of Default).
 //! - Each new character gets `Health` (Script,
 //!   `content/avatar/scripts/humanoidHealthRegenScript.rbxmx`) and `Animate`
 //!   (LocalScript with its animation values: R15
@@ -214,13 +230,9 @@ fn script_node(name: &str, class: &str, run_context: Option<u32>, source: String
 }
 
 /// A file or folder of the project as an instance: a folder with an
-/// `init*.lua` is that script with the rest as children, else a Folder; a
-/// project file of its own (`.rbxp`) is its tree.
+/// `init*.lua` is that script with the rest as children, else a Folder.
 fn path_node(p: &Path, name: &str) -> Option<Node> {
     if p.is_file() {
-        if p.extension().is_some_and(|e| e == "rbxp") {
-            return project_file(p, name);
-        }
         let (_, class, rc) = script_kind(p.file_name()?.to_str()?)?;
         return Some(script_node(name, class, rc, read(p)?));
     }
@@ -251,19 +263,54 @@ fn path_node(p: &Path, name: &str) -> Option<Node> {
     Some(node)
 }
 
-/// A project node laid over what its `$path` gave (or a new instance):
-/// `$className`, `$properties`, and its children by name.
-fn project_node(name: &str, j: &serde_json::Value, base: &Path) -> Option<Node> {
-    let mut node = match j.get("$path").and_then(|p| p.as_str()) {
-        Some(p) => path_node(&base.join(p), name)?,
-        None => Node::new(name, if name == "StarterPlayerScripts" { "StarterPlayerScripts" } else { "Folder" }),
-    };
-    apply_project(&mut node, j, base);
-    Some(node)
+/// Read the instance tree from a Studio project, including standalone subtrees.
+fn project_tree(path: &Path) -> Result<serde_json::Value, String> {
+    let source = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut json: serde_json::Value =
+        serde_json::from_str(&source).map_err(|e| format!("{}: {e}", path.display()))?;
+    json.pointer_mut("/instanceHierarchy/tree")
+        .filter(|tree| tree.is_object())
+        .map(std::mem::take)
+        .ok_or_else(|| format!("{}: missing instanceHierarchy.tree", path.display()))
 }
 
-fn apply_project(node: &mut Node, j: &serde_json::Value, base: &Path) {
-    let Some(o) = j.as_object() else { return };
+/// Resolve a project node's source before applying its local overrides.
+fn project_node(
+    name: &str,
+    j: &serde_json::Value,
+    base: &Path,
+    includes: usize,
+) -> Result<Node, String> {
+    let mut node = match j.get("$path") {
+        Some(p) => {
+            let path = base.join(p.as_str().ok_or_else(|| format!("{name}: invalid $path"))?);
+            if path.extension().is_some_and(|ext| ext == "rbxp") {
+                if includes >= 32 {
+                    return Err(format!("{}: too many nested project references", path.display()));
+                }
+                let tree = project_tree(&path)?;
+                project_node(name, &tree, path.parent().unwrap_or(base), includes + 1)?
+            } else {
+                path_node(&path, name)
+                    .ok_or_else(|| format!("{}: cannot load project node {name}", path.display()))?
+            }
+        }
+        None => Node::new(
+            name,
+            if name == "StarterPlayerScripts" { "StarterPlayerScripts" } else { "Folder" },
+        ),
+    };
+    apply_project(&mut node, j, base, includes)?;
+    Ok(node)
+}
+
+fn apply_project(
+    node: &mut Node,
+    j: &serde_json::Value,
+    base: &Path,
+    includes: usize,
+) -> Result<(), String> {
+    let o = j.as_object().ok_or_else(|| format!("{}: expected a project node", node.name))?;
     if let Some(c) = o.get("$className").and_then(|c| c.as_str()) {
         node.class = c.to_string();
     }
@@ -279,53 +326,60 @@ fn apply_project(node: &mut Node, j: &serde_json::Value, base: &Path) {
             continue;
         }
         match node.children.iter_mut().find(|c| c.name == *k) {
-            Some(child) => apply_project(child, v, base),
-            None => node.children.extend(project_node(k, v, base)),
+            Some(child) if v.get("$path").is_some() => *child = project_node(k, v, base, includes)?,
+            Some(child) => apply_project(child, v, base, includes)?,
+            None => node.children.push(project_node(k, v, base, includes)?),
         }
     }
-}
-
-/// A project file's tree (`instanceHierarchy.tree`).
-fn project_tree(p: &Path) -> Option<serde_json::Value> {
-    let json: serde_json::Value = serde_json::from_str(&read(p)?).ok()?;
-    json.get("instanceHierarchy")?.get("tree").cloned()
-}
-
-/// A project file named as another project's `$path` (Studio 0.748's
-/// PlayerScripts.rbxp has `InputContexts: { $path: "InputContexts.rbxp" }`
-/// where 0.747 wrote the InputContext / InputAction / InputBinding tree in
-/// place): its tree as the instance, `$path`s inside relative to its folder.
-/// Without this the PlayerModule had no InputContexts at all: its
-/// InputSetup warned "InputContexts not found", ControlModule waited on
-/// `StarterPlayer.PlayerModule:WaitForChild("InputContexts")` for ever, and
-/// the character stood where it spawned.
-fn project_file(p: &Path, name: &str) -> Option<Node> {
-    let tree = project_tree(p)?;
-    project_node(name, &tree, p.parent()?)
+    Ok(())
 }
 
 /// Studio's current player scripts: what PlayerScripts.rbxp puts under
 /// StarterPlayer (PlayerModule, StarterPlayerScripts' children).
-fn project_starter_player(root: &Path) -> Option<Node> {
-    let base = root.join(PLAYER_SCRIPTS);
-    let tree = project_tree(&base.join("PlayerScripts.rbxp"))?;
-    let sp = project_node("StarterPlayer", tree.get("StarterPlayer")?, &base)?;
-    sp.children.iter().any(|c| c.name == "PlayerModule").then_some(sp)
+fn project_starter_player(path: &Path, base: &Path) -> Result<Node, String> {
+    let tree = project_tree(path)?;
+    let starter = tree.get("StarterPlayer")
+        .ok_or_else(|| format!("{}: missing StarterPlayer", path.display()))?;
+    let sp = project_node("StarterPlayer", starter, base, 0)?;
+    let has_loader = sp.children.iter().any(|module| {
+        module.name == "PlayerModule" && module.class == "ModuleScript"
+            && module.children.iter().any(|loader| {
+                loader.name == "PlayerScriptsLoader" && loader.class == "Script"
+            })
+    });
+    if !has_loader {
+        return Err(format!("{}: missing PlayerModule or PlayerScriptsLoader", path.display()));
+    }
+    Ok(sp)
 }
 
-/// Workspace.PlayerScriptsUseInputActionSystem is Disabled (RolloutState 1).
-fn input_action_system_off(doc: &Document) -> bool {
-    doc.workspace()
-        .is_some_and(|ws| crate::scene::enum_u32(doc.prop(ws, "PlayerScriptsUseInputActionSystem")) == Some(1))
+/// Workspace.PlayerScriptsUseInputActionSystem (Enum.RolloutState Default
+/// 0, Disabled 1, Enabled 2) asks for the Input Action System player
+/// scripts: Enabled, or Default once Roblox's rollout makes Default mean
+/// that (`mech::PLAYER_SCRIPTS_DEFAULT_IAS`; see the module docs).
+fn input_action_system_on(doc: &Document) -> bool {
+    let state = doc
+        .workspace()
+        .and_then(|ws| crate::scene::enum_u32(doc.prop(ws, "PlayerScriptsUseInputActionSystem")))
+        .unwrap_or(0);
+    match state {
+        2 => true,
+        1 => false,
+        _ => crate::mech::PLAYER_SCRIPTS_DEFAULT_IAS,
+    }
 }
 
 /// Puts the default player scripts into StarterPlayer.StarterPlayerScripts
 /// (made if missing) unless the place has its own of the same name. Returns
 /// the names inserted.
-pub fn insert_player_scripts(doc: &mut Document) -> Vec<&'static str> {
+pub fn insert_player_scripts(doc: &mut Document) -> Result<Vec<&'static str>, String> {
     let Some(root_dir) = studio_dir() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
+    insert_player_scripts_from(doc, &root_dir)
+}
+
+fn insert_player_scripts_from(doc: &mut Document, root_dir: &Path) -> Result<Vec<&'static str>, String> {
     let root = doc.dom.root_ref();
     let sp = doc.find_child(root, "StarterPlayer").unwrap_or_else(|| {
         doc.dom.insert(
@@ -343,10 +397,15 @@ pub fn insert_player_scripts(doc: &mut Document) -> Vec<&'static str> {
         });
     let base = root_dir.join(PLAYER_SCRIPTS);
     let mut added = Vec::new();
-    // Studio's current layout: StarterPlayer.PlayerModule (see the module docs).
+    // The Input Action System layout: StarterPlayer.PlayerModule (see the
+    // module docs). CreateDefaultPlayerModule false: the place forked it.
     let own_old = ["PlayerModule", "PlayerScriptsLoader"].iter().any(|n| child_named(doc, sps, n).is_some());
-    if !own_old && !input_action_system_off(doc) {
-        if let Some(tree) = project_starter_player(&root_dir) {
+    let create_default = doc.prop(sp, "CreateDefaultPlayerModule") != Some(Variant::Bool(false));
+    if !own_old && input_action_system_on(doc) {
+        let project = base.join("PlayerScripts.rbxp");
+        let present = project.try_exists().map_err(|e| format!("{}: {e}", project.display()))?;
+        if present {
+            let tree = project_starter_player(&project, &base)?;
             for child in tree.children {
                 if child.name == "StarterPlayerScripts" {
                     for c in child.children {
@@ -356,13 +415,15 @@ pub fn insert_player_scripts(doc: &mut Document) -> Vec<&'static str> {
                             doc.mark_tree(r);
                         }
                     }
-                } else if child_named(doc, sp, &child.name).is_none() {
+                } else if child_named(doc, sp, &child.name).is_none()
+                    && (create_default || child.name != "PlayerModule")
+                {
                     added.push(if child.name == "PlayerModule" { "PlayerModule" } else { "StarterPlayer" });
                     let r = doc.dom.insert(sp, child.builder());
                     doc.mark_tree(r);
                 }
             }
-            return added;
+            return Ok(added);
         }
     }
     let mut add = |doc: &mut Document, name: &'static str, b: Option<InstanceBuilder>| {
@@ -381,7 +442,7 @@ pub fn insert_player_scripts(doc: &mut Document) -> Vec<&'static str> {
         read(&base.join("StarterPlayerScripts/PlayerScriptsLoader.lua"))
             .map(|s| script("LocalScript", "PlayerScriptsLoader", s)),
     );
-    add(doc, "PlayerModule", player_module(&root_dir));
+    add(doc, "PlayerModule", player_module(root_dir));
     let sounds = read(&base.join("StarterPlayerScriptsCommon/RbxCharacterSounds.lua")).map(|s| {
         let mut b = script("LocalScript", "RbxCharacterSounds", s);
         if let Some(ab) =
@@ -392,7 +453,7 @@ pub fn insert_player_scripts(doc: &mut Document) -> Vec<&'static str> {
         b
     });
     add(doc, "RbxCharacterSounds", sounds);
-    added
+    Ok(added)
 }
 
 /// Reads a model file (binary or XML) into its own DOM.
@@ -453,80 +514,226 @@ pub fn insert_character_scripts(
 mod tests {
     use super::*;
 
-    /// Studio 0.748's PlayerScripts.rbxp names InputContexts.rbxp as a
-    /// `$path` (0.747 wrote the tree in place): the folder comes through
-    /// with its contexts, actions and bindings, the rest as before.
-    #[test]
-    fn nested_project_file_is_its_tree() {
-        let dir = std::env::temp_dir().join(format!("rustudio-rbxp-{}", std::process::id()));
-        let ps = dir.join(PLAYER_SCRIPTS);
-        let pm = ps.join("StarterPlayer/PlayerModule");
-        std::fs::create_dir_all(&pm).unwrap();
-        std::fs::create_dir_all(ps.join("StarterPlayerScriptsCommon/RbxCharacterSounds")).unwrap();
-        let w = |p: PathBuf, s: &str| std::fs::write(p, s).unwrap();
-        w(pm.join("init.lua"), "return {}");
-        w(pm.join("InputSetup.server.lua"), "-- setup");
-        w(pm.join("PlayerScriptsLoader.client.lua"), "-- loader");
-        w(ps.join("StarterPlayerScriptsCommon/RbxCharacterSounds.lua"), "-- sounds");
-        w(ps.join("StarterPlayerScriptsCommon/RbxCharacterSounds/AtomicBinding.lua"), "return {}");
-        w(
-            ps.join("PlayerScripts.rbxp"),
-            r#"{ "instanceHierarchy": { "tree": { "$className": "DataModel",
-                "StarterPlayer": { "$path": "StarterPlayer",
-                    "StarterPlayerScripts": { "RbxCharacterSounds": { "$className": "LocalScript",
-                        "$path": "StarterPlayerScriptsCommon/RbxCharacterSounds.lua",
-                        "AtomicBinding": { "$path": "StarterPlayerScriptsCommon/RbxCharacterSounds/AtomicBinding.lua" } } },
-                    "PlayerModule": { "InputContexts": { "$className": "Folder", "$path": "InputContexts.rbxp" } } } } } }"#,
+    /// A place whose Workspace.PlayerScriptsUseInputActionSystem is `state`
+    /// (Enum.RolloutState Default 0, Disabled 1, Enabled 2).
+    fn place_with_flag(state: u32) -> Document {
+        let mut d = Document::empty();
+        let root = d.dom.root_ref();
+        d.dom.insert(
+            root,
+            InstanceBuilder::new("Workspace").with_name("Workspace").with_property(
+                "PlayerScriptsUseInputActionSystem",
+                rbx_dom_weak::types::Enum::from_u32(state),
+            ),
         );
-        w(
-            ps.join("InputContexts.rbxp"),
-            r#"{ "instanceHierarchy": { "tree": { "$className": "Folder",
-                "CharacterContext": { "$className": "InputContext", "$properties": { "Priority": 150 },
-                    "MoveAction": { "$className": "InputAction", "$properties": { "Type": "Direction2D" },
-                        "KeyboardPrimaryBinding": { "$className": "InputBinding",
-                            "$properties": { "Up": "W", "Down": "S", "Left": "A", "Right": "D" } } },
-                    "JumpAction": { "$className": "InputAction",
-                        "KeyboardBinding": { "$className": "InputBinding", "$properties": { "KeyCode": "Space" } } } } } } }"#,
-        );
-        let sp = project_starter_player(&dir).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-        fn child<'a>(n: &'a Node, name: &str) -> &'a Node {
-            n.children.iter().find(|c| c.name == name).unwrap_or_else(|| {
-                panic!("{} has no {name}: {:?}", n.name, n.children.iter().map(|c| &c.name).collect::<Vec<_>>())
-            })
-        }
-        let enum_of = |n: &Node, k: &str| match n.props.iter().find(|(p, _)| p == k) {
-            Some((_, Variant::Enum(e))) => Some(e.to_u32()),
-            _ => None,
+        d
+    }
+
+    /// An install with both layouts: the Input Action System project
+    /// (PlayerScripts.rbxp + its InputContexts.rbxp) and the classic folders.
+    fn install_with_both_layouts(root: &Path) {
+        let base = root.join(PLAYER_SCRIPTS);
+        let w = |p: PathBuf, s: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, s).unwrap();
         };
-        let key = |name: &str| crate::ltypes::LEnumItem::from_name("KeyCode", name).map(|e| e.value);
-        let sounds = child(child(&sp, "StarterPlayerScripts"), "RbxCharacterSounds");
-        assert_eq!(sounds.class, "LocalScript");
-        assert_eq!(child(sounds, "AtomicBinding").class, "ModuleScript");
-        let pm = child(&sp, "PlayerModule");
-        assert_eq!(pm.class, "ModuleScript");
-        assert_eq!(enum_of(child(pm, "InputSetup"), "RunContext"), Some(1));
-        assert_eq!(enum_of(child(pm, "PlayerScriptsLoader"), "RunContext"), Some(2));
-        let ic = child(pm, "InputContexts");
-        assert_eq!(ic.class, "Folder");
-        let ctx = child(ic, "CharacterContext");
-        assert_eq!(ctx.class, "InputContext");
-        assert!(ctx.props.iter().any(|(k, _)| k == "Priority"), "{:?}", ctx.props);
-        let mv = child(ctx, "MoveAction");
-        assert_eq!(mv.class, "InputAction");
-        assert!(mv.props.iter().any(|(k, _)| k == "Type"), "{:?}", mv.props);
-        let kb = child(mv, "KeyboardPrimaryBinding");
-        assert_eq!(kb.class, "InputBinding");
-        assert_eq!(enum_of(kb, "Up"), key("W"));
-        assert_eq!(enum_of(kb, "Left"), key("A"));
-        assert_eq!(enum_of(child(child(ctx, "JumpAction"), "KeyboardBinding"), "KeyCode"), key("Space"));
+        w(base.join("StarterPlayer/PlayerModule/init.lua"), "return {}");
+        w(base.join("StarterPlayer/PlayerModule/PlayerScriptsLoader.client.lua"), "return");
+        w(base.join("StarterPlayerScripts/PlayerScriptsLoader.lua"), "-- loader");
+        w(base.join("StarterPlayerScripts/PlayerModule.module.lua"), "return {}");
+        w(base.join("StarterPlayerScripts/PlayerModule.module/CameraModule.lua"), "return {}");
+        w(base.join("StarterPlayerScripts/PlayerModule.module/ControlModule.lua"), "return {}");
+        w(base.join("StarterPlayerScriptsCommon/RbxCharacterSounds.lua"), "-- sounds");
+        w(base.join("StarterPlayerScriptsCommon/RbxCharacterSounds/AtomicBinding.lua"), "return {}");
+        w(base.join("PlayerScripts.rbxp"), r#"{
+            "instanceHierarchy": {"tree": {"StarterPlayer": {
+                "$path": "StarterPlayer",
+                "StarterPlayerScripts": {"RbxCharacterSounds": {"$className": "LocalScript",
+                    "$path": "StarterPlayerScriptsCommon/RbxCharacterSounds.lua",
+                    "AtomicBinding": {"$path": "StarterPlayerScriptsCommon/RbxCharacterSounds/AtomicBinding.lua"}}},
+                "PlayerModule": {"InputContexts": {"$path": "InputContexts.rbxp"}}
+            }}}
+        }"#);
+        w(base.join("InputContexts.rbxp"), r#"{
+            "instanceHierarchy": {"tree": {"$className": "Folder",
+                "CharacterContext": {"$className": "InputContext",
+                    "Jump": {"$className": "InputAction",
+                        "Keyboard": {"$className": "InputBinding", "$properties": {"KeyCode": "Space"}}}}
+            }}
+        }"#);
+    }
+
+    /// Which layout a place gets is Workspace.PlayerScriptsUseInputActionSystem:
+    /// Default (a new place, or no Workspace at all) and Disabled are the
+    /// classic PlayerScriptsLoader + PlayerModule + RbxCharacterSounds in
+    /// StarterPlayerScripts, as Roblox's client gives every place without the
+    /// opt-in (rollout phase 1); Enabled is StarterPlayer.PlayerModule, left
+    /// out when CreateDefaultPlayerModule is false; a place's own PlayerModule
+    /// in StarterPlayerScripts (a fork) keeps the classic layout around it.
+    #[test]
+    fn player_scripts_layout_follows_the_rollout_flag() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("rustudio-player-layout-{}-{unique}", std::process::id()));
+        install_with_both_layouts(&root);
+        let classic = ["PlayerScriptsLoader", "PlayerModule", "RbxCharacterSounds"];
+        let check = |mut d: Document, expect: &[&str], classic_tree: bool| {
+            let added = insert_player_scripts_from(&mut d, &root).unwrap();
+            assert_eq!(added, expect);
+            let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
+            let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
+            let n = |p: Ref, name: &str| child_named(&d, p, name);
+            let class = |r: Ref| d.class_of(r).map(|c| c.to_string()).unwrap_or_default();
+            assert_eq!(n(sps, "PlayerScriptsLoader").is_some(), classic_tree);
+            assert_eq!(n(sp, "PlayerModule").is_some(), !classic_tree && expect.contains(&"PlayerModule"));
+            if classic_tree && expect.contains(&"PlayerModule") {
+                let pm = n(sps, "PlayerModule").unwrap();
+                assert_eq!(class(pm), "ModuleScript");
+                assert!(n(pm, "CameraModule").is_some() && n(pm, "ControlModule").is_some());
+                assert_eq!(class(n(sps, "PlayerScriptsLoader").unwrap()), "LocalScript");
+            }
+            if !classic_tree && expect.contains(&"PlayerModule") {
+                let pm = n(sp, "PlayerModule").unwrap();
+                assert_eq!(class(n(pm, "PlayerScriptsLoader").unwrap()), "Script");
+                assert!(n(n(pm, "InputContexts").unwrap(), "CharacterContext").is_some());
+            }
+            let sounds = n(sps, "RbxCharacterSounds").unwrap();
+            assert!(n(sounds, "AtomicBinding").is_some());
+            // A second call adds nothing.
+            assert!(insert_player_scripts_from(&mut d, &root).unwrap().is_empty());
+        };
+        check(Document::empty(), &classic, true);
+        check(place_with_flag(0), &classic, true);
+        check(place_with_flag(1), &classic, true);
+        check(place_with_flag(2), &["PlayerModule", "RbxCharacterSounds"], false);
+        // Enabled, the default module turned off: the place brings its own.
+        let mut d = place_with_flag(2);
+        let root_ref = d.dom.root_ref();
+        d.dom.insert(
+            root_ref,
+            InstanceBuilder::new("StarterPlayer")
+                .with_name("StarterPlayer")
+                .with_property("CreateDefaultPlayerModule", false),
+        );
+        check(d, &["RbxCharacterSounds"], false);
+        // Enabled with a fork in StarterPlayerScripts: the classic layout
+        // around the fork (the loader added, the fork kept).
+        let mut d = place_with_flag(2);
+        let root_ref = d.dom.root_ref();
+        d.dom.insert(
+            root_ref,
+            InstanceBuilder::new("StarterPlayer").with_name("StarterPlayer").with_child(
+                InstanceBuilder::new("StarterPlayerScripts")
+                    .with_name("StarterPlayerScripts")
+                    .with_child(script("ModuleScript", "PlayerModule", "return 'fork'".into())),
+            ),
+        );
+        check(d, &["PlayerScriptsLoader", "RbxCharacterSounds"], true);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_imports_input_contexts_with_properties_and_rejects_missing_sources() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("rustudio-player-project-{}-{unique}", std::process::id()));
+        let base = root.join(PLAYER_SCRIPTS);
+        let module = base.join("StarterPlayer/PlayerModule");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("init.lua"), "return {}").unwrap();
+        std::fs::write(module.join("PlayerScriptsLoader.client.lua"), "return").unwrap();
+        std::fs::write(base.join("PlayerScripts.rbxp"), r#"{
+            "instanceHierarchy": {"tree": {"StarterPlayer": {
+                "$path": "StarterPlayer",
+                "PlayerModule": {
+                    "InputContexts": {"$path": "input/InputContexts.rbxp",
+                        "CharacterContext": {"$properties": {"Priority": 250}}}
+                }
+            }}}
+        }"#).unwrap();
+
+        let mut doc = place_with_flag(2);
+        let err = insert_player_scripts_from(&mut doc, &root).unwrap_err();
+        let sp = doc.find_child(doc.dom.root_ref(), "StarterPlayer").unwrap();
+        assert!(err.contains("InputContexts.rbxp"));
+        assert!(child_named(&doc, sp, "PlayerModule").is_none());
+
+        let input = base.join("input");
+        std::fs::create_dir(&input).unwrap();
+        std::fs::write(input.join("InputContexts.rbxp"), r#"{
+            "instanceHierarchy": {"tree": {"$className": "Folder",
+                "CharacterContext": {"$className": "InputContext",
+                    "$properties": {"Priority": 150, "Sink": true},
+                    "Move": {"$className": "InputAction",
+                        "$properties": {"Type": "Direction2D", "Enabled": false},
+                        "Keyboard": {"$className": "InputBinding",
+                            "$properties": {"Up": "W"}},
+                        "Gamepad": {"$className": "InputBinding",
+                            "$properties": {"KeyCode": "Thumbstick1", "Vector2Scale": [2, -3]}}
+                    }
+                }
+            }}
+        }"#).unwrap();
+        let result = insert_player_scripts_from(&mut doc, &root);
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(result.unwrap(), vec!["PlayerModule"]);
+        let child = |r, name| child_named(&doc, r, name).unwrap();
+        let pm = child(sp, "PlayerModule");
+        let ctx = child(child(pm, "InputContexts"), "CharacterContext");
+        assert_eq!(doc.prop(ctx, "Priority"), Some(Variant::Int32(250)));
+        assert_eq!(doc.prop(ctx, "Sink"), Some(Variant::Bool(true)));
+        let action = child(ctx, "Move");
+        assert_eq!(doc.prop(action, "Enabled"), Some(Variant::Bool(false)));
+        let enum_of = |r, prop| crate::scene::enum_u32(doc.prop(r, prop));
+        let key = |name| crate::ltypes::LEnumItem::from_name("KeyCode", name).map(|e| e.value);
+        assert_eq!(enum_of(child(action, "Keyboard"), "Up"), key("W"));
+        let gamepad = child(action, "Gamepad");
+        assert_eq!(enum_of(gamepad, "KeyCode"), key("Thumbstick1"));
+        assert_eq!(doc.prop(gamepad, "Vector2Scale"), Some(Variant::Vector2(
+            rbx_dom_weak::types::Vector2::new(2.0, -3.0),
+        )));
     }
 
     #[test]
     fn default_scripts_from_studio_folder() {
         let Some(_) = studio_dir() else { return }; // no Studio install on this machine
+        fn len(d: &Document, r: Ref) -> usize {
+            match d.prop(r, "Source") {
+                Some(Variant::String(s)) => s.len(),
+                _ => 0,
+            }
+        }
+        // A new place (PlayerScriptsUseInputActionSystem Default): the
+        // classic PlayerScripts, what Roblox's client gives it today.
         let mut d = Document::empty();
-        let added = insert_player_scripts(&mut d);
+        let added = insert_player_scripts(&mut d).unwrap();
+        assert_eq!(added, vec!["PlayerScriptsLoader", "PlayerModule", "RbxCharacterSounds"]);
+        {
+            let root = d.dom.root_ref();
+            let sp = d.find_child(root, "StarterPlayer").unwrap();
+            let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
+            let n = |p: Ref, name: &str| child_named(&d, p, name);
+            let class = |r: Ref| d.class_of(r).map(|c| c.to_string()).unwrap_or_default();
+            assert!(n(sp, "PlayerModule").is_none());
+            assert_eq!(class(n(sps, "PlayerScriptsLoader").unwrap()), "LocalScript");
+            let pm = n(sps, "PlayerModule").unwrap();
+            assert_eq!(class(pm), "ModuleScript");
+            let cam = n(pm, "CameraModule").unwrap();
+            assert!(n(cam, "ZoomController").and_then(|z| n(z, "Popper")).is_some());
+            assert!(n(cam, "VRCameraTeleportDetector.spec").is_none());
+            assert_eq!(class(n(pm, "ControlModule").unwrap()), "ModuleScript");
+            // (A Folder in this layout: OldPlayerScripts.rbxp's CommonUtils.)
+            let utils = n(pm, "CommonUtils").unwrap();
+            assert_eq!(class(utils), "Folder");
+            assert_eq!(class(n(utils, "CharacterUtil").unwrap()), "ModuleScript");
+            assert!(n(pm, "InputContexts").is_none() && n(pm, "PlayerScriptsLoader").is_none());
+            assert!(n(n(sps, "RbxCharacterSounds").unwrap(), "AtomicBinding").is_some());
+            assert!(len(&d, pm) > 100 && len(&d, cam) > 20_000);
+            assert!(insert_player_scripts(&mut d).unwrap().is_empty());
+        }
+        // The flag Enabled: the Input Action System layout.
+        let mut d = place_with_flag(2);
+        let added = insert_player_scripts(&mut d).unwrap();
         assert_eq!(added, vec!["PlayerModule", "RbxCharacterSounds"]);
         let root = d.dom.root_ref();
         let sp = d.find_child(root, "StarterPlayer").unwrap();
@@ -562,15 +769,9 @@ mod tests {
         let key = |name: &str| crate::ltypes::LEnumItem::from_name("KeyCode", name).map(|e| e.value);
         assert_eq!(enum_of(kb, "Up"), key("W"));
         assert_eq!(enum_of(kb, "Left"), key("A"));
-        fn len(d: &Document, r: Ref) -> usize {
-            match d.prop(r, "Source") {
-                Some(Variant::String(s)) => s.len(),
-                _ => 0,
-            }
-        }
         assert!(len(&d, pm) > 100 && len(&d, cam) > 20_000);
         // A second call keeps what is there.
-        assert!(insert_player_scripts(&mut d).is_empty());
+        assert!(insert_player_scripts(&mut d).unwrap().is_empty());
         let ch = d
             .dom
             .insert(root, InstanceBuilder::new("Model").with_name("Player"));

@@ -144,9 +144,11 @@ unsafe extern "C" fn on_destroy(activity: *mut ndk_sys::ANativeActivity) {
 }
 
 /// The Back button (`Key::BrowserBack` through winit): closes what is open
-/// on top (as Escape does) and otherwise sends the app to the background,
-/// where it stays ready, instead of tearing the activity down.
-pub fn back_pressed(ctx: &egui::Context, raw: &mut egui::RawInput) {
+/// on top (as Escape does), opens and closes the Roblox menu while a game
+/// is played (`playing`: Escape's job in Play, what Back does in Roblox's
+/// own app), and otherwise sends the app to the background, where it
+/// stays ready, instead of tearing the activity down.
+pub fn back_pressed(ctx: &egui::Context, raw: &mut egui::RawInput, playing: bool) {
     let mut back = false;
     raw.events.retain(|e| match e {
         egui::Event::Key { key: egui::Key::BrowserBack, pressed, .. } => {
@@ -159,7 +161,7 @@ pub fn back_pressed(ctx: &egui::Context, raw: &mut egui::RawInput) {
         return;
     }
     let something_open = egui::Popup::is_any_open(ctx) || ctx.memory(|m| m.focused().is_some());
-    if something_open {
+    if something_open || playing {
         for pressed in [true, false] {
             raw.events.push(egui::Event::Key {
                 key: egui::Key::Escape,

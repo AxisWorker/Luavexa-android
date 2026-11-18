@@ -872,6 +872,12 @@
    "source": "Studio (offline Studio) Play: client PlayerScripts source lengths equal the install's files"
   },
   {
+   "name": "default PlayerScripts layout",
+   "group": "character",
+   "value": "Workspace.PlayerScriptsUseInputActionSystem Default or Disabled: PlayerScriptsLoader + PlayerModule + RbxCharacterSounds in StarterPlayerScripts (the client's PlayerScripts); Enabled: StarterPlayer.PlayerModule (PlayerScripts.rbxp, InputContexts) + RbxCharacterSounds. PLAYER_SCRIPTS_DEFAULT_IAS = false",
+   "source": "Roblox's rollout (devforum Input Action System: PlayerScripts rollout, t/4678416): phase 1 through 2026 Default = Disabled, phase 2 early 2027 Default = Enabled; a live Baseplate's Player.PlayerScripts holds the three"
+  },
+  {
    "name": "default Animate (R15)",
    "group": "character",
    "value": "content/avatar/scripts/humanoidAnimateR15_DEPRECATED_20260813.rbxm (28802 chars)",

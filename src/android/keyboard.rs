@@ -157,7 +157,12 @@ fn release_textbox() {
 fn soft_input(show: bool) {
     match super::app() {
         Some(app) if show => app.show_soft_input(true),
-        Some(app) => app.hide_soft_input(true),
+        Some(app) => {
+            app.hide_soft_input(true);
+            // (the navigation bar came up with the keyboard; API 26–29's
+            // sticky flags don't always take it down again)
+            super::system_bars::keyboard_closed();
+        }
         None => log::warn!("soft keyboard: no activity to ask"),
     }
 }
@@ -343,6 +348,11 @@ impl Keyboard {
 
     fn set_height(&mut self, px: i32) {
         if px != self.height_px {
+            // Down by the keyboard's own Back as well as by `soft_input`:
+            // the navigation bar it brought up goes with it.
+            if px <= 0 && self.height_px > 0 {
+                super::system_bars::keyboard_closed();
+            }
             self.height_px = px;
             CHANGED.store(true, Ordering::Relaxed);
         }

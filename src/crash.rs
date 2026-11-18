@@ -11,8 +11,13 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Where reports go.
+/// Where reports go. On Android the app's external files folder
+/// (`Android/data/<package>/files/crash`, readable over USB and `adb pull`
+/// without root; the cache folder is private and the system may clear it).
 pub fn dir() -> PathBuf {
+    #[cfg(target_os = "android")]
+    return crate::android::data_dir().join("crash");
+    #[cfg(not(target_os = "android"))]
     crate::paths::cache().join("rustudio").join("crash")
 }
 

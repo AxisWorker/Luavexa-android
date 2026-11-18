@@ -82,14 +82,16 @@ xbuild quirks worth knowing (commit e67b501):
 | Input | mouse + keyboard | fingers through `src/touch_input.rs` (below); hardware mice / keyboards work as on a desktop |
 | Clipboard | egui-winit (arboard) | egui's copies mirrored to `ClipboardManager` after each frame, pastes read from it (`src/android/clipboard.rs`) |
 | Browser links (`platform::open_url`) | `ctx.open_url` (webbrowser) | `ACTION_VIEW` Intent from the activity (`jni::open_url`); eframe's `links` feature isn't built for Android |
-| Back button | — | closes what is open on top (Escape), otherwise `moveTaskToBack` — the activity isn't destroyed (`src/android/lifecycle.rs`) |
+| System bars | — | hidden (immersive mode): the navigation bar — Back / Home / Recents or the gesture pill, the right edge in landscape — and the status bar; a swipe from the edge shows them for a moment, translucent over the editor, and they go again by themselves (`src/android/system_bars.rs`: API 30+ `WindowInsetsController.hide(systemBars)` with transient-by-swipe, before that the sticky immersive view flags; asked at start and again on focus regained / keyboard down, on the Java main thread). `RUSTUDIO_SYSTEM_BARS=1` keeps them. The camera hole's side stays letterboxed in landscape (the cutout mode isn't changed: the chrome doesn't pad by the cutout inset yet) |
+| Back button | — | closes what is open on top (Escape); in Play opens / closes the Roblox menu (Escape's job, as Back does in Roblox's app); otherwise `moveTaskToBack` — the activity isn't destroyed (`src/android/lifecycle.rs`) |
+| Roblox menu and chat in Play | Esc and `/` | the top bar over the game view (the CoreScripts' TopBar layout, drawn on every platform: `play_game.rs` `top_bar`): the Roblox button opens / closes the menu, the unibar's chat button opens the chat with its box focused — the keyboard comes up for it. `SetCore("TopbarEnabled", false)` hides the bar |
 | Activity destroyed | — | `onDestroy` hook: close request, then `process::exit(0)`; `android_main` always leaves the process when the loop ends (`lifecycle.rs`): status 0 for a close, 2 for an eframe error, 101 for a panic (named in logcat with its crash report) |
 | "Open with rustudio" while it runs | Finder's hand-over (`macos::take_opened`) | a second instance of the activity per VIEW intent (`launchMode` `standard`), caught at the library's entry point: its file is copied in and queued for the editor's next frame, the editor's task comes to the front, the new activity finishes unseen (`src/android/intent.rs`). A place the last start died within 20 s of opening by itself isn't opened again by itself (`state/opening`, `storage.rs`) |
 | UI zoom | 1.0 of the display's scale | first run: the zoom that fits ~1100 points across (0.8 … 1.6 of the density), then View > Zoom In / Out as saved |
 | GPU driver | the system's | the device's Vulkan driver, or on Snapdragon phones the Turnip (Mesa) driver shipped in the APK, swapped in before wgpu starts (`src/android/turnip.rs`; "Turnip driver" below); OpenGL ES as the fallback either way |
 | Graphics quality | level 10 (Studio's defaults) | Automatic from level 3: the 3D view at 0.7 scale (0.5 while the camera moves, scaled up by EASU + RCAS) with 512² textures, 900 studs of view distance, the lite shader, no anisotropic filtering, no MSAA, one shadow cascade, no frame-rate cap (View > Graphics Settings, the 1–10 bar; "Graphics quality" below); saved with the layout |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
-| Crash reports | `~/.cache/rustudio/crash/` | `<cache>/rustudio/crash/` (same `src/crash.rs`: panic hook + signal handlers chain to debuggerd) |
+| Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root). Same `src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`) |
 | Studio content download | ureq + rustls (ring) | the same; started only when ConnectivityManager reports a validated network |
 | Login keyring | `keyring` 4 (Secret Service / Keychain / Credential Manager) | `keyring-core` + `android-native-keyring-store` (SharedPreferences + Android Keystore) behind the same `Entry` API (`crates/rustudio-account/src/store.rs`) |
 | TLS roots (`rustudio-account` MessagingService socket) | OS store (`rustls-native-certs`) | Mozilla's (`webpki-roots`, enabled alongside): Android's CA store isn't in a form `rustls-native-certs` reads; `ureq` already used `webpki-roots` |
@@ -219,7 +221,8 @@ closed) on a touch screen the editor's stick and jump zones are off and
 fingers that land on the view go to the game raw:
 
 1. `touch_input::Touch::filter` keeps a finger that lands on the view
-   (outside `Zones::ui`: the hotbar slots and the chat box stay egui's)
+   (outside `Zones::ui`: the top bar's menu and chat buttons, the hotbar
+   slots and the chat box stay egui's)
    out of egui's stream and queues it as a `GameTouch` (Begin / Change /
    End / Cancel with its position); Play ending or the window losing
    focus cancels them all.
@@ -473,8 +476,10 @@ second at most, 0 none) — and `RUSTUDIO_VIEW_REUSE` (0|1),
 below), `RUSTUDIO_NO_PIPELINE_CACHE`, `RUSTUDIO_NO_PIPELINE_WARMUP`
 (below), `RUSTUDIO_ONE_SUBMIT` (0|1; below), `RUSTUDIO_GPU_BISECT` (1;
 below), `RUSTUDIO_TURNIP` (0|1|force), `RUSTUDIO_GPU_TURBO` (1),
-`RUSTUDIO_TU_DEBUG` (Turnip's flags; "Turnip driver" below). A switch
-wins over the saved Graphics Settings choice for the run.
+`RUSTUDIO_TU_DEBUG` (Turnip's flags; "Turnip driver" below),
+`RUSTUDIO_SYSTEM_BARS` (1: the navigation and status bars stay, instead
+of immersive mode). A switch wins over the saved Graphics Settings choice
+for the run.
 
 **One submit a frame** (`render.rs` `one_submit_wanted`,
 `submit_callback`; on by default on a phone, `RUSTUDIO_ONE_SUBMIT=0`
@@ -1357,6 +1362,35 @@ also echoed to logcat at the next start.
      `perf: … GPU errors N` counts them when the perf log is on, and the
      frame goes on. Desktop keeps wgpu's default (the panic names the
      bug while developing).
+- **Status 101 again (S20 Ultra, 11-18 06:07, pss 1.7 GB, LBG).** With
+  the GPU error handler in, a 101 is a Rust panic proper (an index,
+  an unwrap, a slice) on the editor's thread; which one, only its
+  report says, and none came with that run. The report is now written
+  where a PC can read it — `Android/data/dev.rustudio.studio/files/
+  crash/<timestamp>-<pid>.txt` (`crash::dir`), not the private cache
+  folder — and the next start names it in Output and logcat
+  (`rustudio crashed last time: panic in thread 'main' at
+  src/x.rs:123 — message`). To report one: `adb logcat -d -s rustudio
+  RustPanic RustStdoutStderr` right after (the panic line and the
+  report's path at error level), or relaunch and copy the Output line,
+  or pull the file over USB.
+- **The LBG place on a phone: PlayerModule, menu, wrapped lists.** Three
+  of the first report's four points weren't bugs of the port or had an
+  upstream gap behind them: (1) `PlayerModule` sits where Roblox's
+  client puts it — `Player.PlayerScripts.PlayerModule` (next to
+  `PlayerScriptsLoader` and `RbxCharacterSounds`) for a place whose
+  `Workspace.PlayerScriptsUseInputActionSystem` is Default or Disabled,
+  every place without the opt-in while Roblox's rollout is in phase 1,
+  and `StarterPlayer.PlayerModule` only with the flag Enabled (LBG,
+  Default, with its own fork of `PlayerModule` in StarterPlayerScripts:
+  the fork kept, the engine's `PlayerScriptsLoader` added;
+  `src/default_scripts.rs`, docs/ENGINE-GAPS.md "A new place got the
+  Input Action System PlayerScripts"); (2) no menu or chat button over the game was upstream's state
+  on every platform (Esc and `/` only) — the top bar above; (3) the
+  shop rows and player list running off their frames were
+  `UIListLayout.Wraps` (90 of the place's 250 lists), ignored upstream —
+  `src/gui_walk.rs list_lines`; the glows behind its frames are
+  `UIShadow` (138), now drawn (`src/gui_fx.rs shadow`).
 
 ## Later steps (in order)
 
@@ -1370,6 +1404,10 @@ also echoed to logcat at the next start.
    sliding up to the box: "Text: the soft keyboard"). Left: insets
    (`GuiService.TopbarInset`, `ScreenInsets`), orientation.
 5. `ContextActionService` touch buttons (`createTouchButton`).
+6. The display cutout: the window under the camera hole
+   (`layoutInDisplayCutoutMode` shortEdges) once the chrome pads itself
+   by the cutout inset (`jni::window_insets`), so the letterboxed strip
+   on that side goes the way the navigation bar's did (`system_bars.rs`).
 
 Each step closes rows in docs/ENGINE-GAPS.md; the Creator Hub reference
 pages are the source of truth for every member name, argument and enum.
