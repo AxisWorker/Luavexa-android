@@ -99,7 +99,7 @@ xbuild quirks worth knowing (commit e67b501):
 | Graphics quality | level 10 (Studio's defaults) | Automatic from level 3: the 3D view at 0.7 scale (0.5 while the camera moves, scaled up by EASU + RCAS) with 512² textures, 900 studs of view distance, the lite shader, no anisotropic filtering, no MSAA, one shadow cascade, no frame-rate cap (View > Graphics Settings, the 1–10 bar; "Graphics quality" below); saved with the layout |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
 | Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root). Same `crates/rustudio-core/src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`) |
-| Studio content download | ureq + rustls (ring) | the same; started only when ConnectivityManager reports a validated network |
+| Studio content download | ureq + rustls (ring) | the same, three packages at a time; Play can use the content once the packages are in (the retired textures and View Selector follow in the background). Without a network at start (ConnectivityManager, INTERNET capability — not VALIDATED, which some networks never get) it starts when one comes. A `network check: …` line in Output at every start says whether HTTPS works from the app at all |
 | Login keyring | `keyring` 4 (Secret Service / Keychain / Credential Manager) | `keyring-core` + `android-native-keyring-store` (SharedPreferences + Android Keystore) behind the same `Entry` API (`crates/rustudio-account/src/store.rs`) |
 | TLS roots (`rustudio-account` MessagingService socket) | OS store (`rustls-native-certs`) | Mozilla's (`webpki-roots`, enabled alongside): Android's CA store isn't in a form `rustls-native-certs` reads; `ureq` already used `webpki-roots` |
 
@@ -382,18 +382,21 @@ collapsed), and the bar keeps the focus the same way. Objects are cut,
 copied and pasted from the Explorer's long-press menu as before.
 
 The clipboard itself is `src/android/clipboard.rs` over
-`ClipboardManager`, on the Java main thread both ways (the manager wants
-a Looper thread, and from Android 10 it answers the app of the focused
-window only — a read from elsewhere, or while the window isn't focused,
-comes back empty, not as an error). Writes are fire-and-forget
-(`jni::clipboard_set`; egui's copies are taken out of the platform output
-at the end of the frame). Reads never make the editor's thread wait: the
-text is asked for ahead of time (`clipboard::refresh`, when the text bar
-comes up or the long-press menu opens — the Java thread may itself be
-waiting on the editor's around a pause or a configuration change, which
-is what a blocking read ran into) and the last answer is kept
-(`clipboard::text`); the editor's own copies seed it, so a paste right
-after a copy works even where the system refuses the read. Each step logs
+`ClipboardManager`, asked on the editor's thread (since API 24 the
+manager a Context hands out works from any thread — the "needs a Looper
+thread" condition is Android 4's — and from Android 10 it answers the app
+of the focused window only: a read from elsewhere, or while the window
+isn't focused, comes back empty, not as an error). A write that fails
+there is handed to the Java main thread (`jni::clipboard_set`; egui's
+copies are taken out of the platform output at the end of the frame). A
+paste reads the clipboard at that moment (`clipboard::text_now`, one JNI
+call), so what was copied in another app a second earlier is what
+pastes; the text bar and the long-press menu read once when they open
+(`clipboard::prime`) to enable their Paste, and the last answer is kept
+(`clipboard::text`) — the editor's own copies seed it, so a paste right
+after a copy works even where the system refuses the read. The main
+thread is the fallback when a read fails on the editor's thread
+(`clipboard::refresh`, answered a frame or two later). Each step logs
 a `clipboard:` line (`N chars put on the system clipboard`, `N chars read
 from …`, `the system clipboard has no text (or this window lacks the
 focus)`, `put failed: …` / `read failed: …`), the text bar logs

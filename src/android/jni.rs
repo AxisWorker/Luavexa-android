@@ -473,10 +473,12 @@ pub fn network_available() -> Option<bool> {
         if caps.is_null() {
             return Ok(Some(false));
         }
-        // NET_CAPABILITY_INTERNET = 12, NET_CAPABILITY_VALIDATED = 16.
+        // NET_CAPABILITY_INTERNET = 12. (Not VALIDATED, 16: the system's
+        // connectivity check fails on some networks — a blocked or slow
+        // check server, a VPN, some vendors' builds — while the internet
+        // works; a download given up on that would never start there.)
         let internet = env.call_method(&caps, jni_str!("hasCapability"), jni_sig!("(I)Z"), &[JValue::Int(12)])?.z()?;
-        let validated = env.call_method(&caps, jni_str!("hasCapability"), jni_sig!("(I)Z"), &[JValue::Int(16)])?.z()?;
-        Ok(Some(internet && validated))
+        Ok(Some(internet))
     })
     .unwrap_or_else(|e| {
         log::warn!("connectivity: {e}");
@@ -690,20 +692,43 @@ fn view_url(url: &str, custom_tab: bool) -> Result<()> {
 pub type ClipboardAnswer = std::sync::Arc<std::sync::Mutex<Option<Result<Option<String>>>>>;
 
 /// Puts `text` on the system clipboard (`ClipboardManager.setPrimaryClip`),
-/// so a copy in the editor pastes in other apps. Done on the Java main
-/// thread — ClipboardManager wants a thread with a Looper, and Android
-/// 10+ counts the writes of the focused window's app only, which is what
-/// the main thread is — without the editor's thread waiting for it (the
-/// main thread may itself be waiting on the editor's around a pause or a
-/// configuration change). The outcome goes to the log.
+/// so a copy in the editor pastes in other apps. Done here, on the calling
+/// thread: since API 24 the ClipboardManager a Context hands out uses the
+/// main thread's Handler itself, so any thread may ask it (the "Looper"
+/// condition is Android 4's), and Android 10+'s focus rule is about the
+/// app's window, not the thread. Should it fail all the same (a vendor
+/// framework), the Java main thread is asked, without the editor's thread
+/// waiting for it (the main thread may itself be waiting on the editor's
+/// around a pause or a configuration change). The outcome goes to the log.
 pub fn clipboard_set(text: &str) -> Result<()> {
+    match write_clipboard(text) {
+        Ok(()) => {
+            log::info!("clipboard: {} chars put on the system clipboard", text.chars().count());
+            return Ok(());
+        }
+        Err(e) => log::warn!("clipboard: put failed here ({e}); asking the main thread"),
+    }
     let app = super::app().ok_or("no AndroidApp yet")?;
     let text = text.to_string();
     app.run_on_java_main_thread(Box::new(move || match write_clipboard(&text) {
-        Ok(()) => log::info!("clipboard: {} chars put on the system clipboard", text.chars().count()),
+        Ok(()) => log::info!("clipboard: {} chars put on the system clipboard (main thread)", text.chars().count()),
         Err(e) => log::warn!("clipboard: put failed: {e}"),
     }));
     Ok(())
+}
+
+/// The system clipboard's text, read now on the calling thread (see
+/// [`clipboard_set`] for why any thread may): what is there at the moment
+/// of the paste, not what was there when the field was last asked about.
+/// `Ok(None)`: no text, or (Android 10+) this window hasn't the focus.
+pub fn clipboard_get_now() -> Result<Option<String>> {
+    let text = read_clipboard();
+    match &text {
+        Ok(Some(s)) => log::info!("clipboard: {} chars read from the system clipboard", s.chars().count()),
+        Ok(None) => log::info!("clipboard: the system clipboard has no text (or this window lacks the focus)"),
+        Err(e) => log::warn!("clipboard: read here failed: {e}"),
+    }
+    text
 }
 
 fn write_clipboard(text: &str) -> Result<()> {

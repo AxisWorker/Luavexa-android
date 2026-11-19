@@ -58,9 +58,9 @@ impl TextBar {
         };
         if !self.shown {
             self.shown = true;
-            // (the clipboard's text, for Paste: asked now, shown as soon as
-            // the main thread answers)
-            super::clipboard::refresh();
+            // (the clipboard's text, for Paste: read now, so the button is
+            // enabled at once)
+            super::clipboard::prime();
             log::info!(
                 "text bar: up for {}",
                 match want {
@@ -115,7 +115,8 @@ impl TextBar {
                                 });
                             }
                             if item(ui, "Paste", clipboard.is_some()) {
-                                chosen = Some(Event::Paste(clipboard.clone().unwrap_or_default()));
+                                // (what is on the clipboard at this moment)
+                                chosen = Some(Event::Paste(super::clipboard::text_now().or_else(|| clipboard.clone()).unwrap_or_default()));
                             }
                             if item(ui, "Copy", field.is_none() || selection) {
                                 chosen = Some(Event::Copy);

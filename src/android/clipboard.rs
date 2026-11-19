@@ -10,6 +10,10 @@
 //! keyboard, when the window comes back into focus, when the text menu or
 //! bar opens) and kept here ([`text`]) for the frame it is wanted in. The
 //! text the editor copied is kept too, so Paste follows a Copy at once.
+//! A paste reads the clipboard at that moment as well ([`text`] →
+//! `jni::clipboard_get_now`, on the editor's thread: any thread may, see
+//! there), so what was copied in another app a second ago is what pastes;
+//! the asked-ahead answer is the fallback when that read fails.
 //!
 //! What never reaches the editor: the soft keyboard's own paste key. A
 //! NativeActivity has no `InputConnection`, so the keyboard is in the
@@ -87,9 +91,40 @@ pub fn poll() {
 }
 
 /// The clipboard's text as last known (a read's answer, or the editor's
-/// own last copy), if any.
+/// own last copy), if any. Cheap: for a Paste button's enabled state,
+/// every frame. The paste itself takes [`text_now`].
 pub fn text() -> Option<String> {
     cache().text.clone()
+}
+
+/// The clipboard's text at this moment: read from the system clipboard
+/// now (what the user copied last, in whichever app), else — when the
+/// read itself fails, not when the clipboard is empty — as last known. One
+/// JNI call: for the moment of a paste, and [`prime`], not every frame.
+pub fn text_now() -> Option<String> {
+    match super::jni::clipboard_get_now() {
+        Ok(now) => {
+            let mut c = cache();
+            if now.is_some() {
+                c.text = now.clone();
+            }
+            // (empty, or not ours to read: the editor's own last copy
+            // still pastes within the editor)
+            now.or_else(|| c.text.clone())
+        }
+        Err(_) => cache().text.clone(),
+    }
+}
+
+/// When a text menu or bar opens: the clipboard's text read now, so Paste
+/// is enabled at once; the main thread is asked instead if the read here
+/// fails.
+pub fn prime() {
+    match super::jni::clipboard_get_now() {
+        Ok(Some(s)) => cache().text = Some(s),
+        Ok(None) => {}
+        Err(_) => refresh(),
+    }
 }
 
 /// Puts `text` on the system clipboard and remembers it as the
@@ -106,9 +141,10 @@ pub fn set(text: String) {
 
 /// In `App::raw_input_hook`: takes a read's answer; a paste of
 /// egui-winit's (a hardware keyboard's Ctrl+V) takes the system
-/// clipboard's text when it has one — the marker alone (nothing ever
-/// copied) pastes nothing; the window coming back into focus (the user
-/// may have copied in another app) asks for the text again.
+/// clipboard's text as read at that moment, when it has one — the marker
+/// alone (nothing ever copied) pastes nothing; the window coming back into
+/// focus (the user may have copied in another app) asks for the text
+/// again.
 pub fn before_frame(raw: &mut egui::RawInput) {
     poll();
     if raw.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(true))) {
@@ -117,7 +153,7 @@ pub fn before_frame(raw: &mut egui::RawInput) {
     if !raw.events.iter().any(|e| matches!(e, egui::Event::Paste(_))) {
         return;
     }
-    let system = text();
+    let system = text_now();
     raw.events.retain_mut(|e| {
         let egui::Event::Paste(text) = e else { return true };
         match &system {

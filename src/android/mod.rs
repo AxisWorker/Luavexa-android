@@ -186,11 +186,32 @@ pub fn run(app: AndroidApp) {
     // Studio's built-in content (the CDN download, ~60 MB compressed) in the
     // background when it isn't there yet, as on a desktop; the editor works
     // without it meanwhile. Pure-Rust TLS (ureq + rustls/ring), no OpenSSL.
+    // (`network_available` asks for NET_CAPABILITY_INTERNET only: VALIDATED
+    // is missing on networks whose connectivity check is blocked or slow —
+    // some vendors' and regions' — while the internet works, and the
+    // download must not be given up on those.) Without a network, the
+    // download starts when one comes, rather than at the next launch.
     if jni::network_available().unwrap_or(true) {
         rustudio_core::studio_content::spawn_background_install_if_missing();
     } else {
-        log::warn!("no network: Studio content download postponed");
+        log::warn!("no network yet: Studio content download waits for one");
+        let _ = std::thread::Builder::new().name("studio-content-wait".into()).spawn(|| {
+            for _ in 0..180 {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                if jni::network_available().unwrap_or(true) {
+                    log::info!("network is up: starting the Studio content download");
+                    rustudio_core::studio_content::spawn_background_install_if_missing();
+                    return;
+                }
+            }
+            log::warn!("no network for half an hour: Studio content download left to the next launch");
+        });
     }
+    // One request at start, so a report says whether HTTPS works from this
+    // app at all (Output and logcat: "network check: …"): a no-network
+    // phone, a DNS or certificate problem and a blocked CDN each read
+    // differently there.
+    network_check();
     // Studio Settings: the user's, kept in the app's folder (as a plain
     // desktop run keeps them; src/studio_settings.rs).
     crate::studio_settings::init(true);
@@ -362,4 +383,27 @@ pub mod touch {
         ed.ui.zoom = zoom;
         ed.auto_zoom = false;
     }
+}
+
+/// A GET of Roblox's small client-version page on a thread of its own, with
+/// short timeouts; the result goes to Output (through the Studio content
+/// messages) and to logcat.
+fn network_check() {
+    let _ = std::thread::Builder::new().name("network-check".into()).spawn(|| {
+        use std::time::{Duration, Instant};
+        const URL: &str = "https://clientsettingscdn.roblox.com/v2/client-version/WindowsStudio64";
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(30)))
+            .user_agent(concat!("rustudio/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .into();
+        let t0 = Instant::now();
+        let (err, line) = match agent.get(URL).call() {
+            Ok(r) => (false, format!("network check: HTTP {} from clientsettingscdn.roblox.com in {} ms", r.status().as_u16(), t0.elapsed().as_millis())),
+            Err(e) => (true, format!("network check failed after {} ms: {e} (GET {URL}); nothing from Roblox — sign-in, assets, Studio content — can work until this does", t0.elapsed().as_millis())),
+        };
+        if err { log::warn!("{line}") } else { log::info!("{line}") }
+        rustudio_core::studio_content::note(err, line);
+    });
 }

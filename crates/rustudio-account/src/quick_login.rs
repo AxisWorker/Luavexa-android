@@ -251,17 +251,51 @@ impl QuickLogin {
     /// (the reason went to `on_status`).
     pub fn wait(&self, stop: &dyn Fn() -> bool, on_status: &mut dyn FnMut(&QuickStatus)) -> Result<Option<String>> {
         let mut last = QuickStatus::Created;
+        // A check that fails to reach Roblox (the phone's connection
+        // changing while the browser is in front, a moment without
+        // network) is no verdict on the code: a few are let pass, the
+        // code being good for minutes; only failing on end on gives up.
+        const PATIENCE: u32 = 6;
+        let mut failures = 0u32;
         loop {
             if stop() {
                 return Ok(None);
             }
-            let now = self.status()?;
+            let now = match self.status() {
+                Ok(s) => {
+                    failures = 0;
+                    s
+                }
+                Err(e) if failures + 1 < PATIENCE => {
+                    failures += 1;
+                    eprintln!("[Info] Roblox: browser sign-in: check {failures} of {PATIENCE} failed ({e}); trying again");
+                    std::thread::sleep(Duration::from_secs(3));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             if now != last {
                 on_status(&now);
                 last = now.clone();
             }
             match now {
-                QuickStatus::Validated => return self.finish().map(Some),
+                QuickStatus::Validated => {
+                    // The exchange is one POST; a connection that fails
+                    // under it gets two more goes (the token is good
+                    // until it is used).
+                    let mut tries = 0u32;
+                    loop {
+                        match self.finish() {
+                            Ok(c) => return Ok(Some(c)),
+                            Err(e) if tries < 2 && !e.0.starts_with("Roblox") => {
+                                tries += 1;
+                                eprintln!("[Info] Roblox: browser sign-in: the token exchange failed ({e}); trying again");
+                                std::thread::sleep(Duration::from_secs(3));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
                 QuickStatus::Cancelled | QuickStatus::Expired => return Ok(None),
                 _ => {}
             }

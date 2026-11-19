@@ -15,9 +15,13 @@
 //! - `ReflectionMetadata.xml`, taken alone out of `RobloxStudio.zip` with
 //!   HTTP range requests (about 30 KB instead of the 120 MB package).
 //!
-//! About 60 MB to download. `rustudio --install-studio-content` does it in
-//! the terminal; a normal launch does it in the background the first time
-//! (`RUSTUDIO_NO_STUDIO_FETCH=1` turns that off).
+//! About 60 MB to download, a few packages at a time. `rustudio
+//! --install-studio-content` does it in the terminal; a normal launch does
+//! it in the background the first time (`RUSTUDIO_NO_STUDIO_FETCH=1` turns
+//! that off). The install counts as complete — Play uses it — once the
+//! packages and ReflectionMetadata.xml are there; the retired textures and
+//! the View Selector follow, and are made good at a later start if they
+//! don't.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -75,6 +79,11 @@ fn post(err: bool, t: String) {
         m.push((err, t));
     }
 }
+/// A line for Output from another start-up check (the Android entry
+/// point's network check), shown with the download's messages.
+pub fn note(err: bool, text: String) {
+    post(err, text);
+}
 
 /// On a normal launch with no Studio content anywhere, download it in the
 /// background and report to Output.
@@ -107,6 +116,8 @@ pub fn spawn_background_install_if_missing() {
         let step = |s: &str| {
             if s.starts_with("downloading ") || (s.starts_with("fetching ") && !s.starts_with("fetching legacy ")) {
                 post(false, format!("Studio content: {s}…"));
+            } else if s.starts_with("ready") || s.starts_with("couldn't ") {
+                post(false, format!("Studio content: {s}"));
             }
         };
         // A connection that drops gets a few more tries here (the download
@@ -134,8 +145,17 @@ pub fn spawn_background_install_if_missing() {
 }
 
 fn agent() -> ureq::Agent {
+    use std::time::Duration;
+    // A slow connection may take what it takes for an 18 MB package; a
+    // dead one (a phone that changed networks, a process thawed after a
+    // while in the background) must fail within the minute so the next
+    // try can go on where this one stopped, not sit on a socket for as
+    // long as the kernel retransmits.
     ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(600)))
+        .timeout_resolve(Some(Duration::from_secs(20)))
+        .timeout_connect(Some(Duration::from_secs(20)))
+        .timeout_recv_response(Some(Duration::from_secs(60)))
+        .timeout_per_read(Some(Duration::from_secs(60)))
         .user_agent(concat!("rustudio/", env!("CARGO_PKG_VERSION")))
         .build()
         .into()
@@ -237,7 +257,7 @@ fn install_view_selector(agent: &ureq::Agent, version: &str, root: &Path) -> Res
     has_view_selector(root).then_some(()).ok_or_else(|| "Studio packages are missing View Selector files".into())
 }
 
-pub fn install(progress: &dyn Fn(&str)) -> Result<String, String> {
+pub fn install(progress: &(dyn Fn(&str) + Sync)) -> Result<String, String> {
     let agent = agent();
     let v: serde_json::Value = serde_json::from_slice(&get(&agent, VERSION_URL, None)?)
         .map_err(|e| format!("version answer: {e}"))?;
@@ -271,49 +291,38 @@ pub fn install(progress: &dyn Fn(&str)) -> Result<String, String> {
     std::fs::create_dir_all(&partial).map_err(|e| e.to_string())?;
     std::fs::write(partial.join(".version"), format!("{stamp}\n")).map_err(|e| e.to_string())?;
 
+    // The packages a few at a time (each is one request; on a phone's
+    // connection the wait for each is mostly latency, and the biggest is
+    // 18 MB, so three in flight stay well within memory).
     let result = (|| -> Result<(), String> {
         let total = PACKAGES.len();
-        for (n, (pkg, sub)) in PACKAGES.iter().enumerate() {
-            let done = partial.join(format!(".done-{pkg}"));
-            if done.is_file() {
-                continue;
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let failed: Mutex<Option<String>> = Mutex::new(None);
+        std::thread::scope(|scope| {
+            for _ in 0..PARALLEL_PACKAGES.min(total) {
+                scope.spawn(|| loop {
+                    let n = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some((pkg, sub)) = PACKAGES.get(n) else { return };
+                    if failed.lock().map(|f| f.is_some()).unwrap_or(true) {
+                        return;
+                    }
+                    let done = partial.join(format!(".done-{pkg}"));
+                    if done.is_file() {
+                        continue;
+                    }
+                    progress(&format!("downloading {pkg} ({}/{total})", n + 1));
+                    if let Err(e) = install_package(&agent, &version, pkg, &partial.join(sub), &done) {
+                        if let Ok(mut f) = failed.lock() {
+                            f.get_or_insert(e);
+                        }
+                        return;
+                    }
+                });
             }
-            progress(&format!("downloading {pkg} ({}/{total})", n + 1));
-            let url = format!("{CDN}/{version}-{pkg}");
-            let bytes = get(&agent, &url, None)?;
-            let zip = Zip::parse(&bytes).map_err(|e| format!("{pkg}: {e}"))?;
-            for e in &zip.entries {
-                if e.name.ends_with(['/', '\\']) {
-                    continue;
-                }
-                let data = zip.read(&bytes, e).map_err(|err| format!("{pkg} {}: {err}", e.name))?;
-                write_file(&partial.join(sub), &e.name, &data)?;
-            }
-            std::fs::write(&done, "").map_err(|e| e.to_string())?;
+        });
+        if let Some(e) = failed.lock().ok().and_then(|mut f| f.take()) {
+            return Err(e);
         }
-        // Studio resolves retired rbxasset paths through LegacyContentTable,
-        // not another deployment zip. Materialize its missing textures too so
-        // a downloaded content tree is usable by file-based consumers.
-        let legacy: Vec<(&str, &str)> = include_str!("../../../assets/legacy-content.tsv")
-            .lines()
-            .filter_map(|line| line.split_once('\t'))
-            .filter(|(path, _)| path.starts_with("textures/") && !partial.join("content").join(path).is_file())
-            .collect();
-        if !legacy.is_empty() {
-            progress(&format!("fetching {} retired textures one by one", legacy.len()));
-        }
-        for (path, id) in legacy {
-            let id: u64 = id.trim().parse().map_err(|e| format!("legacy texture {path}: {e}"))?;
-            progress(&format!("fetching legacy {path}"));
-            match crate::assets::remote_cached(id) {
-                Ok(bytes) => write_file(&partial.join("content"), path, &bytes)?,
-                // Some retired entries have also been removed from asset
-                // delivery. They must not prevent installing current content.
-                Err(e) => progress(&format!("legacy {path} unavailable: {e}")),
-            }
-        }
-        progress("downloading Studio View Selector");
-        install_view_selector(&agent, &version, &partial)?;
         for (pkg, file) in SINGLE_FILES {
             if partial.join(file).is_file() {
                 continue;
@@ -338,7 +347,81 @@ pub fn install(progress: &dyn Fn(&str)) -> Result<String, String> {
     let _ = std::fs::remove_dir_all(&dest);
     std::fs::rename(&partial, &dest).map_err(|e| format!("{}: {e}", dest.display()))?;
     progress(&format!("installed in {}", dest.display()));
+    // Play has what it needs from here (character, player scripts, fonts,
+    // textures). What follows is the editor's finish, which may take a
+    // while on a slow connection and a hundred requests: it mustn't keep
+    // Play waiting, and a failure in it is made good at the next start
+    // (`spawn_background_install_if_missing` for the View Selector; a
+    // retired texture is fetched by id when a place asks for it,
+    // assets.rs `legacy_content`).
+    progress("ready: Play now uses Roblox's default character and player scripts; the rest (retired textures, the View Selector) is fetched in the background");
+    install_extras(&agent, &version, &dest, progress);
     Ok(version)
+}
+
+/// How many packages are downloaded at once.
+const PARALLEL_PACKAGES: usize = 3;
+/// How many retired textures are fetched at once.
+const PARALLEL_LEGACY: usize = 2;
+
+/// One package: downloaded, unpacked under `into`, and `done` written.
+fn install_package(agent: &ureq::Agent, version: &str, pkg: &str, into: &Path, done: &Path) -> Result<(), String> {
+    let url = format!("{CDN}/{version}-{pkg}");
+    let bytes = get(agent, &url, None)?;
+    let zip = Zip::parse(&bytes).map_err(|e| format!("{pkg}: {e}"))?;
+    for e in &zip.entries {
+        if e.name.ends_with(['/', '\\']) {
+            continue;
+        }
+        let data = zip.read(&bytes, e).map_err(|err| format!("{pkg} {}: {err}", e.name))?;
+        write_file(into, &e.name, &data)?;
+    }
+    std::fs::write(done, "").map_err(|e| e.to_string())
+}
+
+/// The editor's extras, into an installed `root`: the retired textures
+/// Studio resolves through LegacyContentTable (materialized so file-based
+/// consumers find them), and the View Selector cube. Best effort: what
+/// fails is said and left for the next start.
+fn install_extras(agent: &ureq::Agent, version: &str, root: &Path, progress: &(dyn Fn(&str) + Sync)) {
+    let legacy: Vec<(&str, &str)> = include_str!("../../../assets/legacy-content.tsv")
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(path, _)| path.starts_with("textures/") && !root.join("content").join(path).is_file())
+        .collect();
+    if !legacy.is_empty() {
+        progress(&format!("fetching {} retired textures", legacy.len()));
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..PARALLEL_LEGACY.min(legacy.len()) {
+                scope.spawn(|| loop {
+                    let n = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some((path, id)) = legacy.get(n) else { return };
+                    progress(&format!("fetching legacy {path}"));
+                    let Ok(id) = id.trim().parse::<u64>() else {
+                        progress(&format!("legacy texture {path}: bad id"));
+                        continue;
+                    };
+                    match crate::assets::remote_cached(id) {
+                        Ok(bytes) => {
+                            if let Err(e) = write_file(&root.join("content"), path, &bytes) {
+                                progress(&format!("legacy {path}: {e}"));
+                            }
+                        }
+                        // Some retired entries have also been removed from
+                        // asset delivery; a place that wants one asks by id.
+                        Err(e) => progress(&format!("legacy {path} unavailable: {e}")),
+                    }
+                });
+            }
+        });
+    }
+    if !has_view_selector(root) {
+        progress("downloading Studio View Selector");
+        if let Err(e) = install_view_selector(agent, version, root) {
+            progress(&format!("couldn't download Studio's View Selector ({e}); the next start tries again"));
+        }
+    }
 }
 
 /// Write `name` (a zip path, `\` or `/` separated) under `root`, refusing

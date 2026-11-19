@@ -69,9 +69,9 @@ impl TextMenu {
                 _ => {}
             }
             let at = r.interact_pointer_pos().or_else(|| ctx.pointer_latest_pos()).unwrap_or(r.rect.left_bottom());
-            // (the clipboard's text as last read; asked for again now, and
-            // Paste comes alive when the answer lands while the menu is up)
-            super::clipboard::refresh();
+            // (the clipboard's text, read now; should that fail, the main
+            // thread is asked and Paste comes alive when its answer lands)
+            super::clipboard::prime();
             let clipboard = super::clipboard::text();
             let surrender = ctx.options_mut(|o| {
                 std::mem::replace(&mut o.input_options.surrender_focus_on, egui::SurrenderFocusOn::Never)
@@ -115,7 +115,8 @@ impl TextMenu {
                             chosen = Some(Event::Copy);
                         }
                         if item(ui, "Paste", open.clipboard.is_some()) {
-                            chosen = Some(Event::Paste(open.clipboard.clone().unwrap_or_default()));
+                            // (what is on the clipboard at this moment)
+                            chosen = Some(Event::Paste(super::clipboard::text_now().or_else(|| open.clipboard.clone()).unwrap_or_default()));
                         }
                         if item(ui, "Select all", true) {
                             chosen = Some(Event::Key {

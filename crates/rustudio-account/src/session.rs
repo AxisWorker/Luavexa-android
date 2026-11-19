@@ -425,12 +425,27 @@ pub fn session_agent() -> ureq::Agent {
 }
 
 fn session_agent_with_timeout(timeout: Option<std::time::Duration>) -> ureq::Agent {
+    use std::time::Duration;
     // Redirects are reported, not followed: a cookie call that is sent to
     // a login page is a refusal, and a POST must not be replayed elsewhere.
+    //
+    // No limit on a whole call (an upload or a big download takes what it
+    // takes), but a limit on every step of one: a connection that dies
+    // under the app — a phone switching from Wi-Fi to mobile data while
+    // the browser is in front for a sign-in, a process frozen in the
+    // background and thawed — must fail and be retried, not hang the
+    // caller for as long as the kernel keeps retransmitting (the
+    // "Confirmed, signing in…" that never ended).
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
         .timeout_global(timeout)
+        .timeout_resolve(Some(Duration::from_secs(20)))
+        .timeout_connect(Some(Duration::from_secs(20)))
+        .timeout_send_request(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(Duration::from_secs(60)))
+        .timeout_per_read(Some(Duration::from_secs(60)))
+        .timeout_per_write(Some(Duration::from_secs(60)))
         .user_agent(concat!(
             "Mozilla/5.0 (X11; Linux x86_64) rustudio/",
             env!("CARGO_PKG_VERSION")
