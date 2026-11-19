@@ -4192,7 +4192,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "android_logger",
  "ash",
@@ -4258,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-account"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "android-native-keyring-store",
  "base64 0.23.1",
@@ -4277,14 +4277,14 @@ dependencies = [
 
 [[package]]
 name = "rustudio-android"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "rustudio",
 ]
 
 [[package]]
 name = "rustudio-core"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "bytemuck",
  "chrono",
@@ -4311,7 +4311,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-engine"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "blake2",
  "blake3",
@@ -4347,7 +4347,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-net"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "base64 0.23.1",
  "blake2",
@@ -4367,7 +4367,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-physics"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "flate2",
  "glam 0.30.10",
@@ -4381,7 +4381,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-player"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "bytemuck",
  "chrono",
@@ -4408,7 +4408,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-render"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "blake3",
  "bytemuck",

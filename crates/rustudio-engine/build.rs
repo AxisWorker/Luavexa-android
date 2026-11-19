@@ -10,9 +10,11 @@
 //! rustudio-core takes the tables at start-up.
 //!
 //! The source walk is shared with the root build script:
-//! build/source_claims.rs.
+//! build_support/source_claims.rs. (Not under a directory named `build/`:
+//! tools that treat that name as generated output — global gitignores,
+//! workspace exports — have dropped the file and broken the build.)
 
-include!("build/source_claims.rs");
+include!("build_support/source_claims.rs");
 
 const CLAIMERS: &[(&str, &[&str])] = &[
     ("pages", &["domains/pages"]),
@@ -74,5 +76,5 @@ fn member_claims() {
 fn main() {
     member_claims();
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=build/source_claims.rs");
+    println!("cargo:rerun-if-changed=build_support/source_claims.rs");
 }
