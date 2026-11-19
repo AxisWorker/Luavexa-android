@@ -1,7 +1,7 @@
 # Engine gaps (measured)
 
 What real games touch that rustudio doesn't implement, counted by the gap
-telemetry (`RUSTUDIO_GAPS=FILE`, src/telemetry.rs) while playing the
+telemetry (`RUSTUDIO_GAPS=FILE`, crates/rustudio-core/src/telemetry.rs) while playing the
 fidelity corpus: **Place A** (lobby, START GAME, 60 s of a Map 1 match with
 walking and firing), the **demo** scene and the **control** place (Play,
 walking, jumping, clicking). Every member is checked against Studio's own API
@@ -22,7 +22,7 @@ Gap kinds:
 Were silent stubs (AddVertex returned 0, Size (0, 0), ReadPixelsBuffer nil,
 `Content.fromObject` missing): Place A's WeaponModels / CamoFx / CamoLayers fell
 back inside their pcalls and every camo'd gun drew plain grey. Now
-(src/editable.rs, a runtime submodule):
+(crates/rustudio-engine/src/editable.rs, a runtime submodule):
 
 - **Content** is a datatype (typeof "Content"; `SourceType`, `Uri`,
   `Object`): `Content.none`, `fromUri`, `fromAssetId`, `fromObject(EditableImage | EditableMesh)`.
@@ -114,7 +114,7 @@ documented one (create.roblox.com/docs/reference/engine/classes/…).
 | 16 | 2 | ScriptContext.Error | event-unwired | Fires when a script errors: (message, stackTrace, script) | Place A DevErrors, Main | **done**: fired for every script error on that side, with the script when its name resolves |
 | 17 | 2 | StudioTestService.GetTestArgs | missing | The arguments a test run was started with (ExecuteRunModeAsync / ExecutePlayModeAsync); nil for a plain Play | Place A DevTest, Progression | **done**: nil |
 | 18 | 1 | UserInputService.GamepadDisconnected | event-unwired | Fires when a gamepad is unplugged, with its UserInputType | Place A GameInput | open: no gamepad input yet |
-| 19 | 1 | UserInputService.LastInputTypeChanged | event-unwired | Fires when the kind of input the player last used changes (keyboard, mouse movement, a button…), with the new UserInputType | Place A GameInput | **done**: from the input stream; GetLastInputType() follows it |
+| 19 | 1 | UserInputService.LastInputTypeChanged | event-unwired | Fires when the kind of input the player last used changes (keyboard, mouse movement, a button…), with the new UserInputType | Place A GameInput | **done**: from the input stream; GetLastInputType() follows it, and before any input answers the device's kind (Touch on a touch screen, Keyboard on a desktop) as Roblox does — the PlayerModule picks its touch controls from that first answer |
 
 After the fixes the same runs touch: Place A 3 open gaps (GuiService.MenuOpened,
 Humanoid.Seated, UserInputService.GamepadDisconnected), demo and control 6
@@ -129,10 +129,10 @@ engine's sources (build.rs) now covers both.
 
 ## Round 14: every script-reachable member exists
 
-**Stubs.** `tools/gen_stubs.py` writes `src/api_stubs.rs` from the dump:
+**Stubs.** `tools/gen_stubs.py` writes `crates/rustudio-core/src/api_stubs.rs` from the dump:
 4646 members a game script may reach (Security None; properties by read
 security), each with a typed default (`false`, `0`, `""`, `{}`, the enum's
-item 0, `Vector3.new()`…, a signal). `src/stubs.rs` answers from it only
+item 0, `Vector3.new()`…, a signal). `crates/rustudio-engine/src/stubs.rs` answers from it only
 after the runtime's own lookups fail: reads give the default (or what a
 script wrote; read-only ones refuse with Studio's message), writes are kept
 per instance and fire Changed, calls return the typed empty value, events
@@ -197,7 +197,7 @@ Diagnosed with probes on both sides (round 13):
    (0 `ZHit` remotes). With no kills the player was downed at ~88 s, the
    session ended and its folder (with Round / RoundState) was deleted:
    that is the nil the probes read. **Fixed**: one shared table per Play
-   session (src/collision_groups.rs) used by both runtimes' queries and by
+   session (crates/rustudio-core/src/collision_groups.rs) used by both runtimes' queries and by
    the physics (rapier interaction groups; the character collides as its
    root part's group).
 2. **SetAttribute fired on an unchanged value** (2236 AttributeChanged for
@@ -226,7 +226,7 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
 - **WorldRoot:GetPartsInPart compared bounding boxes**; Roblox tests the real
   shapes (Place A's headroom probes rely on it: a turned brush's or a terrain
   chunk's box covers far more than the part). Now exact: box vs box by
-  separating axes, box vs mesh triangles (src/query_shapes.rs).
+  separating axes, box vs mesh triangles (crates/rustudio-physics/src/query_shapes.rs).
 - **Invoke before the callback existed errored** ("OnInvoke is not set" /
   "OnServerInvoke is not set"). Roblox holds the call: a BindableFunction's
   `Invoke` yields until `OnInvoke` is set (and never resumes if it never
@@ -235,7 +235,7 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
   character's Controls LocalScript (LBG, Android) invoked a BindableFunction
   40 ms before the 70k-line renderer LocalScript set its callback and died
   at that line every spawn. Now every path waits a frame at a time
-  (src/runtime.rs PRELUDE `__rs_wait_callback`, INVOKE_PRELUDE
+  (crates/rustudio-engine/src/runtime.rs PRELUDE `__rs_wait_callback`, INVOKE_PRELUDE
   `__rs_serve_invoke`; test `invoke_waits_for_the_callback`).
 - **Studio 0.748's PlayerModule lost its InputContexts** (content
   `version-8d7a1009c17e4ff8`, deployed 2025-11-16). `PlayerScripts.rbxp` now
@@ -252,7 +252,7 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
   a `$path` ending in `.rbxp` is loaded as that project's `tree`, relative
   to its own file, `$properties` over an imported tree apply, and a missing
   source is an error Play reports ("Could not load Studio PlayerModule for
-  Play: …") instead of a silent empty Folder (src/default_scripts.rs
+  Play: …") instead of a silent empty Folder (crates/rustudio-core/src/default_scripts.rs
   `project_tree` / `project_node`; test
   `project_imports_input_contexts_with_properties_and_rejects_missing_sources`).
   The port's own fix of the same gap was dropped for upstream's.
@@ -283,7 +283,7 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
   the flex alignments grow the items or spread them along a line and
   spread the lines across, Automatic / Start / Center / End / Stretch set
   the items within their line, and an AutomaticSize parent holds the
-  lines (src/gui_walk.rs `list_lines`; AbsoluteContentSize follows the
+  lines (crates/rustudio-engine/src/gui_walk.rs `list_lines`; AbsoluteContentSize follows the
   drawn boxes; test `list_wraps_and_flexes`). Not done: UIFlexItem Shrink
   and a Fill line narrower than its items (nothing shrinks).
 - **UIShadow was not drawn** (138 in LBG: glows behind its result frames,
@@ -291,24 +291,45 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
   object's background: the box (with its UICorner) moved by Offset, grown
   by Spread, its edge softened over BlurRadius (scale of the shorter side),
   in Color at 1 - Transparency; ShowBehindParent false leaves out the part
-  under the box (src/gui_fx.rs `shadow`; test `ui_shadow_under_the_box`).
+  under the box (crates/rustudio-engine/src/gui_fx.rs `shadow`; test `ui_shadow_under_the_box`).
   Not done: Inset, Text mode, a UIGradient under the shadow.
 - **No top bar over the game**: the Roblox menu (Esc) and the chat (`/`)
   had keys only, so a phone — no Esc, no `/` — never reached either, and a
   Studio playtest's view lacked the bar Studio draws in the 58 px inset.
   Now the CoreScripts' TopBar (Chrome layout, Constants.lua: 44 px
   buttons, 16 in from the side, 12 apart) is drawn over the game view in
-  Play: the Roblox button opens and closes the menu, the unibar's chat
-  button opens the chat window with its box focused (hidden with
+  Play from Roblox's own TopBar textures (content/textures/ui/TopBar:
+  iconBase.png as each button's plate, coloredlogo.png for the Roblox
+  button, chatOn.png / chatOff.png for the chat button; the @2x / @3x
+  sheets at a phone's density; while the menu is open the bar gives way
+  to the round close button, as TopBarApp hides TopBarFrame for
+  CloseMenuButtonRound; hand-drawn stand-ins until Studio's content is
+  installed): the Roblox button opens and closes the menu, the unibar's
+  chat button opens the chat window with its box focused (hidden with
   SetCoreGuiEnabled(Chat, false)). `StarterGui:SetCore("TopbarEnabled",
   false)` hides the bar and `SetCore("ChatActive", open)` opens / closes
   the chat, as the CoreScripts' registerSetCores does, and
   `GetCore("TopbarEnabled")` reads it back (TopbarPlus's IconController
-  polls it; the other GetCore keys still return nil) (src/play_game.rs
-  `top_bar`, src/runtime_ext.rs; test `set_core_topbar_and_chat`). Not
+  polls it; the other GetCore keys still return nil) (crates/rustudio-player/src/play_game.rs
+  `top_bar`, crates/rustudio-engine/src/runtime_ext.rs; test `set_core_topbar_and_chat`). Not
   done: the unibar's other icons (captures, emotes, leaderboard,
   inventory), the health bar, notifications; a hidden bar keeps the 58 px
   GuiInset (Roblox drops it to 0 — ScreenGuis then start at the top).
+- **A short Team Create join played as if whole**: `rustudio_net`'s
+  `Ready` is 1.5 s without an instance batch, not the server's end of
+  transfer, and a child parked for a parent that never arrived, or
+  instances still streaming when the server dropped the session, left no
+  trace — a game then fails on a missing child (LBG's
+  `MeshGroup.BeanWind.Mesh` in a place opened from Roblox: 154,702
+  instances joined, the saved file has 160,078, the stream reset 3.5 s
+  after Ready; from the file the same handler runs clean). The Output now
+  counts the parked instances at Ready (a few named) and, at a
+  disconnect, the instances that came after Ready or that the join never
+  finished, each asking to reopen the place or open a saved .rbxl before
+  playing (`model.rs` `parked_count`, `cloud_ui.rs` `ready_count`). Not
+  done: the protocol's own end-of-join signal; a join that stalls under
+  QUIC flow control while the phone is busy applying batches can still
+  pass for quiet.
 
 ## Coverage of Studio's API
 
@@ -368,7 +389,7 @@ Round 12 fidelity scores (render, settled shots): Place A 49.5, demo 69.3
   a Studio calibration scene (transparency steps over light and dark).
 - **Place A chapel brightness** (Soft spot lights) and the **skybox / stud scale**
   remain open.
-- **Graphics quality levels** (the Android port; `src/quality.rs`):
+- **Graphics quality levels** (the Android port; `crates/rustudio-render/src/quality.rs`):
   `settings().Rendering.EditQualityLevel` now does what Studio's does —
   Automatic or Level01–21 onto a 1–10 bar of view distance, part detail,
   texture size, texture filtering, the lite shader (no normal maps,
@@ -430,5 +451,5 @@ camera 75 → 100 with the 2° tolerance unchanged.
    mouse path stays). The soft keyboard over a game's TextBox:
    `OnScreenKeyboardVisible / Position / Size` in the game's
    coordinates and `TextBox.ReturnPressedFromOnScreenKeyboard`
-   (src/viewport.rs `keyboard_pan`, src/runtime_ext.rs `device_prop`;
+   (src/viewport.rs `keyboard_pan`, crates/rustudio-engine/src/runtime_ext.rs `device_prop`;
    zero and never on a desktop, as in Studio).

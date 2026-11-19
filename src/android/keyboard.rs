@@ -8,9 +8,11 @@
 //! insets ([`jni::keyboard_height_later`](super::jni::keyboard_height_later))
 //! and
 //!
-//! * the editor's panels are laid out above it ([`Keyboard::shrink`] takes
-//!   that much off the root `Ui` in `App::ui`, so the dock, the 3D view and
-//!   the status bar move up as `adjustResize` would move an Android view)
+//! * the editor's panels are laid out above it and the text bar over it
+//!   (text_bar.rs: Cut / Copy / Paste / Select all; [`Keyboard::shrink`]
+//!   takes that much — [`Keyboard::room`] — off the root `Ui` in `App::ui`,
+//!   so the dock, the 3D view and the status bar move up as `adjustResize`
+//!   would move an Android view)
 //!   — unless a game's TextBox is typed into: the keyboard then lies over
 //!   the window as it does over a phone's games, and the 3D view slides up
 //!   by what shows the box above it (`Editor::keyboard_pan` in
@@ -20,7 +22,11 @@
 //!   the keyboard's place as `UserInputService.OnScreenKeyboardVisible /
 //!   Position / Size`;
 //! * it is egui's bottom safe-area inset, so windows, menus and popups keep
-//!   to the area above it too ([`Keyboard::before_frame`]);
+//!   to the area above it too ([`Keyboard::before_frame`]) — again not
+//!   while a game's TextBox is typed into: egui lays its bottom panels out
+//!   above the inset, and the status bar rose with the keyboard over the
+//!   box the view had just slid up to show; the inset stays 0 then
+//!   ([`Keyboard::cover`] tells the view how much the keyboard covers);
 //! * the frame the room changes, [`reveal`] is true: the field being typed
 //!   into scrolls itself into view (properties.rs `text_cell`, the script
 //!   editor: [`reveal_cursor`]), as Android scrolls a focused EditText.
@@ -117,6 +123,12 @@ pub struct Keyboard {
     shown: bool,
     /// Since when nothing has wanted the keyboard, while `shown`.
     unwanted_since: Option<Instant>,
+    /// The keyboard lies over the window (up for a game's TextBox): no
+    /// room is made for it — no inset, no `shrink` — and the view slides
+    /// instead (`cover`). Decided while something wants the keyboard and
+    /// kept until it is down, so the panels don't jump for the frames
+    /// between a TextBox's focus going and the keyboard's slide out.
+    over: bool,
 }
 
 /// What wants the soft keyboard.
@@ -144,8 +156,8 @@ pub fn wanted(ctx: &egui::Context, textbox: bool) -> Option<Want> {
 /// FocusLost (`focus_events`), the GUI stops typing into it (`focus_req`).
 fn release_textbox() {
     for ch in 0..2u8 {
-        let _c = crate::gui::share_channel(ch);
-        let mut sh = crate::gui::share();
+        let _c = rustudio_engine::gui::share_channel(ch);
+        let mut sh = rustudio_engine::gui::share();
         if let Some(f) = sh.focus.take() {
             sh.focus_events.push((f, false, false, None));
             sh.focus_req.push(None);
@@ -200,10 +212,20 @@ pub fn reveal_cursor(ui: &egui::Ui, out: &egui::text_edit::TextEditOutput) {
 
 impl Keyboard {
     /// In `App::raw_input_hook`: reads the keyboard's height when it may
-    /// have changed and hands it to egui as the bottom safe-area inset.
-    pub fn before_frame(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput, textbox: bool) {
+    /// have changed and hands it to egui as the bottom safe-area inset —
+    /// unless the keyboard lies over the window (`game_box`: a game's
+    /// TextBox has the focus; `textbox` covers it and a plugin GUI's).
+    /// With the inset, egui's bottom panels end above the keyboard: the
+    /// status bar rose with it and sat over the very box being typed
+    /// into, the view slid up by the keyboard's height behind it.
+    pub fn before_frame(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput, textbox: bool, game_box: bool) {
         CHANGED.store(false, Ordering::Relaxed);
         let want = wanted(ctx, textbox);
+        if let Some(w) = want {
+            // (a focused egui field comes first in `wanted`: the game's
+            // box is typed into only while none is)
+            self.over = w == Want::TextBox && game_box;
+        }
         let watching = want.is_some() || self.height_px > 0 || self.last_read.is_some_and(|(h, _)| h > 0);
         if watching {
             let now = Instant::now();
@@ -230,7 +252,7 @@ impl Keyboard {
             self.focus_since = None;
         }
         // Every frame, down (zero) or up: egui keeps the last inset given.
-        let bottom = self.height(ctx);
+        let bottom = if self.over { 0.0 } else { self.room(ctx) };
         raw.safe_area_insets = Some(SafeAreaInsets(MarginF32 { left: 0.0, right: 0.0, top: 0.0, bottom }));
     }
 
@@ -352,6 +374,7 @@ impl Keyboard {
             // the navigation bar it brought up goes with it.
             if px <= 0 && self.height_px > 0 {
                 super::system_bars::keyboard_closed();
+                self.over = false;
             }
             self.height_px = px;
             CHANGED.store(true, Ordering::Relaxed);
@@ -366,14 +389,31 @@ impl Keyboard {
         self.height_px as f32 / ctx.pixels_per_point().max(0.1)
     }
 
-    /// At the start of `App::ui`: the root `Ui` ends above the keyboard, so
-    /// every panel laid out in it does too.
+    /// The keyboard's height plus the band of the text bar above it
+    /// (text_bar.rs: Cut / Copy / Paste / Select all), in points: what the
+    /// window's bottom gives up while the keyboard is up (0 while it is
+    /// down).
+    pub fn room(&self, ctx: &egui::Context) -> f32 {
+        let keyboard = self.height(ctx);
+        if keyboard <= 0.0 { 0.0 } else { keyboard + super::text_bar::HEIGHT }
+    }
+
+    /// What the keyboard and the bar cover of the window while the
+    /// keyboard lies over it (a game's TextBox: `Editor::keyboard_cover`,
+    /// the view slides by it); 0 while room is made for them instead.
+    pub fn cover(&self, ctx: &egui::Context) -> f32 {
+        if self.over { self.room(ctx) } else { 0.0 }
+    }
+
+    /// At the start of `App::ui`: the root `Ui` ends above the keyboard
+    /// and the bar, so every panel laid out in it does too (not while the
+    /// keyboard lies over the window: `cover`).
     pub fn shrink(&self, ui: &mut egui::Ui) {
-        let keyboard = self.height(ui.ctx());
-        if keyboard <= 0.0 {
+        let room = self.room(ui.ctx());
+        if room <= 0.0 || self.over {
             return;
         }
         let full = ui.max_rect().height();
-        ui.set_max_height((full - keyboard).max(MIN_HEIGHT.min(full)));
+        ui.set_max_height((full - room).max(MIN_HEIGHT.min(full)));
     }
 }

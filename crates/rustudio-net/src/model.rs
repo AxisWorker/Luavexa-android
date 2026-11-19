@@ -83,6 +83,34 @@ impl LiveModel {
     pub fn instance_count(&self) -> usize {
         self.refs.len()
     }
+    /// Instances that arrived before their parent and are still waiting for
+    /// it (not in the DOM, not counted by `instance_count`). Some left at
+    /// the end of a join mean the place came over incomplete.
+    pub fn parked_count(&self) -> usize {
+        self.pending.values().map(Vec::len).sum()
+    }
+    /// A few of the parked instances, for a notice: `Class "Name" (parent
+    /// 0x…)`.
+    pub fn parked_sample(&self, n: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for (parent, children) in &self.pending {
+            for c in children {
+                if out.len() >= n {
+                    return out;
+                }
+                let name = c
+                    .props
+                    .iter()
+                    .find_map(|(k, v)| match (k.as_str(), v) {
+                        ("Name", PropValue::String(s)) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| c.class.clone());
+                out.push(format!("{} \"{name}\" (parent {parent:#x})", c.class));
+            }
+        }
+        out
+    }
 
     /// Apply one op. Unknown/undecoded ops are ignored safely.
     pub fn apply(&mut self, op: RepOp) {

@@ -13,7 +13,7 @@
 use egui::{ComboBox, Grid, RichText, Slider};
 
 use crate::app::Editor;
-use crate::quality::{Overrides, RenderSettings, Shadows, LEVELS};
+use rustudio_render::quality::{Overrides, RenderSettings, Shadows, LEVELS};
 
 impl Editor {
     /// The window, while View > Graphics Settings has it open.
@@ -44,7 +44,7 @@ impl Editor {
     }
 
     fn graphics_settings_body(&mut self, ui: &mut egui::Ui) {
-        let format = self.render_state.as_ref().map(|rs| rs.device.clone());
+        let format = self.game.render_state.as_ref().map(|rs| rs.device.clone());
         let g = &mut self.graphics;
         ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(28.0);
 
@@ -116,7 +116,7 @@ impl Editor {
                 &mut o.lite,
                 lite(lv.lite),
                 &[(true, "Simple"), (false, "Full")],
-                |v| lite(if *v { crate::quality::LITE_PHONE } else { 0 }).to_string(),
+                |v| lite(if *v { rustudio_render::quality::LITE_PHONE } else { 0 }).to_string(),
             );
             choice(
                 ui,
@@ -179,7 +179,7 @@ impl Editor {
                 g.over = Overrides::default();
             }
             if ui.button("Restore Defaults").clicked() {
-                *g = crate::quality::Graphics::platform_default();
+                *g = rustudio_render::quality::Graphics::platform_default();
             }
         });
         ui.separator();
@@ -189,7 +189,7 @@ impl Editor {
             None => egui_wgpu::wgpu::TextureFormat::Rgba16Float,
         };
         ui.small(format!("Drawing at {}", s.describe(scene)));
-        if crate::quality::Graphics::env_level().is_some() {
+        if rustudio_render::quality::Graphics::env_level().is_some() {
             ui.small(RichText::new("RUSTUDIO_QUALITY is set for this run: it overrides the level.").weak());
         }
         #[cfg(target_os = "android")]

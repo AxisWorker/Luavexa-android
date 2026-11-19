@@ -256,7 +256,7 @@ pub fn model_upload(title: &str, description: &str, user_id: u64) -> (&'static s
 
 /// The Asset Configuration windows: Save uploads the selection on a worker
 /// thread (only from a person's click: harness answers never upload).
-fn asset_config_ui(ctx: &egui::Context, doc: &crate::doc::Document) {
+fn asset_config_ui(ctx: &egui::Context, doc: &rustudio_core::doc::Document) {
     CONFIGS.with(|c| {
         let mut close = Vec::new();
         for cfg in c.borrow_mut().iter_mut() {
@@ -350,7 +350,7 @@ fn upload_model(title: &str, description: &str, rbxm: &[u8]) -> Result<u64, Stri
 /// native (rfd), awaited off the UI thread (on Android rustudio's own
 /// picker, drawn here); the asset-id picker is a window like Studio's
 /// Asset Configuration.
-pub fn ui(ctx: &egui::Context, doc: &crate::doc::Document) {
+pub fn ui(ctx: &egui::Context, doc: &rustudio_core::doc::Document) {
     use crate::file_dialog::Request;
     for (id, kind) in take_new() {
         match kind {
@@ -393,7 +393,7 @@ pub fn ui(ctx: &egui::Context, doc: &crate::doc::Document) {
         }
     }
     for url in std::mem::take(&mut *URLS.lock().unwrap_or_else(|e| e.into_inner())) {
-        crate::platform::open_url(ctx, &url);
+        crate::browser::open_url(ctx, &url);
     }
     #[cfg(target_os = "android")]
     FILE_PICKS.with(|p| {
@@ -497,14 +497,14 @@ fn spawn(ctx: &egui::Context, id: u64, d: crate::file_dialog::Request, pick: Pic
 
 /// Wavefront OBJ of the parts under `refs` (each part as its box; a
 /// MeshPart / union as its bounding box).
-pub fn obj_text(doc: &crate::doc::Document, refs: &[rbx_dom_weak::types::Ref]) -> String {
+pub fn obj_text(doc: &rustudio_core::doc::Document, refs: &[rbx_dom_weak::types::Ref]) -> String {
     use rbx_dom_weak::types::Variant;
     let mut out = String::from("# Exported by rustudio\n");
     let mut base = 1;
     let mut seen = std::collections::HashSet::new();
     for r in refs {
         for i in doc.dom.descendants_of(*r) {
-            if !seen.insert(i.referent()) || !crate::doc::is_a(i.class.as_str(), "BasePart") {
+            if !seen.insert(i.referent()) || !rustudio_core::doc::is_a(i.class.as_str(), "BasePart") {
                 continue;
             }
             let (Some(Variant::CFrame(cf)), Some(Variant::Vector3(size))) =

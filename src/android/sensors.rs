@@ -27,24 +27,22 @@ const TYPE_GAME_ROTATION_VECTOR: c_int = 15;
 /// 60 Hz samples are plenty.
 const RATE_USEC: i32 = 16_666;
 
-/// The latest sample of each sensor.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Reading {
-    /// TYPE_LINEAR_ACCELERATION (the accelerometer without gravity), m/s².
-    pub acceleration: [f32; 3],
-    /// TYPE_GRAVITY, m/s² (about 9.81 long, pointing down in device axes).
-    pub gravity: [f32; 3],
-    /// TYPE_GYROSCOPE, rad/s about the device axes.
-    pub gyro: [f32; 3],
-    /// TYPE_GAME_ROTATION_VECTOR (else TYPE_ROTATION_VECTOR): the device's
-    /// orientation as a unit quaternion (x, y, z, w).
-    pub rotation: [f32; 4],
-    /// How many samples have arrived (a changed count means a changed
-    /// reading, for firing the *Changed events once per new sample).
-    pub acceleration_seq: u32,
-    pub gravity_seq: u32,
-    pub gyro_seq: u32,
-    pub rotation_seq: u32,
+/// The latest sample of each sensor (the engine's type: TYPE_LINEAR_ACCELERATION
+/// and TYPE_GRAVITY in m/s², TYPE_GYROSCOPE in rad/s,
+/// TYPE_GAME_ROTATION_VECTOR — else TYPE_ROTATION_VECTOR — as a unit
+/// quaternion, and a count of the samples of each).
+pub use rustudio_engine::device_sensors::Reading;
+
+/// The engine's view of these sensors (`device_sensors::install` at start).
+pub fn source() -> rustudio_engine::device_sensors::Source {
+    rustudio_engine::device_sensors::Source {
+        available: || {
+            let a = available();
+            (a.accelerometer, a.gyroscope)
+        },
+        set_enabled,
+        latest,
+    }
 }
 
 /// What the device has, asked once.

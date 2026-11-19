@@ -5,10 +5,11 @@
 //!
 //! What differs from a desktop and lives here:
 //!
-//! * [`paths`](self): the app's own folders stand in for `~/.local/share`
-//!   and friends (`Context.getFilesDir()`, `getExternalFilesDir()`,
-//!   `getCacheDir()`), and `api-dump.json` is unpacked from the APK's assets
-//!   ([`assets`]).
+//! * The folders (crates/rustudio-core/src/android_dirs.rs, told to the core
+//!   crate by [`run`]): the app's own stand in for `~/.local/share` and
+//!   friends (`Context.getFilesDir()`, `getExternalFilesDir()`,
+//!   `getCacheDir()`), and `api-dump.json` is unpacked from the APK's
+//!   assets ([`assets`]).
 //! * Logging: `log` lines, and anything printed to stdout / stderr, go to
 //!   logcat under the tag `rustudio` ([`logcat`]).
 //! * The lifecycle: eframe's wgpu backend drops the window and its surface
@@ -18,10 +19,16 @@
 //! * The window: the whole screen, the navigation and status bars hidden
 //!   until a swipe from the edge shows them for a moment
 //!   ([`system_bars`]).
+//! * Text: the soft keyboard's room and its showing ([`keyboard`]), the
+//!   system clipboard ([`clipboard`]) and, since the keyboard has no Ctrl
+//!   and its paste key never reaches a NativeActivity, Cut / Copy / Paste
+//!   / Select all on a bar above the keyboard ([`text_bar`]) and in the
+//!   text fields' long-press menu ([`text_menu`]).
 //! * The Roblox services with a device behind them ([`jni`]: Vibrator,
 //!   orientation, window insets, connectivity; [`sensors`]: accelerometer,
-//!   gyroscope, rotation; [`storage`]: files opened through the system
-//!   picker / share sheet).
+//!   gyroscope, rotation, installed as the engine's
+//!   `device_sensors::Source`; [`storage`]: files opened through the
+//!   system picker / share sheet).
 //! * The GPU driver: on Snapdragon devices the Turnip (Mesa) Vulkan
 //!   driver shipped in the APK is swapped in for the Adreno driver before
 //!   wgpu starts ([`turnip`]).
@@ -38,6 +45,7 @@ pub mod perf_hint;
 pub mod sensors;
 pub mod storage;
 pub mod system_bars;
+pub mod text_bar;
 pub mod text_menu;
 pub mod turnip;
 
@@ -56,84 +64,15 @@ pub fn app() -> Option<&'static AndroidApp> {
     APP.get()
 }
 
-/// The app's folders, decided once at start.
-struct Dirs {
-    /// `Context.getFilesDir()`: `/data/user/0/<package>/files`. Private,
-    /// backed up, counts against internal storage.
-    files: PathBuf,
-    /// `Context.getExternalFilesDir(null)`: `/storage/emulated/0/Android/
-    /// data/<package>/files`. Still the app's own (no permission needed) but
-    /// on the shared volume, visible to file managers, and the right place
-    /// for the Studio content download and the person's places.
-    external: Option<PathBuf>,
-    /// `Context.getCacheDir()`: `/data/user/0/<package>/cache` (the system
-    /// may clear it).
-    cache: PathBuf,
-}
+/// The app's folders (crates/rustudio-core/src/android_dirs.rs), told to the
+/// core crate by [`run`] before any path is read.
+pub use rustudio_core::android_dirs::{cache_dir, config_dir, data_dir, files_dir, pictures_dir, resource_dir, state_dir};
 
-static DIRS: OnceLock<Dirs> = OnceLock::new();
-
-fn dirs() -> &'static Dirs {
-    DIRS.get_or_init(|| {
-        let files = app()
-            .and_then(|a| a.internal_data_path())
-            .unwrap_or_else(|| PathBuf::from("/data/local/tmp/rustudio"));
-        let external = app().and_then(|a| a.external_data_path()).filter(|p| {
-            std::fs::create_dir_all(p).is_ok() && is_writable(p)
-        });
-        // getCacheDir() is files/../cache for every app; android-activity
-        // doesn't hand it over, so it's derived rather than asked for.
-        let cache = files.parent().map(|p| p.join("cache")).unwrap_or_else(|| files.join("cache"));
-        let _ = std::fs::create_dir_all(&files);
-        let _ = std::fs::create_dir_all(&cache);
-        Dirs { files, external, cache }
-    })
-}
-
-fn is_writable(dir: &Path) -> bool {
-    let probe = dir.join(".rustudio-write-test");
-    let ok = std::fs::write(&probe, b"").is_ok();
-    let _ = std::fs::remove_file(&probe);
-    ok
-}
-
-/// The folder standing in for the home folder (`getFilesDir()`).
-pub fn files_dir() -> PathBuf {
-    dirs().files.clone()
-}
-
-/// Where big, user-visible data goes (`paths::data()`): the external files
-/// folder when there is one, else the internal one.
-pub fn data_dir() -> PathBuf {
-    let d = dirs();
-    d.external.clone().unwrap_or_else(|| d.files.clone())
-}
-
-/// Caches (`paths::cache()`): `getCacheDir()`.
-pub fn cache_dir() -> PathBuf {
-    dirs().cache.clone()
-}
-
-/// Settings and state (`paths::config()` / `paths::state()`): under the
-/// internal files folder, so they are backed up with the app.
-pub fn config_dir() -> PathBuf {
-    dirs().files.join("config")
-}
-
-pub fn state_dir() -> PathBuf {
-    dirs().files.join("state")
-}
-
-/// Screenshots (`paths::pictures()`): the app's external Pictures folder
-/// (writing to the shared Pictures collection needs MediaStore).
-pub fn pictures_dir() -> PathBuf {
-    data_dir().join("Pictures")
-}
-
-/// Files unpacked from the APK's `assets/` (api-dump.json), where
-/// `paths::resource` looks first.
-pub fn resource_dir() -> PathBuf {
-    dirs().files.join("resources")
+/// Hands the core crate the activity's folders (`getFilesDir()`,
+/// `getExternalFilesDir(null)`).
+fn init_dirs(app: &AndroidApp) {
+    let files = app.internal_data_path().unwrap_or_else(|| PathBuf::from("/data/local/tmp/rustudio"));
+    rustudio_core::android_dirs::init(files, app.external_data_path());
 }
 
 /// Sets the environment the desktop code and the `dirs` crate read
@@ -141,7 +80,8 @@ pub fn resource_dir() -> PathBuf {
 /// `std::env::temp_dir`), so nothing outside this module needs to know it
 /// runs on Android. HOME isn't set in an Android process.
 fn export_env() {
-    let d = dirs();
+    let files = files_dir();
+    let cache = cache_dir();
     let set = |k: &str, v: &Path| {
         // SAFETY: called once, at the start of android_main, before this
         // process has any Rust thread that reads the environment. (The
@@ -151,13 +91,13 @@ fn export_env() {
             std::env::set_var(k, v)
         };
     };
-    set("HOME", &d.files);
+    set("HOME", &files);
     set("XDG_CONFIG_HOME", &config_dir());
     set("XDG_STATE_HOME", &state_dir());
-    set("XDG_CACHE_HOME", &d.cache);
+    set("XDG_CACHE_HOME", &cache);
     set("XDG_DATA_HOME", &data_dir());
-    set("TMPDIR", &d.cache.join("tmp"));
-    let _ = std::fs::create_dir_all(d.cache.join("tmp"));
+    set("TMPDIR", &cache.join("tmp"));
+    let _ = std::fs::create_dir_all(cache.join("tmp"));
     // The editor's RUSTUDIO_* switches, for a device that has no shell
     // environment to launch from:
     //   adb shell setprop debug.rustudio.env "RUSTUDIO_SSAO=1 RUSTUDIO_VIEW_REUSE=0"
@@ -203,7 +143,7 @@ pub fn run(app: AndroidApp) {
         "rustudio {} starting (Android API {}; {})",
         env!("CARGO_PKG_VERSION"),
         AndroidApp::sdk_version(),
-        crate::perf_log::build()
+        rustudio_render::perf_log::build()
     );
     if APP.set(app.clone()).is_err() {
         // (not expected: the entry point keeps any activity after the
@@ -212,7 +152,11 @@ pub fn run(app: AndroidApp) {
         log::error!("android_main ran again in this process: this activity is finished, the editor keeps running");
         return;
     }
+    init_dirs(&app);
     export_env();
+    // The motion sensors behind UserInputService (sensors.rs), for the
+    // engine's device_sensors.
+    rustudio_engine::device_sensors::install(sensors::source());
     // The navigation and status bars out of the way (immersive mode), on
     // the main thread when it gets to it; the window grows to the screen.
     system_bars::hide();
@@ -224,7 +168,9 @@ pub fn run(app: AndroidApp) {
     );
     // A panic or fatal signal leaves a report in the cache folder, listed
     // in Output at the next start (and logcat gets the panic message).
-    crate::crash::install();
+    rustudio_core::crash::install();
+    // Studio's installations of the engine's start-up hooks (src/studio_hooks.rs).
+    crate::studio_hooks::install();
     // The Turnip (Mesa) Vulkan driver in place of the Adreno driver on
     // Snapdragon devices (turnip.rs): now, before eframe exists, because
     // wgpu loads libvulkan.so once, at its first instance.
@@ -234,20 +180,21 @@ pub fn run(app: AndroidApp) {
     }
     // os.clock counts from here; the Luau flags are process-global and set
     // before any VM exists.
-    let _ = crate::runtime::process_start();
-    crate::runtime::luau_flags();
-    crate::matpack::init_from_env();
+    let _ = rustudio_engine::runtime::process_start();
+    rustudio_engine::runtime::luau_flags();
+    rustudio_render::matpack::init_from_env();
     // Studio's built-in content (the CDN download, ~60 MB compressed) in the
     // background when it isn't there yet, as on a desktop; the editor works
     // without it meanwhile. Pure-Rust TLS (ureq + rustls/ring), no OpenSSL.
     if jni::network_available().unwrap_or(true) {
-        crate::studio_content::spawn_background_install_if_missing();
+        rustudio_core::studio_content::spawn_background_install_if_missing();
     } else {
         log::warn!("no network: Studio content download postponed");
     }
     // Studio Settings: the user's, kept in the app's folder (as a plain
     // desktop run keeps them; src/studio_settings.rs).
     crate::studio_settings::init(true);
+    rustudio_core::rustudio_settings::init(true);
     // A place or model this activity was started with (VIEW intent,
     // content: URI): copied into the app's folder and opened.
     let open = storage::launch_file(&app);
@@ -256,8 +203,9 @@ pub fn run(app: AndroidApp) {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default().with_title("rustudio").with_app_id("rustudio"),
         // Vulkan first, GLES 3 where there is no usable Vulkan driver
-        // (crate::wgpu_options); vsync.
-        wgpu_options: crate::wgpu_options(false),
+        // (offscreen::wgpu_options_with, with Turnip's objects where
+        // crate::wgpu_setup made them); vsync.
+        wgpu_options: crate::offscreen::wgpu_options_with(false, crate::wgpu_setup),
         // eframe's own window state file would go through `directories`,
         // which has no Android folders.
         persistence_path: Some(files_dir().join("eframe.ron")),
@@ -302,7 +250,7 @@ pub fn run(app: AndroidApp) {
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "<non-string panic payload>".into());
             log::error!("rustudio: panic on the editor's thread: {msg}");
-            if let Some(p) = crate::crash::last_report() {
+            if let Some(p) = rustudio_core::crash::last_report() {
                 log::error!("rustudio: crash report {} (echoed to Output and logcat at the next start)", p.display());
             }
             std::process::exit(101);

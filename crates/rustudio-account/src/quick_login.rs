@@ -4,10 +4,17 @@
 //! Roblox, and once they confirm, the code and its private key are traded for
 //! a `.ROBLOSECURITY` session of rustudio's own. The browser's own cookie is
 //! never read.
+//!
+//! The editor may not live through the browser visit: on Android the system
+//! can stop the process while the browser is in front. [`QuickLogin::remember`]
+//! keeps the pending code in a file next to `account.toml` and
+//! [`QuickLogin::pending`] hands it back to the next start, which goes on
+//! polling as if nothing happened.
 
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::{session::session_agent, Result};
+use crate::{session::session_agent, AccountConfig, Result};
 
 /// Where the person types the code (roblox.com asks them to log in first if
 /// that browser isn't signed in).
@@ -19,11 +26,19 @@ const LOGIN: &str = "https://auth.roblox.com/v2/login";
 const COOKIE: &str = ".ROBLOSECURITY";
 
 /// A pending Quick Sign-in. `private_key` proves this client asked for the
-/// code; it never leaves this process except to Roblox.
+/// code; it goes nowhere but to Roblox and (while the code is pending) the
+/// private file [`QuickLogin::remember`] writes.
 pub struct QuickLogin {
     pub code: String,
     private_key: String,
 }
+
+/// Where a pending code waits for the next start, next to `account.toml`.
+const PENDING_FILE: &str = "quick-login.json";
+
+/// A pending code older than this isn't resumed; Roblox's codes don't last
+/// that long anyway (an unknown code reads as expired).
+const PENDING_FOR: Duration = Duration::from_secs(10 * 60);
 
 impl std::fmt::Debug for QuickLogin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -81,6 +96,21 @@ fn roblox_error(text: &str) -> Option<String> {
     v.get("errors")?.get(0)?.get("message")?.as_str().map(str::to_owned)
 }
 
+/// Writes `text` to `path` readable by this user only.
+fn write_private(path: &std::path::Path, text: &str) -> Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut f = options.open(path)?;
+    f.write_all(text.as_bytes())?;
+    Ok(())
+}
+
 impl QuickLogin {
     /// Asks Roblox for a new code.
     pub fn start() -> Result<QuickLogin> {
@@ -99,8 +129,60 @@ impl QuickLogin {
         }
     }
 
+    /// A code from an earlier [`QuickLogin::start`] (resuming after a
+    /// restart; see [`QuickLogin::pending`]).
+    pub fn from_parts(code: String, private_key: String) -> QuickLogin {
+        QuickLogin { code, private_key }
+    }
+
     fn body(&self) -> serde_json::Value {
         serde_json::json!({ "code": self.code, "privateKey": self.private_key })
+    }
+
+    /// The pending-code file (`RUSTUDIO_ACCOUNT_CONFIG` moves it with the
+    /// config).
+    pub fn pending_path() -> PathBuf {
+        AccountConfig::path().with_file_name(PENDING_FILE)
+    }
+
+    /// Keeps this code for a later start ([`QuickLogin::pending`]): the
+    /// editor may be stopped while the browser is in front. The file is
+    /// private to the user and [`QuickLogin::forget`] removes it once the
+    /// sign-in ends either way.
+    pub fn remember(&self) -> Result<()> {
+        let path = Self::pending_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let started = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let text = serde_json::json!({ "code": self.code, "privateKey": self.private_key, "started": started }).to_string();
+        write_private(&path, &text)
+    }
+
+    /// Removes the pending-code file, if any.
+    pub fn forget() {
+        let _ = std::fs::remove_file(Self::pending_path());
+    }
+
+    /// The code an earlier run was waiting on, if it is recent enough to
+    /// still be valid. A stale or unreadable file is removed.
+    pub fn pending() -> Option<QuickLogin> {
+        let text = std::fs::read_to_string(Self::pending_path()).ok()?;
+        let parsed = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| {
+            let field = |k: &str| v.get(k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
+            let started = v.get("started").and_then(|x| x.as_u64())?;
+            Some((field("code")?, field("privateKey")?, started))
+        });
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        match parsed {
+            Some((code, private_key, started)) if now.saturating_sub(started) <= PENDING_FOR.as_secs() => {
+                Some(QuickLogin { code, private_key })
+            }
+            _ => {
+                Self::forget();
+                None
+            }
+        }
     }
 
     /// Where the code is now.
@@ -191,5 +273,37 @@ impl QuickLogin {
                 std::thread::sleep(Duration::from_millis(250));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `RUSTUDIO_ACCOUNT_CONFIG` is process-wide: one test owns it.
+    #[test]
+    fn pending_code_round_trip() {
+        let dir = std::env::temp_dir().join(format!("rustudio-quick-login-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("RUSTUDIO_ACCOUNT_CONFIG", dir.join("account.toml"));
+        assert!(QuickLogin::pending().is_none());
+        let q = QuickLogin::from_parts("ABC123".into(), "secret".into());
+        q.remember().unwrap();
+        assert_eq!(QuickLogin::pending_path(), dir.join("quick-login.json"));
+        let back = QuickLogin::pending().expect("fresh code resumes");
+        assert_eq!((back.code.as_str(), back.private_key.as_str()), ("ABC123", "secret"));
+        // The file survives being read (the resumed run removes it when the sign-in ends).
+        assert!(QuickLogin::pending_path().exists());
+        // A stale code is dropped, file and all.
+        let old = serde_json::json!({ "code": "OLD", "privateKey": "k", "started": 1_000 }).to_string();
+        std::fs::write(QuickLogin::pending_path(), old).unwrap();
+        assert!(QuickLogin::pending().is_none());
+        assert!(!QuickLogin::pending_path().exists());
+        // So is one that doesn't parse.
+        std::fs::write(QuickLogin::pending_path(), "{").unwrap();
+        assert!(QuickLogin::pending().is_none());
+        assert!(!QuickLogin::pending_path().exists());
+        QuickLogin::forget();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

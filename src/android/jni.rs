@@ -32,9 +32,27 @@ fn vm() -> Result<JavaVM> {
 }
 
 /// Runs `f` with this thread attached to the JVM (a local frame of its own;
-/// a pending Java exception becomes the error).
+/// a pending Java exception becomes the error). The exception is caught
+/// and cleared here, and the error names it (`SecurityException: ...`):
+/// left pending it would fail every JNI call made on this thread after
+/// it — the editor's thread never returns to Java to throw it — and on
+/// the Java main thread it would be thrown out of the Looper and end the
+/// process.
 pub fn with_env<T>(f: impl FnOnce(&mut Env) -> jni::errors::Result<T>) -> Result<T> {
-    vm()?.attach_current_thread(|env| f(env)).map_err(|e: jni::errors::Error| e.to_string())
+    vm()?
+        .attach_current_thread(|env| {
+            let r = f(env);
+            if env.exception_check() {
+                if let Err(e) = env.exception_catch() {
+                    return Err(e);
+                }
+            }
+            r
+        })
+        .map_err(|e: jni::errors::Error| match e {
+            jni::errors::Error::CaughtJavaException { name, msg, .. } => format!("{name}: {msg}"),
+            e => e.to_string(),
+        })
 }
 
 /// Runs `f` with the Activity (a borrowed reference to the one
@@ -614,6 +632,27 @@ fn on_main_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static, wai
 /// `startActivity(new Intent(ACTION_VIEW, Uri.parse(url)))`: the default
 /// browser (the Quick Sign-in confirm page, the documentation links).
 pub fn open_url(url: &str) -> Result<()> {
+    // As a Custom Tab first: the page opens inside the editor's own task,
+    // in the default browser with that browser's cookies (a roblox.com
+    // sign-in among them), and Back or the tab's close button lead
+    // straight back to the editor, which is what a browser sign-in needs.
+    // A browser without Custom Tabs ignores the extra and shows the page
+    // as it would any link. If no activity takes it, the plain intent in
+    // a task of its own is tried (and reports the failure).
+    match view_url(url, true) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            log::warn!("open url: as a Custom Tab: {e}; trying a plain view");
+            view_url(url, false)
+        }
+    }
+}
+
+/// An `ACTION_VIEW` of `url`: as a Custom Tab in the editor's task
+/// (`custom_tab`; the `EXTRA_SESSION` extra with no binder is what marks
+/// one, no support library needed), or plainly with
+/// `FLAG_ACTIVITY_NEW_TASK`, in a task of its own.
+fn view_url(url: &str, custom_tab: bool) -> Result<()> {
     with_activity(|env, activity| {
         let jurl = env.new_string(url)?;
         let uri = env
@@ -625,9 +664,20 @@ pub fn open_url(url: &str) -> Result<()> {
             jni_sig!("(Ljava/lang/String;Landroid/net/Uri;)V"),
             &[JValue::Object(&action), JValue::Object(&uri)],
         )?;
-        // FLAG_ACTIVITY_NEW_TASK: the browser in its own task, the editor
-        // stays where it is in the back stack.
-        env.call_method(&intent, jni_str!("addFlags"), jni_sig!("(I)Landroid/content/Intent;"), &[JValue::Int(0x1000_0000)])?;
+        if custom_tab {
+            let extras = env.new_object(jni_str!("android/os/Bundle"), jni_sig!("()V"), &[])?;
+            let key = env.new_string("android.support.customtabs.extra.SESSION")?;
+            let null = JObject::null();
+            env.call_method(
+                &extras,
+                jni_str!("putBinder"),
+                jni_sig!("(Ljava/lang/String;Landroid/os/IBinder;)V"),
+                &[JValue::Object(&key), JValue::Object(&null)],
+            )?;
+            env.call_method(&intent, jni_str!("putExtras"), jni_sig!("(Landroid/os/Bundle;)Landroid/content/Intent;"), &[JValue::Object(&extras)])?;
+        } else {
+            env.call_method(&intent, jni_str!("addFlags"), jni_sig!("(I)Landroid/content/Intent;"), &[JValue::Int(0x1000_0000)])?;
+        }
         env.call_method(activity, jni_str!("startActivity"), jni_sig!("(Landroid/content/Intent;)V"), &[JValue::Object(&intent)])?;
         Ok(())
     })
@@ -635,76 +685,103 @@ pub fn open_url(url: &str) -> Result<()> {
 
 // ---------------------------------------------------------- clipboard
 
-/// Puts `text` on the system clipboard (ClipboardManager.setPrimaryClip),
-/// so a copy in the editor pastes in other apps.
+/// A clipboard read's answer, once the main thread has made it (`None`: no
+/// text on the clipboard, or none this window may read).
+pub type ClipboardAnswer = std::sync::Arc<std::sync::Mutex<Option<Result<Option<String>>>>>;
+
+/// Puts `text` on the system clipboard (`ClipboardManager.setPrimaryClip`),
+/// so a copy in the editor pastes in other apps. Done on the Java main
+/// thread — ClipboardManager wants a thread with a Looper, and Android
+/// 10+ counts the writes of the focused window's app only, which is what
+/// the main thread is — without the editor's thread waiting for it (the
+/// main thread may itself be waiting on the editor's around a pause or a
+/// configuration change). The outcome goes to the log.
 pub fn clipboard_set(text: &str) -> Result<()> {
+    let app = super::app().ok_or("no AndroidApp yet")?;
     let text = text.to_string();
-    on_main_thread(
-        move || {
-            with_activity(|env, activity| {
-                let cm = system_service(env, activity, "clipboard")?;
-                if cm.is_null() {
-                    return Err(jni::errors::Error::NullPtr("ClipboardManager"));
-                }
-                let label = env.new_string("rustudio")?;
-                let jtext = env.new_string(&text)?;
-                let clip = env
-                    .call_static_method(
-                        jni_str!("android/content/ClipData"),
-                        jni_str!("newPlainText"),
-                        jni_sig!("(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;"),
-                        &[JValue::Object(&label), JValue::Object(&jtext)],
-                    )?
-                    .l()?;
-                env.call_method(&cm, jni_str!("setPrimaryClip"), jni_sig!("(Landroid/content/ClipData;)V"), &[JValue::Object(&clip)])?;
-                log::info!("clipboard: {} chars put on the system clipboard", text.chars().count());
-                Ok(())
-            })
-        },
-        std::time::Duration::from_millis(400),
-    )?
+    app.run_on_java_main_thread(Box::new(move || match write_clipboard(&text) {
+        Ok(()) => log::info!("clipboard: {} chars put on the system clipboard", text.chars().count()),
+        Err(e) => log::warn!("clipboard: put failed: {e}"),
+    }));
+    Ok(())
 }
 
-/// The system clipboard's text (the first item of the primary clip, coerced
-/// to text), if any. Android 10+ only answers the app with input focus,
-/// which the editor has when a paste is asked for.
-pub fn clipboard_get() -> Result<Option<String>> {
-    on_main_thread(
-        || {
-            with_activity(|env, activity| {
-                let cm = system_service(env, activity, "clipboard")?;
-                if cm.is_null() {
-                    return Ok(None);
-                }
-                let clip = env.call_method(&cm, jni_str!("getPrimaryClip"), jni_sig!("()Landroid/content/ClipData;"), &[])?.l()?;
-                if clip.is_null() {
-                    // Empty, or (Android 10+) this window hasn't the input
-                    // focus, which only the focused app's reads are allowed.
-                    log::info!("clipboard: the system clipboard has no clip (or this window lacks the focus)");
-                    return Ok(None);
-                }
-                let n = env.call_method(&clip, jni_str!("getItemCount"), jni_sig!("()I"), &[])?.i()?;
-                if n <= 0 {
-                    return Ok(None);
-                }
-                let item = env
-                    .call_method(&clip, jni_str!("getItemAt"), jni_sig!("(I)Landroid/content/ClipData$Item;"), &[JValue::Int(0)])?
-                    .l()?;
-                let cs = env
-                    .call_method(&item, jni_str!("coerceToText"), jni_sig!("(Landroid/content/Context;)Ljava/lang/CharSequence;"), &[JValue::Object(activity)])?
-                    .l()?;
-                if cs.is_null() {
-                    return Ok(None);
-                }
-                let s = env.call_method(&cs, jni_str!("toString"), jni_sig!("()Ljava/lang/String;"), &[])?.l()?;
-                let s = env.as_cast::<jni::objects::JString>(&s)?;
-                let s = (*s).to_string();
-                log::info!("clipboard: {} chars read from the system clipboard", s.chars().count());
-                Ok(Some(s))
-            })
-        },
-        std::time::Duration::from_millis(400),
-    )?
+fn write_clipboard(text: &str) -> Result<()> {
+    with_activity(|env, activity| {
+        let cm = system_service(env, activity, "clipboard")?;
+        if cm.is_null() {
+            return Err(jni::errors::Error::NullPtr("ClipboardManager"));
+        }
+        let label = env.new_string("rustudio")?;
+        let jtext = env.new_string(text)?;
+        let clip = env
+            .call_static_method(
+                jni_str!("android/content/ClipData"),
+                jni_str!("newPlainText"),
+                jni_sig!("(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;"),
+                &[JValue::Object(&label), JValue::Object(&jtext)],
+            )?
+            .l()?;
+        env.call_method(&cm, jni_str!("setPrimaryClip"), jni_sig!("(Landroid/content/ClipData;)V"), &[JValue::Object(&clip)])?;
+        Ok(())
+    })
+}
+
+/// Asks the Java main thread for the system clipboard's text (the first
+/// item of the primary clip, coerced to text). The answer lands in the
+/// returned slot when the main thread gets to it (a frame or two); the
+/// editor's thread doesn't wait (see [`clipboard_set`]). Android 10+
+/// answers only the app whose window has the input focus — the editor's,
+/// once it is in front — and Android 12+ may show "rustudio pasted from
+/// your clipboard" for a read.
+pub fn clipboard_get_later() -> ClipboardAnswer {
+    let slot: ClipboardAnswer = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let answer = slot.clone();
+    match super::app() {
+        None => *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err("no AndroidApp yet".to_string())),
+        Some(app) => app.run_on_java_main_thread(Box::new(move || {
+            let text = read_clipboard();
+            match &text {
+                Ok(Some(s)) => log::info!("clipboard: {} chars read from the system clipboard", s.chars().count()),
+                Ok(None) => log::info!("clipboard: the system clipboard has no text (or this window lacks the focus)"),
+                Err(e) => log::warn!("clipboard: read failed: {e}"),
+            }
+            *answer.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+        })),
+    }
+    slot
+}
+
+fn read_clipboard() -> Result<Option<String>> {
+    with_activity(|env, activity| {
+        let cm = system_service(env, activity, "clipboard")?;
+        if cm.is_null() {
+            return Ok(None);
+        }
+        let clip = env.call_method(&cm, jni_str!("getPrimaryClip"), jni_sig!("()Landroid/content/ClipData;"), &[])?.l()?;
+        if clip.is_null() {
+            // Empty, or (Android 10+) this window hasn't the input focus,
+            // which only the focused app's reads are allowed.
+            return Ok(None);
+        }
+        let n = env.call_method(&clip, jni_str!("getItemCount"), jni_sig!("()I"), &[])?.i()?;
+        if n <= 0 {
+            return Ok(None);
+        }
+        let item = env
+            .call_method(&clip, jni_str!("getItemAt"), jni_sig!("(I)Landroid/content/ClipData$Item;"), &[JValue::Int(0)])?
+            .l()?;
+        let cs = env
+            .call_method(&item, jni_str!("coerceToText"), jni_sig!("(Landroid/content/Context;)Ljava/lang/CharSequence;"), &[JValue::Object(activity)])?
+            .l()?;
+        if cs.is_null() {
+            return Ok(None);
+        }
+        let s = env.call_method(&cs, jni_str!("toString"), jni_sig!("()Ljava/lang/String;"), &[])?.l()?;
+        let s = env.as_cast::<jni::objects::JString>(&s)?;
+        let s = (*s).to_string();
+        Ok((!s.is_empty()).then_some(s))
+    })
 }
 
 // ---------------------------------------------------------- storage access

@@ -1,162 +1,88 @@
 //! rustudio: a native editor for Roblox place and model files.
 //!
-//! The crate is a library so two entry points can share it: `src/main.rs`
-//! (the desktop binary: Linux, macOS, Windows) calls [`desktop_main`], and
-//! `crates/rustudio-android` (the `cdylib` Android's `NativeActivity`
-//! loads) calls `android::run` from its `android_main`. Everything else
-//! lives here; what only one kind of system has is behind
-//! `#[cfg(target_os = "android")]` / `#[cfg(not(target_os = "android"))]`.
+//! This crate is the studio: the editor (`app::Editor`), its panels and
+//! viewport, the plugin host and plugin API, the toolbox, the self-test and
+//! project sync, plus the play code until it moves to `rustudio-player`.
+//! Everything it builds on is a crate under `crates/` — `rustudio-core`
+//! (document, math, assets, logging), `rustudio-physics` (solver, bodies,
+//! collision, queries), `rustudio-render` (wgpu renderer, scene, lighting),
+//! `rustudio-engine` (Luau runtime, API domains, replication, GUI, audio,
+//! rigs), `rustudio-account` (the Roblox session) and `rustudio-net` (Team
+//! Create) — and every use of them names the crate.
+//!
+//! What is not added here: code that belongs to a crate below (a domain, a
+//! renderer pass, a solver step) and code that only the player needs. An
+//! import that points up from one of those crates does not compile, which is
+//! the boundary this crate sits on top of.
+//!
+//! `src/main.rs` is the GUI entry point and calls [`run`]; the Android
+//! `cdylib` (crates/rustudio-android, the library `NativeActivity` loads)
+//! calls [`android::run`] from its `android_main` instead. What only one
+//! kind of system has is behind `#[cfg(target_os = "android")]` /
+//! `#[cfg(not(target_os = "android"))]`.
 
-mod grass_stream;
-mod plugin_store;
-mod toolbox;
-mod ui_pointer;
-mod offscreen;
+pub mod plugin_store;
+pub mod toolbox;
+pub mod ui_pointer;
+pub mod update;
+pub mod account_ui;
+pub mod char_builder;
+pub mod ribbon_quick;
+#[cfg(target_os = "macos")]
+pub mod macos;
+pub mod cloud_ui;
+pub mod join_ui;
+pub mod app;
 #[cfg(not(target_os = "android"))]
 mod native_loop;
-mod sim_clock;
-mod bytecode_cache;
-mod heap;
-mod load_trace;
-mod update;
-mod env_probe;
-mod account_ui;
-mod char_builder;
-mod game_avatar;
-mod emote_wheel;
 #[cfg(target_os = "android")]
 pub mod android;
-pub mod device_sensors;
-pub mod touch_gestures;
-pub mod touch_input;
-pub mod perf_log;
-pub mod quality;
-mod graphics_settings;
-mod ribbon_quick;
-mod cmeta;
-mod studio_content;
-mod paths;
-mod platform;
-#[cfg(target_os = "macos")]
-mod macos;
-mod dtmeta;
-mod cloud_ui;
-mod join_ui;
-mod asset_report;
-mod app;
-mod frame_watchdog;
-mod class_icons;
-mod assets;
-mod audio;
-mod audio_dsp;
-mod audio_scene;
-mod audio_capture;
-mod avatar;
-mod bench;
-mod gpu_timing;
-mod bin_dump;
-mod camera;
-mod collision;
-mod collision_groups;
+pub mod graphics_settings;
+pub mod browser;
+pub use rustudio_player::{account, asset_report, emote_wheel, game, game_view, keys, offscreen, run_harness, player_app, play};
+pub mod frame_watchdog;
+pub mod class_icons;
+pub mod bin_dump;
 #[cfg(unix)]
-mod control;
-mod coverage;
-mod crash;
-mod default_scripts;
-mod doc;
-mod effects;
-mod attachment;
-mod explorer;
-mod file_dialog;
-mod hypr;
-mod game_settings;
-mod gamepad;
-mod studio_settings;
-mod rustudio_settings;
-mod fbx;
-mod fbx_anim;
-mod api;
-mod api_stubs;
-mod client_joints;
-mod query_shapes;
-mod fidelity;
-mod telemetry;
-mod gui;
-mod gui_modal;
-mod icons;
-mod live_drafts;
-mod layout_store;
-mod panels;
-mod lighting;
-mod lightgrid;
-mod keys;
-mod mouse_lock;
-mod lightocc;
-mod ltypes;
-mod math;
-mod matpack;
-mod mech;
-mod part_drag;
-mod output_panel;
-mod props_layout;
-mod prop_slider;
-mod color_editors;
-mod mesh;
-mod truss;
-mod mesh_bvh;
-mod physics;
-mod solver;
-mod solver_ticks;
-mod humanoid;
-mod physics_mesh;
-mod play;
-mod plugin_host;
-mod project;
-mod project_config;
-mod project_export;
-mod project_ui;
-mod project_sync;
-mod project_values;
-mod properties;
-mod render;
-mod clouds;
-mod sun_shadow;
-mod replicate;
-mod anim_replicate;
-mod rig;
-mod runtime;
-mod globals_parity;
-mod sharedtable;
-mod scene;
-mod skin;
-mod cage_rbf;
-mod hsr;
-mod skin_gpu;
-mod highlight;
-mod script_editor;
-mod selftest;
-mod terrain;
-mod terrain_editor;
-mod terrain_region;
-mod terrain_ui;
-mod terrain_brush;
-mod terrain_gen;
-mod terrain_mat;
-mod world_gui;
-mod texture;
-mod theme;
-mod ti;
-mod studio_ui;
-mod studio_actions;
-mod studio_ribbon;
-mod studio_panels;
-mod start_page;
-mod ui_shots;
-mod grass_temporal;
-mod viewport;
-mod viewport_menu;
-mod water;
-mod wrap;
+pub mod control;
+pub mod coverage;
+pub mod explorer;
+pub mod file_dialog;
+pub mod hypr;
+pub mod studio_settings;
+pub mod fidelity;
+pub mod engine_tables;
+pub mod icons;
+pub mod live_drafts;
+pub mod layout_store;
+pub mod panels;
+pub mod part_drag;
+pub mod output_panel;
+pub mod props_layout;
+pub mod prop_slider;
+pub mod color_editors;
+pub mod plugin_host;
+pub mod project;
+pub mod project_config;
+pub mod project_export;
+pub mod project_ui;
+pub mod project_sync;
+pub mod properties;
+pub mod script_editor;
+pub mod selftest;
+pub mod terrain_editor;
+pub mod terrain_ui;
+pub mod terrain_brush;
+pub mod terrain_gen;
+pub mod studio_ui;
+pub mod studio_actions;
+pub mod studio_hooks;
+pub mod studio_ribbon;
+pub mod studio_panels;
+pub mod start_page;
+pub mod ui_shots;
+pub mod viewport;
+pub mod viewport_menu;
 
 use std::path::PathBuf;
 
@@ -334,7 +260,7 @@ fn rerun_headless() -> Option<i32> {
     let _ = std::fs::create_dir_all(&tmp);
     let gs_log = tmp.join("gamescope.log");
     let gs_out = std::fs::File::create(&gs_log).ok();
-    load_trace::mark("headless: starting gamescope");
+    rustudio_core::load_trace::mark("headless: starting gamescope");
     let mut cmd = std::process::Command::new("gamescope");
     let mut pumps = Vec::new();
     if let Some(f) = gs_out {
@@ -383,9 +309,8 @@ fn rerun_headless() -> Option<i32> {
             }
         }
     }
-    // gamescope exits 0 whatever happened to its client (a panic, or another
-    // agent's `pkill -9 -f gamescopereaper` / loose pkill patterns killing
-    // it), so a run that never wrote its screenshot looked like a success.
+    // gamescope exits 0 even if its client panics or is killed.
+    // Without the client status, a run with no screenshot looked successful.
     // A shell inside records rustudio's own exit status (128 + signal when
     // killed); no status at all means the run was killed from outside.
     let status_file = tmp.join("status");
@@ -495,121 +420,22 @@ fn window_arg(argv: &[String]) -> Option<(u32, u32)> {
     Some((w.parse().ok()?, h.parse().ok()?))
 }
 
-/// eframe's wgpu setup, shared by the desktop window and the Android
-/// activity: the renderer samples up to 24 textures in one draw (render.rs),
-/// vsync unless measuring. On Android the backends are Vulkan first, then
-/// OpenGL ES (devices without a working Vulkan driver), chosen by wgpu in
-/// that order; the surface is created from the activity's window on
-/// Resumed, so the instance starts without a display handle everywhere.
-pub(crate) fn wgpu_options(bench_mode: bool) -> egui_wgpu::WgpuConfiguration {
-    egui_wgpu::WgpuConfiguration {
-        wgpu_setup: {
-            let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
-            #[cfg(target_os = "android")]
-            {
-                setup.instance_descriptor.backends =
-                    egui_wgpu::wgpu::Backends::VULKAN | egui_wgpu::wgpu::Backends::GL;
-            }
-            let descriptor = setup.device_descriptor.clone();
-            setup.device_descriptor = std::sync::Arc::new(move |adapter| {
-                let mut d = descriptor(adapter);
-                d.required_limits.max_sampled_textures_per_shader_stage = 24;
-                // Studio HBAO writes its full-resolution R8 visibility UAV.
-                d.required_features |= adapter.features() & egui_wgpu::wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
-                // RUSTUDIO_GPU_TIMING: timestamp queries (gpu_timing.rs).
-                d.required_features |= gpu_timing::features(adapter.features());
-                // GPU memory in blocks sized for memory use (8-64 MB), not
-                // wgpu's default 128-256 MB device blocks: the allocator keeps
-                // its last empty block, so a 1440 island settled 2.18-2.19 GB
-                // with them and 1.79-1.81 GB with these, with the same frame
-                // instructions, GPU time and texture load time (RX 9070,
-                // Vulkan; Windows RTX 3070: 1.83-2.09 -> 1.58-1.61 GB).
-                // RUSTUDIO_GPU_MEMORY=performance: wgpu's default blocks.
-                if std::env::var("RUSTUDIO_GPU_MEMORY").ok().as_deref() != Some("performance") {
-                    d.memory_hints = egui_wgpu::wgpu::MemoryHints::MemoryUsage;
-                }
-                // The 32-bit float scene target of the Low / non-HDR
-                // settings (quality.rs scene_format), and the driver's
-                // pipeline cache the renderer keeps on disk so a second
-                // start compiles no shaders (render.rs PipelineCache).
-                let want = egui_wgpu::wgpu::Features::RG11B10UFLOAT_RENDERABLE | egui_wgpu::wgpu::Features::PIPELINE_CACHE;
-                d.required_features |= adapter.features() & want;
-                // GPU timestamps for the perf log's line (render::GpuTimer),
-                // where the device has them.
-                if crate::perf_log::on() {
-                    let want = egui_wgpu::wgpu::Features::TIMESTAMP_QUERY | egui_wgpu::wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-                    d.required_features |= adapter.features() & want;
-                }
-                d
-            });
-            // On a Snapdragon phone with the Turnip driver swapped in
-            // (android::turnip), the renderer's objects are made on
-            // Turnip's loader up front and handed over as they are.
-            #[cfg(target_os = "android")]
-            let turnip = crate::android::turnip::wgpu_setup(&setup);
-            #[cfg(not(target_os = "android"))]
-            let turnip: Option<egui_wgpu::WgpuSetupExisting> = None;
-            match turnip {
-                Some(existing) => egui_wgpu::WgpuSetup::Existing(existing),
-                None => egui_wgpu::WgpuSetup::CreateNew(setup),
-            }
-        },
-        surface: egui_wgpu::SurfaceConfig {
-            // No vsync when measuring or driven for captures: a shot waits
-            // for a few frames after each camera move.
-            present_mode: present_mode(bench_mode || std::env::var_os("RUSTUDIO_CONTROL").is_some()),
-            desired_maximum_frame_latency: Some(frame_latency()),
-        },
-        ..Default::default()
+/// Finishes eframe's wgpu setup (`offscreen::wgpu_options_with`): on a
+/// Snapdragon phone with the Turnip driver swapped in (android::turnip),
+/// the renderer's objects are made on Turnip's loader up front and handed
+/// over as they are; everywhere else wgpu makes them.
+pub(crate) fn wgpu_setup(setup: egui_wgpu::WgpuSetupCreateNew) -> egui_wgpu::WgpuSetup {
+    #[cfg(target_os = "android")]
+    if let Some(existing) = crate::android::turnip::wgpu_setup(&setup) {
+        return egui_wgpu::WgpuSetup::Existing(existing);
     }
+    egui_wgpu::WgpuSetup::CreateNew(setup)
 }
 
-/// The swapchain's present mode: vsync (`AutoVsync`: FIFO, relaxed where
-/// the driver has it) unless `no_vsync`. `RUSTUDIO_PRESENT_MODE` overrides
-/// for measuring — `fifo`, `relaxed`, `mailbox`, `immediate`, `vsync`,
-/// `novsync`; a mode the surface lacks falls back to FIFO in wgpu, with a
-/// warning in its log.
-pub fn present_mode(no_vsync: bool) -> egui_wgpu::wgpu::PresentMode {
-    use egui_wgpu::wgpu::PresentMode;
-    match std::env::var("RUSTUDIO_PRESENT_MODE").ok().as_deref().map(str::trim) {
-        Some("fifo") => PresentMode::Fifo,
-        Some("relaxed") => PresentMode::FifoRelaxed,
-        Some("mailbox") => PresentMode::Mailbox,
-        Some("immediate") => PresentMode::Immediate,
-        Some("vsync") => PresentMode::AutoVsync,
-        Some("novsync") => PresentMode::AutoNoVsync,
-        _ if no_vsync => PresentMode::AutoNoVsync,
-        _ => PresentMode::AutoVsync,
-    }
-}
-
-/// The present mode's name for the perf log (the editor's: never the
-/// bench's or the control harness's).
-pub fn present_mode_name() -> String {
-    format!("{:?}", present_mode(false))
-}
-
-/// Frames the presentation engine may hold ahead of the one being drawn:
-/// the swapchain gets one image more than this. 1 (two images) on a
-/// computer, egui's low-latency default. On Android it is 2: the
-/// compositor keeps the image on screen until it has latched the next
-/// one, so with two images every frame first waits for that — a vsync of
-/// nothing, half the refresh rate at best (the first phone measurements:
-/// ~31 ms waited per frame at 60 Hz whether the camera moved or not; egui
-/// notes the same halving on iOS). Three images let the next frame start
-/// while the last one is still queued. `RUSTUDIO_FRAME_LATENCY` (1 to 3)
-/// overrides, for measuring.
-pub fn frame_latency() -> u32 {
-    let default = if cfg!(target_os = "android") { 2 } else { 1 };
-    std::env::var("RUSTUDIO_FRAME_LATENCY")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .map_or(default, |n| n.clamp(1, 3))
-}
-
-/// The desktop program: command-line options, the test harness, then the
-/// editor window (`src/main.rs` is just a call to this).
-pub fn desktop_main() -> eframe::Result<()> {
+/// The whole program: parse the command line and run the editor, a tool
+/// command or a harness run (`src/main.rs` calls this; the Android app
+/// starts in `android::run` instead, with no command line).
+pub fn run() -> eframe::Result<()> {
     // Headless runs are silent unless --audio (before any thread starts).
     {
         let argv: Vec<String> = std::env::args().collect();
@@ -630,9 +456,13 @@ pub fn desktop_main() -> eframe::Result<()> {
         }
     }
     restore_parent_fds();
-    load_trace::init();
+    rustudio_core::load_trace::init();
     // First: a panic or fatal signal from here on leaves a report.
-    crash::install();
+    rustudio_core::crash::install();
+    // Studio's installations of the engine's start-up hooks (the plugin API
+    // domain; see src/studio_hooks.rs). Before any command below makes a
+    // runtime, so the engine's tables have the registered members.
+    studio_hooks::install();
     // RUSTUDIO_CRASH_TEST=panic|segv|thread: check the reports themselves.
     match std::env::var("RUSTUDIO_CRASH_TEST").as_deref() {
         Ok("panic") => panic!("RUSTUDIO_CRASH_TEST panic"),
@@ -647,10 +477,10 @@ pub fn desktop_main() -> eframe::Result<()> {
         _ => {}
     }
     // os.clock counts from here, as Studio's does from its process start.
-    let _ = runtime::process_start();
+    let _ = rustudio_engine::runtime::process_start();
     // Before any thread makes a Luau VM: the flags are process-global.
-    runtime::luau_flags();
-    matpack::init_from_env();
+    rustudio_engine::runtime::luau_flags();
+    rustudio_render::matpack::init_from_env();
     // RUSTUDIO_PLACE_CONTEXT=ID: ask asset delivery in that Roblox place's
     // context for a local file (a copy of a Roblox place).
     if let Some(p) = std::env::var("RUSTUDIO_PLACE_CONTEXT").ok().and_then(|v| v.parse().ok()) {
@@ -669,7 +499,7 @@ pub fn desktop_main() -> eframe::Result<()> {
     // `--install-studio-content`: download Studio's built-in content from
     // Roblox's CDN into ~/.local/share/rustudio/studio, then exit.
     if std::env::args().any(|a| a == "--install-studio-content") {
-        match studio_content::install(&|s| eprintln!("studio content: {s}")) {
+        match rustudio_core::studio_content::install(&|s| eprintln!("studio content: {s}")) {
             Ok(_) => std::process::exit(0),
             Err(e) => {
                 eprintln!("studio content: {e}");
@@ -690,11 +520,11 @@ pub fn desktop_main() -> eframe::Result<()> {
         }
     }
     // `--solver-ticks SCENE.json [--out FILE]`: one compiled physics scene
-    // stepped tick by tick, every body's state printed (src/solver_ticks.rs).
+    // stepped tick by tick, every body's state printed (crates/rustudio-physics/src/solver_ticks.rs).
     if let Some(i) = argv.iter().position(|a| a == "--solver-ticks") {
         let scene = argv.get(i + 1).cloned().unwrap_or_default();
         let out = argv.iter().position(|a| a == "--out").and_then(|j| argv.get(j + 1)).map(|s| s.as_str());
-        match solver_ticks::run(&scene, out) {
+        match rustudio_physics::solver_ticks::run(&scene, out) {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 eprintln!("solver-ticks: {e}");
@@ -719,7 +549,7 @@ pub fn desktop_main() -> eframe::Result<()> {
         if let Some(j) = argv.iter().position(|a| a == "--containers") {
             o.containers = argv.get(j + 1).map(|s| s.split(',').map(String::from).collect()).unwrap_or_default();
         }
-        let res = doc::Document::open(std::path::Path::new(src)).and_then(|d| project_export::export(&d, &out, &o));
+        let res = rustudio_core::doc::Document::open(std::path::Path::new(src)).and_then(|d| project_export::export(&d, &out, &o));
         match res {
             Ok(r) => {
                 for w in &r.warnings {
@@ -804,7 +634,7 @@ pub fn desktop_main() -> eframe::Result<()> {
     // in the background (never in test runs, which must be reproducible).
     let test_run = is_test_run(&std::env::args().collect::<Vec<_>>());
     if !test_run {
-        studio_content::spawn_background_install_if_missing();
+        rustudio_core::studio_content::spawn_background_install_if_missing();
     }
     let mut open: Option<PathBuf> = None;
     let mut screenshot: Option<PathBuf> = None;
@@ -814,7 +644,7 @@ pub fn desktop_main() -> eframe::Result<()> {
     let mut start_play = false;
     let mut bench: Option<PathBuf> = None;
     let mut camera: Option<[f32; 5]> = None;
-    let mut seconds = mech::PERF_SECONDS;
+    let mut seconds = rustudio_core::mech::PERF_SECONDS;
     let mut shot_after: Option<f32> = None;
     let mut shots: Vec<f32> = Vec::new();
     let mut from_play = false;
@@ -960,7 +790,7 @@ pub fn desktop_main() -> eframe::Result<()> {
             "--fail-on-error" => fail_on_error = true,
             "--fixed-dt" => {
                 let v = args.next().unwrap_or_default();
-                match sim_clock::parse_dt(&v) {
+                match rustudio_core::sim_clock::parse_dt(&v) {
                     Some(dt) => fixed_dt = Some(dt),
                     None => {
                         eprintln!("--fixed-dt: can't read {v:?} (1/60, 0.0166 or 60hz)");
@@ -985,7 +815,7 @@ pub fn desktop_main() -> eframe::Result<()> {
             "--stats" => {
                 // Counts of what's in a place (no window).
                 let path = args.next().map(PathBuf::from).unwrap_or_default();
-                match doc::Document::open(&path) {
+                match rustudio_core::doc::Document::open(&path) {
                     Ok(d) => print!("{}", d.stats()),
                     Err(e) => eprintln!("{e}"),
                 }
@@ -1015,7 +845,7 @@ pub fn desktop_main() -> eframe::Result<()> {
                 // Writes every script's full source under DIR as <Full.Name>.luau (no window).
                 let path = args.next().map(PathBuf::from).unwrap_or_default();
                 let dir = args.next().map(PathBuf::from).unwrap_or_default();
-                match doc::Document::open(&path) {
+                match rustudio_core::doc::Document::open(&path) {
                     Ok(d) => {
                         let _ = std::fs::create_dir_all(&dir);
                         let mut n = 0;
@@ -1033,7 +863,7 @@ pub fn desktop_main() -> eframe::Result<()> {
             "--fetch-assets" => {
                 // Downloads public assets by id (rustudio's cache path) into
                 // DIR as <id>.<ext>; a texture pack's maps come along. Used to
-                // give an offline Studio the terrain packs (round 21).
+                // give the offline Studio the terrain packs (round 21).
                 let dir = args.next().map(PathBuf::from).unwrap_or_default();
                 let _ = std::fs::create_dir_all(&dir);
                 let mut queue: Vec<u64> = args.by_ref().filter_map(|a| a.parse().ok()).collect();
@@ -1042,7 +872,7 @@ pub fn desktop_main() -> eframe::Result<()> {
                     if !done.insert(id) {
                         continue;
                     }
-                    match assets::public_cached(id) {
+                    match rustudio_core::assets::public_cached(id) {
                         Ok(b) => {
                             let text = std::str::from_utf8(&b).ok();
                             let ext = if b.starts_with(b"\x89PNG") {
@@ -1054,7 +884,7 @@ pub fn desktop_main() -> eframe::Result<()> {
                             } else {
                                 "bin"
                             };
-                            if let Some(p) = text.and_then(|t| matpack::parse_pack(t).ok()) {
+                            if let Some(p) = text.and_then(|t| rustudio_core::texture_pack::parse_pack(t).ok()) {
                                 queue.extend([p.color, p.normal, p.roughness, p.metalness, p.height].into_iter().flatten());
                             }
                             let out = dir.join(format!("{id}.{ext}"));
@@ -1072,7 +902,7 @@ pub fn desktop_main() -> eframe::Result<()> {
                 // Prints the source of scripts whose full name contains PATTERN (no window).
                 let path = args.next().map(PathBuf::from).unwrap_or_default();
                 let pat = args.next().unwrap_or_default();
-                match doc::Document::open(&path) {
+                match rustudio_core::doc::Document::open(&path) {
                     Ok(d) => print!("{}", d.script_sources(&pat)),
                     Err(e) => eprintln!("{e}"),
                 }
@@ -1148,69 +978,68 @@ pub fn desktop_main() -> eframe::Result<()> {
         demo = true;
     }
 
-    // --fixed-dt: simulated clocks from here (src/sim_clock.rs).
+    // --fixed-dt: simulated clocks from here (crates/rustudio-core/src/sim_clock.rs).
     if let Some(dt) = fixed_dt {
-        sim_clock::enable(dt);
+        rustudio_core::sim_clock::enable(dt);
     }
     let harness = app::Harness {
-        shot_after,
-        log_out,
-        actions,
-        pointer: None,
-        started: sim_clock::now(),
-        held: 0.0,
-        screenshot,
+        run: run_harness::RunHarness {
+            shot_after,
+            log_out,
+            input: run_harness::HarnessInput { actions, pointer: None, shift: false },
+            started: rustudio_core::sim_clock::now(),
+            held: 0.0,
+            screenshot,
+            screenshot_requested: false,
+            start_play,
+            camera,
+            shots,
+            shot_next: 0,
+            shot_lines: Vec::new(),
+            from_play,
+            play_started: None,
+            play_game_time: None,
+            frame_ms: Vec::new(),
+            last_frame: None,
+            no_ui,
+            no_render,
+            end_after: (no_ui && seconds_given && bench.is_none()).then_some(seconds),
+            fail_on_error,
+            result,
+            end_value: None,
+            run_frames: Vec::new(),
+            run_last: None,
+            run_playing: false,
+            finished: false,
+            bench: bench.map(|out| {
+                let label = open
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "new place".into());
+                rustudio_core::bench::Bench::new(Some(out), &label, start_play, seconds)
+            }),
+        },
         selftest: selftest.map(selftest::SelfTest::new),
         ui_shots: ui_shots.map(ui_shots::UiShots::new),
-        screenshot_requested: false,
-        start_play,
-        camera,
-        shift: false,
-        shots,
-        shot_next: 0,
-        shot_lines: Vec::new(),
-        from_play,
-        play_started: None,
-        play_game_time: None,
-        frame_ms: Vec::new(),
-        last_frame: None,
         open_roblox: open_roblox.map(|p| (p, local_copy)),
         team_create,
         roblox_picker,
         roblox_settings,
         ui_due: Vec::new(),
-        no_ui,
         overlays,
-        no_render,
-        // (--seconds ends a --no-ui run; with --bench it is the measuring time)
-        end_after: (no_ui && seconds_given && bench.is_none()).then_some(seconds),
-        fail_on_error,
-        result,
         plugin_files,
         installed_plugins,
         plugin_dirs,
         no_plugins,
         plugins_started: false,
-        end_value: None,
-        run_frames: Vec::new(),
-        run_last: None,
-        run_playing: false,
-        finished: false,
-        bench: bench.map(|out| {
-            let label = open
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "new place".into());
-            bench::Bench::new(Some(out), &label, start_play, seconds)
-        }),
     };
     // No vsync when measuring, so frame times show the real cost.
     // (--fixed-dt: as fast as the machine allows)
-    let bench_mode = harness.bench.is_some() || harness.selftest.is_some() || sim_clock::on();
+    let bench_mode = harness.run.bench.is_some() || harness.selftest.is_some() || rustudio_core::sim_clock::on();
     let argv: Vec<String> = std::env::args().collect();
     let size = match window_arg(&argv) {
         Some((w, h)) => [w as f32, h as f32],
-        None if harness.bench.is_some() => [1265.0, 900.0],
+        None if harness.run.bench.is_some() => [1265.0, 900.0],
         // The self-test's lighting references were read in a 952×519 view
         // (rounds 7–15); round 16's chrome is 25 px shorter, so 33 px less window.
         None if harness.selftest.is_some() => [1265.0, 867.0],
@@ -1219,10 +1048,10 @@ pub fn desktop_main() -> eframe::Result<()> {
     // Studio Settings: the user's for plain runs (src/studio_settings.rs).
     studio_settings::init(layout_store::enabled(&harness));
     // rustudio's own options: likewise only for runs a person drives, never
-    // under RUSTUDIO_DETERMINISTIC (src/rustudio_settings.rs).
-    rustudio_settings::init(layout_store::enabled(&harness));
+    // under RUSTUDIO_DETERMINISTIC (crates/rustudio-core/src/rustudio_settings.rs).
+    rustudio_core::rustudio_settings::init(layout_store::enabled(&harness));
     // The saved window (src/layout_store.rs), for plain interactive runs.
-    let saved_layout = (!harness.no_ui && layout_store::enabled(&harness)).then(layout_store::load).flatten();
+    let saved_layout = (!harness.run.no_ui && layout_store::enabled(&harness)).then(layout_store::load).flatten();
     let icon = egui::IconData {
         rgba: icons::logo_rgba(64),
         width: 64,
@@ -1234,7 +1063,7 @@ pub fn desktop_main() -> eframe::Result<()> {
         .with_inner_size(size)
         .with_icon(icon);
     // (--no-ui: any size, the view is the whole window)
-    if !harness.no_ui {
+    if !harness.run.no_ui {
         viewport = viewport.with_min_inner_size([900.0, 560.0]);
     }
     // A test run gets the size it asked for even on a smaller desktop
@@ -1253,7 +1082,7 @@ pub fn desktop_main() -> eframe::Result<()> {
     if std::env::var_os("RUSTUDIO_CONTROL").is_some() {
         viewport = viewport.with_active(false).with_window_level(egui::WindowLevel::AlwaysOnBottom);
     }
-    let wgpu_options = wgpu_options(bench_mode);
+    let wgpu_options = offscreen::wgpu_options_with(bench_mode, wgpu_setup);
     // --headless / --no-render: no window at all (src/offscreen.rs).
     if headless {
         let px = [size[0].round() as u32, size[1].round() as u32];
@@ -1261,8 +1090,9 @@ pub fn desktop_main() -> eframe::Result<()> {
             wgpu_options,
             offscreen::Options { size: px, render: !no_render, paced: !bench_mode },
             move |ctx, rs| app::RustudioApp::new_in(ctx, rs, None, open, harness, demo),
+            app::RustudioApp::frame,
         );
-        crate::telemetry::flush();
+        rustudio_core::telemetry::flush();
         std::process::exit(code.max(app::EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed)));
     }
     let options = eframe::NativeOptions {

@@ -7,7 +7,7 @@
 //! it for 12 hours. `RUSTUDIO_NO_UPDATE_CHECK=1` turns the check off;
 //! `RUSTUDIO_UPDATE_URL` points it at another release feed (for testing).
 
-use crate::theme;
+use rustudio_engine::theme;
 use egui::{Align2, RichText};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -85,7 +85,7 @@ impl Updater {
         // RUSTUDIO_NO_UPDATE_CHECK / RUSTUDIO_UI_SHOTS, or the rustudio option.
         // An Android APK is installed by the system: nothing here could put
         // a release in place, so the phone never asks.
-        let off = !crate::rustudio_settings::update_check() || cfg!(target_os = "android");
+        let off = !rustudio_core::rustudio_settings::update_check() || cfg!(target_os = "android");
         if off {
             *stage.lock().unwrap() = Stage::Current;
         } else {
@@ -157,7 +157,7 @@ impl Updater {
                             });
                             if !matches!(stage, Stage::Downloading(_)) {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                    let x = ui.add(egui::Button::new(RichText::new("✕").size(12.0).color(theme::TEXT_DIM)).frame(false));
+                                    let x = ui.add(egui::Button::new(rustudio_engine::ti::text("x", 12.0).color(theme::TEXT_DIM)).frame(false));
                                     let tip = if matches!(stage, Stage::Available(_)) { "Hide for 12 hours" } else { "Close" };
                                     if x.on_hover_text(tip).clicked() {
                                         close = true;
@@ -350,7 +350,7 @@ fn source_build() -> bool {
 }
 
 fn snooze_file() -> PathBuf {
-    crate::paths::config().join("rustudio").join("update-dismissed")
+    rustudio_core::paths::config().join("rustudio").join("update-dismissed")
 }
 
 fn now() -> u64 {

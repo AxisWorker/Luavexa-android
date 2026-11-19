@@ -5,7 +5,9 @@
 //! are the events the keyboard shortcuts would be: `Event::Cut`, `Copy`,
 //! `Paste(the system clipboard's text)` and Ctrl+A, fed to egui through
 //! `App::raw_input_hook` on the next frame. The copies reach the system
-//! clipboard through src/android/clipboard.rs.
+//! clipboard through src/android/clipboard.rs, which also keeps the text
+//! Paste pastes. The same four stand on the bar above the keyboard
+//! (text_bar.rs), which needs no long press to be found.
 //!
 //! Two things egui does on its own are undone here: a right click moves
 //! the caret to the finger (the selection from before the press comes back
@@ -67,13 +69,10 @@ impl TextMenu {
                 _ => {}
             }
             let at = r.interact_pointer_pos().or_else(|| ctx.pointer_latest_pos()).unwrap_or(r.rect.left_bottom());
-            let clipboard = match super::jni::clipboard_get() {
-                Ok(text) => text.filter(|t| !t.is_empty()),
-                Err(e) => {
-                    log::warn!("clipboard: {e}");
-                    None
-                }
-            };
+            // (the clipboard's text as last read; asked for again now, and
+            // Paste comes alive when the answer lands while the menu is up)
+            super::clipboard::refresh();
+            let clipboard = super::clipboard::text();
             let surrender = ctx.options_mut(|o| {
                 std::mem::replace(&mut o.input_options.surrender_focus_on, egui::SurrenderFocusOn::Never)
             });
@@ -84,6 +83,11 @@ impl TextMenu {
             self.open = Some(Open { field: id, at, clipboard, surrender });
         }
 
+        if let Some(open) = self.open.as_mut() {
+            if open.clipboard.is_none() {
+                open.clipboard = super::clipboard::text();
+            }
+        }
         if let Some(open) = self.open.as_ref() {
             let id = Id::new(ID);
             let mut keep = focused == Some(open.field) && egui::Popup::is_id_open(ctx, id);

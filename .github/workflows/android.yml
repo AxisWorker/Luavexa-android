@@ -59,7 +59,7 @@ on:
       adrenotools_zip:
         description: "libadrenotools zip URL (libadrenotools.so + hook libraries inside; a TouseefX/libadrenotools-native release or CI artifact via nightly.link)"
         required: false
-        default: "https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44085827920/libadrenotools-arm64-v8a.zip"
+        default: "https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44383713561/libadrenotools-arm64-v8a.zip"
         type: string
       panvk:
         description: "Also ship the PanVK (Mesa) Vulkan driver for Mali GPUs (35 MB more APK; needs turnip on)"
@@ -86,14 +86,18 @@ env:
   # builds; a manual run's inputs above can name others or leave them
   # out). tools/android/fetch-turnip.sh checks these against pinned
   # SHA-256 sums; docs/ANDROID.md "Turnip driver". The libadrenotools
-  # build is the fork's CI artifact of 2026-11-17 12:42 (commit 4d4d482:
-  # the driver.cpp rewrite — HyperOS' vendor Vulkan paths, its own
-  # initialisation switchable off, which the app does, a working PanVK
-  # path) through nightly.link; GitHub keeps
-  # artifacts for 90 days — a release of the fork replaces it then (the
-  # script's comments name the last one, V0.7).
+  # build is the fork's CI artifact of 2026-11-18 19:46 (commit ca1ad33,
+  # run 44383713561: the driver.cpp rewrite of 4d4d482 — HyperOS' vendor
+  # Vulkan paths, its own initialisation switchable off, which the app
+  # does, a working PanVK path — plus the 2026-11-18 fixes for
+  # whole-device reboots with Turnip: the GSL free hook's bad
+  # IOCTL_KGSL_GPUOBJ_FREE, the KGSL_PROP_PWRCTRL ioctl at init) through
+  # nightly.link; GitHub keeps artifacts for 90 days — a release of the
+  # fork replaces it then (the script's comments name the last one,
+  # V0.7). The script strips the Rust debug info out of its two large
+  # libraries with llvm-strip (the `llvm` package above).
   TURNIP_ZIP_URL: https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.0/mesa-turnip-android-26.3.0.zip
-  ADRENOTOOLS_ZIP_URL: https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44085827920/libadrenotools-arm64-v8a.zip
+  ADRENOTOOLS_ZIP_URL: https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44383713561/libadrenotools-arm64-v8a.zip
   PANVK_SO_URL: https://github.com/zenithblue-oss/panvk-kbase-android/releases/download/panvk-kbase-v26.3.1/libvulkan_panfrost-android-aarch64.so
 
 jobs:

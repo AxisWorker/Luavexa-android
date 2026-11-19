@@ -8,20 +8,19 @@ use std::time::Instant;
 use egui::{Key, KeyboardShortcut, Modifiers, RichText};
 use egui_dock::{DockArea, DockState, TabViewer};
 use glam::Vec3;
-use rbx_dom_weak::types::{Ref, Variant};
+use rbx_dom_weak::types::Ref;
 use rbx_dom_weak::InstanceBuilder;
 
-use crate::account_ui::AccountUi;
-use crate::camera::Camera;
-use crate::doc::{self, DocKind, Document};
+use rustudio_core::doc::{self, DocKind, Document};
 use crate::explorer::ExplorerState;
-use crate::mech;
+use rustudio_core::mech;
 use crate::properties::PropertiesState;
-use crate::render::{MeshKind, Renderer};
-use crate::scene::Scene;
+use rustudio_render::render::MeshKind;
 use crate::selftest::SelfTest;
-use crate::theme;
+use rustudio_engine::theme;
 use crate::viewport::GizmoDrag;
+
+pub use rustudio_core::log::{Level, LogLine, tee_log};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -48,19 +47,6 @@ impl Tool {
             Tool::Rotate => "Rotate",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Level {
-    Info,
-    Warn,
-    Error,
-}
-
-pub struct LogLine {
-    pub at: String,
-    pub level: Level,
-    pub text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,48 +96,10 @@ pub struct HudStats {
 }
 
 pub struct Harness {
-    /// `--shot-after S`: take the screenshot S seconds after start instead of
-    /// after SCREENSHOT_FRAMES frames (Play sessions need time to load).
-    pub shot_after: Option<f32>,
-    /// `--log FILE`: write the Output lines there on exit.
-    pub log_out: Option<PathBuf>,
-    /// `--click X,Y@S` / `--key NAME@S`: input at S seconds (X,Y in the 3D
-    /// view, pixels from its top-left).
-    pub actions: Vec<(f32, HarnessAction)>,
-    /// The pointer's last window position seen in the input (harness clicks
-    /// while the game holds the mouse press there).
-    pub pointer: Option<egui::Pos2>,
-    pub started: Instant,
-    pub screenshot: Option<PathBuf>,
+    pub run: RunHarness,
     pub selftest: Option<SelfTest>,
     /// `--ui-shots DIR`: pictures of the chrome (src/ui_shots.rs).
     pub ui_shots: Option<crate::ui_shots::UiShots>,
-    pub screenshot_requested: bool,
-    /// `--play`: start a Play session right after loading.
-    pub start_play: bool,
-    /// `--bench`: frame-time measurement.
-    pub bench: Option<crate::bench::Bench>,
-    /// `--camera x,y,z,yaw,pitch`: starting camera (degrees).
-    pub camera: Option<[f32; 5]>,
-    /// `--shift S:HOLD`: Shift held (egui reports it as a modifier, not a key).
-    pub shift: bool,
-    /// `--shots T1,T2,…`: a window and a viewport screenshot at each time
-    /// (FILE-<t>s.png / FILE-<t>s.view.png), the Output log with each, then exit.
-    pub shots: Vec<f32>,
-    pub shot_next: usize,
-    /// `[shot] PATH` lines for the shots written so far (stdout and --log).
-    pub shot_lines: Vec<String>,
-    /// `--from-play`: harness times count from the moment Play starts (as a
-    /// Studio playtest's do), not from program start.
-    pub from_play: bool,
-    pub play_started: Option<Instant>,
-    /// Play's simulated seconds since it started, when frames step a fixed dt
-    /// (RUSTUDIO_FIXED_DT): then the harness clock is this one, so a run's shots
-    /// and exit come at the same game time however loaded the machine is.
-    pub play_game_time: Option<f32>,
-    /// Frame times (ms) since Play started, for the fidelity report.
-    pub frame_ms: Vec<f32>,
-    pub last_frame: Option<Instant>,
     /// `--open-roblox ID|URL`: open that place from Roblox once the session
     /// is checked.
     pub open_roblox: Option<(u64, bool)>,
@@ -161,22 +109,9 @@ pub struct Harness {
     pub roblox_settings: bool,
     /// `--action NAME@S` menu actions now due (run where the egui context is).
     pub ui_due: Vec<String>,
-    /// `--no-ui`: the 3D view (or the game) alone over the whole window; no
-    /// editor UI is built (RustudioApp::no_ui_frame).
-    pub no_ui: bool,
     /// `--overlays`: with --no-ui, keep the editor's view overlays (grid,
     /// selection, gizmos, hover, view cube, readouts) in Edit state.
     pub overlays: bool,
-    /// `--no-render`: no GPU device on purpose (src/offscreen.rs); shots
-    /// write no picture.
-    pub no_render: bool,
-    /// `--seconds N` without --bench in a --no-ui run: end the run at N
-    /// seconds on the harness clock (from Play's start with --from-play).
-    pub end_after: Option<f32>,
-    /// `--fail-on-error`: exit 1 when the Output has an error line.
-    pub fail_on_error: bool,
-    /// `--result FILE`: one JSON for CI at the end of the run (finish_run).
-    pub result: Option<PathBuf>,
     /// `--plugin FILE` (repeatable) / `--plugins-dir DIR`: plugins loaded
     /// once the place is open; `--no-plugins`: none at all.
     pub plugin_files: Vec<PathBuf>,
@@ -185,107 +120,70 @@ pub struct Harness {
     pub plugin_dirs: Vec<PathBuf>,
     pub no_plugins: bool,
     pub plugins_started: bool,
-    /// StudioTestService:EndTest's value once a script ended the run.
-    pub end_value: Option<String>,
-    /// Every frame's interval and work (ms), from the first frame in Edit
-    /// state, from Play's start in Play (the --result frame statistics).
-    pub run_frames: Vec<(f32, f32)>,
-    pub run_last: Option<Instant>,
-    pub run_playing: bool,
-    pub finished: bool,
-    /// Seconds the (Edit state) schedule was held by a harness wait for an
-    /// event (`toolbox:await-ask`): actions, shots and the end come that
-    /// much later, so what follows the wait runs relative to the event.
-    pub held: f32,
 }
 
-/// The process's exit code once a harness run finished (finish_run).
-pub static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+use crate::game::Game;
+use crate::run_harness::{RunHarness, frame_grid};
+pub use crate::run_harness::{EXIT_CODE, HarnessAction, save_png};
+use rustudio_render::{camera::Camera, scene::Scene};
 
 impl Harness {
-    /// Whether StudioTestService:EndTest ends the whole run here (a --no-ui
-    /// run, or any run with --result) rather than only stopping Play.
-    pub fn ends_on_end_test(&self) -> bool {
-        self.no_ui || self.result.is_some()
-    }
-
     /// A plain interactive run: no screenshots, tests or timed actions (the
-    /// Android app, which has no command line; `desktop_main` fills the
-    /// fields from its options).
+    /// Android app, which has no command line; `run` fills the fields from
+    /// its options).
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub fn interactive() -> Self {
         Harness {
-            shot_after: None,
-            log_out: None,
-            actions: Vec::new(),
-            pointer: None,
-            started: crate::sim_clock::now(),
-            screenshot: None,
+            run: RunHarness {
+                input: Default::default(),
+                shot_after: None,
+                log_out: None,
+                started: rustudio_core::sim_clock::now(),
+                screenshot: None,
+                screenshot_requested: false,
+                start_play: false,
+                bench: None,
+                camera: None,
+                shots: Vec::new(),
+                shot_next: 0,
+                shot_lines: Vec::new(),
+                from_play: false,
+                play_started: None,
+                play_game_time: None,
+                frame_ms: Vec::new(),
+                last_frame: None,
+                no_ui: false,
+                no_render: false,
+                end_after: None,
+                fail_on_error: false,
+                result: None,
+                end_value: None,
+                run_frames: Vec::new(),
+                run_last: None,
+                run_playing: false,
+                finished: false,
+                held: 0.0,
+            },
             selftest: None,
             ui_shots: None,
-            screenshot_requested: false,
-            start_play: false,
-            bench: None,
-            camera: None,
-            shift: false,
-            shots: Vec::new(),
-            shot_next: 0,
-            shot_lines: Vec::new(),
-            from_play: false,
-            play_started: None,
-            frame_ms: Vec::new(),
-            last_frame: None,
             open_roblox: None,
             team_create: None,
             roblox_picker: None,
             roblox_settings: false,
             ui_due: Vec::new(),
-            no_ui: false,
             overlays: false,
-            no_render: false,
-            end_after: None,
-            fail_on_error: false,
-            result: None,
             plugin_files: Vec::new(),
             installed_plugins: Vec::new(),
             plugin_dirs: Vec::new(),
             no_plugins: false,
             plugins_started: false,
-            end_value: None,
-            run_frames: Vec::new(),
-            run_last: None,
-            run_playing: false,
-            finished: false,
-            held: 0.0,
-            play_game_time: None,
         }
-    }
-
-    /// Seconds on the harness clock (None before Play when --from-play).
-    pub fn now(&self) -> Option<f32> {
-        if self.from_play {
-            if self.play_started.is_some() && self.play_game_time.is_some() {
-                return self.play_game_time;
-            }
-            self.play_started.map(|t| crate::sim_clock::since(t).as_secs_f32())
-        } else {
-            Some(self.unheld_now() - self.held)
-        }
-    }
-
-    /// Seconds since start, holds included.
-    pub fn unheld_now(&self) -> f32 {
-        crate::sim_clock::since(self.started).as_secs_f32()
     }
 }
 
 pub struct Editor {
-    pub doc: Document,
-    /// The document's Highlights, kept from its change journal (viewport.rs).
-    pub highlight_index: Option<crate::doc::ClassIndex>,
-    pub cam: Camera,
+    pub game: Game,
     pub tool: Tool,
-    pub snap_move: bool,
     /// Model tab Collisions: handle moves / scales stop where parts would
     /// overlap (TransformHandlesImplementation._safelyTransformParts).
     pub collisions: bool,
@@ -303,25 +201,12 @@ pub struct Editor {
     /// Align Dragged Objects (StudioService.AlignDraggedObjects): dropped
     /// selections turn to the nearest axis alignment of the target surface.
     pub align_dragged: bool,
-    pub move_inc: f32,
-    pub snap_rotate: bool,
-    pub rotate_inc: f32,
-    pub local_space: bool,
     pub show_grid: bool,
     /// The scene alone in the 3D view, without the editor's own drawing (the
     /// ground grid, selection and hover boxes, handles, the drag box, the
     /// tool readout and axis compass): comparison captures (src/control.rs).
     pub clean_view: bool,
-    pub log: Vec<LogLine>,
     pub clipboard: Option<Vec<u8>>,
-    pub render_state: Option<egui_wgpu::RenderState>,
-    pub renderer: Option<Renderer>,
-    pub scene: Scene,
-    /// The parts inside drawn ViewportFrames (vf_render.rs), drawn by the
-    /// same `sync_draws` as the world's, with their own draw cache.
-    pub vf_scene: Scene,
-    pub vf_draw_cache: crate::viewport::DrawCache,
-    pub vf_draws_asset_gen: u64,
     pub hover: Option<Ref>,
     pub drag: Option<GizmoDrag>,
     pub marquee: Option<egui::Pos2>,
@@ -333,19 +218,17 @@ pub struct Editor {
     pub part_drag: Option<crate::part_drag::PartDrag>,
     pub explorer: ExplorerState,
     pub props: PropertiesState,
-    pub account: AccountUi,
     /// The character builder window (Home / Avatar → Character).
     pub chars: crate::char_builder::CharBuilder,
     /// Places stored on Roblox: File > Open from Roblox, Save to Roblox.
     pub cloud: crate::cloud_ui::CloudUi,
+    pub(crate) account_destination: Option<crate::account_ui::Picker>,
     /// Scripts to open (or focus) as editor tabs at the end of the frame.
     pub open_script: Vec<Ref>,
     /// Script tabs a plugin closed (ScriptDocument:CloseAsync).
     pub close_script: Vec<Ref>,
     document_tabs_reset: bool,
     pub scripts: crate::script_editor::ScriptTabs,
-    /// The running Play / Run session, if any.
-    pub play: Option<crate::play::PlaySession>,
     /// Studio plugins in the edit DataModel (src/plugin_host).
     pub plugins: crate::plugin_host::PluginHost,
     /// Plugin toolbars / menus / shortcuts as the editor draws them
@@ -354,74 +237,16 @@ pub struct Editor {
     /// Plugin dock widgets' panels, CoreGui over the edit viewport, and the
     /// edit-mode input plugins hear (src/plugin_host/widgets_ui.rs).
     pub plugin_ui: crate::plugin_host::widgets_ui::PluginUi,
-    /// Fixed frame time for deterministic self-tests.
-    pub fixed_dt: Option<f32>,
-    /// ParticleEmitters, Beams and Trails (round 25).
-    pub effects: crate::effects::Effects,
-    /// Loaded MeshPart / SpecialMesh geometry.
-    pub meshes: crate::assets::MeshCache,
-    pub textures: crate::assets::TextureCache,
-    /// Cloud asset downloads + disk cache.
-    pub assets: crate::assets::AssetStore,
-    /// ScreenGuis / SurfaceGuis / BillboardGuis: textures, fonts, hover, focus.
-    pub gui: crate::gui::Gui,
-    /// Clothing-template box meshes by body part name.
-    pub clothing_meshes: std::collections::HashMap<String, u32>,
-    /// The rig picker: Some(R15 / R6) is an explicit choice that wins over
-    /// the place's setting and the avatar; None (Auto) lets them decide.
-    pub play_rig: Option<crate::rig::RigType>,
-    /// Play opens on the client's view, as Studio does (the self-test's
-    /// older steps turn this off to watch the server).
-    pub play_shows_client: bool,
-    /// Last frame: (loaded meshes drawn, textured parts, decals, clothed body parts).
-    pub draw_stats: [usize; 4],
-    /// What the renderer holds per part.
-    pub draw_cache: crate::viewport::DrawCache,
     /// RUSTUDIO_CONTROL: the comparison-capture socket (src/control.rs).
     #[cfg(unix)]
     pub control: Option<crate::control::Control>,
-    /// Bumped whenever a downloaded asset arrives (parts waiting on one are redone).
-    pub asset_gen: u64,
-    pub draws_asset_gen: u64,
-    /// matpack::generation() and wrap::generation() last seen.
-    pub material_gen: u64,
-    pub wrap_gen: u64,
-    /// Uploaded layered-clothing pieces: (fitting, piece) → (mesh, centre, extent).
-    pub wrap_meshes: HashMap<(usize, usize), (u32, glam::Vec3, glam::Vec3)>,
-    /// Fitting failures already reported.
-    pub wrap_warned: std::collections::HashSet<String>,
-    /// Triangles in the drawn voxel terrain.
-    pub terrain_tris: usize,
-    /// The terrain as last drawn (document id, Terrain, voxels), so an edit
-    /// re-meshes only the chunks it changed (round 21).
-    pub terrain_drawn: Option<(u64, rbx_dom_weak::types::Ref, crate::terrain::Voxels)>,
-    /// Terrain shader parameters to rebuild (colours, packs arriving), and
-    /// the material-pack generation they were built at.
-    pub terrain_params_dirty: bool,
-    pub terrain_params_gen: u64,
-    pub terrain_present: [bool; 23],
-    /// Chunks with Grass tops (decoration candidates) and those whose blades
-    /// are built.
-    pub terrain_grass_chunks: std::collections::HashSet<[i32; 3]>,
-    pub terrain_grass_built: std::collections::HashSet<[i32; 3]>,
-    pub terrain_grass_length: f32,
-    /// The water look last drawn (WaterColor, WaterTransparency, WaterReflectance).
-    pub terrain_water_look: Option<([u8; 3], f32, f32)>,
-    /// Terrain water's waves and clearness for the water pass (round 24).
-    pub water_waves: crate::water::WaterLook,
-    /// Studio's scene environment probe (env_probe.rs).
-    pub env_probe: crate::env_probe::EnvProbe,
     /// The Terrain Editor's tools and settings.
     pub terrain_ed: crate::terrain_editor::TerrainEditor,
     /// The Toolbox panel's state (src/toolbox), kept while it is hidden.
     pub toolbox: crate::toolbox::Toolbox,
     /// This frame's Toolbox preview ViewportFrames (drawn with the GUI's).
-    pub toolbox_vf: std::collections::HashMap<rbx_dom_weak::types::Ref, crate::render::vf::Request>,
-    /// A brush stroke's voxels, the chunks it touched and whether water may
-    /// have changed: drawn next frame without decoding the grid.
-    pub terrain_brushed: Option<(crate::terrain::Voxels, Vec<[i32; 3]>, bool)>,
+    pub toolbox_vf: std::collections::HashMap<rbx_dom_weak::types::Ref, rustudio_render::render::vf::Request>,
     /// Physical key positions held (movement keys; src/keys.rs).
-    pub phys: crate::keys::PhysicalKeys,
     /// Seconds the fly keys have been held / released (speed ramp).
     pub fly_held: f32,
     pub fly_idle: f32,
@@ -439,7 +264,6 @@ pub struct Editor {
     /// The view selector's meshes for the current view.
     pub selector_cache: crate::viewport::SelectorCache,
     pub hover_outline_refs: (Option<(rbx_dom_weak::types::Ref, u64)>, Vec<rbx_dom_weak::types::Ref>),
-    pub viewport_rect: egui::Rect,
     /// Android: the points of the window's bottom the soft keyboard lies
     /// over while a game TextBox is typed into (`RustudioApp::frame`; the
     /// panels are not laid out above it then: `Editor::keyboard_pan`).
@@ -448,57 +272,33 @@ pub struct Editor {
     /// How far the 3D view, its GUIs with it, is slid up to show the
     /// TextBox typed into above the soft keyboard (`keyboard_pan`).
     pub view_pan: f32,
-    pub frame_no: u64,
     pub harness: Harness,
     pub last_frame: Instant,
     pub fps: f32,
     pub confirm_discard: Option<PendingAction>,
     /// Selection as of the last Explorer sync.
     pub last_selection: Vec<Ref>,
-    /// Active right-drag camera look with the cursor grabbed.
-    pub look_grab: Option<crate::viewport::LookGrab>,
-    /// Locked grab failed once (e.g. X11): use Confined from then on.
-    pub grab_use_confined: bool,
-    /// The game holds the cursor (UserInputService.MouseBehavior while playing).
-    pub game_grab: Option<crate::viewport::LookGrab>,
-    pub game_cursor_hidden: bool,
-    /// Cursor commands sent, newest last (the self-test checks them).
-    pub cursor_log: Vec<String>,
-    /// The 3D view rendered at this many pixels instead of its panel's
-    /// (camera aspect from it; drawn scaled into the panel): self-test
-    /// steps that compare with a Studio capture at Studio's view size.
-    pub view_render_size: Option<[u32; 2]>,
     /// The 3D view's graphics quality (View > Graphics Settings;
-    /// src/quality.rs): the level 1–10, Automatic, and the settings set
-    /// apart from the level. Phones start in Automatic at level 3,
-    /// computers at 10; `RUSTUDIO_QUALITY` overrides.
-    pub graphics: crate::quality::Graphics,
+    /// crates/rustudio-render/src/quality.rs): the level 1–10, Automatic,
+    /// and the settings set apart from the level. Phones start in
+    /// Automatic at level 3, computers at 10; `RUSTUDIO_QUALITY` overrides.
+    pub graphics: rustudio_render::quality::Graphics,
     /// Automatic quality's frame-rate watch (quality.rs).
-    pub quality_auto: crate::quality::Auto,
+    pub quality_auto: rustudio_render::quality::Auto,
     /// Studio Settings > Rendering > Editor Quality Level as last seen:
     /// a change there (the dialog, `settings()` from Luau) sets `graphics`
     /// (`Editor::quality_tick`).
     pub quality_studio_seen: u32,
-    /// Fingers (Android): what the viewport laid out for them and the
-    /// movement stick's state (src/touch_input.rs).
-    pub touch: crate::touch_input::Touch,
     /// The first frame picks the UI zoom from the screen (Android, a fresh
     /// layout: android::touch::auto_zoom).
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub auto_zoom: bool,
-    /// The last 3D frame shown again while nothing in it changed
-    /// (viewport.rs; RUSTUDIO_VIEW_REUSE=0|1, on by default on phones).
-    pub view_reuse: crate::viewport::ViewReuse,
-    /// Whether the camera moves (viewport.rs): the 3D view's scale.
-    pub motion: crate::viewport::Motion,
     /// Play's frame-rate cap (quality.rs `fps_cap`): when the next frame
     /// may go out, and how long the last one waited for its turn (s).
     pub cap_next: Option<Instant>,
     pub cap_wait: f32,
     /// CPU time of the last frame's update + draw submission (ms).
     pub last_work_ms: f32,
-    /// Local lights, sky faces and the sky-visibility map.
-    pub lighting: crate::viewport::LightingState,
     /// The open project folder (files are the truth; src/project_sync.rs).
     pub project: Option<crate::project_sync::ProjectState>,
     /// A folder with several project files: (folder, the files) to choose from.
@@ -513,8 +313,6 @@ pub struct Editor {
     pub dialogs: crate::file_dialog::Dialogs,
     /// Studio's chrome: ribbon tab, run type, panel toggles, popups (src/studio_ui.rs).
     pub ui: crate::studio_ui::UiState,
-    /// Test Here: the character's first spawn point (the camera's position).
-    pub play_here: Option<Vec3>,
     /// View > Screenshot waiting for the frame.
     pub pending_user_shot: Option<PathBuf>,
     /// The Start Page (src/start_page.rs): shown when nothing is open.
@@ -544,7 +342,7 @@ pub struct RustudioApp {
     last_plugin_tick: Instant,
     plugins_ticked_between_frames: bool,
     /// Frame times to the log every few seconds (src/perf_log.rs).
-    perf: crate::perf_log::PerfLog,
+    perf: rustudio_render::perf_log::PerfLog,
     pub dock: DockState<Tab>,
     pub ed: Editor,
     /// Keeps the dock, window and view settings (src/layout_store.rs).
@@ -558,6 +356,10 @@ pub struct RustudioApp {
     /// The text fields' long-press menu (src/android/text_menu.rs).
     #[cfg(target_os = "android")]
     text_menu: crate::android::text_menu::TextMenu,
+    /// Cut / Copy / Paste / Select all above the soft keyboard
+    /// (src/android/text_bar.rs).
+    #[cfg(target_os = "android")]
+    text_bar: crate::android::text_bar::TextBar,
     /// The display's refresh rate in Hz (0 unknown): the frame budget the
     /// CPU governor is told (src/android/perf_hint.rs), the perf log's
     /// line, the frame-rate cap's lead.
@@ -606,40 +408,28 @@ impl RustudioApp {
         harness: Harness,
         demo: bool,
     ) -> Self {
-        crate::ti::install(egui_ctx);
+        crate::studio_hooks::install();
+        rustudio_engine::ti::install(egui_ctx);
         theme::apply(egui_ctx);
-        crate::mouse_lock::note_window(wayland);
+        rustudio_engine::mouse_lock::note_window(wayland);
         // (the renderer is made below, once the saved layout has said
-        // which graphics level it is for)
-        let renderer = None;
-        let graphics = crate::quality::Graphics::platform_default();
+        // which graphics level it is for: Game::new(None) leaves it out)
+        let graphics = rustudio_render::quality::Graphics::platform_default();
+        let mut game = Game::new(None);
+        game.render_state = render_state;
         let mut ed = Editor {
+            game,
             dialogs: crate::file_dialog::Dialogs::new(egui_ctx.clone()),
-            doc: Document::new_place(),
-            highlight_index: None,
-            cam: Camera::default(),
             tool: Tool::Select,
-            snap_move: mech::SNAP_ON_BY_DEFAULT,
             collisions: mech::COLLISIONS_ON_BY_DEFAULT,
             join_surfaces: mech::JOIN_SURFACES_ON_BY_DEFAULT,
             physical_drag: mech::PHYSICAL_DRAG_BY_DEFAULT,
             part_snap: mech::PART_SNAP_ON_BY_DEFAULT,
             use_bounding_boxes: mech::USE_BOUNDING_BOXES_BY_DEFAULT,
             align_dragged: mech::ALIGN_DRAGGED_BY_DEFAULT,
-            move_inc: mech::MOVE_SNAP,
-            snap_rotate: mech::SNAP_ON_BY_DEFAULT,
-            rotate_inc: mech::ROTATE_SNAP_DEG,
-            local_space: false,
             show_grid: true,
             clean_view: false,
-            log: Vec::new(),
             clipboard: None,
-            render_state,
-            renderer,
-            scene: Scene::default(),
-            vf_scene: Scene::viewport_frames(),
-            vf_draw_cache: Default::default(),
-            vf_draws_asset_gen: 0,
             hover: None,
             drag: None,
             marquee: None,
@@ -648,52 +438,21 @@ impl RustudioApp {
             part_drag: None,
             explorer: ExplorerState::default(),
             props: PropertiesState::default(),
-            account: AccountUi::new(),
             chars: Default::default(),
             cloud: crate::cloud_ui::CloudUi::new(),
+            account_destination: None,
             open_script: Vec::new(),
             close_script: Vec::new(),
             document_tabs_reset: false,
             scripts: Default::default(),
-            play: None,
             plugins: Default::default(),
             plugin_ui: Default::default(),
             plugin_bar: Default::default(),
-            fixed_dt: None,
-            effects: Default::default(),
-            meshes: Default::default(),
-            textures: Default::default(),
-            assets: Default::default(),
-            gui: Default::default(),
-            clothing_meshes: Default::default(),
-            play_rig: None,
-            play_shows_client: true,
-            draw_stats: [0; 4],
-            draw_cache: Default::default(),
             #[cfg(unix)]
             control: None,
-            asset_gen: 0,
-            draws_asset_gen: 0,
-            material_gen: 0,
-            wrap_gen: 0,
-            wrap_meshes: HashMap::new(),
-            wrap_warned: Default::default(),
-            terrain_tris: 0,
-            terrain_drawn: None,
-            terrain_params_dirty: true,
-            terrain_params_gen: u64::MAX,
-            terrain_present: [false; 23],
-            terrain_grass_chunks: Default::default(),
-            terrain_grass_built: Default::default(),
-            terrain_grass_length: -1.0,
-            terrain_water_look: None,
-            water_waves: Default::default(),
-            env_probe: Default::default(),
             terrain_ed: Default::default(),
             toolbox: Default::default(),
             toolbox_vf: Default::default(),
-            terrain_brushed: None,
-            phys: Default::default(),
             fly_held: 0.0,
             fly_idle: 0.0,
             last_zoom: None,
@@ -704,34 +463,20 @@ impl RustudioApp {
             hover_outline_refs: (None, Vec::new()),
             selector_cache: Default::default(),
             selection_outline_refs: std::cell::RefCell::new((u64::MAX, Vec::new(), Vec::new())),
-            viewport_rect: egui::Rect::NOTHING,
             keyboard_cover: 0.0,
             view_pan: 0.0,
-            frame_no: 0,
             harness,
             last_frame: Instant::now(),
             fps: 0.0,
             confirm_discard: None,
             last_selection: Vec::new(),
-            look_grab: None,
-            grab_use_confined: !crate::mouse_lock::platform_locks(),
-            game_grab: None,
-            game_cursor_hidden: false,
-            cursor_log: Vec::new(),
-            view_render_size: None,
             graphics,
             quality_auto: Default::default(),
             quality_studio_seen: graphics.studio_level(),
-            touch: Default::default(),
             auto_zoom: false,
-            view_reuse: crate::viewport::ViewReuse::new(
-                std::env::var("RUSTUDIO_VIEW_REUSE").map_or(cfg!(target_os = "android"), |v| v != "0"),
-            ),
-            motion: Default::default(),
             cap_next: None,
             cap_wait: 0.0,
             last_work_ms: 0.0,
-            lighting: Default::default(),
             project: None,
             project_choice: None,
             project_export: None,
@@ -741,7 +486,6 @@ impl RustudioApp {
                 Box::new(crate::plugin_store::runtime::HostBridge::default()),
             ),
             ui: crate::studio_ui::UiState::default(),
-            play_here: None,
             pending_user_shot: None,
             start: Default::default(),
             switch_to_viewport: false,
@@ -751,7 +495,7 @@ impl RustudioApp {
             env!("CARGO_PKG_VERSION"),
             doc::db().classes.len()
         ));
-        for line in crate::crash::unseen_reports() {
+        for line in rustudio_core::crash::unseen_reports() {
             // (and in logcat, where a device run is read)
             #[cfg(target_os = "android")]
             log::error!("{line}");
@@ -763,7 +507,7 @@ impl RustudioApp {
         for line in crate::android::storage::take_notices() {
             ed.error(line);
         }
-        if ed.render_state.is_none() && !ed.harness.no_render {
+        if ed.game.render_state.is_none() && !ed.harness.run.no_render {
             ed.error("No wgpu renderer available; the 3D viewport is disabled.");
         }
         let open_none = open.is_none();
@@ -772,29 +516,29 @@ impl RustudioApp {
         } else if demo {
             ed.build_demo();
         }
-        if !ed.harness.no_ui {
-            ed.explorer.expand_defaults(&ed.doc);
+        if !ed.harness.run.no_ui {
+            ed.explorer.expand_defaults(&ed.game.doc);
         }
         // No UI: the scene alone (the comparison captures' clean view)
         // unless --overlays keeps the editor's overlays.
-        if ed.harness.no_ui && !ed.harness.overlays {
+        if ed.harness.run.no_ui && !ed.harness.overlays {
             ed.clean_view = true;
         }
         if ed.harness.selftest.is_some() {
             // Deterministic play-session timing for the scripted test.
-            ed.fixed_dt = Some(1.0 / 60.0);
+            ed.game.fixed_dt = Some(1.0 / 60.0);
         }
         // RUSTUDIO_FIXED_DT=HZ (tests only): Play steps 1/HZ s a frame however
         // long frames take (with RUSTUDIO_GAME_CLOCK, probes timed by os.clock
         // see an unloaded machine).
         if let Some(hz) = std::env::var("RUSTUDIO_FIXED_DT").ok().and_then(|v| v.parse::<f32>().ok()).filter(|h| *h > 0.0) {
-            ed.fixed_dt = Some(1.0 / hz);
+            ed.game.fixed_dt = Some(1.0 / hz);
         }
-        // --fixed-dt (src/sim_clock.rs): the same fixed step, every clock on it.
-        if let Some(dt) = crate::sim_clock::dt() {
-            ed.fixed_dt = Some(dt);
+        // --fixed-dt (crates/rustudio-core/src/sim_clock.rs): the same fixed step, every clock on it.
+        if let Some(dt) = rustudio_core::sim_clock::dt() {
+            ed.game.fixed_dt = Some(dt);
         }
-        if ((ed.harness.selftest.is_none() && ed.harness.bench.is_none())
+        if ((ed.harness.selftest.is_none() && ed.harness.run.bench.is_none())
             || std::env::var_os("RUSTUDIO_SESSION").is_some())
             && std::env::var_os("RUSTUDIO_NO_SESSION").is_none()
         {
@@ -803,7 +547,7 @@ impl RustudioApp {
             // avatar. LoadAsset at Play start waits for the check. The
             // self-test and --bench opt in with RUSTUDIO_SESSION=1;
             // RUSTUDIO_NO_SESSION=1 keeps any run signed out.
-            ed.account.restore();
+            ed.game.account.restore();
         }
         if let Some((u, p)) = ed.harness.team_create { ed.open_team_create(u, p); }
         ed.cloud.open_when_ready = ed.harness.open_roblox.map(|(p, copy)| (p, None, copy));
@@ -819,12 +563,12 @@ impl RustudioApp {
                 Err(e) => eprintln!("[control] can't listen on {path}: {e}"),
             }
         }
-        if let Some([x, y, z, yaw, pitch]) = ed.harness.camera {
-            ed.cam.pos = Vec3::new(x, y, z);
-            ed.cam.yaw = yaw.to_radians();
-            ed.cam.pitch = pitch.to_radians();
-            ed.cam.focus = ed.cam.pos + ed.cam.forward() * 50.0;
-        } else if ed.harness.bench.as_ref().is_some_and(|b| !b.play) {
+        if let Some([x, y, z, yaw, pitch]) = ed.harness.run.camera {
+            ed.game.cam.pos = Vec3::new(x, y, z);
+            ed.game.cam.yaw = yaw.to_radians();
+            ed.game.cam.pitch = pitch.to_radians();
+            ed.game.cam.focus = ed.game.cam.pos + ed.game.cam.forward() * 50.0;
+        } else if ed.harness.run.bench.as_ref().is_some_and(|b| !b.play) {
             // Worst case for drawing: the whole place in view.
             ed.frame_all();
         }
@@ -833,7 +577,7 @@ impl RustudioApp {
         let plain = ed.harness.plain();
         // RUSTUDIO_START_PAGE=1 forces it (screenshots of the page itself).
         let forced = std::env::var_os("RUSTUDIO_START_PAGE").is_some();
-        if !ed.harness.no_ui && (forced || (open_none && !demo && plain && std::env::var_os("RUSTUDIO_NO_START_PAGE").is_none())) {
+        if !ed.harness.run.no_ui && (forced || (open_none && !demo && plain && std::env::var_os("RUSTUDIO_NO_START_PAGE").is_none())) {
             ed.show_start_page();
             let page = std::env::var("RUSTUDIO_START_PAGE").unwrap_or_default();
             ed.start.open_page(&page);
@@ -842,7 +586,7 @@ impl RustudioApp {
         let mut dock = default_dock();
         let mut layout = None;
         let mut panels = crate::panels::Panels::default();
-        if !ed.harness.no_ui && crate::layout_store::enabled(&ed.harness) {
+        if !ed.harness.run.no_ui && crate::layout_store::enabled(&ed.harness) {
             let saved = crate::layout_store::load();
             if let Some(l) = &saved {
                 l.apply(&mut ed);
@@ -853,7 +597,7 @@ impl RustudioApp {
             }
             layout = Some(crate::layout_store::Saver::new(saved.as_ref()));
             // (plugin widgets' restore state beside layout.json)
-            crate::plugin_host::widgets_ui::set_persist_dir(Some(crate::paths::config().join("rustudio")));
+            crate::plugin_host::widgets_ui::set_persist_dir(Some(rustudio_core::paths::config().join("rustudio")));
         }
         // (the saved layout's graphics choice, or the platform's, into
         // Studio Settings > Rendering > Editor Quality Level)
@@ -863,11 +607,11 @@ impl RustudioApp {
         // (a GPU validation error is a logcat line, not the end of the
         // process: src/android/mod.rs install_gpu_error_handler)
         #[cfg(target_os = "android")]
-        if let Some(rs) = ed.render_state.as_ref() {
+        if let Some(rs) = ed.game.render_state.as_ref() {
             crate::android::install_gpu_error_handler(&rs.device);
         }
-        ed.renderer = ed.render_state.as_ref().map(|rs| {
-            if crate::perf_log::on() {
+        ed.game.renderer = ed.game.render_state.as_ref().map(|rs| {
+            if rustudio_render::perf_log::on() {
                 eprintln!("render settings: {}", settings.describe(settings.scene_format(&rs.device)));
                 // (the compressed texture formats the device could hold the
                 // material arrays in: docs/ANDROID.md "Material textures")
@@ -880,7 +624,7 @@ impl RustudioApp {
                     has("BC", egui_wgpu::wgpu::Features::TEXTURE_COMPRESSION_BC)
                 );
             }
-            Renderer::new(&rs.device, &rs.queue, Some(&rs.adapter.get_info()), Renderer::msaa_support_of(&rs.adapter), settings.clone())
+            rustudio_render::render::Renderer::new(&rs.device, &rs.queue, Some(&rs.adapter.get_info()), rustudio_render::render::Renderer::msaa_support_of(&rs.adapter), settings.clone())
         });
         // Comparison captures (src/control.rs) want the 3D view as big as the
         // other program's: the view alone, no Explorer / Properties / Output.
@@ -889,7 +633,7 @@ impl RustudioApp {
             dock = DockState::new(vec![Tab::Viewport]);
         }
         // (--no-ui never shows the dock.)
-        if ed.harness.no_ui {
+        if ed.harness.run.no_ui {
             dock = DockState::new(vec![Tab::Viewport]);
         }
         // `--play` starts once the 3D view has its size (Camera.ViewportSize).
@@ -907,6 +651,8 @@ impl RustudioApp {
             keyboard: Default::default(),
             #[cfg(target_os = "android")]
             text_menu: Default::default(),
+            #[cfg(target_os = "android")]
+            text_bar: Default::default(),
             refresh_hz: display_refresh_hz(),
             cpu_usage: None,
         }
@@ -938,76 +684,35 @@ fn display_refresh_hz() -> f32 {
 
 // ------------------------------------------------------------------ logging
 
-fn timestamp() -> String {
-    // Studio's Output timestamp: HH:MM:SS.mmm in local time.
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let secs = (ms / 1000) as i64;
-    let offset = chrono::DateTime::from_timestamp(secs, 0)
-        .map(|t| t.with_timezone(&chrono::Local).offset().local_minus_utc())
-        .unwrap_or(0);
-    let s = ((ms / 1000) as i64 + offset as i64).rem_euclid(86_400) as u64;
-    format!("{:02}:{:02}:{:02}.{:03}", s / 3600, (s / 60) % 60, s % 60, ms % 1000)
-}
-
-/// `RUSTUDIO_LOG_TEE=FILE`: every Output line is also appended to FILE as it
-/// is logged (the Output keeps only its newest lines; per-frame traces such
-/// as checks/humanoid-physics/feel need them all).
-pub(crate) fn tee_log(text: &str) {
-    use std::io::Write;
-    static TEE: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
-    let tee = TEE.get_or_init(|| {
-        let path = std::env::var_os("RUSTUDIO_LOG_TEE")?;
-        let f = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
-        Some(std::sync::Mutex::new(std::io::BufWriter::new(f)))
-    });
-    if let Some(f) = tee {
-        if let Ok(mut f) = f.lock() {
-            let _ = writeln!(f, "{text}");
-            // Whole lines reach the file even if the run is killed.
-            let _ = f.flush();
-        }
-    }
-}
-
 impl Editor {
     pub fn push_log(&mut self, level: Level, text: impl Into<String>) {
-        let text = text.into();
-        // Android: every Output line to logcat (`RustStdoutStderr`); the
-        // panel is small on a phone and a report needs the Info lines too.
-        if level != Level::Info || cfg!(target_os = "android") {
-            eprintln!("[{level:?}] {text}");
-        }
-        tee_log(&text);
-        self.log.push(LogLine {
-            at: timestamp(),
-            level,
-            text,
-        });
-        // Studio Settings > Output > Maximum Output Lines (5000: past it the
-        // oldest fifth goes).
-        let max = crate::studio_settings::studio("Maximum Output Lines", 5000.0).clamp(10.0, 1e7) as usize;
-        if self.log.len() > max {
-            let n = self.log.len() - max - 1 + max / 5;
-            self.log.drain(0..n);
-            self.output_view.log_drained(n);
-        }
+        self.game.push_log(level, text);
+        self.flush_output_changes();
     }
-    pub fn info(&mut self, t: impl Into<String>) {
-        self.push_log(Level::Info, t)
+
+    pub fn info(&mut self, text: impl Into<String>) {
+        self.push_log(Level::Info, text);
+    }
+
+    pub(crate) fn flush_output_changes(&mut self) {
+        if std::mem::take(&mut self.game.log_cleared) {
+            self.output_view.log_cleared();
+        }
+        let drained = std::mem::take(&mut self.game.log_drained);
+        if drained != 0 {
+            self.output_view.log_drained(drained);
+        }
     }
 
     /// The plugin store's frame: startup loads, folder watching, Roblox jobs;
     /// its lines go to Output.
     pub fn plugins_tick(&mut self) {
-        let client = self.account.shared_client();
+        let client = self.game.account.shared_client();
         let host_on = self.plugins.enabled();
         if let Some(b) = self.plugin_store.runtime.bridge() {
             b.host_enabled = host_on;
         }
-        self.plugin_store.tick(client, self.frame_no);
+        self.plugin_store.tick(client, self.game.frame_no);
         // The store's loads / unloads / reloads, applied to the host.
         let cmds = self.plugin_store.runtime.bridge().map(|b| std::mem::take(&mut b.cmds)).unwrap_or_default();
         for cmd in cmds {
@@ -1064,14 +769,14 @@ impl Editor {
 
     /// Manage Plugins, permission prompts, Publish as Plugin.
     pub fn plugins_ui(&mut self, ctx: &egui::Context) {
-        let client = self.account.shared_client();
+        let client = self.game.account.shared_client();
         crate::plugin_store::ui::show(ctx, &mut self.plugin_store, client);
         // Plugin menus (ShowAsync), Customize Shortcuts, bound plugin keys.
         self.plugin_popups(ctx);
         self.customize_shortcuts_window(ctx);
         self.plugin_shortcut_keys(ctx);
         // Dialogs plugins opened (src/plugin_host/prompts.rs).
-        crate::plugin_host::prompts::ui(ctx, &self.doc);
+        crate::plugin_host::prompts::ui(ctx, &self.game.doc);
     }
     pub fn warn(&mut self, t: impl Into<String>) {
         self.push_log(Level::Warn, t)
@@ -1088,7 +793,7 @@ impl Editor {
     /// settings set apart from it (View > Graphics Settings, the saved
     /// layout), then the run's `RUSTUDIO_*` switches over them (a device
     /// run's comparison wins over the saved choices).
-    pub fn render_settings(&self) -> crate::quality::RenderSettings {
+    pub fn render_settings(&self) -> rustudio_render::quality::RenderSettings {
         self.graphics.settings()
     }
 
@@ -1097,7 +802,7 @@ impl Editor {
     /// (src/android/keyboard.rs).
     #[cfg(target_os = "android")]
     pub fn textbox_focused(&self) -> bool {
-        (self.play.is_some() && self.gui.focus.is_some()) || self.plugin_ui.has_text_focus()
+        (self.game.play.is_some() && self.game.gui.focus.is_some()) || self.plugin_ui.has_text_focus()
     }
 
     /// Chooses the graphics level (`Some(1..=10)`) or Automatic (`None`,
@@ -1119,9 +824,9 @@ impl Editor {
             self.quality_studio_seen = self.graphics.studio_level();
             crate::studio_settings::set_edit_quality_level(self.quality_studio_seen);
         }
-        if crate::perf_log::on() {
+        if rustudio_render::perf_log::on() {
             let s = self.render_settings();
-            let format = match self.render_state.as_ref() {
+            let format = match self.game.render_state.as_ref() {
                 Some(rs) => s.scene_format(&rs.device),
                 None => egui_wgpu::wgpu::TextureFormat::Rgba16Float,
             };
@@ -1140,7 +845,7 @@ impl Editor {
             // though the bar shows 3)
             self.quality_studio_seen = studio;
             let before = self.graphics;
-            self.graphics.apply_choice(crate::quality::level_from_studio(studio));
+            self.graphics.apply_choice(rustudio_render::quality::level_from_studio(studio));
             if self.graphics != before {
                 self.quality_auto.reset();
                 self.quality_changed(false);
@@ -1150,12 +855,12 @@ impl Editor {
             return;
         }
         // (a frame shown again, not drawn, says nothing about drawing)
-        let drawn = self.hud.viewport_drawn && !self.view_reuse.reused_now;
+        let drawn = self.hud.viewport_drawn && !self.game.view_reuse.reused_now;
         let step = if drawn { self.quality_auto.frame(now, dt, cost, self.graphics.level) } else { None };
         if let Some(step) = step {
             match step {
-                crate::quality::Step::Down => self.graphics.level = self.graphics.level.saturating_sub(1).max(1),
-                crate::quality::Step::Up => self.graphics.level = (self.graphics.level + 1).min(crate::quality::LEVELS),
+                rustudio_render::quality::Step::Down => self.graphics.level = self.graphics.level.saturating_sub(1).max(1),
+                rustudio_render::quality::Step::Up => self.graphics.level = (self.graphics.level + 1).min(rustudio_render::quality::LEVELS),
             }
             // (Automatic stays Automatic in Studio's enum: no mirror)
             self.quality_changed(false);
@@ -1173,15 +878,15 @@ impl Editor {
         self.marquee_base.clear();
         self.ui.dock_moves.clear();
         self.ui.panel_requests.retain(|(tab, _)| !matches!(tab, Tab::Script(_)));
-        self.doc = doc;
-        self.scene = Scene::default();
+        self.game.doc = doc;
+        self.game.scene = Scene::default();
         self.drag = None;
         self.hover = None;
         self.open_script.clear();
         self.scripts = Default::default();
         self.explorer = ExplorerState::default();
-        self.explorer.expand_defaults(&self.doc);
-        if !self.use_saved_camera() {
+        self.explorer.expand_defaults(&self.game.doc);
+        if !self.game.use_saved_camera() {
             self.frame_all();
         }
         // Plugins run in the place that's open: the
@@ -1189,48 +894,15 @@ impl Editor {
         self.plugin_store.on_place_opened();
     }
 
-    /// Starts at the place's saved camera (Workspace.CurrentCamera), as
-    /// Studio does. False when the place has none.
-    fn use_saved_camera(&mut self) -> bool {
-        let Some(ws) = self.doc.workspace() else {
-            return false;
-        };
-        let cam = match self.doc.prop(ws, "CurrentCamera") {
-            Some(Variant::Ref(r)) if self.doc.exists(r) => Some(r),
-            _ => self.doc.find_child(ws, "Camera"),
-        };
-        let Some(xf) = cam.and_then(|c| crate::scene::xform_of(&self.doc, c)) else {
-            return false;
-        };
-        if !xf.pos.is_finite() || xf.pos.length() < 1e-3 {
-            return false;
-        }
-        let look = -xf.rot.z_axis;
-        let focus = cam.and_then(|c| match self.doc.prop(c, "Focus") {
-            Some(Variant::CFrame(f)) => Some(crate::math::v3(f.position)),
-            _ => None,
-        });
-        self.cam = Camera {
-            mode: self.cam.mode,
-            ..Camera::default()
-        };
-        self.cam.pos = xf.pos;
-        self.cam.pitch = look.y.clamp(-1.0, 1.0).asin();
-        self.cam.yaw = (-look.x).atan2(-look.z);
-        self.cam.focus = focus
-            .filter(|f| (*f - xf.pos).length() > 0.5)
-            .unwrap_or(xf.pos + look * 20.0);
-        true
-    }
 
     pub fn open_path(&mut self, path: PathBuf) {
         // (the start counts as settled 20 s after this: android/storage.rs)
         #[cfg(target_os = "android")]
         crate::android::storage::opening(&path);
         // File > Recent remembers what a person opens (not test runs).
-        let harness = self.harness.screenshot.is_some()
+        let harness = self.harness.run.screenshot.is_some()
             || self.harness.selftest.is_some()
-            || self.harness.bench.is_some()
+            || self.harness.run.bench.is_some()
             || self.harness.ui_shots.is_some();
         if !harness && path.exists() {
             crate::studio_ui::remember_recent(&mut self.ui, &path);
@@ -1257,9 +929,9 @@ impl Editor {
         match Document::open(&path) {
             Ok(d) => {
                 let n = d.dom.descendants().count();
-                crate::load_trace::mark("document built");
+                rustudio_core::load_trace::mark("document built");
                 self.set_document(d);
-                crate::load_trace::mark(&format!("opened ({n} instances)"));
+                rustudio_core::load_trace::mark(&format!("opened ({n} instances)"));
                 self.info(format!("Opened {} ({n} instances)", path.display()));
             }
             Err(e) => self.error(format!("Could not open {}: {e}", path.display())),
@@ -1313,15 +985,15 @@ impl Editor {
     /// wait until Play stops).
     pub fn project_tick(&mut self) {
         let Some(mut st) = self.project.take() else { return };
-        let playing = self.play.is_some();
-        if !playing && self.doc.id == st.doc_id {
-            st.write_back(&mut self.doc);
+        let playing = self.game.play.is_some();
+        if !playing && self.game.doc.id == st.doc_id {
+            st.write_back(&mut self.game.doc);
         }
         if let Some(changed) = st.poll_disk() {
             if playing {
                 st.reapply_after_play = true;
-            } else if self.doc.id == st.doc_id {
-                let n = st.reconcile(&mut self.doc);
+            } else if self.game.doc.id == st.doc_id {
+                let n = st.reconcile(&mut self.game.doc);
                 if n > 0 {
                     st.sourcemap_dirty = true;
                     let mut names: Vec<String> = changed
@@ -1334,16 +1006,16 @@ impl Editor {
                 }
             }
         }
-        if !playing && st.reapply_after_play && self.doc.id == st.doc_id {
+        if !playing && st.reapply_after_play && self.game.doc.id == st.doc_id {
             st.reapply_after_play = false;
-            let n = st.reconcile(&mut self.doc);
+            let n = st.reconcile(&mut self.game.doc);
             self.info(format!("Project: {n} instance(s) updated from files changed during Play"));
         }
         if !st.log.is_empty() {
             st.sourcemap_dirty = true;
         }
-        if st.sourcemap_dirty && !playing && self.doc.id == st.doc_id {
-            st.update_sourcemap(&self.doc);
+        if st.sourcemap_dirty && !playing && self.game.doc.id == st.doc_id {
+            st.update_sourcemap(&self.game.doc);
         }
         for l in std::mem::take(&mut st.log) {
             self.info(format!("Project: {l}"));
@@ -1359,8 +1031,8 @@ impl Editor {
     /// paths changed (so an untouched project saves nothing).
     pub(crate) fn save_project(&mut self) {
         let Some(mut st) = self.project.take() else { return };
-        if self.play.is_none() {
-            st.write_back(&mut self.doc);
+        if self.game.play.is_none() {
+            st.write_back(&mut self.game.doc);
         }
         let dirty = st.place_dirty;
         let place = st.place.clone();
@@ -1396,12 +1068,12 @@ impl Editor {
             Purpose::OpenFolder => self.open_folder(path, true),
             Purpose::SaveAs => self.save_to(path),
             Purpose::InsertModel => self.insert_model_file(path),
-            Purpose::SaveSelection(sel) => match self.doc.save_selection_to(&sel, &path) {
+            Purpose::SaveSelection(sel) => match self.game.doc.save_selection_to(&sel, &path) {
                 Ok(()) => self.info(format!("Saved selection to {}", path.display())),
                 Err(e) => self.error(format!("Save failed: {e}")),
             },
             Purpose::SaveLocalPlugin(sel) => {
-                self.doc.selection = sel;
+                self.game.doc.selection = sel;
                 self.save_local_plugin_to(path);
             }
             Purpose::TerrainImage { height } => self.load_import_image(path, height),
@@ -1432,28 +1104,28 @@ impl Editor {
             return self.save_project();
         }
         // A local copy of a Team Create place saves to a file.
-        if self.doc.cloud.as_ref().is_some_and(|o| o.local_copy) {
-            return match self.doc.path.clone() {
+        if self.game.doc.cloud.as_ref().is_some_and(|o| o.local_copy) {
+            return match self.game.doc.path.clone() {
                 Some(p) => self.save_to(p),
                 None => self.save_as(),
             };
         }
         // A place opened from Roblox: Ctrl+S is Save to Roblox, as in Studio.
-        if self.doc.cloud.is_some() || self.live_team_create_ids().is_some() {
+        if self.game.doc.cloud.is_some() || self.live_team_create_ids().is_some() {
             return self.save_cloud(rustudio_account::VersionType::Saved, false);
         }
-        match self.doc.path.clone() {
+        match self.game.doc.path.clone() {
             Some(p) => self.save_to(p),
             None => self.save_as(),
         }
     }
 
     pub fn save_as(&mut self) {
-        let (name, exts): (&str, &[&str]) = match self.doc.kind {
+        let (name, exts): (&str, &[&str]) = match self.game.doc.kind {
             DocKind::Place => ("Roblox place", &["rbxl", "rbxlx"]),
             DocKind::Model => ("Roblox model", &["rbxm", "rbxmx"]),
         };
-        let default = match self.doc.kind {
+        let default = match self.game.doc.kind {
             DocKind::Place => "place.rbxl",
             DocKind::Model => "model.rbxm",
         };
@@ -1463,7 +1135,7 @@ impl Editor {
     }
 
     pub fn save_to(&mut self, p: PathBuf) {
-        match self.doc.save_to(&p) {
+        match self.game.doc.save_to(&p) {
             Ok(()) => self.info(format!("Saved {}", p.display())),
             Err(e) => self.error(format!("Save failed: {e}")),
         }
@@ -1479,7 +1151,7 @@ impl Editor {
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let parent = self.paste_target(false);
-                let refs = self.doc.paste(&bytes, parent, "Insert from file");
+                let refs = self.game.doc.paste(&bytes, parent, "Insert from file");
                 self.info(format!(
                     "Inserted {} object(s) from {}",
                     refs.len(),
@@ -1492,61 +1164,61 @@ impl Editor {
     }
 
     pub fn save_selection(&mut self) {
-        if self.doc.selection.is_empty() {
+        if self.game.doc.selection.is_empty() {
             self.warn("Select something to save as a model");
             return;
         }
         use crate::file_dialog::{Kind, Purpose};
         let d = crate::file_dialog::Request::new().add_filter("Roblox model", &["rbxm", "rbxmx"]).set_file_name("model.rbxm");
-        self.dialogs.start(Purpose::SaveSelection(self.doc.selection.clone()), d, Kind::SaveFile);
+        self.dialogs.start(Purpose::SaveSelection(self.game.doc.selection.clone()), d, Kind::SaveFile);
     }
 
     pub fn select(&mut self, refs: Vec<Ref>) {
-        self.doc.selection = refs;
+        self.game.doc.selection = refs;
     }
 
     /// Whenever the selection changes (viewport click, undo/redo, paste,
     /// Explorer…), expand the ancestors of every selected object and scroll
     /// the newest one into view.
     fn sync_explorer_to_selection(&mut self) {
-        if self.doc.selection == self.last_selection {
+        if self.game.doc.selection == self.last_selection {
             return;
         }
         if std::env::var_os("RUSTUDIO_PICK_TRACE").is_some() {
-            eprintln!("[pick selection] {:?}", self.doc.selection.iter().map(|r| self.doc.dom.get_by_ref(*r).map(|i| (&i.name, &i.class))).collect::<Vec<_>>());
+            eprintln!("[pick selection] {:?}", self.game.doc.selection.iter().map(|r| self.game.doc.dom.get_by_ref(*r).map(|i| (&i.name, &i.class))).collect::<Vec<_>>());
         }
-        let added: Vec<Ref> = self
+        let added: Vec<Ref> = self.game
             .doc
             .selection
             .iter()
             .copied()
             .filter(|r| !self.last_selection.contains(r))
             .collect();
-        for &r in &self.doc.selection {
-            self.explorer.expand_ancestors(&self.doc, r);
+        for &r in &self.game.doc.selection {
+            self.explorer.expand_ancestors(&self.game.doc, r);
         }
-        if let Some(&r) = added.last().or(self.doc.selection.last()) {
+        if let Some(&r) = added.last().or(self.game.doc.selection.last()) {
             self.explorer.scroll_to = Some(r);
         }
-        self.last_selection = self.doc.selection.clone();
+        self.last_selection = self.game.doc.selection.clone();
     }
 
     pub fn undo(&mut self) {
-        match self.doc.undo() {
+        match self.game.doc.undo() {
             Some(l) => self.info(format!("Undo: {l}")),
             None => self.warn("Nothing to undo"),
         }
     }
 
     pub fn redo(&mut self) {
-        match self.doc.redo() {
+        match self.game.doc.redo() {
             Some(l) => self.info(format!("Redo: {l}")),
             None => self.warn("Nothing to redo"),
         }
     }
 
     pub fn copy(&mut self) -> bool {
-        match self.doc.copy(&self.doc.selection.clone()) {
+        match self.game.doc.copy(&self.game.doc.selection.clone()) {
             Some(bytes) => {
                 self.clipboard = Some(bytes);
                 true
@@ -1557,23 +1229,23 @@ impl Editor {
 
     pub fn cut(&mut self) {
         if self.copy() {
-            let sel = self.doc.selection.clone();
-            self.doc.remove(&sel);
+            let sel = self.game.doc.selection.clone();
+            self.game.doc.remove(&sel);
         }
     }
 
     /// Paste goes next to the selection (or into it with `into`), else Workspace.
     fn paste_target(&self, into: bool) -> Ref {
-        match self.doc.selection.first() {
+        match self.game.doc.selection.first() {
             Some(&r) if into => r,
-            Some(&r) => self
+            Some(&r) => self.game
                 .doc
                 .dom
                 .get_by_ref(r)
                 .map(|i| i.parent())
                 .filter(|p| p.is_some())
-                .unwrap_or(self.doc.default_parent()),
-            None => self.doc.default_parent(),
+                .unwrap_or(self.game.doc.default_parent()),
+            None => self.game.doc.default_parent(),
         }
     }
 
@@ -1583,21 +1255,21 @@ impl Editor {
             return;
         };
         let parent = self.paste_target(into);
-        let refs = self.doc.paste(&bytes, parent, "Paste");
+        let refs = self.game.doc.paste(&bytes, parent, "Paste");
         self.select(refs);
     }
 
     pub fn duplicate(&mut self) {
-        let sel = self.doc.selection.clone();
+        let sel = self.game.doc.selection.clone();
         // Commit the motion so far before Duplicate's own undo step. Keep the
         // pointer geometry, but transfer the active targets to the copies.
         let free = self.part_drag.clone();
         let handle = self.drag.clone();
         self.finish_part_drag();
         self.finish_drag();
-        let roots: Vec<_> = self.doc.top_level(&sel).into_iter()
-            .filter(|r| self.doc.can_edit_structure(*r)).collect();
-        let refs = self.doc.duplicate(&sel);
+        let roots: Vec<_> = self.game.doc.top_level(&sel).into_iter()
+            .filter(|r| self.game.doc.can_edit_structure(*r)).collect();
+        let refs = self.game.doc.duplicate(&sel);
         self.part_drag = free;
         self.drag = handle;
         if !refs.is_empty() {
@@ -1605,7 +1277,7 @@ impl Editor {
             let mut pending: Vec<_> = roots.into_iter().zip(refs.iter().copied()).collect();
             while let Some((old, new)) = pending.pop() {
                 map.insert(old, new);
-                if let (Some(a), Some(b)) = (self.doc.dom.get_by_ref(old), self.doc.dom.get_by_ref(new)) {
+                if let (Some(a), Some(b)) = (self.game.doc.dom.get_by_ref(old), self.game.doc.dom.get_by_ref(new)) {
                     pending.extend(a.children().iter().copied().zip(b.children().iter().copied()));
                 }
             }
@@ -1616,23 +1288,23 @@ impl Editor {
     }
 
     pub fn delete(&mut self) {
-        let sel = self.doc.selection.clone();
-        let n = self.doc.remove(&sel);
+        let sel = self.game.doc.selection.clone();
+        let n = self.game.doc.remove(&sel);
         if n == 0 && !sel.is_empty() {
             self.warn("Services and the root cannot be deleted");
         }
     }
 
     pub fn group(&mut self) {
-        let sel = self.doc.selection.clone();
-        if let Some(m) = self.doc.group(&sel) {
+        let sel = self.game.doc.selection.clone();
+        if let Some(m) = self.game.doc.group(&sel) {
             self.select(vec![m]);
         }
     }
 
     pub fn ungroup(&mut self) {
-        let sel = self.doc.selection.clone();
-        let refs = self.doc.ungroup(&sel);
+        let sel = self.game.doc.selection.clone();
+        let refs = self.game.doc.ungroup(&sel);
         if !refs.is_empty() {
             self.select(refs);
         }
@@ -1664,22 +1336,22 @@ impl Editor {
         if class != "Part" {
             b = b.with_class(class);
         }
-        let parent = self.doc.default_parent();
-        let r = self.doc.insert(parent, b);
+        let parent = self.game.doc.default_parent();
+        let r = self.game.doc.insert(parent, b);
         self.select(vec![r]);
     }
 
     /// Where a new part lands: the point under the screen centre, snapped.
     pub(crate) fn spawn_point(&mut self, size: Vec3) -> Vec3 {
-        self.scene.sync(&mut self.doc);
-        let rect = if self.viewport_rect.is_positive() {
-            self.viewport_rect
+        self.game.scene.sync(&mut self.game.doc);
+        let rect = if self.game.viewport_rect.is_positive() {
+            self.game.viewport_rect
         } else {
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))
         };
-        let ray = self.cam.ray(rect, rect.center());
+        let ray = self.game.cam.ray(rect, rect.center());
         let mut best: Option<f32> = None;
-        for p in &self.scene.parts {
+        for p in &self.game.scene.parts {
             if let Some(t) = ray.hit_obb(&p.xf, p.size) {
                 if best.is_none_or(|b| t < b) {
                     best = Some(t);
@@ -1692,18 +1364,18 @@ impl Editor {
                 .hit_plane(Vec3::ZERO, Vec3::Y)
                 .filter(|t| *t < 500.0)
                 .map(|t| ray.at(t))
-                .unwrap_or(self.cam.pos + self.cam.forward() * 20.0),
+                .unwrap_or(self.game.cam.pos + self.game.cam.forward() * 20.0),
         };
-        let snap = |v: f32| crate::math::snap(v, if self.snap_move { self.move_inc } else { 0.0 });
+        let snap = |v: f32| rustudio_core::math::snap(v, if self.game.snap_move { self.game.move_inc } else { 0.0 });
         Vec3::new(snap(hit.x), hit.y + size.y / 2.0, snap(hit.z))
     }
 
     pub fn insert_class(&mut self, class: &str, parent: Ref) {
         if class == "Part" {
             self.insert_part(MeshKind::Block);
-            if parent != self.doc.default_parent() {
-                let sel = self.doc.selection.clone();
-                self.doc.reparent(&sel, parent);
+            if parent != self.game.doc.default_parent() {
+                let sel = self.game.doc.selection.clone();
+                self.game.doc.reparent(&sel, parent);
             }
             return;
         }
@@ -1720,7 +1392,7 @@ impl Editor {
                 .with_property(
                     "CFrame",
                     rbx_dom_weak::types::CFrame::new(
-                        crate::math::rv3(pos),
+                        rustudio_core::math::rv3(pos),
                         rbx_dom_weak::types::Matrix3::identity(),
                     ),
                 );
@@ -1733,20 +1405,20 @@ impl Editor {
             };
             b = b.with_property("Source", src.to_string());
         }
-        let r = self.doc.insert(parent, b);
+        let r = self.game.doc.insert(parent, b);
         self.select(vec![r]);
     }
 
     pub fn selected_parts(&self) -> Vec<Ref> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        for &r in &self.doc.selection {
-            if self.scene.get(r).is_some() && seen.insert(r) {
+        for &r in &self.game.doc.selection {
+            if self.game.scene.get(r).is_some() && seen.insert(r) {
                 out.push(r);
             }
-            for d in self.doc.dom.descendants_of(r) {
+            for d in self.game.doc.dom.descendants_of(r) {
                 let dr = d.referent();
-                if dr != r && self.scene.get(dr).is_some() && seen.insert(dr) {
+                if dr != r && self.game.scene.get(dr).is_some() && seen.insert(dr) {
                     out.push(dr);
                 }
             }
@@ -1757,7 +1429,7 @@ impl Editor {
     /// Bounding box (min, max) of the selected parts.
     pub fn selection_bounds(&self) -> Option<(Vec3, Vec3)> {
         let parts = self.selected_parts();
-        let mut it = parts.iter().filter_map(|r| self.scene.get(*r));
+        let mut it = parts.iter().filter_map(|r| self.game.scene.get(*r));
         let first = it.next()?;
         let mut b = crate::viewport::part_aabb(first);
         for p in it {
@@ -1768,9 +1440,9 @@ impl Editor {
     }
 
     pub fn focus_selection(&mut self) {
-        self.scene.sync(&mut self.doc);
+        self.game.scene.sync(&mut self.game.doc);
         match self.selection_bounds() {
-            Some((mn, mx)) => self.cam.frame((mn + mx) * 0.5, (mx - mn).length() * 0.5),
+            Some((mn, mx)) => self.game.cam.frame((mn + mx) * 0.5, (mx - mn).length() * 0.5),
             None => self.warn("Select a part to focus on"),
         }
     }
@@ -1779,46 +1451,21 @@ impl Editor {
     /// Frames where most of the parts are: the 10th–90th percentile box of
     /// part centres, so a few stray far-away parts don't throw it off.
     pub fn frame_all(&mut self) {
-        self.scene.sync(&mut self.doc);
-        let centers: Vec<Vec3> = self
-            .scene
-            .parts
-            .iter()
-            .filter(|p| p.size.max_element() <= 200.0 && p.xf.pos.is_finite())
-            .map(|p| p.xf.pos)
-            .collect();
-        self.cam = Camera {
-            mode: self.cam.mode,
-            ..Camera::default()
-        };
-        if centers.is_empty() {
-            return;
-        }
-        let quantile = |axis: usize, q: f32| {
-            let mut v: Vec<f32> = centers.iter().map(|c| c[axis]).collect();
-            v.sort_by(f32::total_cmp);
-            v[((v.len() - 1) as f32 * q).round() as usize]
-        };
-        let lo = Vec3::new(quantile(0, 0.1), quantile(1, 0.1), quantile(2, 0.1));
-        let hi = Vec3::new(quantile(0, 0.9), quantile(1, 0.9), quantile(2, 0.9));
-        self.cam.frame(
-            (lo + hi) * 0.5,
-            ((hi - lo).length() * 0.5).clamp(8.0, 2000.0),
-        );
+        self.game.frame_all();
     }
 
     /// The sample scene used for screenshots and `--demo`.
     pub fn build_demo(&mut self) {
-        let last = build_demo_parts(&mut self.doc);
-        self.doc.selection = vec![last];
+        let last = build_demo_parts(&mut self.game.doc);
+        self.game.doc.selection = vec![last];
         self.tool = Tool::Move;
-        self.cam = Camera::default();
-        self.cam.pos = Vec3::new(14.0, 22.0, 34.0);
-        self.cam.yaw = 0.32;
-        self.cam.pitch = -0.5;
-        self.cam.focus = self.cam.pos + self.cam.forward() * 40.0;
+        self.game.cam = Camera::default();
+        self.game.cam.pos = Vec3::new(14.0, 22.0, 34.0);
+        self.game.cam.yaw = 0.32;
+        self.game.cam.pitch = -0.5;
+        self.game.cam.focus = self.game.cam.pos + self.game.cam.forward() * 40.0;
         // Demo edits should not show up as undoable history.
-        self.doc.clear_history();
+        self.game.doc.clear_history();
         self.info("Loaded the sample scene");
     }
 }
@@ -1856,6 +1503,7 @@ impl Editor {
         let sc = |m: Modifiers, k: Key| KeyboardShortcut::new(m, k);
         let cs = Modifiers::COMMAND | Modifiers::SHIFT;
         let mut actions: Vec<&str> = Vec::new();
+        let textbox = (self.game.play.is_some() && self.game.gui.focus.is_some()) || self.plugin_ui.has_text_focus();
         ctx.input_mut(|i| {
             let mut check = |s: KeyboardShortcut, name: &'static str| {
                 if i.consume_shortcut(&s) {
@@ -1894,17 +1542,21 @@ impl Editor {
             }
             check(sc(Modifiers::NONE, Key::F2), "rename");
             check(sc(Modifiers::NONE, Key::F), "focus");
-            // egui turns Ctrl+C/X/V into clipboard events.
-            for ev in &i.events {
-                match ev {
-                    egui::Event::Copy => actions.push("copy"),
-                    egui::Event::Cut => actions.push("cut"),
-                    // egui-winit sends Ctrl+V and Ctrl+Shift+V as Paste (only
-                    // when the system clipboard holds text: copy puts a note
-                    // there); Shift held means Paste Into.
-                    egui::Event::Paste(_) if i.modifiers.shift => actions.push("paste_into"),
-                    egui::Event::Paste(_) => actions.push("paste"),
-                    _ => {}
+            // egui turns Ctrl+C/X/V into clipboard events — a Roblox
+            // TextBox's while one has the keyboard (gui_input.rs
+            // `Gui::keyboard` copies its text and types a paste in).
+            if !textbox {
+                for ev in &i.events {
+                    match ev {
+                        egui::Event::Copy => actions.push("copy"),
+                        egui::Event::Cut => actions.push("cut"),
+                        // egui-winit sends Ctrl+V and Ctrl+Shift+V as Paste (only
+                        // when the system clipboard holds text: copy puts a note
+                        // there); Shift held means Paste Into.
+                        egui::Event::Paste(_) if i.modifiers.shift => actions.push("paste_into"),
+                        egui::Event::Paste(_) => actions.push("paste"),
+                        _ => {}
+                    }
                 }
             }
         });
@@ -1920,71 +1572,8 @@ impl Editor {
         }
     }
 
-    /// While the client of a Play session is shown: this frame's key presses
-    /// go to the game (UserInputService, the hotbar, the in-game menu) and
-    /// are taken out of the input so no editor shortcut sees them. Shared by
-    /// the editor and the no-UI mode (`--no-ui`), where Escape also reaches
-    /// the game's scripts (gameProcessedEvent true) as well as opening the
-    /// menu, and no editor shortcut (F5, Shift+F5, F8) comes first.
     pub(crate) fn game_keys(&mut self, ctx: &egui::Context) {
-        let no_ui = self.harness.no_ui;
-        if self.play_game_input() {
-            let esc = ctx.input(|i| {
-                i.events.iter().any(|e| {
-                    matches!(
-                        e,
-                        egui::Event::Key { key: Key::Escape, pressed: true, repeat: false, .. }
-                    )
-                })
-            });
-            if esc {
-                self.toggle_game_menu();
-            }
-            // Presses this frame: a tap pressed and released within one frame
-            // never shows in keys_down, yet scripts must see it. The key
-            // positions are physical, like Roblox's KeyCodes (src/keys.rs).
-            // (Escape belongs to the Roblox menu: games never hear it.)
-            let taps: Vec<Key> = ctx.input(|i| {
-                i.events
-                    .iter()
-                    .filter_map(|e| match e {
-                        egui::Event::Key {
-                            key,
-                            physical_key,
-                            pressed: true,
-                            repeat: false,
-                            ..
-                        } if physical_key.unwrap_or(*key) != Key::Escape => {
-                            Some(physical_key.unwrap_or(*key))
-                        }
-                        _ => None,
-                    })
-                    .collect()
-            });
-            // The open menu takes the keys (R, L); the game hears none.
-            if !self.game_menu_keys(&taps) {
-                // (A focused TextBox has them: game-processed, Enter included.)
-                let processed = self.gui.focus.is_some();
-                if let Some(s) = self.play.as_mut() {
-                    if !processed {
-                        s.game.hotbar_taps.extend(taps.iter().copied());
-                    }
-                    s.game.key_taps.extend(taps.into_iter().map(|k| (k, processed)));
-                }
-            }
-            // No UI: the menu has Escape first, and UserInputService hears it
-            // too, as processed (play_tick lets it past the open menu).
-            if esc && no_ui {
-                if let Some(s) = self.play.as_mut() {
-                    s.game.key_taps.push((Key::Escape, true));
-                }
-            }
-            ctx.input_mut(|i| {
-                i.events.retain(
-                    |e| !matches!(e, egui::Event::Key { modifiers, .. } if modifiers.is_none()),
-                );
-            });
-        }
+        self.game.game_keys(ctx, self.harness.run.no_ui);
     }
 
     /// Puts a line on the system clipboard after a copy: egui-winit only
@@ -1997,7 +1586,7 @@ impl Editor {
             return;
         }
         if self.clipboard.is_some() && self.harness.selftest.is_none() {
-            ctx.copy_text(format!("rustudio: {} object(s) copied", self.doc.selection.len()));
+            ctx.copy_text(format!("rustudio: {} object(s) copied", self.game.doc.selection.len()));
         }
     }
 
@@ -2028,10 +1617,10 @@ impl Editor {
             "new" => self.request(PendingAction::New),
             "insert_object" => {
                 let parent = self.insert_parent();
-                let at = self.viewport_rect.center() - egui::vec2(120.0, 200.0);
+                let at = self.game.viewport_rect.center() - egui::vec2(120.0, 200.0);
                 self.open_insert_popup(parent, at);
             }
-            "toggle_space" => self.local_space = !self.local_space,
+            "toggle_space" => self.game.local_space = !self.game.local_space,
             "rotate_selection" => self.rotate_selection(false),
             "tilt_selection" => self.rotate_selection(true),
             "tool_select" => self.tool = self.tool.toggle(Tool::Select),
@@ -2039,8 +1628,8 @@ impl Editor {
             "tool_scale" => self.tool = self.tool.toggle(Tool::Scale),
             "tool_rotate" => self.tool = self.tool.toggle(Tool::Rotate),
             "rename" => {
-                if let Some(&r) = self.doc.selection.first() {
-                    let name = self
+                if let Some(&r) = self.game.doc.selection.first() {
+                    let name = self.game
                         .doc
                         .dom
                         .get_by_ref(r)
@@ -2057,7 +1646,7 @@ impl Editor {
 
     /// Asks before throwing away unsaved changes.
     pub fn request(&mut self, action: PendingAction) {
-        if self.doc.dirty() && self.harness.selftest.is_none() {
+        if self.game.doc.dirty() && self.harness.selftest.is_none() {
             self.confirm_discard = Some(action);
         } else {
             self.perform(action);
@@ -2072,7 +1661,7 @@ impl Editor {
             PendingAction::OpenFolder => self.open_folder_dialog(),
             PendingAction::OpenCloud(p, v, copy) => self.perform_open_cloud(p, v, copy),
             PendingAction::Close => {
-                if self.play.is_some() {
+                if self.game.play.is_some() {
                     self.stop_play();
                 }
                 self.new_place();
@@ -2080,7 +1669,7 @@ impl Editor {
             }
             PendingAction::Quit => {
                 crate::studio_settings::flush();
-                crate::rustudio_settings::flush();
+                rustudio_core::rustudio_settings::flush();
                 std::process::exit(0)
             }
             PendingAction::Restart => self.restart(),
@@ -2094,9 +1683,9 @@ impl Editor {
         let mut args: Vec<String> = Vec::new();
         if let Some((universe, place)) = self.live_team_create_ids() {
             args = vec!["--team-create".into(), universe.to_string(), place.to_string()];
-        } else if let Some(path) = &self.doc.path {
+        } else if let Some(path) = &self.game.doc.path {
             args.push(path.display().to_string());
-        } else if let Some(origin) = &self.doc.cloud {
+        } else if let Some(origin) = &self.game.doc.cloud {
             args = vec!["--open-roblox".into(), origin.place_id.to_string(), "--local-copy".into()];
         }
         // After an update the running file was renamed: start the new one.
@@ -2116,8 +1705,8 @@ impl Editor {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         self.hud.status_drawn = true;
         ui.horizontal(|ui| {
-            let sel = self.doc.selection.len();
-            if let Some(s) = self.play_status() {
+            let sel = self.game.doc.selection.len();
+            if let Some(s) = self.game.play_status() {
                 ui.label(RichText::new(format!("● {s}")).color(theme::ERROR).strong());
                 ui.separator();
             }
@@ -2125,13 +1714,13 @@ impl Editor {
             ui.separator();
             ui.label(format!("{sel} selected"));
             ui.separator();
-            ui.label(format!("{} parts", self.scene.parts.len()));
+            ui.label(format!("{} parts", self.game.scene.parts.len()));
             ui.separator();
-            let p = self.cam.pos;
+            let p = self.game.cam.pos;
             ui.label(format!("Camera {:.1}, {:.1}, {:.1}", p.x, p.y, p.z));
             ui.separator();
-            ui.label(if self.snap_move {
-                format!("Snap {} st / {}°", self.move_inc, self.rotate_inc)
+            ui.label(if self.game.snap_move {
+                format!("Snap {} st / {}°", self.game.move_inc, self.game.rotate_inc)
             } else {
                 "Snap off".into()
             });
@@ -2195,12 +1784,12 @@ impl Editor {
             ui.label(RichText::new("Discard unsaved changes?").strong());
             ui.label(format!(
                 "{} has changes that are not saved.",
-                self.doc.title
+                self.game.doc.title
             ));
             ui.horizontal(|ui| {
                 if ui.button("Save first").clicked() {
                     self.save();
-                    decided = Some(!self.doc.dirty());
+                    decided = Some(!self.game.doc.dirty());
                 }
                 if ui.button("Discard").clicked() {
                     decided = Some(true);
@@ -2234,11 +1823,11 @@ impl TabViewer for Viewer<'_> {
         match tab {
             Tab::Script(r) => format!("📜 {}", self.ed.script_title(*r)).into(),
             // Studio's document tab: the place's name.
-            Tab::Viewport => match self.ed.play_status() {
-                Some(s) => RichText::new(format!("{} — {s}", self.ed.doc.title))
+            Tab::Viewport => match self.ed.game.play_status() {
+                Some(s) => RichText::new(format!("{} — {s}", self.ed.game.doc.title))
                     .color(theme::ACCENT)
                     .into(),
-                None => self.ed.doc.title.clone().into(),
+                None => self.ed.game.doc.title.clone().into(),
             },
             Tab::Properties => crate::properties::panel_title(self.ed).into(),
             Tab::Plugin(n) => self.ed.plugin_widget_title(*n).into(),
@@ -2255,7 +1844,7 @@ impl TabViewer for Viewer<'_> {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
-        let _p = crate::bench::scope(match tab {
+        let _p = rustudio_core::bench::scope(match tab {
             Tab::Viewport => "viewport",
             Tab::Explorer => "explorer",
             Tab::Properties => "properties",
@@ -2337,7 +1926,7 @@ impl TabViewer for Viewer<'_> {
 
     fn is_closeable(&self, tab: &Tab) -> bool {
         // The place tab's × is File > Close Place (not while playing).
-        *tab != Tab::Viewport || self.ed.play_status().is_none()
+        *tab != Tab::Viewport || self.ed.game.play_status().is_none()
     }
 
     fn on_close(&mut self, tab: &mut Tab) -> egui_dock::tab_viewer::OnCloseResponse {
@@ -2393,7 +1982,7 @@ impl RustudioApp {
             // desktop). That's not fatal: skip the window this frame, and
             // after a run of failures dock its tabs back.
             let builder = w.builder();
-            let shown = crate::crash::recoverable(std::panic::AssertUnwindSafe(|| ctx.show_viewport_immediate(id, builder, |ui, class| {
+            let shown = rustudio_core::crash::recoverable(std::panic::AssertUnwindSafe(|| ctx.show_viewport_immediate(id, builder, |ui, class| {
                 ed.ui.popped_class = Some(class);
                 let vctx = ui.ctx().clone();
                 w.track(&vctx);
@@ -2420,7 +2009,7 @@ impl RustudioApp {
                     w.fails += 1;
                     eprintln!("rustudio: panel window {} could not be shown ({} frames)", w.key, w.fails);
                     ctx.request_repaint();
-                    w.fails >= crate::mech::PANEL_WINDOW_MAX_FAILS
+                    w.fails >= rustudio_core::mech::PANEL_WINDOW_MAX_FAILS
                 }
             };
             if close {
@@ -2475,7 +2064,7 @@ impl RustudioApp {
 impl eframe::App for RustudioApp {
     fn on_exit(&mut self) {
         crate::studio_settings::flush();
-        crate::rustudio_settings::flush();
+        rustudio_core::rustudio_settings::flush();
         crate::plugin_host::widgets_ui::on_exit();
         if let Some(s) = self.layout.as_mut() {
             s.save(&self.dock, &self.panels, &self.ed);
@@ -2492,7 +2081,7 @@ impl eframe::App for RustudioApp {
         }
         // Going to the background: the free heap pages go back now, so the
         // process is judged (and kept) by what it really holds.
-        crate::heap::trim();
+        rustudio_core::heap::trim();
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         // Fingers: scroll / tap / hold / look, before egui sees them; a
@@ -2503,17 +2092,19 @@ impl eframe::App for RustudioApp {
             // cards that are taps, long presses for menus): the finger
             // layer is for the editor's chrome and 3D view, once a place
             // is open.
-            let start_page = self.ed.start.visible && self.ed.doc.id == self.ed.start.doc_id;
-            self.ed.touch.set_enabled(!start_page, raw);
-            self.ed.touch.filter(_ctx, raw, self.ed.frame_no);
+            let start_page = self.ed.start.visible && self.ed.game.doc.id == self.ed.start.doc_id;
+            self.ed.game.touch.set_enabled(!start_page, raw);
+            self.ed.game.touch.filter(_ctx, raw, self.ed.game.frame_no);
             // (the clipboard first: it swaps egui-winit's pastes, Ctrl+V,
-            // for the system clipboard's text; the menu's paste comes with
-            // its text)
+            // for the system clipboard's text; the menu's and the bar's
+            // pastes come with their text)
             crate::android::clipboard::before_frame(raw);
             self.text_menu.before_frame(raw);
+            self.text_bar.before_frame(raw);
             let textbox = self.ed.textbox_focused();
-            self.keyboard.before_frame(_ctx, raw, textbox);
-            let playing = self.ed.play_game_input();
+            let game_box = self.ed.game.play.is_some() && self.ed.game.gui.focus.is_some();
+            self.keyboard.before_frame(_ctx, raw, textbox, game_box);
+            let playing = self.ed.game.play_game_input();
             crate::android::lifecycle::back_pressed(_ctx, raw, playing);
             // The window back in focus: the system bars hidden again.
             crate::android::system_bars::before_frame(raw);
@@ -2524,7 +2115,7 @@ impl eframe::App for RustudioApp {
         // runs them in a headless gamescope with no pointer; here the real
         // pointer is dropped before the script's own input goes in.
         if cfg!(windows)
-            && (self.ed.harness.selftest.is_some() || self.ed.harness.screenshot.is_some() || self.ed.harness.ui_shots.is_some())
+            && (self.ed.harness.selftest.is_some() || self.ed.harness.run.screenshot.is_some() || self.ed.harness.ui_shots.is_some())
             && std::env::var_os("RUSTUDIO_VISIBLE_TESTS").is_none()
         {
             raw.events.retain(|e| {
@@ -2542,13 +2133,13 @@ impl eframe::App for RustudioApp {
         if let Some(t) = self.ed.harness.selftest.as_mut() {
             t.inject(raw);
         }
-        if !self.ed.harness.actions.is_empty() {
+        if !self.ed.harness.run.input.actions.is_empty() {
             self.ed.harness_inject(raw);
         }
         if let Some(u) = self.ed.harness.ui_shots.as_mut() {
             u.inject(raw);
         }
-        self.ed.phys.ingest(raw);
+        self.ed.game.phys.ingest(raw);
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -2581,9 +2172,9 @@ impl RustudioApp {
     }
 
     fn tick_plugins(ed: &mut Editor, last_tick: &mut Instant, now: Instant) {
-        let _p = crate::bench::scope("plugin_tick");
+        let _p = rustudio_core::bench::scope("plugin_tick");
         let dt = now.saturating_duration_since(std::mem::replace(last_tick, now)).as_secs_f32();
-        let step = ed.fixed_dt.map_or_else(|| frame_grid(dt) as f64, f64::from);
+        let step = ed.game.fixed_dt.map_or_else(|| frame_grid(dt) as f64, f64::from);
         ed.plugin_tick(step);
     }
 
@@ -2599,26 +2190,22 @@ impl RustudioApp {
     /// One frame, in eframe's window or offscreen (src/offscreen.rs).
     pub fn frame(&mut self, ui: &mut egui::Ui) {
         // (the whole frame, for --bench: the editor's and --no-ui's alike)
-        let _frame_scope = crate::bench::scope("frame");
-        crate::sim_clock::advance();
+        let _frame_scope = rustudio_core::bench::scope("frame");
+        rustudio_core::sim_clock::advance();
         let ctx = ui.ctx().clone();
-        self.watchdog.begin(ctx.input(|i| !i.viewport().minimized.unwrap_or(false)) && (self.ed.play.is_some() || self.ed.harness.screenshot.is_some()));
+        self.watchdog.begin(ctx.input(|i| !i.viewport().minimized.unwrap_or(false)) && (self.ed.game.play.is_some() || self.ed.harness.run.screenshot.is_some()));
         // The panels end above the soft keyboard while a field is typed in
         // — except a game's TextBox: the keyboard then lies over the
         // window, as it does over a phone's games (the panels laid out
         // above it leave a landscape phone a view a few lines tall, the
         // box typed into squeezed or off it, the status bar in its
         // place), and the view slides up to show the box
-        // (Editor::keyboard_pan).
+        // (Editor::keyboard_pan). Which of the two: android/keyboard.rs
+        // `over`, decided in raw_input_hook with the safe-area inset.
         #[cfg(target_os = "android")]
         {
-            let game_box = self.ed.play.is_some()
-                && self.ed.gui.focus.is_some()
-                && crate::android::keyboard::focused_text(&ctx).is_none();
-            self.ed.keyboard_cover = if game_box { self.keyboard.height(&ctx) } else { 0.0 };
-            if !game_box {
-                self.keyboard.shrink(ui);
-            }
+            self.ed.keyboard_cover = self.keyboard.cover(&ctx);
+            self.keyboard.shrink(ui);
         }
         let ed = &mut self.ed;
         // Files opened from Finder (double-click, Open With, the Dock icon).
@@ -2642,13 +2229,13 @@ impl RustudioApp {
         // missing, leaving the window black until the next resume.
         #[cfg(target_os = "android")]
         {
-            if ed.harness.started.elapsed() < std::time::Duration::from_secs(3) {
+            if ed.harness.run.started.elapsed() < std::time::Duration::from_secs(3) {
                 ctx.request_repaint();
             }
             crate::android::touch::auto_zoom(ed, &ctx);
             // Two frames went through the swapchain: a start on the Turnip
             // driver (android/turnip.rs) counts as good from here.
-            if ed.frame_no == 2 {
+            if ed.game.frame_no == 2 {
                 crate::android::turnip::mark_healthy();
             }
         }
@@ -2656,7 +2243,7 @@ impl RustudioApp {
         if let crate::update::Action::Restart = self.updater.show(&ctx) {
             ed.request(PendingAction::Restart);
         }
-        ed.frame_no += 1;
+        ed.game.frame_no += 1;
         let frame_start = Instant::now();
         // The CPU governor's frame hint (src/android/perf_hint.rs): the
         // last frame's time on the CPU (eframe's, without the wait for the
@@ -2664,7 +2251,7 @@ impl RustudioApp {
         // the frame-rate cap's while a game is capped.
         #[cfg(target_os = "android")]
         if let Some(cpu) = self.cpu_usage {
-            let cap = if ed.play.is_some() { ed.render_settings().fps_cap } else { 0 };
+            let cap = if ed.game.play.is_some() { ed.render_settings().fps_cap } else { 0 };
             let hz = if cap > 0 { cap as f32 } else if self.refresh_hz > 1.0 { self.refresh_hz } else { 60.0 };
             crate::android::perf_hint::frame(
                 std::time::Duration::from_secs_f32(cpu.max(0.0)),
@@ -2672,13 +2259,13 @@ impl RustudioApp {
             );
         }
         let causes = ctx.repaint_causes();
-        if crate::perf_log::on() {
+        if rustudio_render::perf_log::on() {
             self.perf.repaint_causes(&causes);
         }
         let now = Instant::now();
         let dt = now.duration_since(ed.last_frame).as_secs_f32();
         ed.last_frame = now;
-        crate::load_trace::frame(ed.frame_no.saturating_sub(1) as u64, dt as f64 * 1000.0);
+        rustudio_core::load_trace::frame(ed.game.frame_no.saturating_sub(1) as u64, dt as f64 * 1000.0);
         // The status bar's fps counts the frames that followed the frame
         // before at once — asked for by it, or brought by input — not the
         // ones a timer woke the editor for (a poll, a tooltip, a sway) or
@@ -2690,58 +2277,15 @@ impl RustudioApp {
             ed.fps = ed.fps * 0.9 + (1.0 / dt) * 0.1;
         }
         ed.hud = HudStats::default();
-        for (err, m) in crate::studio_content::take_messages() {
-            if err { ed.error(m) } else { ed.info(m) }
-        }
-        ed.assets.set_client(ed.account.shared_client());
-        // --fixed-dt: last frame's downloads land now, not whenever (src/sim_clock.rs).
-        if crate::sim_clock::on() {
-            ed.assets.wait_pending(std::time::Duration::from_secs(60));
-        }
-        let done = ed.assets.poll();
-        if ed.textures.poll_decoded() {
-            ed.asset_gen += 1;
-        }
-        if crate::load_trace::on() {
-            let (pending, loaded) = ed.textures.counts();
-            crate::load_trace::assets(ed.meshes.count(), pending, loaded);
-        }
-        // (the memory a load's decodes and downloads freed goes back to the
-        // system once it settles: src/heap.rs)
-        crate::heap::settle(ed.textures.counts().0 > 0 || !done.is_empty());
-        if !done.is_empty() {
-            ed.meshes.retry(&done);
-            ed.textures.retry(&done);
-            ed.asset_gen += 1;
-        }
-        // Material texture packs load on their own threads.
-        let mat_gen = crate::matpack::generation();
-        if mat_gen != ed.material_gen {
-            ed.material_gen = mat_gen;
-            ed.asset_gen += 1;
-        }
-        let wrap_gen = crate::wrap::generation();
-        if wrap_gen != ed.wrap_gen {
-            ed.wrap_gen = wrap_gen;
-            ed.asset_gen += 1;
-        }
-        for msg in std::mem::take(&mut ed.assets.messages) {
-            ed.info(msg);
-        }
-        for (level, text) in ed.account.poll() {
-            ed.push_log(level, text);
-        }
+        ed.game.poll_assets();
+        ed.flush_output_changes();
         self.watchdog.stage("asset polling", "Play tick: scripts/physics");
-        if ed.play.is_some() {
-            let mut step = ed.fixed_dt.unwrap_or_else(|| frame_grid(dt));
-            if let Some(f) = ed.fixed_dt.filter(|_| std::env::var_os("RUSTUDIO_GAME_CLOCK").is_some()) {
-                // (the scripts' os.clock spinning of the last frame: whole fixed periods)
-                step += crate::runtime::take_game_clock_spent(1.0 / f);
+        if ed.game.play.is_some() {
+            let step = ed.game.play_step(dt);
+            if ed.game.fixed_dt.is_some() && ed.harness.run.play_started.is_some() {
+                *ed.harness.run.play_game_time.get_or_insert(0.0) += step;
             }
-            if ed.fixed_dt.is_some() && ed.harness.play_started.is_some() {
-                *ed.harness.play_game_time.get_or_insert(0.0) += step;
-            }
-            let _p = crate::bench::scope("play_tick");
+            let _p = rustudio_core::bench::scope("play_tick");
             ed.play_tick(&ctx, step);
         }
         self.watchdog.stage("Play tick", "plugins");
@@ -2756,7 +2300,7 @@ impl RustudioApp {
         ed.plugins_tick();
         ed.toolbox_tick(&ctx);
         ed.toolbox_harness_tick();
-        if self.ed.harness.no_ui {
+        if self.ed.harness.run.no_ui {
             self.no_ui_frame(ui, &ctx, frame_start, dt);
             return;
         }
@@ -2789,15 +2333,15 @@ impl RustudioApp {
         ed.project_windows(&ctx);
         ed.sync_explorer_to_selection();
         {
-            let _p = crate::bench::scope("scene_sync");
-            ed.scene.sync(&mut ed.doc);
+            let _p = rustudio_core::bench::scope("scene_sync");
+            ed.game.scene.sync(&mut ed.game.doc);
         }
 
         if ctx.input(|i| i.viewport().close_requested())
-            && ed.doc.dirty()
-            && ed.harness.screenshot.is_none()
+            && ed.game.doc.dirty()
+            && ed.harness.run.screenshot.is_none()
             && ed.harness.selftest.is_none()
-            && ed.harness.bench.is_none()
+            && ed.harness.run.bench.is_none()
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ed.confirm_discard = Some(PendingAction::Quit);
@@ -2827,11 +2371,11 @@ impl RustudioApp {
             ed.confirm_ui(&ctx);
             ed.account_window(&ctx);
             ed.cloud_windows(&ctx);
-            if ed.harness.screenshot.is_some() {
+            if ed.harness.run.screenshot.is_some() {
                 ed.harness_tick(&ctx);
                 ctx.request_repaint();
             }
-            if ed.account.busy() || ed.assets.busy() {
+            if ed.game.account.busy() || ed.game.assets.busy() {
                 ctx.request_repaint();
             }
             self.watchdog.complete();
@@ -2876,7 +2420,7 @@ impl RustudioApp {
             }
         }
 
-        let _dock_scope = crate::bench::scope("dock_panels");
+        let _dock_scope = rustudio_core::bench::scope("dock_panels");
         let windows: Vec<(String, String)> = self.panels.popped.iter().map(|w| (w.key.clone(), w.title())).collect();
         let mut dock_rect = egui::Rect::NOTHING;
         egui::CentralPanel::default()
@@ -3009,7 +2553,7 @@ impl RustudioApp {
         ed.graphics_settings_ui(&ctx);
         ed.studio_settings_ui(&ctx);
         ed.user_screenshot_tick(&ctx);
-        crate::runtime::domains::assets_cloud::capture::frame_tick(&ctx, ed.viewport_rect);
+        rustudio_engine::runtime::domains::assets_cloud::capture::frame_tick(&ctx, ed.game.viewport_rect);
         ed.confirm_ui(&ctx);
         ed.account_window(&ctx);
         ed.character_builder_window(&ctx);
@@ -3017,16 +2561,19 @@ impl RustudioApp {
         self.watchdog.stage("dock UI", "harness and screenshot readback");
         self.finish_frame(&ctx, frame_start, dt);
         // The soft keyboard follows what there is to type into; egui-winit
-        // gets no IME output (src/android/keyboard.rs).
+        // gets no IME output (src/android/keyboard.rs). Over the keyboard,
+        // the text bar (src/android/text_bar.rs).
         #[cfg(target_os = "android")]
         {
             let textbox = self.ed.textbox_focused();
+            let want = crate::android::keyboard::wanted(&ctx, textbox);
+            self.text_bar.end_frame(&ctx, &self.keyboard, want);
             self.keyboard.end_frame(&ctx, textbox);
         }
         // The memory, as it grows (src/android/memory.rs).
         #[cfg(target_os = "android")]
         {
-            let doing = match (&self.ed.doc.path, self.ed.play.is_some()) {
+            let doing = match (&self.ed.game.doc.path, self.ed.game.play.is_some()) {
                 (Some(p), playing) => format!(
                     "{} {}",
                     if playing { "playing" } else { "editing" },
@@ -3052,10 +2599,9 @@ impl RustudioApp {
         let work_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
         ed.last_work_ms = work_ms;
         // RUSTUDIO_GPU_TIMING: resolve this frame's GPU timestamps, collect finished ones.
-        if let Some(rs) = ed.render_state.as_ref() {
-            crate::gpu_timing::end_frame(&rs.device, &rs.queue);
+        if let Some(rs) = ed.game.render_state.as_ref() {
+            rustudio_render::gpu_timing::end_frame(&rs.device, &rs.queue);
         }
-        let mut bench_done = false;
         // Automatic quality judges a frame by its work, not by what it
         // waited: the frame's CPU time (eframe's, the frame before, the
         // wait for the display left out) against the renderer's GPU time
@@ -3065,93 +2611,22 @@ impl RustudioApp {
         // all there is (a frame's wait for the frame-rate cap isn't
         // slowness either way).
         let interval = (dt - ed.cap_wait).max(0.0);
-        let cost = match (self.cpu_usage, ed.renderer.as_ref().and_then(|r| r.gpu_last_frame_ms())) {
+        let cost = match (self.cpu_usage, ed.game.renderer.as_ref().and_then(|r| r.gpu_last_frame_ms())) {
             (Some(cpu), Some(gpu_ms)) => cpu.max(gpu_ms / 1000.0).max(work_ms / 1000.0).min(interval),
             _ => interval,
         };
         ed.quality_tick(Instant::now(), interval, cost);
-        if let Some(b) = ed.harness.bench.as_mut() {
-            // Edit-mode benchmark: turn the camera slowly so several views count.
-            // (RUSTUDIO_BENCH_STILL=1: the camera stays put, an idle editor)
-            if !b.play && std::env::var_os("RUSTUDIO_BENCH_STILL").is_none() {
-                ed.cam.yaw += crate::mech::BENCH_TURN_DEG_PER_S.to_radians() * dt;
-                ed.cam.focus = ed.cam.pos + ed.cam.forward() * (ed.cam.focus - ed.cam.pos).length();
-            }
-            // Play benches count from Play's start (a live join can take a
-            // minute before Play), not from the window opening.
-            let ready = !b.play || ed.harness.play_started.is_some();
-            if ready && !b.done && b.frame(work_ms) {
-                let mut report = b.report();
-                if let Some(r) = ed.renderer.as_ref() {
-                    report["render"] = serde_json::json!(format!("{:?}", r.stats));
-                }
-                if let Some(p) = ed.play.as_ref() {
-                    let (dynamic, fixed) = p.physics.counts();
-                    report["physics"] = serde_json::json!({"assemblies": dynamic, "awake": p.physics.awake(), "fixed_colliders": fixed, "steps": p.physics.steps, "stages": p.physics.stage_times()});
-                    let sample: Vec<String> = p
-                        .physics
-                        .awake_sample(25)
-                        .into_iter()
-                        .map(|(r, pos, vel, n)| {
-                            let mut path = Vec::new();
-                            let mut cur = r;
-                            while let Some(i) = ed.doc.dom.get_by_ref(cur) {
-                                path.push(i.name.clone());
-                                cur = i.parent();
-                            }
-                            path.reverse();
-                            let kids: Vec<String> = ed
-                                .doc
-                                .dom
-                                .get_by_ref(r)
-                                .map(|i| {
-                                    i.children()
-                                        .iter()
-                                        .filter_map(|c| ed.doc.class_of(*c).map(|k| k.to_string()))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            let size =
-                                crate::scene::vec3_of(ed.doc.prop(r, "Size")).unwrap_or_default();
-                            format!(
-                                "{} n={n} size={size:.1} pos={pos:.1} vel={vel:.1} kids={kids:?}",
-                                path.join(".")
-                            )
-                        })
-                        .collect();
-                    report["awake_sample"] = serde_json::json!(sample);
-                }
-                let text = serde_json::to_string_pretty(&report).unwrap_or_default();
-                if let Some(out) = &ed.harness.log_out {
-                    let log: String = ed
-                        .log
-                        .iter()
-                        .map(|l| format!("{:?}: {}\n", l.level, l.text.replace(crate::output_panel::STACK_MARK, "")))
-                        .collect();
-                    let _ = std::fs::write(out, log);
-                }
-                if let Some(out) = &b.out {
-                    if let Err(e) = std::fs::write(out, &text) {
-                        eprintln!("bench: can't write {}: {e}", out.display());
-                    }
-                    let _ = std::fs::write(out.with_extension("frames.json"), b.frames_json().to_string());
-                }
-                println!("{text}");
-                bench_done = true;
-            }
-            ctx.request_repaint();
-        }
-        if bench_done {
+        if ed.harness.run.bench_frame(&mut ed.game, &ctx, work_ms, dt) {
             ed.finish_run(&ctx, "bench");
         }
         if ed.drag.is_some()
-            || ed.play.is_some()
-            || ed.assets.busy()
-            || ed.textures.decoding()
+            || ed.game.play.is_some()
+            || ed.game.assets.busy()
+            || ed.game.textures.decoding()
             || ctx.input(|i| i.pointer.any_down() || !i.keys_down.is_empty())
-            || ed.harness.screenshot.is_some()
+            || ed.harness.run.screenshot.is_some()
             || ed.harness.selftest.is_some()
-            || ed.account.busy()
+            || ed.game.account.busy()
         {
             ctx.request_repaint();
         }
@@ -3162,9 +2637,9 @@ impl RustudioApp {
             crate::android::clipboard::after_frame(&ctx);
             self.text_menu.end_frame(&ctx);
         }
-        if crate::perf_log::on() {
-            let (renderer, render_state) = (&self.ed.renderer, &self.ed.render_state);
-            let view_reuse = &mut self.ed.view_reuse;
+        if rustudio_render::perf_log::on() {
+            let (renderer, render_state) = (&self.ed.game.renderer, &self.ed.game.render_state);
+            let view_reuse = &mut self.ed.game.view_reuse;
             let refresh_hz = self.refresh_hz;
             self.perf.frame(
                 work_ms,
@@ -3203,8 +2678,8 @@ impl RustudioApp {
                         i.driver_info,
                         i.device_type,
                         rs.target_format,
-                        crate::present_mode_name(),
-                        crate::frame_latency(),
+                        crate::offscreen::present_mode_name(),
+                        crate::offscreen::frame_latency(),
                         if refresh_hz > 1.0 { format!("{refresh_hz:.0} Hz") } else { "rate unknown".to_string() },
                     ))
                 },
@@ -3222,8 +2697,8 @@ impl RustudioApp {
     fn no_ui_frame(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, frame_start: Instant, dt: f32) {
         let ed = &mut self.ed;
         {
-            let _p = crate::bench::scope("scene_sync");
-            ed.scene.sync(&mut ed.doc);
+            let _p = rustudio_core::bench::scope("scene_sync");
+            ed.game.scene.sync(&mut ed.game.doc);
         }
         if (ctx.zoom_factor() - ed.ui.zoom).abs() > 1e-3 {
             ctx.set_zoom_factor(ed.ui.zoom);
@@ -3256,189 +2731,32 @@ impl RustudioApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG))
             .show(ui, |ui| {
-                let _p = crate::bench::scope("viewport");
+                let _p = rustudio_core::bench::scope("viewport");
                 ed.viewport_ui(ui);
             });
         // Open plugin widgets as fixed panels over the view (no dock here).
-        if ed.play.is_none() {
+        if ed.game.play.is_none() {
             ed.plugin_noui_widgets(ctx);
         }
         ed.user_screenshot_tick(ctx);
-        crate::runtime::domains::assets_cloud::capture::frame_tick(ctx, ed.viewport_rect);
+        rustudio_engine::runtime::domains::assets_cloud::capture::frame_tick(ctx, ed.game.viewport_rect);
         self.watchdog.stage("3D view", "harness and screenshot readback");
         self.finish_frame(ctx, frame_start, dt);
     }
 }
 
 impl Editor {
-    /// The end of a harness run (shots taken, --bench measured, --seconds
-    /// reached, EndTest): writes --log and --result, sets the exit code
-    /// (--fail-on-error) and closes. Without --result / --fail-on-error /
-    /// --no-ui it only closes, as runs always did.
     pub fn finish_run(&mut self, ctx: &egui::Context, reason: &str) {
-        if self.harness.finished {
+        if self.harness.run.finished {
             return;
         }
-        self.harness.finished = true;
         crate::plugin_host::widgets_ui::on_exit();
-        let errors = self.log.iter().filter(|l| l.level == Level::Error).count();
-        let warnings = self.log.iter().filter(|l| l.level == Level::Warn).count();
-        let code = i32::from(self.harness.fail_on_error && errors > 0);
-        if code != 0 {
-            eprintln!("--fail-on-error: {errors} error line(s) in the Output");
-        }
-        EXIT_CODE.store(code, std::sync::atomic::Ordering::Relaxed);
-        if reason != "shots" && reason != "bench" {
-            if let Some(out) = &self.harness.log_out {
-                let text: String = self
-                    .log
-                    .iter()
-                    .map(|l| format!("{:?}: {}\n", l.level, l.text.replace(crate::output_panel::STACK_MARK, "")))
-                    .chain(self.harness.shot_lines.iter().map(|l| format!("{l}\n")))
-                    .collect();
-                if let Err(e) = std::fs::write(out, text) {
-                    eprintln!("log: can't write {}: {e}", out.display());
-                }
-            }
-        }
-        if let Some(out) = self.harness.result.clone() {
-            let body = self.result_json(reason, errors, warnings, code);
-            if let Err(e) = std::fs::write(&out, serde_json::to_string_pretty(&body).unwrap_or_default()) {
-                eprintln!("--result: can't write {}: {e}", out.display());
-            }
-        }
-        crate::telemetry::flush();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-    }
-
-    fn result_json(&self, reason: &str, errors: usize, warnings: usize, code: i32) -> serde_json::Value {
-        let output: Vec<serde_json::Value> = self
-            .log
-            .iter()
-            .map(|l| {
-                let level = match l.level {
-                    Level::Info => "info",
-                    Level::Warn => "warning",
-                    Level::Error => "error",
-                };
-                serde_json::json!({"level": level, "text": l.text.replace(crate::output_panel::STACK_MARK, "")})
-            })
-            .collect();
-        let mut ms: Vec<f32> = self.harness.run_frames.iter().map(|f| f.0).collect();
-        let work: f32 = self.harness.run_frames.iter().map(|f| f.1).sum::<f32>() / self.harness.run_frames.len().max(1) as f32;
-        ms.sort_by(|a, b| a.total_cmp(b));
-        let pct = |p: f32| ms.get(((ms.len() as f32 * p) as usize).min(ms.len().saturating_sub(1))).copied().unwrap_or(0.0);
-        let mean = ms.iter().sum::<f32>() / ms.len().max(1) as f32;
-        let shots: Vec<String> = self
-            .harness
-            .shot_lines
-            .iter()
-            .filter_map(|l| l.strip_prefix("[shot] ").map(str::to_string))
-            .collect();
-        let value = self
-            .harness
-            .end_value
-            .as_deref()
-            .map(|v| serde_json::from_str(v).unwrap_or(serde_json::Value::Null));
-        let (cpu_s, peak_rss_mb) = process_usage();
-        serde_json::json!({
-            "ended": reason,
-            "exit_code": code,
-            "state": if self.harness.play_started.is_some() { "play" } else { "edit" },
-            "no_ui": self.harness.no_ui,
-            "end_test_value": value,
-            "seconds": self.harness.now(),
-            "errors": errors,
-            "warnings": warnings,
-            "frames": {
-                "count": ms.len(),
-                "mean_ms": mean,
-                "p50_ms": pct(0.5),
-                "p99_ms": pct(0.99),
-                "max_ms": ms.last().copied().unwrap_or(0.0),
-                "mean_work_ms": work,
-                "fixed_dt": self.fixed_dt,
-            },
-            "shots": shots,
-            "plugins": self.plugins.result_json(),
-            "plugin_toolbars": self.plugin_ui_json(),
-            "toolbox": self.toolbox.result_json(),
-            "process": {"cpu_s": cpu_s, "peak_rss_mb": peak_rss_mb, "rss_mb": current_rss_mb()},
-            "output": output,
-        })
-    }
-}
-
-/// This process's resident memory now (MB; NaN where not supported).
-fn current_rss_mb() -> f64 {
-    #[cfg(target_os = "linux")]
-    {
-        let pages = std::fs::read_to_string("/proc/self/statm")
-            .ok()
-            .and_then(|s| s.split_whitespace().nth(1)?.parse::<f64>().ok());
-        // SAFETY: sysconf only reads a system constant.
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as f64;
-        pages.map_or(f64::NAN, |p| p * page / (1024.0 * 1024.0))
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-        // SAFETY: a zeroed counters struct with its size set, as the API asks.
-        let mut m: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
-        m.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-        if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut m, m.cb) } != 0 {
-            m.WorkingSetSize as f64 / (1024.0 * 1024.0)
-        } else {
-            f64::NAN
-        }
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        f64::NAN
-    }
-}
-
-/// This process's CPU time (user + system, s) and peak resident memory (MB).
-fn process_usage() -> (f64, f64) {
-    #[cfg(unix)]
-    {
-        // SAFETY: getrusage fills the struct we pass.
-        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
-        let cpu = ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 * 1e-6
-            + ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 * 1e-6;
-        // (Linux reports kilobytes)
-        (cpu, ru.ru_maxrss as f64 / 1024.0)
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::FILETIME;
-        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
-        let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-        let (mut created, mut exited, mut kernel, mut user) = (z, z, z, z);
-        let secs = |f: FILETIME| (((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64) as f64 * 1e-7;
-        // SAFETY: the current process's pseudo-handle and four FILETIME out-pointers.
-        let cpu = if unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) } != 0 {
-            secs(kernel) + secs(user)
-        } else {
-            f64::NAN
-        };
-        // SAFETY: a zeroed counters struct with its size set, as the API asks.
-        let mut m: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
-        m.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-        let peak = if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut m, m.cb) } != 0 {
-            m.PeakWorkingSetSize as f64 / (1024.0 * 1024.0)
-        } else {
-            f64::NAN
-        };
-        (cpu, peak)
-    }
-    // Not supported here: NaN, null in --result.
-    #[cfg(not(any(unix, windows)))]
-    {
-        (f64::NAN, f64::NAN)
+        let extras = self.harness.run.result.as_ref().map(|_| [
+            ("plugins", self.plugins.result_json()),
+            ("plugin_toolbars", self.plugin_ui_json()),
+            ("toolbox", self.toolbox.result_json()),
+        ]);
+        self.harness.run.finish_run(&self.game, ctx, reason, extras.into_iter().flatten());
     }
 }
 
@@ -3456,7 +2774,7 @@ impl RustudioApp {
     fn cap_frame_rate(&mut self) {
         let ed = &mut self.ed;
         ed.cap_wait = 0.0;
-        let cap = if ed.play.is_some() { ed.render_settings().fps_cap } else { 0 };
+        let cap = if ed.game.play.is_some() { ed.render_settings().fps_cap } else { 0 };
         if cap == 0 {
             ed.cap_next = None;
             return;
@@ -3478,72 +2796,17 @@ impl RustudioApp {
 
 impl Editor {
     fn harness_tick(&mut self, ctx: &egui::Context) {
-        if self.harness.start_play && self.viewport_rect.is_positive() && self.frame_no >= 2 && !self.place_loading() {
-            self.harness.start_play = false;
-            self.start_play(crate::runtime::RunMode::Play);
-            self.harness.play_started = Some(crate::sim_clock::now());
+        if self.harness.run.start_play && self.game.viewport_rect.is_positive() && self.game.frame_no >= 2 && !self.place_loading() {
+            self.harness.run.start_play = false;
+            self.start_play(rustudio_engine::runtime::RunMode::Play);
+            self.harness.run.play_started = Some(rustudio_core::sim_clock::now());
         }
-        if self.harness.play_started.is_some() {
-            let now = Instant::now();
-            if let Some(last) = self.harness.last_frame.replace(now) {
-                self.harness.frame_ms.push((now - last).as_secs_f32() * 1000.0);
-            }
-        }
-        // --result's frame statistics: Edit state from the first frame, Play
-        // from its start (the first Play frame clears the Edit ones).
-        if self.harness.result.is_some() {
-            let now = Instant::now();
-            let playing = self.harness.play_started.is_some();
-            if playing != self.harness.run_playing {
-                self.harness.run_playing = playing;
-                self.harness.run_frames.clear();
-                self.harness.run_last = None;
-            }
-            if let Some(last) = self.harness.run_last.replace(now) {
-                self.harness.run_frames.push(((now - last).as_secs_f32() * 1000.0, self.last_work_ms));
-            }
-        }
-        if self.harness.finished {
+        if let Some(reason) = self.harness.run.tick_before_shot(&mut self.game, self.last_work_ms) {
+            self.finish_run(ctx, reason);
             return;
         }
-        // A script ended the run (StudioTestService:EndTest), or --seconds.
-        if self.harness.end_value.is_some() {
-            self.finish_run(ctx, "EndTest");
+        if self.harness.run.finished {
             return;
-        }
-        if let (Some(end), Some(now)) = (self.harness.end_after, self.harness.now()) {
-            if now >= end {
-                self.finish_run(ctx, "seconds");
-                return;
-            }
-        }
-        // Timed Luau (`--luau`), once Play runs.
-        let Some(t) = self.harness.now() else { return };
-        if self.play.is_some() {
-            let due: Vec<(bool, String)> = self
-                .harness
-                .actions
-                .iter()
-                .filter_map(|(at, a)| match a {
-                    HarnessAction::Luau(server, code) if *at <= t => Some((*server, code.clone())),
-                    _ => None,
-                })
-                .collect();
-            if !due.is_empty() {
-                self.harness
-                    .actions
-                    .retain(|(at, a)| !(matches!(a, HarnessAction::Luau(..)) && *at <= t));
-                for (server, code) in due {
-                    let side = if server {
-                        crate::runtime::Side::Server
-                    } else {
-                        crate::runtime::Side::Client
-                    };
-                    if let Some(e) = self.run_luau(side, &code) {
-                        self.error(format!("--luau: {e}"));
-                    }
-                }
-            }
         }
         if let Some(mut t) = self.harness.selftest.take() {
             let done = t.tick(self, ctx);
@@ -3553,554 +2816,54 @@ impl Editor {
             }
             return;
         }
-        let Some(path) = self.harness.screenshot.clone() else {
-            return;
-        };
-        let now = self.harness.now();
-        // `--shots`: the next timed shot, else the single one.
-        let multi = self.harness.shot_next < self.harness.shots.len();
-        let due = if multi {
-            now.is_some_and(|t| t >= self.harness.shots[self.harness.shot_next])
-        } else if !self.harness.shots.is_empty() {
-            false
+        let widgets = if self.harness.run.no_ui {
+            Vec::new()
         } else {
-            match self.harness.shot_after {
-                Some(s) => now.is_some_and(|t| t >= s),
-                None => self.frame_no >= mech::SCREENSHOT_FRAMES,
+            self.plugin_widget_rects()
+        };
+        let reason = self.harness.run.tick_shots(&self.game, ctx, |image, path, written| {
+            let ppp = ctx.pixels_per_point();
+            for (key, r) in widgets {
+                let safe: String = key.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
+                let wp = path.with_extension(format!("widget-{safe}.png"));
+                if save_png(&crate::plugin_host::widgets_ui::crop(image, r, ppp), &wp).is_ok() {
+                    written.push(wp);
+                }
             }
-        };
-        let path = if multi {
-            let t = self.harness.shots[self.harness.shot_next];
-            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            path.with_file_name(format!("{stem}-{t}s.png"))
-        } else {
-            path
-        };
-        if due && !self.harness.screenshot_requested {
-            self.harness.screenshot_requested = true;
-            self.write_asset_report();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
-        }
-        let shot = ctx.input(|i| {
-            i.raw.events.iter().find_map(|e| match e {
-                egui::Event::Screenshot { image, .. } if self.harness.screenshot_requested => Some(image.clone()),
-                _ => None,
-            })
         });
-        if let Some(image) = shot {
-            if let Ok(hdr_path) = std::env::var("RUSTUDIO_DUMP_HDR") {
-                if let Some((w,h,data)) = self.renderer.as_ref().zip(self.render_state.as_ref()).and_then(|(r,rs)| r.read_hdr(rs)) {
-                    if std::fs::write(&hdr_path, data).is_ok() { eprintln!("HDR {w} {h} RGBA16Float {hdr_path}"); }
-                }
-            }
-            let mut written = Vec::new();
-            // (--no-render: an empty picture, nothing to write)
-            if !(image.size == [0, 0] && self.harness.no_render) {
-                match save_png(&image, &path) {
-                    Ok(()) => written.push(path.clone()),
-                    Err(e) => eprintln!("screenshot failed: {e}"),
-                }
-            }
-            // Just the 3D view too (FILE.view.png), to compare with Studio's viewport.
-            // (--no-ui: the window is the view, one picture is enough.)
-            if (self.harness.shot_after.is_some() || multi) && self.viewport_rect.is_positive() && !self.harness.no_ui {
-                let ppp = ctx.pixels_per_point();
-                let r = self.viewport_rect;
-                let (x0, y0) = ((r.min.x * ppp) as usize, (r.min.y * ppp) as usize);
-                let (w, h) = (
-                    ((r.width() * ppp) as usize).min(image.size[0].saturating_sub(x0)),
-                    ((r.height() * ppp) as usize).min(image.size[1].saturating_sub(y0)),
-                );
-                let pixels = (0..h)
-                    .flat_map(|y| (0..w).map(move |x| (x, y)))
-                    .map(|(x, y)| image.pixels[(y0 + y) * image.size[0] + x0 + x])
-                    .collect();
-                let view = egui::ColorImage::new([w, h], pixels);
-                let view_path = path.with_extension("view.png");
-                if save_png(&view, &view_path).is_ok() {
-                    written.push(view_path);
-                }
-            }
-            // Each open plugin widget's content too (FILE.widget-<key>.png).
-            if !self.harness.no_ui {
-                let ppp = ctx.pixels_per_point();
-                for (key, r) in self.plugin_widget_rects() {
-                    let safe: String = key.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
-                    let wp = path.with_extension(format!("widget-{safe}.png"));
-                    if save_png(&crate::plugin_host::widgets_ui::crop(&image, r, ppp), &wp).is_ok() {
-                        written.push(wp);
-                    }
-                }
-            }
-            // The written paths, for callers that don't rebuild the names.
-            for p in written {
-                let p = std::path::absolute(&p).unwrap_or(p);
-                let line = format!("[shot] {}", p.display());
-                println!("{line}");
-                self.harness.shot_lines.push(line);
-            }
-            if let Some(out) = &self.harness.log_out {
-                let text: String = self
-                    .log
-                    .iter()
-                    .map(|l| format!("{:?}: {}\n", l.level, l.text.replace(crate::output_panel::STACK_MARK, "")))
-                    .chain(self.harness.shot_lines.iter().map(|l| format!("{l}\n")))
-                    .collect();
-                if let Err(e) = std::fs::write(out, text) {
-                    eprintln!("log: can't write {}: {e}", out.display());
-                }
-            }
-            crate::telemetry::flush();
-            if multi {
-                self.harness.shot_next += 1;
-                self.harness.screenshot_requested = false;
-                self.write_frame_times(&path);
-                self.write_cursor_state(&path);
-                if self.harness.shot_next < self.harness.shots.len() {
-                    return;
-                }
-            }
-            self.finish_run(ctx, "shots");
+        if let Some(reason) = reason {
+            self.finish_run(ctx, reason);
         }
-        if self.harness.shot_after.is_none()
-            && self.harness.shots.is_empty()
-            && self.frame_no > mech::SCREENSHOT_FRAMES + 600
-        {
-            eprintln!("screenshot timed out");
-            std::process::exit(2);
-        }
+
     }
 }
 
 impl Editor {
-    /// FILE.frames.json beside a shot: frame times since Play started.
-    fn write_frame_times(&self, shot: &std::path::Path) {
-        let mut ms = self.harness.frame_ms.clone();
-        if ms.is_empty() {
-            return;
-        }
-        let mean = ms.iter().sum::<f32>() / ms.len() as f32;
-        ms.sort_by(|a, b| a.total_cmp(b));
-        let p99 = ms[((ms.len() as f32 * 0.99) as usize).min(ms.len() - 1)];
-        let body = serde_json::json!({
-            "frames": ms.len(),
-            "mean_ms": mean,
-            "p99_ms": p99,
-            "fps": 1000.0 / mean.max(1e-3),
-        });
-        let _ = std::fs::write(shot.with_extension("frames.json"), body.to_string());
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum HarnessAction {
-    Click(f32, f32),
-    Key(egui::Key),
-    /// A key held down (true) or let go (false): `--key NAME@S:HOLD`.
-    KeyState(egui::Key, bool),
-    /// `--wheel NOTCHES@S` over the 3D view's centre (positive = forward,
-    /// zoom in), or `--wheel NOTCHES@S:X,Y` at that view position.
-    Wheel(f32, Option<(f32, f32)>),
-    /// `--type "TEXT"@S`: typed text (egui Text events: a focused TextBox
-    /// receives the characters).
-    Text(String),
-    /// Shift held down or let go.
-    Shift(bool),
-    /// The right mouse button over the 3D view's centre, down or up.
-    RightButton(bool),
-    /// Raw mouse motion (pixels), as a grabbed cursor reports it.
-    MouseMotion(f32, f32),
-    /// The cursor at a view position (`--ldrag`), and the left button there
-    /// going down / up.
-    PointerAt(f32, f32),
-    LeftButton(f32, f32, bool),
-    /// `--luau server|client FILE@S`: run Luau on that side of Play.
-    Luau(bool, String),
-    /// `--action NAME@S`: a Studio menu action by id (`panel_output` closes
-    /// or opens the Output panel, resizing the 3D view mid-run).
-    UiAction(String),
-}
-
-impl HarnessAction {
-    /// "X,Y@S" for clicks, "NAME@S" for a key tap, "NAME@S:HOLD" to hold
-    /// it HOLD seconds.
-    pub fn parse(s: &str, click: bool) -> Option<Vec<(f32, HarnessAction)>> {
-        let (what, at) = s.split_once('@')?;
-        if click {
-            let at: f32 = at.trim().parse().ok()?;
-            let (x, y) = what.split_once(',')?;
-            return Some(vec![(
-                at,
-                HarnessAction::Click(x.trim().parse().ok()?, y.trim().parse().ok()?),
-            )]);
-        }
-        let key = egui::Key::from_name(what.trim())?;
-        match at.split_once(':') {
-            Some((at, hold)) => {
-                let (at, hold): (f32, f32) = (at.trim().parse().ok()?, hold.trim().parse().ok()?);
-                Some(vec![
-                    (at, HarnessAction::KeyState(key, true)),
-                    (at + hold, HarnessAction::KeyState(key, false)),
-                ])
-            }
-            None => Some(vec![(at.trim().parse().ok()?, HarnessAction::Key(key))]),
-        }
-    }
-
-    /// `--wheel NOTCHES@S` or `--wheel NOTCHES@S:X,Y` (view coordinates).
-    pub fn parse_wheel(s: &str) -> Option<(f32, HarnessAction)> {
-        let (n, at) = s.split_once('@')?;
-        let n: f32 = n.trim().parse().ok()?;
-        let (at, pos) = match at.split_once(':') {
-            Some((at, xy)) => {
-                let (x, y) = xy.split_once(',')?;
-                (at, Some((x.trim().parse().ok()?, y.trim().parse().ok()?)))
-            }
-            None => (at, None),
-        };
-        Some((at.trim().parse().ok()?, HarnessAction::Wheel(n, pos)))
-    }
-
-    /// `--type TEXT@S` (the last '@' splits, so the text may hold one).
-    pub fn parse_type(s: &str) -> Option<(f32, HarnessAction)> {
-        let (text, at) = s.rsplit_once('@')?;
-        Some((at.trim().parse().ok()?, HarnessAction::Text(text.to_string())))
-    }
-
-    /// `--ldrag X1,Y1>X2,Y2@S`: left-drag in the 3D view (view coordinates):
-    /// press at S, move in 10 steps over 0.5 s, let go at S + 0.6.
-    /// `--lhold X,Y@S:HOLD`: the left button pressed at X,Y at S, let go at S + HOLD
-    /// (a game's press-and-hold, e.g. carrying a grabbed part).
-    pub fn parse_lhold(s: &str) -> Option<Vec<(f32, HarnessAction)>> {
-        let (xy, when) = s.split_once('@')?;
-        let (at, hold) = when.split_once(':')?;
-        let (at, hold): (f32, f32) = (at.trim().parse().ok()?, hold.trim().parse().ok()?);
-        let (x, y) = xy.split_once(',')?;
-        let (x, y): (f32, f32) = (x.trim().parse().ok()?, y.trim().parse().ok()?);
-        Some(vec![
-            (at - 0.2, HarnessAction::PointerAt(x, y)),
-            (at, HarnessAction::LeftButton(x, y, true)),
-            (at + hold, HarnessAction::LeftButton(x, y, false)),
-        ])
-    }
-
-    pub fn parse_ldrag(s: &str) -> Option<Vec<(f32, HarnessAction)>> {
-        let (what, at) = s.split_once('@')?;
-        let at: f32 = at.trim().parse().ok()?;
-        let (a, b) = what.split_once('>')?;
-        let xy = |p: &str| -> Option<(f32, f32)> {
-            let (x, y) = p.split_once(',')?;
-            Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
-        };
-        let ((x1, y1), (x2, y2)) = (xy(a)?, xy(b)?);
-        let mut v = vec![(at - 0.2, HarnessAction::PointerAt(x1, y1)), (at, HarnessAction::LeftButton(x1, y1, true))];
-        for k in 1..=10 {
-            let f = k as f32 / 10.0;
-            v.push((at + 0.05 * k as f32, HarnessAction::PointerAt(x1 + (x2 - x1) * f, y1 + (y2 - y1) * f)));
-        }
-        v.push((at + 0.6, HarnessAction::LeftButton(x2, y2, false)));
-        Some(v)
-    }
-
-    /// `--rdrag DX,DY@S`: right-drag over the view: press at S, move DX,DY
-    /// pixels in 10 steps over 0.5 s, let go at S + 0.6.
-    pub fn parse_rdrag(s: &str) -> Option<Vec<(f32, HarnessAction)>> {
-        let (what, at) = s.split_once('@')?;
-        let at: f32 = at.trim().parse().ok()?;
-        let (x, y) = what.split_once(',')?;
-        let (dx, dy): (f32, f32) = (x.trim().parse().ok()?, y.trim().parse().ok()?);
-        let mut v = vec![(at, HarnessAction::RightButton(true))];
-        for k in 1..=10 {
-            v.push((
-                at + 0.05 * k as f32,
-                HarnessAction::MouseMotion(dx / 10.0, dy / 10.0),
-            ));
-        }
-        v.push((at + 0.6, HarnessAction::RightButton(false)));
-        Some(v)
-    }
-}
-
-impl Editor {
-    /// Timed harness input, injected like real events.
     pub fn harness_inject(&mut self, raw: &mut egui::RawInput) {
-        let Some(t) = self.harness.now() else { return };
-        // No 3D view yet (the start page): clicks are window coordinates.
-        let vp = if self.viewport_rect.is_finite() {
-            self.viewport_rect
-        } else {
-            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::ZERO)
-        };
-        // The game holds the mouse (MouseBehavior.LockCenter): a held cursor
-        // never travels, so clicks land where it is held and pointer moves
-        // are dropped. Moving it would read as a huge mouse
-        // delta and fling a first-person camera (only --rdrag's raw motion
-        // turns it then).
-        let locked = self.lock_center_held();
-        // Where the real pointer is now: a held cursor's clicks happen there.
-        for e in &raw.events {
-            if let egui::Event::PointerMoved(p) = e {
-                self.harness.pointer = Some(*p);
+        let mut input = std::mem::take(&mut self.harness.run.input);
+        input.inject(self.game.viewport_rect, self.game.lock_center_held(), self.harness.run.now(), raw, |name, raw| {
+            if self.plugin_widget_action(&name, raw) {
+                // plugin-widget:PLUGIN/WIDGET:CMD
+            } else if self.harness_pointer(&name, raw) {
+                // ptr:VERB:TARGET
+            } else if let Some(ans) = name.strip_prefix("plugin-prompt:") {
+                crate::plugin_host::prompts::answer_oldest(ans);
+            } else if let Some(t) = crate::plugin_host::Trigger::parse(&name) {
+                match t {
+                    crate::plugin_host::Trigger::Button(tb, b) => self.plugin_harness_click(&tb, &b),
+                    t => self.plugins.trigger(t),
+                }
+            } else {
+                self.harness.ui_due.push(name);
             }
-        }
-        let held_at = self.harness.pointer.unwrap_or(vp.center());
-        let mut i = 0;
-        while i < self.harness.actions.len() {
-            if self.harness.actions[i].0 > t {
-                i += 1;
-                continue;
-            }
-            if matches!(self.harness.actions[i].1, HarnessAction::Luau(..)) {
-                i += 1;
-                continue;
-            }
-            let (_, a) = self.harness.actions.remove(i);
-            match a {
-                HarnessAction::Luau(..) => {}
-                HarnessAction::Click(x, y) => {
-                    let p = if locked { held_at } else { vp.min + egui::vec2(x, y) };
-                    if !locked {
-                        raw.events.push(egui::Event::PointerMoved(p));
-                    }
-                    for pressed in [true, false] {
-                        raw.events.push(egui::Event::PointerButton {
-                            pos: p,
-                            button: egui::PointerButton::Primary,
-                            pressed,
-                            modifiers: egui::Modifiers::NONE,
-                        });
-                    }
-                }
-                HarnessAction::Key(key) => {
-                    for pressed in [true, false] {
-                        raw.events.push(egui::Event::Key {
-                            key,
-                            physical_key: None,
-                            pressed,
-                            repeat: false,
-                            modifiers: egui::Modifiers::NONE,
-                        });
-                    }
-                }
-                HarnessAction::KeyState(key, pressed) => {
-                    raw.events.push(egui::Event::Key {
-                        key,
-                        physical_key: None,
-                        pressed,
-                        repeat: false,
-                        modifiers: egui::Modifiers::NONE,
-                    });
-                }
-                HarnessAction::Wheel(n, at) => {
-                    let p = at.map_or(vp.center(), |(x, y)| vp.min + egui::vec2(x, y));
-                    raw.events.push(egui::Event::PointerMoved(p));
-                    raw.events.push(egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Line,
-                        delta: egui::vec2(0.0, n),
-                        modifiers: egui::Modifiers::NONE,
-                        phase: egui::TouchPhase::Move,
-                    });
-                }
-                HarnessAction::Text(text) => raw.events.push(egui::Event::Text(text)),
-                HarnessAction::Shift(on) => self.harness.shift = on,
-                HarnessAction::RightButton(pressed) => {
-                    let p = if locked { held_at } else { vp.center() };
-                    if !locked {
-                        raw.events.push(egui::Event::PointerMoved(p));
-                    }
-                    raw.events.push(egui::Event::PointerButton {
-                        pos: p,
-                        button: egui::PointerButton::Secondary,
-                        pressed,
-                        modifiers: egui::Modifiers::NONE,
-                    });
-                }
-                HarnessAction::PointerAt(x, y) => {
-                    if !locked {
-                        raw.events.push(egui::Event::PointerMoved(vp.min + egui::vec2(x, y)));
-                    }
-                }
-                HarnessAction::LeftButton(x, y, pressed) => {
-                    let p = if locked { held_at } else { vp.min + egui::vec2(x, y) };
-                    if !locked {
-                        raw.events.push(egui::Event::PointerMoved(p));
-                    }
-                    raw.events.push(egui::Event::PointerButton {
-                        pos: p,
-                        button: egui::PointerButton::Primary,
-                        pressed,
-                        modifiers: egui::Modifiers::NONE,
-                    });
-                }
-                HarnessAction::MouseMotion(dx, dy) => {
-                    raw.events.push(egui::Event::MouseMoved(egui::vec2(dx, dy)));
-                }
-                HarnessAction::UiAction(name) => {
-                    // plugin-button:TOOLBAR/BUTTON, plugin-action:ID (src/plugin_host);
-                    // plugin-prompt:ANSWER answers the oldest plugin dialog.
-                    if self.plugin_widget_action(&name, raw) {
-                        // plugin-widget:PLUGIN/WIDGET:CMD (plugin_host/widgets_ui.rs)
-                    } else if self.harness_pointer(&name, raw) {
-                        // ptr:VERB:TARGET (ui_pointer.rs)
-                    } else if let Some(ans) = name.strip_prefix("plugin-prompt:") {
-                        crate::plugin_host::prompts::answer_oldest(ans);
-                    } else if let Some(t) = crate::plugin_host::Trigger::parse(&name) {
-                        match t {
-                            // A click on the ribbon button (Enabled and a
-                            // script tab in front count, as in Studio).
-                            crate::plugin_host::Trigger::Button(tb, b) => self.plugin_harness_click(&tb, &b),
-                            t => self.plugins.trigger(t),
-                        }
-                    } else {
-                        self.harness.ui_due.push(name)
-                    }
-                }
-            }
-        }
-        for e in &raw.events {
-            if let egui::Event::PointerMoved(p) = e {
-                self.harness.pointer = Some(*p);
-            }
-        }
+        });
+        self.harness.run.input = input;
     }
-}
-
-pub fn save_png(image: &egui::ColorImage, path: &std::path::Path) -> Result<(), String> {
-    let [w, h] = image.size;
-    let mut bytes = Vec::with_capacity(w * h * 4);
-    for c in &image.pixels {
-        bytes.extend_from_slice(&[c.r(), c.g(), c.b(), 255]);
-    }
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-    }
-    image::save_buffer(
-        path,
-        &bytes,
-        w as u32,
-        h as u32,
-        image::ExtendedColorType::Rgba8,
-    )
-    .map_err(|e| e.to_string())
 }
 
 /// The sample scene's parts, scripts and lights, into a place document
 /// (`--demo`, and the fidelity corpus's demo place). Returns the Ball.
-pub fn build_demo_parts(doc: &mut Document) -> Ref {
-        let ws = doc.default_parent();
-        let parts: [(&str, u32, [f32; 3], [f32; 3], [u8; 3]); 6] = [
-            (
-                "Tower",
-                1,
-                [-14.0, 6.0, -10.0],
-                [6.0, 12.0, 6.0],
-                [196, 112, 70],
-            ),
-            (
-                "Ball",
-                0,
-                [-4.0, 2.0, -4.0],
-                [4.0, 4.0, 4.0],
-                [80, 160, 220],
-            ),
-            (
-                "Pipe",
-                2,
-                [8.0, 1.5, -8.0],
-                [10.0, 3.0, 3.0],
-                [110, 190, 120],
-            ),
-            ("Step", 1, [10.0, 0.5, 4.0], [8.0, 1.0, 8.0], [230, 200, 90]),
-            (
-                "Bridge",
-                1,
-                [-2.0, 8.0, -18.0],
-                [24.0, 1.0, 4.0],
-                [150, 150, 165],
-            ),
-            ("Lamp", 1, [3.0, 3.0, 6.0], [1.0, 6.0, 1.0], [250, 240, 220]),
-        ];
-        let mut last = Ref::none();
-        for (name, shape, p, s, c) in parts {
-            let r = doc.insert(
-                ws,
-                doc::new_part(name, shape, Vec3::from(p), Vec3::from(s), c),
-            );
-            last = if name == "Ball" { r } else { last };
-        }
-        let ramp = doc::new_part(
-            "Ramp",
-            1,
-            Vec3::new(-14.0, 2.0, 0.0),
-            Vec3::new(6.0, 4.0, 8.0),
-            [196, 112, 70],
-        )
-        .with_class("WedgePart");
-        doc.insert(ws, ramp);
-        let model = doc
-            .insert(ws, InstanceBuilder::new("Model").with_name("Statue"));
-        doc.insert(
-            model,
-            InstanceBuilder::new("MeshPart")
-                .with_name("StatueMesh")
-                .with_property("Anchored", true)
-                .with_property("Size", rbx_dom_weak::types::Vector3::new(4.0, 7.0, 4.0))
-                .with_property(
-                    "CFrame",
-                    rbx_dom_weak::types::CFrame::new(
-                        rbx_dom_weak::types::Vector3::new(18.0, 4.5, -14.0),
-                        rbx_dom_weak::types::Matrix3::identity(),
-                    ),
-                )
-                .with_property(
-                    "Color",
-                    rbx_dom_weak::types::Color3uint8::new(170, 140, 210),
-                ),
-        );
-        doc.insert(
-            model,
-            doc::new_part(
-                "Plinth",
-                1,
-                Vec3::new(18.0, 0.5, -14.0),
-                Vec3::new(6.0, 1.0, 6.0),
-                [90, 90, 100],
-            ),
-        );
-        let glass = doc::new_part(
-            "Glass",
-            1,
-            Vec3::new(2.0, 3.0, -12.0),
-            Vec3::new(8.0, 6.0, 0.5),
-            [180, 220, 255],
-        )
-        .with_property("Transparency", 0.5f32);
-        doc.insert(ws, glass);
-        let neon = doc::new_part(
-            "NeonStrip",
-            1,
-            Vec3::new(3.0, 6.25, 6.0),
-            Vec3::new(2.0, 0.5, 2.0),
-            [255, 120, 60],
-        )
-        .with_property("Material", rbx_dom_weak::types::Enum::from_u32(288));
-        doc.insert(ws, neon);
-        let sp = doc.find_child(ws, "Script");
-        if sp.is_none() {
-            let sss = doc
-                .find_child(doc.dom.root_ref(), "ServerScriptService")
-                .unwrap_or(ws);
-            doc.insert(
-                sss,
-                InstanceBuilder::new("Script")
-                    .with_name("Main")
-                    .with_property("Source", "print(\"Hello from rustudio\")\n".to_string()),
-            );
-        }
-        last
-}
+pub use crate::game::build_demo_parts;
 
 /// The whole pixels the 3D view covers in a screenshot of the window: its
 /// rectangle in points scaled by `ppp`, rounded inward, where an edge within
@@ -4116,28 +2879,4 @@ pub fn view_pixels(r: egui::Rect, ppp: f32, size: [usize; 2]) -> (usize, usize, 
     let (x0, y0) = (start(r.min.x, size[0]), start(r.min.y, size[1]));
     let (x1, y1) = (end(r.max.x, size[0]), end(r.max.y, size[1]));
     (x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
-}
-
-/// RUSTUDIO_FRAME_GRID=HZ (tests only): a frame's time snapped to whole
-/// periods of a HZ display, the remainder carried, as a vsynced monitor
-/// hands frames out. Headless runs pace frames with a timer that drifts
-/// against the 240 Hz world clock; the drift changes on which tick a frame
-/// starts (and with it where the Humanoid's 2-tick solves fall) at random
-/// from run to run. Without the variable: `dt` as it is.
-fn frame_grid(dt: f32) -> f32 {
-    use std::sync::{Mutex, OnceLock};
-    static HZ: OnceLock<Option<f32>> = OnceLock::new();
-    static OWED: Mutex<f32> = Mutex::new(0.0);
-    let Some(hz) = *HZ.get_or_init(|| std::env::var("RUSTUDIO_FRAME_GRID").ok().and_then(|v| v.parse::<f32>().ok()).filter(|h| *h > 0.0))
-    else {
-        return dt;
-    };
-    let mut owed = OWED.lock().unwrap();
-    *owed += dt;
-    let n = (*owed * hz).round().max(1.0);
-    // (a frame shorter than a period still gets one: a headless pacer runs
-    // such frames to catch up, a display never does. No more than a quarter
-    // period of that is held against the frames that follow.)
-    *owed = (*owed - n / hz).max(-0.25 / hz);
-    n / hz
 }

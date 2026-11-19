@@ -1,42 +1,123 @@
 //! The system clipboard. egui-winit has no clipboard backend on Android
 //! (its copies stay in a string inside the process), so copies are
-//! mirrored to `ClipboardManager` after each frame and a paste reads it
-//! back first ([`jni::clipboard_set`](super::jni::clipboard_set) /
-//! [`jni::clipboard_get`](super::jni::clipboard_get)).
+//! mirrored to `ClipboardManager` after each frame and pastes take its
+//! text ([`jni::clipboard_set`](super::jni::clipboard_set) /
+//! [`jni::clipboard_get_later`](super::jni::clipboard_get_later)).
+//!
+//! Both go through the Java main thread without the editor's thread
+//! waiting: a copy is sent and forgotten; the clipboard's text is asked
+//! for ahead of the paste ([`refresh`] — when a text field gets the
+//! keyboard, when the window comes back into focus, when the text menu or
+//! bar opens) and kept here ([`text`]) for the frame it is wanted in. The
+//! text the editor copied is kept too, so Paste follows a Copy at once.
+//!
+//! What never reaches the editor: the soft keyboard's own paste key. A
+//! NativeActivity has no `InputConnection`, so the keyboard is in the
+//! framework's fallback mode, where a committed string longer than one
+//! character becomes a `KeyEvent.ACTION_MULTIPLE` whose characters only
+//! the Java object carries — nothing of them reaches native code (that
+//! is also why the keyboard offers no word suggestions here). Hence the
+//! editor's own Paste: the bar above the keyboard (text_bar.rs) and the
+//! text fields' long-press menu (text_menu.rs).
 //!
 //! egui-winit swallows the paste shortcut while its own string is empty
 //! (no `Event::Paste` at all), so the first frame gives it a marker text:
 //! every paste then arrives as `Paste(marker)` and is swapped for the
-//! system clipboard's text here (`before_frame` runs before the text
-//! menu's, text_menu.rs, whose paste comes with its text). The soft
-//! keyboard's own paste key commits text through the IME and needs none
-//! of this. Every read and write is logged (`adb logcat -s rustudio`:
-//! "clipboard: ..."); Android 10+ lets only the focused app read.
+//! system clipboard's text here (`before_frame` runs before the menu's and
+//! the bar's, whose pastes come with their text). Every read and write is
+//! logged (`adb logcat -s rustudio`: "clipboard: ..."); Android 10+ lets
+//! only the focused app read.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use super::jni::ClipboardAnswer;
 
 /// egui-winit's stand-in clipboard text (never shown, never mirrored).
 const SEED: &str = "\u{200b}rustudio-clipboard-seed\u{200b}";
+/// A question the main thread hasn't answered in this long is given up
+/// on (it is busy with a pause or a configuration change) and asked again.
+const GIVE_UP: Duration = Duration::from_secs(2);
 
-/// The last text this app put on the clipboard (not copied back out again).
-static LAST_SET: Mutex<Option<String>> = Mutex::new(None);
+struct Cache {
+    /// The clipboard's text as last read, or as last put there by the
+    /// editor (`None`: none, or not read yet).
+    text: Option<String>,
+    /// The question out to the main thread, and when it was asked.
+    asked: Option<(Instant, ClipboardAnswer)>,
+}
+
+static CACHE: Mutex<Cache> = Mutex::new(Cache { text: None, asked: None });
 static SEEDED: AtomicBool = AtomicBool::new(false);
 
-/// In `App::raw_input_hook`: a paste takes the system clipboard's text when
-/// it has one; the marker alone (nothing ever copied) pastes nothing.
+fn cache() -> std::sync::MutexGuard<'static, Cache> {
+    CACHE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Asks the main thread for the clipboard's text, unless a question is
+/// already out. The answer shows in [`text`] once [`poll`] has taken it
+/// (`before_frame` does, every frame).
+pub fn refresh() {
+    let mut c = cache();
+    if let Some((when, _)) = &c.asked {
+        if when.elapsed() < GIVE_UP {
+            return;
+        }
+    }
+    c.asked = Some((Instant::now(), super::jni::clipboard_get_later()));
+}
+
+/// Takes the last question's answer, once it has come.
+pub fn poll() {
+    let mut c = cache();
+    let Some((_, slot)) = &c.asked else { return };
+    let answer = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match answer {
+        Some(Ok(text)) => {
+            c.asked = None;
+            c.text = text;
+        }
+        Some(Err(e)) => {
+            c.asked = None;
+            log::warn!("clipboard: {e}");
+        }
+        None => {}
+    }
+}
+
+/// The clipboard's text as last known (a read's answer, or the editor's
+/// own last copy), if any.
+pub fn text() -> Option<String> {
+    cache().text.clone()
+}
+
+/// Puts `text` on the system clipboard and remembers it as the
+/// clipboard's text.
+pub fn set(text: String) {
+    if text.is_empty() {
+        return;
+    }
+    if let Err(e) = super::jni::clipboard_set(&text) {
+        log::warn!("clipboard: {e}");
+    }
+    cache().text = Some(text);
+}
+
+/// In `App::raw_input_hook`: takes a read's answer; a paste of
+/// egui-winit's (a hardware keyboard's Ctrl+V) takes the system
+/// clipboard's text when it has one — the marker alone (nothing ever
+/// copied) pastes nothing; the window coming back into focus (the user
+/// may have copied in another app) asks for the text again.
 pub fn before_frame(raw: &mut egui::RawInput) {
+    poll();
+    if raw.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(true))) {
+        refresh();
+    }
     if !raw.events.iter().any(|e| matches!(e, egui::Event::Paste(_))) {
         return;
     }
-    let system = match super::jni::clipboard_get() {
-        Ok(Some(s)) if !s.is_empty() => Some(s),
-        Ok(_) => None,
-        Err(e) => {
-            log::warn!("clipboard: {e}");
-            None
-        }
-    };
+    let system = text();
     raw.events.retain_mut(|e| {
         let egui::Event::Paste(text) = e else { return true };
         match &system {
@@ -47,6 +128,8 @@ pub fn before_frame(raw: &mut egui::RawInput) {
             None => text.as_str() != SEED,
         }
     });
+    // (for the next one: what is there now)
+    refresh();
 }
 
 /// At the end of `App::update`: text egui was asked to copy this frame
@@ -64,11 +147,8 @@ pub fn after_frame(ctx: &egui::Context) {
         })
     });
     let Some(text) = copied else { return };
-    if LAST_SET.lock().unwrap().as_deref() == Some(text.as_str()) {
+    if cache().text.as_deref() == Some(text.as_str()) {
         return;
     }
-    match super::jni::clipboard_set(&text) {
-        Ok(()) => *LAST_SET.lock().unwrap() = Some(text),
-        Err(e) => log::warn!("clipboard: {e}"),
-    }
+    set(text);
 }

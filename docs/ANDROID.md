@@ -2,9 +2,16 @@
 
 The Android app is the same editor as the desktop one — the `rustudio`
 library (src/lib.rs) — inside a `NativeActivity`. What differs is in
-`src/android/` (compiled only for `target_os = "android"`) and in
+`src/android/` (compiled only for `target_os = "android"`), in
 `crates/rustudio-android/` (the `cdylib` the activity loads, with the
-`manifest.yaml` xbuild turns into the AndroidManifest). Targets:
+`manifest.yaml` xbuild turns into the AndroidManifest) and in
+`crates/rustudio-core/src/android_dirs.rs` (the app's folders, which core's
+`paths.rs` and `crash.rs` read; `android::run` sets them). The pieces that
+work on any system with a touch screen or a device's sensors live in the
+workspace's crates like the rest of the engine: `touch_input.rs` and
+`device_sensors.rs` in rustudio-engine (the sensors behind a `Source` the
+Android entry point installs), `touch_gestures.rs` in rustudio-player,
+`quality.rs` and `perf_log.rs` in rustudio-render. Targets:
 `aarch64-linux-android` (arm64-v8a, every phone and tablet) and
 `x86_64-linux-android` (the emulator).
 
@@ -73,25 +80,25 @@ xbuild quirks worth knowing (commit e67b501):
 
 | Concern | Desktop | Android |
 |---|---|---|
-| Entry point | `src/main.rs` → `rustudio::desktop_main()` | `crates/rustudio-android/src/lib.rs`: `rustudio_on_create` (the manifest's `android.app.func_name`) → android-activity's `ANativeActivity_onCreate` + the destroy hook; `android_main` → `rustudio::android::run()` |
+| Entry point | `src/main.rs` → `rustudio::run()` | `crates/rustudio-android/src/lib.rs`: `rustudio_on_create` (the manifest's `android.app.func_name`) → android-activity's `ANativeActivity_onCreate` + the destroy hook; `android_main` → `rustudio::android::run()` |
 | Window / GPU | eframe + winit (Wayland, X11, Windows, macOS) | eframe + winit on `NativeActivity` (`android-native-activity`); wgpu Vulkan, GLES 3 fallback (`wgpu_options` in src/lib.rs) |
 | Lifecycle | — | eframe's wgpu backend drops the window + surface in `suspended()` and recreates them in `resumed()`; a rotation is a resize and reconfigures the swapchain |
-| Folders (`src/paths.rs`) | `~/.local/share`, `~/.config`, `~/.local/state`, `~/.cache`, `~/Pictures` | `getExternalFilesDir()` for data (Studio content, places), `getFilesDir()/config`, `/state`, `getCacheDir()`, `<external>/Pictures` (`src/android/mod.rs`); `HOME` and the `XDG_*` variables are set to the same so `dirs` (rustudio-account) agrees |
+| Folders (`crates/rustudio-core/src/paths.rs`) | `~/.local/share`, `~/.config`, `~/.local/state`, `~/.cache`, `~/Pictures` | `getExternalFilesDir()` for data (Studio content, places), `getFilesDir()/config`, `/state`, `getCacheDir()`, `<external>/Pictures` (`src/android/mod.rs`); `HOME` and the `XDG_*` variables are set to the same so `dirs` (rustudio-account) agrees |
 | `api-dump.json` | next to the executable / app bundle / source tree | APK `assets/`, unpacked to `files/resources/` at first start (`src/android/assets.rs`) |
 | File dialogs | rfd (async, on a worker thread) | rustudio's own picker (`src/android/storage.rs`) over the app folder and, once the storage permission is granted from the picker's own button, shared storage (Download, Documents, …); "Open with rustudio" from file managers through the VIEW intent (`content:` URIs copied in via ContentResolver) |
-| Input | mouse + keyboard | fingers through `src/touch_input.rs` (below); hardware mice / keyboards work as on a desktop |
+| Input | mouse + keyboard | fingers through `crates/rustudio-engine/src/touch_input.rs` (below); hardware mice / keyboards work as on a desktop |
 | Clipboard | egui-winit (arboard) | egui's copies mirrored to `ClipboardManager` after each frame, pastes read from it (`src/android/clipboard.rs`) |
 | Browser links (`platform::open_url`) | `ctx.open_url` (webbrowser) | `ACTION_VIEW` Intent from the activity (`jni::open_url`); eframe's `links` feature isn't built for Android |
 | System bars | — | hidden (immersive mode): the navigation bar — Back / Home / Recents or the gesture pill, the right edge in landscape — and the status bar; a swipe from the edge shows them for a moment, translucent over the editor, and they go again by themselves (`src/android/system_bars.rs`: API 30+ `WindowInsetsController.hide(systemBars)` with transient-by-swipe, before that the sticky immersive view flags; asked at start and again on focus regained / keyboard down, on the Java main thread). `RUSTUDIO_SYSTEM_BARS=1` keeps them. The camera hole's side stays letterboxed in landscape (the cutout mode isn't changed: the chrome doesn't pad by the cutout inset yet) |
 | Back button | — | closes what is open on top (Escape); in Play opens / closes the Roblox menu (Escape's job, as Back does in Roblox's app); otherwise `moveTaskToBack` — the activity isn't destroyed (`src/android/lifecycle.rs`) |
-| Roblox menu and chat in Play | Esc and `/` | the top bar over the game view (the CoreScripts' TopBar layout, drawn on every platform: `play_game.rs` `top_bar`): the Roblox button opens / closes the menu, the unibar's chat button opens the chat with its box focused — the keyboard comes up for it. `SetCore("TopbarEnabled", false)` hides the bar |
+| Roblox menu and chat in Play | Esc and `/` | the top bar over the game view (the CoreScripts' TopBar layout, drawn on every platform: `play_game.rs` `top_bar`) from Roblox's own TopBar textures (`content/textures/ui/TopBar/`: `iconBase.png` button plate, `coloredlogo.png` Roblox button, `chatOn.png` / `chatOff.png`, `close.png` while the menu is open; `@2x` / `@3x` at a phone's density; hand-drawn shapes only until the content is installed): the Roblox button opens / closes the menu, the unibar's chat button opens the chat with its box focused — the keyboard comes up for it. `SetCore("TopbarEnabled", false)` hides the bar |
 | Activity destroyed | — | `onDestroy` hook: close request, then `process::exit(0)`; `android_main` always leaves the process when the loop ends (`lifecycle.rs`): status 0 for a close, 2 for an eframe error, 101 for a panic (named in logcat with its crash report) |
 | "Open with rustudio" while it runs | Finder's hand-over (`macos::take_opened`) | a second instance of the activity per VIEW intent (`launchMode` `standard`), caught at the library's entry point: its file is copied in and queued for the editor's next frame, the editor's task comes to the front, the new activity finishes unseen (`src/android/intent.rs`). A place the last start died within 20 s of opening by itself isn't opened again by itself (`state/opening`, `storage.rs`) |
 | UI zoom | 1.0 of the display's scale | first run: the zoom that fits ~1100 points across (0.8 … 1.6 of the density), then View > Zoom In / Out as saved |
 | GPU driver | the system's | the device's Vulkan driver, or on Snapdragon phones the Turnip (Mesa) driver shipped in the APK, swapped in before wgpu starts (`src/android/turnip.rs`; "Turnip driver" below); OpenGL ES as the fallback either way |
 | Graphics quality | level 10 (Studio's defaults) | Automatic from level 3: the 3D view at 0.7 scale (0.5 while the camera moves, scaled up by EASU + RCAS) with 512² textures, 900 studs of view distance, the lite shader, no anisotropic filtering, no MSAA, one shadow cascade, no frame-rate cap (View > Graphics Settings, the 1–10 bar; "Graphics quality" below); saved with the layout |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
-| Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root). Same `src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`) |
+| Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root). Same `crates/rustudio-core/src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`) |
 | Studio content download | ureq + rustls (ring) | the same; started only when ConnectivityManager reports a validated network |
 | Login keyring | `keyring` 4 (Secret Service / Keychain / Credential Manager) | `keyring-core` + `android-native-keyring-store` (SharedPreferences + Android Keystore) behind the same `Entry` API (`crates/rustudio-account/src/store.rs`) |
 | TLS roots (`rustudio-account` MessagingService socket) | OS store (`rustls-native-certs`) | Mozilla's (`webpki-roots`, enabled alongside): Android's CA store isn't in a form `rustls-native-certs` reads; `ureq` already used `webpki-roots` |
@@ -109,7 +116,7 @@ Gated with `#[cfg(not(target_os = "android"))]` (would not compile):
 | `rfd` (Cargo.toml) and the rfd code in `src/file_dialog.rs` | rfd 0.15 has no Android backend | `file_dialog::Request` + `android::storage::Picker` |
 | the rfd dialogs plugins open (`src/plugin_host/prompts.rs`: PromptImportFile, ImportFbxRig, PromptSaveSelection, ExportPlace / ExportSelection; 0.2.0) | as above | the same `Request`, drawn as the in-app picker by `prompts::ui` each frame (one file per prompt; the harness's `plugin-prompt:` answers work unchanged) |
 | the `xdg-open` / `open` / `cmd start` spawns in `src/toolbox/ui.rs::open_url` and `src/plugin_store/ui.rs::open_plugins_folder` (0.2.0) | no such programs in an app sandbox | an ACTION_VIEW Intent (`android::jni::open_url`); the Plugins folder's path is reported in the Plugins panel instead of opened |
-| `libc::getloadavg` in `src/platform.rs::load_average` | Bionic has it only from API 29; the symbol is absent from the libc crate's Android bindings | returns "?" |
+| `libc::getloadavg` in `crates/rustudio-core/src/platform.rs::load_average` | Bionic has it only from API 29; the symbol is absent from the libc crate's Android bindings | returns "?" |
 | `eframe` features `wayland`, `x11` | desktop window systems | `android-native-activity` (target-specific dependency tables in Cargo.toml) |
 
 Desktop-only by behaviour (compile fine, never active on Android, left
@@ -117,9 +124,9 @@ ungated so the shared code paths stay one):
 
 - `src/hypr.rs` (Hyprland IPC through `hyprctl`), `src/layout_store.rs`
   window geometry — no `HYPRLAND_INSTANCE_SIGNATURE`, nothing happens.
-- `src/mouse_lock.rs` — pointer lock / confine logic over egui types; no
+- `crates/rustudio-engine/src/mouse_lock.rs` — pointer lock / confine logic over egui types; no
   pointer on a touch screen, so the Default/LockCenter paths are no-ops.
-- `src/play.rs` gamepad scan of `/dev/input/by-id` — the folder isn't
+- `crates/rustudio-player/src/play.rs` gamepad scan of `/dev/input/by-id` — the folder isn't
   readable in an app sandbox; gamepads will come through winit / `AInputEvent`
   in a later step.
 - `src/app.rs` and `src/selftest/fidelity.rs` self-relaunch with
@@ -134,7 +141,7 @@ ungated so the shared code paths stay one):
   `keyring` shim module over `keyring-core` with
   `android-native-keyring-store` as the default store, so `session.rs` and
   `store.rs` compile unchanged.
-- `src/domains/media_video.rs` `dlopen` of libvpx / libopus — Android has
+- `crates/rustudio-engine/src/domains/media_video.rs` `dlopen` of libvpx / libopus — Android has
   no system copies; the loaders fail gracefully (no video decoding).
 
 ## Audit: Roblox services on a device
@@ -158,7 +165,7 @@ provides or still has to.
 | `Player:GetMouse()`, `Mouse` while playing | desktop pointer | **to do**: the first touch stands in (as Roblox does) |
 | `VRService`, gamepads | stubs | unchanged |
 
-## Fingers (`src/touch_input.rs`)
+## Fingers (`crates/rustudio-engine/src/touch_input.rs`)
 
 egui-winit makes the first finger the mouse pointer with the left button
 down, which is wrong for most of the editor: a finger laid on an Explorer
@@ -183,7 +190,7 @@ A lift leaves the pointer where it was for the rest of its frame: the
 `PointerGone` goes to egui at the start of the next one. egui clears
 `latest_pos` — what `Response::hover_pos` reads — at a `PointerGone` in
 the frame it comes, and the GUI input shared by the game's ScreenGuis in
-Play, the plugin widgets and plugins' CoreGui (`src/gui_input.rs`
+Play, the plugin widgets and plugins' CoreGui (`crates/rustudio-engine/src/gui_input.rs`
 `input`) takes a press or a release only where the pointer hovers, so a
 tap whose press, release and `PointerGone` came in one frame was no click
 on any GuiButton: nothing in a plugin widget answered a tap, nor TopbarPlus
@@ -227,7 +234,7 @@ fingers that land on the view go to the game raw:
    End / Cancel with its position); Play ending or the window losing
    focus cancels them all.
 2. `viewport.rs` hands the frame's `GameTouch`es to `Gui::touch_input`
-   (`src/gui_input.rs`): hit-tests each against the game's ScreenGuis,
+   (`crates/rustudio-engine/src/gui_input.rs`): hit-tests each against the game's ScreenGuis,
    fires the GuiObjects' `MouseEnter / Moved / Leave`, `InputBegan /
    Changed / Ended` (a `GuiArg::Touch` → the finger's InputObject),
    `MouseButton1Down / Up / Click`, `Activated` (Active buttons only; an
@@ -238,13 +245,13 @@ fingers that land on the view go to the game raw:
    `began_on` (the GuiButtons under its landing point). With the game
    menu open every finger is `sunk`.
 3. `play_game.rs game_viewport` runs the gestures over them
-   (`src/touch_gestures.rs`: tap, tap in world, long press, pan, pinch,
+   (`crates/rustudio-player/src/touch_gestures.rs`: tap, tap in world, long press, pan, pinch,
    rotate, swipe; `mech::TOUCH_*`), makes an unprocessed tap in the world
    the game's click (the Mouse's `Button1Down / Up`, ClickDetectors,
    tools) and the latest finger the game's `Pointer` while no mouse is
    there.
 4. `play.rs` dispatches each `TouchOut` to `__rs_touch_event` and each
-   gesture to `__rs_touch_gesture` (`src/library.luau`) after the GUI's
+   gesture to `__rs_touch_gesture` (`crates/rustudio-engine/src/library.luau`) after the GUI's
    events: `domains/gui_input.luau` "Fingers" assigns the finger to the
    input actions whose bindings use it (`UIButton`: landed on it;
    `TouchPosition / TouchDelta / TouchPinch`, gated by `UIModifier` when
@@ -256,13 +263,22 @@ fingers that land on the view go to the game raw:
    the ContextActionService bindings and fires UserInputService's events
    (`gameProcessedEvent` when the GUI or a bound action took it).
 
-`device_prop` (`src/runtime_ext.rs`) answers `TouchEnabled`,
+`device_prop` (`crates/rustudio-engine/src/runtime_ext.rs`) answers `TouchEnabled`,
 `TouchScreenEnabled`, `PreferredInput = Touch`, `MouseEnabled =
 KeyboardEnabled = false` on a touch screen and `AccelerometerEnabled /
-GyroscopeEnabled` from the device's sensors (`src/device_sensors.rs` over
+GyroscopeEnabled` from the device's sensors (`crates/rustudio-engine/src/device_sensors.rs` over
 `src/android/sensors.rs`: `GetDeviceAcceleration / Gravity / Rotation`
 and the `Device*Changed` events, in g and as a CFrame, the sensors on
-from the first script that asks). `RUSTUDIO_TOUCH=0` (the
+from the first script that asks). `UserInputService:GetLastInputType()`
+answers `Touch` on a touch screen before any finger has landed (Roblox's
+first answer is the device's own kind; `library.luau` `last_input`,
+Keyboard on a desktop): the PlayerModule's ControlModule reads it once
+as it starts to pick its controls, so the thumbstick and `TouchGui`'s
+`JumpButton` exist from the first spawn — games build their own touch
+buttons next to that JumpButton when the server's join-time settings
+arrive (LBG's `SetSettings`: with Keyboard as the first answer the
+JumpButton only appeared at the first touch, and the game's Dash / M1 /
+Block buttons only with the next spawn's re-send). `RUSTUDIO_TOUCH=0` (the
 `debug.rustudio.env` property) puts the editor's stick and jump back
 (the keyboard-and-mouse reading of fingers) on a device; `=1` turns the
 game's touch on on a desktop with a touch screen.
@@ -292,13 +308,18 @@ half the height and the menu, toolbars and status bar most of the rest,
 so the 3D view above them was a strip a few lines tall with the game's
 GUI squeezed into it and the box typed into off it, under the status
 bar. Instead the keyboard lies over the window, as it does over a
-phone's games, and `Editor::keyboard_pan` (src/viewport.rs) slides the
-3D view, its GUIs with it, up by what shows the box above the keyboard's
-top edge (as Android pans a window to its focused field: never past the
-box's own top edge leaving the view, never further than the keyboard
-covers the view), back when the keyboard goes. What slides above the
-view's panel is clipped; the fingers that land there are the toolbar's
-(`Zones::viewport` is the visible part). The game's scripts see the
+phone's games — and then **nothing** is moved for it: the bottom
+safe-area inset stays zero as well (`Keyboard::over`), because egui lays
+its panels and top-level `Ui`s inside the safe area (`content_rect`), and
+an inset given while the panels were left alone had the status bar float
+up to the keyboard's top edge on its own, over the view. Only
+`Editor::keyboard_pan` (src/viewport.rs, the studio crate) moves: it slides the 3D view,
+its GUIs with it, up by what shows the box above the keyboard (and the
+text bar on it, below) — as Android pans a window to its focused field:
+never past the box's own top edge leaving the view, never further than
+the keyboard covers the view — and back when the keyboard goes. What
+slides above the view's panel is clipped; the fingers that land there are
+the toolbar's (`Zones::viewport` is the visible part). The game's scripts see the
 keyboard where Roblox's client reports it: `UserInputService.
 OnScreenKeyboardVisible / OnScreenKeyboardPosition / OnScreenKeyboardSize`
 in the game's coordinates (`touch_input::set_soft_keyboard`, read by
@@ -339,15 +360,45 @@ and a tap on the field starts it again. A zero with nothing focused takes
 the room away at once.
 
 The soft keyboard has no Ctrl, egui's text fields have no menu of their
-own and egui-winit has no clipboard on Android, so a long press on a text
-field opens `src/android/text_menu.rs`: Cut, Copy, Paste (the system
-clipboard's text, `jni::clipboard_get`) and Select all, fed to egui as
-the events the shortcuts would be (`Event::Cut` / `Copy` / `Paste` /
-Ctrl+A) through `raw_input_hook` on the next frame; the copies reach
-`ClipboardManager` through `src/android/clipboard.rs`. The menu keeps the
-field's focus for its tap (egui's rule is a click outside takes it) and
-puts back the selection egui's right click collapsed. Objects are cut,
+own, egui-winit has no clipboard on Android, and the keyboard's own paste
+key never reaches a NativeActivity (its text arrives as key events, which
+winit drops — the clipboard isn't involved). So while the keyboard is up
+for anything, a **text bar** stands in a band right above it
+(`src/android/text_bar.rs`, `HEIGHT` points; part of the room keyboard.rs
+makes, or of what the view slides up for a game's TextBox): Cut, Copy,
+Paste and Select all for an egui field, Paste and Copy for a Roblox
+TextBox (a game's in Play, a plugin widget's), fed to egui as the events
+the shortcuts would be (`Event::Cut` / `Copy` / `Paste(text)` / Ctrl+A)
+through `raw_input_hook` on the next frame. egui's `TextEdit` answers
+them; a TextBox gets them in `Gui::keyboard` (crates/rustudio-engine/src/gui_input.rs): Paste
+types the clipboard's text in (a single-line box gets line breaks as
+spaces), Copy copies the box's text. The `Editor::shortcuts` Copy / Cut /
+Paste actions (objects, in the Explorer) stand back while a TextBox has
+the focus, as they do for an egui field. A long press on an egui text
+field still opens the same entries as a menu (`src/android/text_menu.rs`,
+which keeps the field's focus for its tap — egui's rule is a click
+outside takes it — and puts back the selection egui's right click
+collapsed), and the bar keeps the focus the same way. Objects are cut,
 copied and pasted from the Explorer's long-press menu as before.
+
+The clipboard itself is `src/android/clipboard.rs` over
+`ClipboardManager`, on the Java main thread both ways (the manager wants
+a Looper thread, and from Android 10 it answers the app of the focused
+window only — a read from elsewhere, or while the window isn't focused,
+comes back empty, not as an error). Writes are fire-and-forget
+(`jni::clipboard_set`; egui's copies are taken out of the platform output
+at the end of the frame). Reads never make the editor's thread wait: the
+text is asked for ahead of time (`clipboard::refresh`, when the text bar
+comes up or the long-press menu opens — the Java thread may itself be
+waiting on the editor's around a pause or a configuration change, which
+is what a blocking read ran into) and the last answer is kept
+(`clipboard::text`); the editor's own copies seed it, so a paste right
+after a copy works even where the system refuses the read. Each step logs
+a `clipboard:` line (`N chars put on the system clipboard`, `N chars read
+from …`, `the system clipboard has no text (or this window lacks the
+focus)`, `put failed: …` / `read failed: …`), the text bar logs
+`text bar: …`, and `adb shell dumpsys clipboard` shows whether a primary
+clip exists at all.
 
 The layer is **off on the Start Page** (`Touch::set_enabled` from
 `raw_input_hook`, while `start_page_ui` would draw): that page is plain
@@ -365,7 +416,7 @@ CameraModule follows the character and whose ControlModule moves it all
 come from Studio's own content, which rustudio has none of in the APK: at
 its first start the editor downloads it from Roblox's CDN (about 60 MB
 compressed, 13 packages plus a hundred or so retired textures fetched one
-by one; `src/studio_content.rs`) into the app's files folder
+by one; `crates/rustudio-core/src/studio_content.rs`) into the app's files folder
 (`…/files/rustudio/studio`). That takes a few minutes on a phone. Until
 it is there, Play spawns rustudio's stand-in character — plain blocks, no
 face, no animation — and no camera or movement script follows it; Output
@@ -386,7 +437,7 @@ Every few seconds the editor logs a line like
 perf: 136 frames in 5.0 s: 36.9 ms apart (p95 72.3, worst 89), 120 back to back 33.4 ms apart = 6.4 ms CPU + 27.0 ms GPU/display wait, 16 after a pause; editor 5.2 ms + egui 1.2 ms on the CPU; 3D GPU 9.8 ms per drawn frame = shadows 3.1 + probe 0.0 + scene 4.2 + see-through 0.0 + ssao 1.1 + bloom/dof 0.4 + post 1.0 (68 measured); window 1550x720 px at 1.40 px/pt, 3D view 816x310 px (scale 0.70, AO off, shadow maps x0.50), 3D frames drawn 68 / shown again 68; sections (ms/frame): dock_panels 4.3, viewport 3.4, vp_render 3.0, vpr_scene 1.1, vpr_submit 0.8, vpr_cull 0.6; frames asked by: app.rs:2531 x120, viewport.rs:2113 x16
 ```
 
-(`src/perf_log.rs`; `adb logcat -s rustudio`, or `RUSTUDIO_PERF_LOG=1` on
+(`crates/rustudio-render/src/perf_log.rs`; `adb logcat -s rustudio`, or `RUSTUDIO_PERF_LOG=1` on
 a desktop). eframe draws a frame when the frame before asked for one
 (`request_repaint`) or input arrives, so the frames split in two: the
 "back to back" ones, asked for at once by the frame before
@@ -507,7 +558,7 @@ figures against the steps: a step that drops "scene" names the cost; a
 but a wait the timestamps straddle (the display's pacing, the driver's),
 and the "no 3D frame" step's interval is the editor's own.
 
-### Graphics quality (`src/quality.rs`, `src/graphics_settings.rs`)
+### Graphics quality (`crates/rustudio-render/src/quality.rs`, `src/graphics_settings.rs`)
 
 The 3D view's per-frame fixed costs on the device — the 4× MSAA
 Rgba16Float scene and its resolve, a full-resolution Rgba16Float copy of
@@ -519,7 +570,7 @@ cloud layer — were paid whatever the scene held: an empty baseplate took
 part in the frustum drawn however far and small, every material at 1024²
 — grew with the place. View > Graphics Settings has Studio's bar, a level
 from 1 (fastest) to 10 (Studio's defaults; the tables are `QUALITY_*` in
-`src/mech.rs`), or Automatic, and each setting apart from the level
+`crates/rustudio-core/src/mech.rs`), or Automatic, and each setting apart from the level
 ("Auto" follows it); View > Graphics Quality has the same levels as a
 menu. A phone starts in Automatic at level 3, a computer at 10
 (`Graphics::platform_default`); the choices are kept in the saved layout
@@ -672,7 +723,7 @@ What the renderer does with the settings (`render.rs`):
   count — always Rgba16Float, since the "covered" marker is its alpha and
   the 32-bit scene format of levels 1–4 has none — and without MSAA the
   encode reads the scene texture itself. 0.2.0's ViewportFrame targets
-  (`src/vf_render.rs`) and highlight masks (`src/highlight.rs`) follow
+  (`crates/rustudio-render/src/vf_render.rs`) and highlight masks (`crates/rustudio-render/src/highlight.rs`) follow
   the level's sample count and format the same way (no multisampled
   texture and no resolve at 1 sample).
 - **Pipelines compiled when first needed** (`Pipes`, `Renderer::pipe`),
@@ -700,7 +751,7 @@ is what the next run has to show (it is an illustration until then).
 
 What the port does about it:
 
-- **Three swapchain images** (`lib::frame_latency`; `RUSTUDIO_FRAME_LATENCY`
+- **Three swapchain images** (`offscreen::frame_latency`, crates/rustudio-player; `RUSTUDIO_FRAME_LATENCY`
   1 to 3 overrides): egui's low-latency default asks for one frame of
   latency, two images. Android's compositor keeps the image on screen
   until it has latched the next one, so with two images every frame first
@@ -820,12 +871,12 @@ the script; `android.yml`'s `TURNIP_ZIP_URL` / `ADRENOTOOLS_ZIP_URL` /
 `PANVK_SO_URL` and the manual run's `turnip_zip` / `adrenotools_zip` /
 `panvk_so` inputs name the same three):
 
-- libadrenotools: <https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44085827920/libadrenotools-arm64-v8a.zip>
+- libadrenotools: <https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44383713561/libadrenotools-arm64-v8a.zip>
   (`libadrenotools.so`, `libhook_impl.so`, `libmain_hook.so`,
   `libfile_redirect_hook.so`, `libgsl_alloc_hook.so`, `libshadowhook.so`,
   `libshadowhook_nothing.so`, `libbytehook.so`) — the fork's CI build of
-  commit 4d4d482 (2026-11-17 12:42, "driver: fix initial", the
-  `driver.cpp` rewrite), which looks for the system's Vulkan loader
+  commit ca1ad33 (2026-11-18 19:46, workflow run 44383713561). It has
+  the `driver.cpp` rewrite of 4d4d482 (2026-11-17), which looks for the system's Vulkan loader
   under the vendor paths too (`/system/lib64`, `/system/vendor/lib64`,
   `/vendor/lib64`, `/odm/lib64`, `/product/lib64`, `/system_ext/lib64`:
   what HyperOS devices need), lets its own initialisation be switched
@@ -845,7 +896,25 @@ the script; `android.yml`'s `TURNIP_ZIP_URL` / `ADRENOTOOLS_ZIP_URL` /
   (`ADRENOTOOLS_FORCE_DRIVER=turnip|panvk`, `ADRENOTOOLS_DRIVER_DIR`,
   `ADRENOTOOLS_DRIVER_NAME`, `ADRENOTOOLS_HOOK_DIR`,
   `ADRENOTOOLS_HOOK_SYSTEM`) only matter when its own initialisation
-  runs, which here it doesn't. GitHub keeps workflow artifacts for 90
+  runs, which here it doesn't. On top of that, the fork's fixes of
+  2026-11-18 (commits 95ddbd5, 3360339) for whole-device reboots with
+  Turnip — a freeze, the sound stuttering, a green screen, a restart:
+  the GSL free hook zeroed `gpuaddr` before `IOCTL_KGSL_GPUMEM_GET_INFO`
+  and then sent `IOCTL_KGSL_GPUOBJ_FREE` a garbage id, freeing a GPU
+  object still in use (a GPU fault in the kernel, a KGSL panic, a
+  reboot); the `adrenotools_set_turbo(false)` its init did on every
+  start, a `KGSL_PROP_PWRCTRL` ioctl that some Adreno kernels crash on,
+  is gone (turbo is only on request now, `RUSTUDIO_GPU_TURBO` below);
+  the GSL alloc / free hooks and the pending GPU mapping are under a
+  mutex (Vulkan calls them from several threads); handle leaks and an
+  unaligned `MAP_FIXED` are fixed. `libadrenotools.so` and
+  `libhook_impl.so` of this build carry a Rust layer (cxx) for the
+  pending-mapping bookkeeping, the Mali mailbox and the dispatch state,
+  and come with Rust std's debug info — 8 MB each; the script strips
+  that with `llvm-strip --strip-debug` when it finds one (PATH or the
+  NDK named by `ANDROID_NDK_HOME`; the workflow's `llvm` package), to
+  3.4 MB each — the symbol tables stay, so crash logs still name
+  functions; `STRIP=0` keeps it. GitHub keeps workflow artifacts for 90
   days; after that, point `ADRENOTOOLS_ZIP` at a release of the fork
   (V0.7,
   <https://github.com/TouseefX/libadrenotools-native/releases/download/V0.7/libadrenotools-arm64-v8a.zip>,
@@ -944,7 +1013,7 @@ the launch screen is up — `turnip::activate()`:
    (TM) 650 — turnip Mesa driver Mesa 26.3.0-lto (Vulkan 1.3.363)`),
    then destroys it. `turnip: ACTIVE — …` follows when it is Turnip.
 
-Then `wgpu_options` (src/lib.rs) asks `turnip::wgpu_setup()` for the
+Then `wgpu_setup` (src/lib.rs, through `offscreen::wgpu_options_with`) asks `turnip::wgpu_setup()` for the
 renderer's objects: ash's `Entry::from_static_fn` on that
 `vkGetInstanceProcAddr`, a `VkInstance` made exactly as wgpu-hal's own
 `Instance::init` makes one (its `desired_extensions`, application info,
@@ -993,7 +1062,11 @@ file `files/turnip/off`; takes effect at the next start). From adb:
 choice and the failed-start marker, `=force` also skips the device checks
 (for a Snapdragon the properties don't name). `RUSTUDIO_GPU_TURBO=1`
 asks libadrenotools for the GPU's top clocks (`adrenotools_set_turbo`, a
-KGSL property; thermal limits still apply; works with either driver).
+KGSL property; thermal limits still apply; works with either driver) —
+with care: the `KGSL_PROP_PWRCTRL` ioctl behind it crashes some Adreno
+kernels (the fork stopped sending it at init for that reason: a crash
+there takes the whole device down), so leave it off on a device that
+has rebooted with Turnip.
 
 *Turnip's own switches* (Mesa's `TU_DEBUG` options) are under the same
 heading while Turnip is active, for when something draws wrong with it —
@@ -1174,7 +1247,7 @@ signal, an abort's message — `memory allocation of N bytes failed` for
 one out of memory — and every thread's stack) and `adb shell dumpsys
 activity exit-info dev.rustudio.studio` (the reason and the memory at the
 end: `reason=2 (SIGNALED) status=6` is SIGABRT, `status=11` SIGSEGV,
-`reason=3 (LOW_MEMORY)` the system's killer). `src/crash.rs` no longer
+`reason=3 (LOW_MEMORY)` the system's killer). `crates/rustudio-core/src/crash.rs` no longer
 captures a backtrace in the fatal-signal handler on Android: it writes
 the note and hands the signal to debuggerd at once. The backtrace ran
 under a 5 s alarm and, in a process at several GB, the alarm won — the
@@ -1237,13 +1310,40 @@ also echoed to logcat at the next start.
   set, and `keyring::Entry::new` failed on Android so the session check
   errored before the code showed. `platform::open_url` and the keyring
   shim.
+- **Browser sign-in lost when the editor came back.** The code page took
+  the screen, and while it was in front the system stopped the editor's
+  process (a place open is 1–2 GB; `dumpsys activity exit-info` showed
+  it force-stopped by the system's own app manager and by memory
+  pressure) — the polling job that would have traded the confirmed code
+  for a session lived in that process, and the restart came up signed
+  out with nothing to go on with. Two changes. The pending code is kept
+  on disk (`QuickLogin::remember`: `quick-login.json` next to
+  `account.toml`, in the app's private files, readable by this user
+  only, removed when the sign-in ends either way) and the next start
+  takes it up before the usual session check (`AccountUi::restore` →
+  `QuickLogin::pending`, within ten minutes of the start of the
+  sign-in: it polls the same code, so a confirmation given while the
+  editor was gone signs it in, an expired one says so, and the account
+  panel opens by itself to show which; logcat: `taking up code … again
+  after a restart`). And the page opens as a **Custom Tab** in the
+  editor's own task (`jni::open_url`: the `EXTRA_SESSION` extra with no
+  binder, no support library needed; a browser without Custom Tabs
+  shows the page as usual, and no `FLAG_ACTIVITY_NEW_TASK`, which would
+  put the tab in a task of its own), with the default browser's cookies —
+  the roblox.com sign-in Quick Sign-in needs — and Back or the tab's close
+  button landing straight on the editor instead of on the browser's
+  own task. The cookie field no longer takes the focus (and brings the
+  soft keyboard up over the code) while a browser sign-in is showing it.
+  (What would truly keep the process alive, a foreground service, needs
+  a Java service class and a `<service>` element, neither of which an
+  xbuild manifest can carry.)
 - **Opening a file asked for All-files access.** NativeActivity gets no
   `onActivityResult`, so the system document picker can't hand a choice
   back; the in-app picker lists the app's own folder without any
   permission and offers a button for shared storage (All files access on
   API 30+, the runtime permission below). "Open with rustudio" from a
   Files app needs nothing.
-- **Panels didn't scroll, no camera on touch.** `src/touch_input.rs`.
+- **Panels didn't scroll, no camera on touch.** `crates/rustudio-engine/src/touch_input.rs`.
 - **Start Page lists wouldn't scroll / taps misfired.** The finger layer
   ran there too, with no viewport to publish its zones, over a page that
   is plain egui; it is off until a place opens (see "Fingers").
@@ -1384,25 +1484,27 @@ also echoed to logcat at the next start.
   and `StarterPlayer.PlayerModule` only with the flag Enabled (LBG,
   Default, with its own fork of `PlayerModule` in StarterPlayerScripts:
   the fork kept, the engine's `PlayerScriptsLoader` added;
-  `src/default_scripts.rs`, docs/ENGINE-GAPS.md "A new place got the
+  `crates/rustudio-core/src/default_scripts.rs`, docs/ENGINE-GAPS.md "A new place got the
   Input Action System PlayerScripts"); (2) no menu or chat button over the game was upstream's state
   on every platform (Esc and `/` only) — the top bar above; (3) the
   shop rows and player list running off their frames were
   `UIListLayout.Wraps` (90 of the place's 250 lists), ignored upstream —
-  `src/gui_walk.rs list_lines`; the glows behind its frames are
-  `UIShadow` (138), now drawn (`src/gui_fx.rs shadow`).
+  `crates/rustudio-engine/src/gui_walk.rs list_lines`; the glows behind its frames are
+  `UIShadow` (138), now drawn (`crates/rustudio-engine/src/gui_fx.rs shadow`).
 
 ## Later steps (in order)
 
 1. ~~Touch for the game~~ ("Fingers in Play"). Left: GuiObject's own
    `TouchLongPress / Pan / Pinch / Rotate / Swipe`, `TouchDrag`.
 2. ~~Device properties and sensors~~ (`device_prop()`,
-   `src/device_sensors.rs`).
+   `crates/rustudio-engine/src/device_sensors.rs`).
 3. Haptics (`HapticService`, `HapticEffect`) through `jni::vibrate*`.
 4. ~~Soft keyboard for a game's TextBoxes~~ (`OnScreenKeyboardVisible /
    Position / Size`, `ReturnPressedFromOnScreenKeyboard`, the view
    sliding up to the box: "Text: the soft keyboard"). Left: insets
-   (`GuiService.TopbarInset`, `ScreenInsets`), orientation.
+   (`GuiService.TopbarInset`, `ScreenInsets`), orientation; a selection
+   in a game's TextBox (the text bar's Copy takes the whole text, its
+   Cut and Select all are for egui fields).
 5. `ContextActionService` touch buttons (`createTouchButton`).
 6. The display cutout: the window under the camera hole
    (`layoutInDisplayCutoutMode` shortEdges) once the chrome pads itself

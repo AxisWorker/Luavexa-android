@@ -104,7 +104,7 @@ fn device_line() -> String {
 pub fn tick(doing: &str) {
     let now = Instant::now();
     if super::lifecycle::take_low_memory() {
-        crate::heap::trim();
+        rustudio_core::heap::trim();
         log::warn!(
             "memory: the system is low on memory at {} MB resident{}{}",
             resident_mb().unwrap_or(0),

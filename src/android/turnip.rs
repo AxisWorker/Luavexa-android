@@ -21,7 +21,7 @@
 //! adapter, device and queue on that loader — ash's `Entry::from_static_fn`
 //! on its `vkGetInstanceProcAddr`, the instance exactly as wgpu-hal's own
 //! `Instance::init` makes one, `wgpu_hal::vulkan::Instance::from_raw`,
-//! `wgpu::Instance::from_hal` — and `wgpu_options` hands them to eframe as
+//! `wgpu::Instance::from_hal` — and `wgpu_options` (crates/rustudio-player/src/offscreen.rs, finished by lib.rs `wgpu_setup`) hands them to eframe as
 //! `egui_wgpu::WgpuSetup::Existing`. wgpu itself is unchanged.
 //!
 //! Why not the fork's patch of the system loader. Left to itself the fork
@@ -94,7 +94,8 @@
 //! offers "Try again"). `RUSTUDIO_TURNIP=1` overrides the window's choice
 //! and the marker; `RUSTUDIO_TURNIP=force` also skips the device checks
 //! (the GPU, model, HyperOS and Android version ones). `RUSTUDIO_GPU_TURBO=1` asks libadrenotools for the GPU's top
-//! clocks (`adrenotools_set_turbo`; thermal limits still apply);
+//! clocks (`adrenotools_set_turbo`; thermal limits still apply; an ioctl
+//! some Adreno kernels crash on, so not for a device that has rebooted);
 //! Turnip's own switches (`TU_DEBUG`): Graphics Settings > GPU driver
 //! lists the useful ones ([`SWITCHES`]: LRZ, binning, tiled rendering,
 //! …) and keeps them in `files/turnip/debug`, which the driver watches
@@ -1098,7 +1099,12 @@ fn try_activate() -> Result<Status, Status> {
     }
 
     // The GPU's top clocks, on request (a KGSL property; thermal limits
-    // still apply). Independent of which driver is in use.
+    // still apply). Independent of which driver is in use. Never on by
+    // itself: the KGSL_PROP_PWRCTRL ioctl behind it crashes some Adreno
+    // kernels — a reboot of the whole device — which is why
+    // libadrenotools-native stopped sending it at init (its 2026-11-18
+    // reboot fixes); the build pinned in tools/android/fetch-turnip.sh
+    // has that.
     if std::env::var("RUSTUDIO_GPU_TURBO").map_or(false, |v| v.trim() == "1") {
         type SetTurbo = unsafe extern "C" fn(bool);
         match unsafe { symbol::<SetTurbo>(handle, c"adrenotools_set_turbo") } {
