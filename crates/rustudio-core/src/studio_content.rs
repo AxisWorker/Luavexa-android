@@ -151,14 +151,19 @@ fn agent() -> ureq::Agent {
     // while in the background) must fail within the minute so the next
     // try can go on where this one stopped, not sit on a socket for as
     // long as the kernel retransmits.
-    ureq::Agent::config_builder()
-        .timeout_resolve(Some(Duration::from_secs(20)))
-        .timeout_connect(Some(Duration::from_secs(20)))
-        .timeout_recv_response(Some(Duration::from_secs(60)))
-        .timeout_per_read(Some(Duration::from_secs(60)))
-        .user_agent(concat!("rustudio/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into()
+    // One agent (connection pool) for the whole install.
+    static AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(|| {
+        let config = ureq::Agent::config_builder()
+            .timeout_resolve(Some(Duration::from_secs(15)))
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_recv_response(Some(Duration::from_secs(60)))
+            .timeout_per_read(Some(Duration::from_secs(60)))
+            .max_idle_connections_per_host(4)
+            .user_agent(concat!("rustudio/", env!("CARGO_PKG_VERSION")))
+            .build();
+        rustudio_account::http::agent(config)
+    });
+    AGENT.clone()
 }
 
 fn get(agent: &ureq::Agent, url: &str, range: Option<(u64, u64)>) -> Result<Vec<u8>, String> {

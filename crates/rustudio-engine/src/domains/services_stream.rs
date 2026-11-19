@@ -556,13 +556,14 @@ fn ws_error(e: &tungstenite::Error) -> (i64, String) {
 // ------------------------------------------------------------------ SSE / RawStream
 
 fn stream_run(id: u64, req: Request, rx: Receiver<Cmd>, cancel: &Cancel) {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_resolve(Some(CONNECT_TIMEOUT))
-        .timeout_connect(Some(CONNECT_TIMEOUT))
-        .http_status_as_error(false)
-        .user_agent("RobloxStudio/WinInet RobloxApp/0.746.0.7461269 (GlobalDist; RobloxDirectDownload)")
-        .build()
-        .into();
+    let agent: ureq::Agent = rustudio_account::http::agent(
+        ureq::Agent::config_builder()
+            .timeout_resolve(Some(CONNECT_TIMEOUT))
+            .timeout_connect(Some(CONNECT_TIMEOUT))
+            .http_status_as_error(false)
+            .user_agent("RobloxStudio/WinInet RobloxApp/0.746.0.7461269 (GlobalDist; RobloxDirectDownload)")
+            .build(),
+    );
     // From here a cancel shuts the agent down: the request, the wait for
     // the response and a body read in progress all return at once.
     if !cancel.set_agent(&agent) {

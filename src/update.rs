@@ -263,11 +263,13 @@ impl Updater {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(600)))
-        .user_agent(concat!("rustudio/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into()
+    rustudio_account::http::agent(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(600)))
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .user_agent(concat!("rustudio/", env!("CARGO_PKG_VERSION")))
+            .build(),
+    )
 }
 
 fn get(url: &str) -> Result<Vec<u8>, String> {

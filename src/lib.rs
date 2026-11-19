@@ -507,6 +507,22 @@ pub fn run() -> eframe::Result<()> {
             }
         }
     }
+    // `--network-check`: how Roblox's servers are reached from here, phase
+    // by phase (the line the Android build logs at every start), then exit.
+    if std::env::args().any(|a| a == "--network-check") {
+        let mut failed = false;
+        for url in [
+            "https://clientsettingscdn.roblox.com/v2/client-version/WindowsStudio64",
+            "https://assetdelivery.roblox.com/v1/asset/?id=1",
+            "https://setup.rbxcdn.com/version",
+        ] {
+            match rustudio_account::http::probe(url) {
+                Ok(s) => eprintln!("network check: {s}"),
+                Err(e) => { failed = true; eprintln!("network check: {e}"); }
+            }
+        }
+        std::process::exit(if failed { 1 } else { 0 });
+    }
     // `--write-corpus DIR`: the fidelity corpus's place files, then exit.
     let argv: Vec<String> = std::env::args().collect();
     if let Some(i) = argv.iter().position(|a| a == "--write-corpus") {

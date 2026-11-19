@@ -435,23 +435,30 @@ fn session_agent_with_timeout(timeout: Option<std::time::Duration>) -> ureq::Age
     // the browser is in front for a sign-in, a process frozen in the
     // background and thawed — must fail and be retried, not hang the
     // caller for as long as the kernel keeps retransmitting (the
-    // "Confirmed, signing in…" that never ended).
-    ureq::Agent::config_builder()
+    // "Confirmed, signing in…" that never ended). The connect budget is
+    // shared by a host's addresses (crate::http): short enough that one
+    // that doesn't answer costs seconds, not the better part of a minute.
+    let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
         .timeout_global(timeout)
-        .timeout_resolve(Some(Duration::from_secs(20)))
-        .timeout_connect(Some(Duration::from_secs(20)))
+        .timeout_resolve(Some(Duration::from_secs(15)))
+        .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_send_request(Some(Duration::from_secs(30)))
         .timeout_recv_response(Some(Duration::from_secs(60)))
         .timeout_per_read(Some(Duration::from_secs(60)))
         .timeout_per_write(Some(Duration::from_secs(60)))
+        // Asset downloads run a dozen at a time on a shared copy of the
+        // session (`downloader`); with ureq's default of 3 idle
+        // connections per host the rest reconnected (TLS and all) per asset.
+        .max_idle_connections_per_host(8)
+        .max_idle_connections(24)
         .user_agent(concat!(
             "Mozilla/5.0 (X11; Linux x86_64) rustudio/",
             env!("CARGO_PKG_VERSION")
         ))
-        .build()
-        .into()
+        .build();
+    crate::http::agent(config)
 }
 
 /// A validated session.

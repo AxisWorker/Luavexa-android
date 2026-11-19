@@ -385,25 +385,23 @@ pub mod touch {
     }
 }
 
-/// A GET of Roblox's small client-version page on a thread of its own, with
-/// short timeouts; the result goes to Output (through the Studio content
-/// messages) and to logcat.
+/// Roblox's small client-version page and its asset CDN, reached phase by
+/// phase (`rustudio_account::http::probe`) on a thread of its own; the
+/// lines go to Output (through the Studio content messages) and to logcat.
+/// `adb logcat -s rustudio` after a start shows where a slow network's
+/// time goes.
 fn network_check() {
     let _ = std::thread::Builder::new().name("network-check".into()).spawn(|| {
-        use std::time::{Duration, Instant};
-        const URL: &str = "https://clientsettingscdn.roblox.com/v2/client-version/WindowsStudio64";
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(30)))
-            .user_agent(concat!("rustudio/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .into();
-        let t0 = Instant::now();
-        let (err, line) = match agent.get(URL).call() {
-            Ok(r) => (false, format!("network check: HTTP {} from clientsettingscdn.roblox.com in {} ms", r.status().as_u16(), t0.elapsed().as_millis())),
-            Err(e) => (true, format!("network check failed after {} ms: {e} (GET {URL}); nothing from Roblox — sign-in, assets, Studio content — can work until this does", t0.elapsed().as_millis())),
-        };
-        if err { log::warn!("{line}") } else { log::info!("{line}") }
-        rustudio_core::studio_content::note(err, line);
+        for url in [
+            "https://clientsettingscdn.roblox.com/v2/client-version/WindowsStudio64",
+            "https://assetdelivery.roblox.com/v1/asset/?id=1",
+        ] {
+            let (err, line) = match rustudio_account::http::probe(url) {
+                Ok(s) => (false, format!("network check: {s}")),
+                Err(e) => (true, format!("network check: {e}; nothing from Roblox — sign-in, assets, Studio content — can work until this does")),
+            };
+            if err { log::warn!("{line}") } else { log::info!("{line}") }
+            rustudio_core::studio_content::note(err, line);
+        }
     });
 }

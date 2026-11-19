@@ -168,12 +168,25 @@ mod asset_tests {
     }
 }
 
+/// The anonymous agent, one for the process: an agent is its connection
+/// pool, and a fresh one per asset paid DNS, TCP and TLS twice per asset
+/// (descriptor, then CDN) — most of an asset's time on a long-latency
+/// mobile link. Clones share the pool.
 pub fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .user_agent(concat!("rustudio/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into()
+    static AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(|| {
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_resolve(Some(std::time::Duration::from_secs(15)))
+            .timeout_connect(Some(std::time::Duration::from_secs(10)))
+            .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
+            .timeout_per_read(Some(std::time::Duration::from_secs(60)))
+            .max_idle_connections_per_host(8)
+            .max_idle_connections(24)
+            .user_agent(concat!("rustudio/", env!("CARGO_PKG_VERSION")))
+            .build();
+        crate::http::agent(config)
+    });
+    AGENT.clone()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
