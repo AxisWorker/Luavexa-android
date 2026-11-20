@@ -12,10 +12,17 @@
 #   * libadrenotools-native: TouseefX's fork of bylaws/libadrenotools
 #     (BSD-2-Clause; libshadowhook / libbytehook inside are ByteDance's,
 #     MIT) — libadrenotools.so and its hook libraries. The pinned build is
-#     the fork's CI artifact of commit ca1ad33 (2026-11-18 19:46, workflow
-#     run 44383713561), served by nightly.link:
-#     https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44383713561/libadrenotools-arm64-v8a.zip
-#     It has the driver.cpp rewrite of 4d4d482 (2026-11-17: the Vulkan
+#     the fork's CI artifact of commit 8c7d9f5 (2026-11-20 05:08, workflow
+#     run 44679007919), served by nightly.link:
+#     https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44679007919/libadrenotools-arm64-v8a.zip
+#     Over the build before it (ca1ad33, run 44383713561) its
+#     constructor's per-generation Turnip defaults give an Adreno 6xx
+#     (the GPU model read after "Adreno" in kgsl's gpu_model, three
+#     digits) TU_DEBUG=noconform,noubwc,nolrz when nothing set TU_DEBUG
+#     before it ran (the UBWC whole-device restarts; the app sets
+#     TU_DEBUG itself and switches UBWC off through the switches file,
+#     src/android/turnip.rs default_switches) — nothing else changed in
+#     its sources. It has the driver.cpp rewrite of 4d4d482 (2026-11-17: the Vulkan
 #     loader looked for under the vendor paths too, which lets HyperOS
 #     devices try Turnip; its own initialisation switchable off with
 #     ADRENOTOOLS_DISABLE=1, which the app sets, and hooking only
@@ -42,25 +49,29 @@
 #     tree names a Mali, and its hooks of the system loader are run,
 #     unused, since it has no ADRENOTOOLS_DISABLE).
 #   * mesa-turnip-android-driver: nihui's Mesa builds for Android
-#     (Mesa: MIT) — libvulkan_freedreno.so:
-#     https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.0/mesa-turnip-android-26.3.0.zip
-#   * panvk-kbase-android: zenithblue-oss's Mesa PanVK built for Android
-#     on ARM's kbase kernel driver (Mesa: MIT) — one bare .so, 35 MB,
-#     put in as libvulkan_panfrost.so (the name libadrenotools-native's
-#     own PanVK path opens, src/driver.cpp init_panvk_driver):
-#     https://github.com/zenithblue-oss/panvk-kbase-android/releases/download/panvk-kbase-v26.3.1/libvulkan_panfrost-android-aarch64.so
-#     PANVK=0 leaves it out (an APK 35 MB smaller that keeps Mali
+#     (Mesa: MIT) — libvulkan_freedreno.so (Mesa 26.3.1-lto, 2026-11-19):
+#     https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.1/mesa-turnip-android-26.3.1.zip
+#   * mali-panvk: JimVulkan's Mesa PanVK for Mali on the stock Arm kbase
+#     kernel driver — no root, no custom kernel (Mesa: MIT; release r10,
+#     Mesa 27.0.0-devel 58f2c55, Vulkan 1.4 on Bifrost G31-G76, Valhall
+#     G57-G78 and the command-stream G610-G925 / G1; Android 12+). The
+#     zip holds libvulkan_panfrost.so (18 MB; the name libadrenotools-
+#     native's own PanVK path opens, src/driver.cpp init_panvk_driver),
+#     a meta.json and the notices:
+#     https://github.com/JimVulkan/mali-panvk/releases/download/v1.6.0/mali-panvk-27.0.0-devel-r10.zip
+#     PANVK=0 leaves it out (an APK 18 MB smaller that keeps Mali
 #     devices on their own driver).
 #
 # Overrides, for a newer build or one of your own:
 #   ADRENOTOOLS_ZIP=<url or local .zip>   TURNIP_ZIP=<url or local .zip>
-#   PANVK_SO=<url or local .so>
+#   PANVK_ZIP=<url or local .zip, or a bare .so>  (PANVK_SO still works)
 #   ADRENOTOOLS_SHA256= / TURNIP_SHA256= / PANVK_SHA256=
 #                                          (checked when given; the
 #                                          defaults are pinned below)
 #   PANVK=0                                no PanVK driver
-#   STRIP=0                                keep the libadrenotools
-#                                          libraries' debug info (they are
+#   STRIP=0                                keep the libraries' debug info
+#                                          (the libadrenotools and Turnip
+#                                          files carry some; they are
 #                                          stripped of it with llvm-strip
 #                                          — from PATH or an NDK named by
 #                                          ANDROID_NDK_HOME / _ROOT /
@@ -77,16 +88,29 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 dest="$root/crates/rustudio-android/libs/arm64-v8a"
 
-ADRENOTOOLS_ZIP="${ADRENOTOOLS_ZIP:-https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44383713561/libadrenotools-arm64-v8a.zip}"
-ADRENOTOOLS_SHA256="${ADRENOTOOLS_SHA256-514fbc941c2bd4b741db7ccadc66bb43599fdac857ab44b883593a1c05b94565}"
-TURNIP_ZIP="${TURNIP_ZIP:-https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.0/mesa-turnip-android-26.3.0.zip}"
-TURNIP_SHA256="${TURNIP_SHA256-6a9bef1c83aa6280e2389d33a992f2d80199d1d13be629c7ff12d5f9f17b5803}"
-PANVK_SO="${PANVK_SO:-https://github.com/zenithblue-oss/panvk-kbase-android/releases/download/panvk-kbase-v26.3.1/libvulkan_panfrost-android-aarch64.so}"
-PANVK_SHA256="${PANVK_SHA256-62c2b3f98ca987d5ab50b6f01e2d2c1c5b3ee995fe93666aa5da9415f65c3348}"
-# An override without a checksum of its own isn't held to the default's.
-if [ "${ADRENOTOOLS_ZIP}" != "https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44383713561/libadrenotools-arm64-v8a.zip" ] && [ -z "${ADRENOTOOLS_SHA256+x}" ]; then ADRENOTOOLS_SHA256=""; fi
-if [ "${TURNIP_ZIP}" != "https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.0/mesa-turnip-android-26.3.0.zip" ] && [ -z "${TURNIP_SHA256+x}" ]; then TURNIP_SHA256=""; fi
-if [ "${PANVK_SO}" != "https://github.com/zenithblue-oss/panvk-kbase-android/releases/download/panvk-kbase-v26.3.1/libvulkan_panfrost-android-aarch64.so" ] && [ -z "${PANVK_SHA256+x}" ]; then PANVK_SHA256=""; fi
+ADRENOTOOLS_ZIP_DEFAULT="https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44679007919/libadrenotools-arm64-v8a.zip"
+TURNIP_ZIP_DEFAULT="https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.1/mesa-turnip-android-26.3.1.zip"
+PANVK_ZIP_DEFAULT="https://github.com/JimVulkan/mali-panvk/releases/download/v1.6.0/mali-panvk-27.0.0-devel-r10.zip"
+ADRENOTOOLS_ZIP="${ADRENOTOOLS_ZIP:-$ADRENOTOOLS_ZIP_DEFAULT}"
+TURNIP_ZIP="${TURNIP_ZIP:-$TURNIP_ZIP_DEFAULT}"
+# (PANVK_SO: the override's earlier name, from when the driver came as a
+# bare .so; either name takes a .zip or a .so)
+PANVK_ZIP="${PANVK_ZIP:-${PANVK_SO:-$PANVK_ZIP_DEFAULT}}"
+# The pinned checksums belong to the pinned downloads: an override without
+# a checksum of its own isn't held to them (decided before the defaults go
+# in, so that an unset *_SHA256 can still be told from a given one).
+if [ -z "${ADRENOTOOLS_SHA256+x}" ]; then
+  ADRENOTOOLS_SHA256=""
+  [ "$ADRENOTOOLS_ZIP" != "$ADRENOTOOLS_ZIP_DEFAULT" ] || ADRENOTOOLS_SHA256=94aacd0a59fa3b23c361ad33a4809018374bcbb0d71564d2f5afc277b114c34c
+fi
+if [ -z "${TURNIP_SHA256+x}" ]; then
+  TURNIP_SHA256=""
+  [ "$TURNIP_ZIP" != "$TURNIP_ZIP_DEFAULT" ] || TURNIP_SHA256=9f38529b5f5f6640c1d600a398cc5218cdf7706066e68e8d2fbc7cbde644a8c0
+fi
+if [ -z "${PANVK_SHA256+x}" ]; then
+  PANVK_SHA256=""
+  [ "$PANVK_ZIP" != "$PANVK_ZIP_DEFAULT" ] || PANVK_SHA256=7e97db4d79d81ec9461d1e0676b62a865561cb56e21c151693aa25ffbe749f1c
+fi
 
 mkdir -p "$dest"
 work="$(mktemp -d)"
@@ -127,15 +151,17 @@ fetch() {
   [ "$n" -gt 0 ] || { echo "$name: no .so files in $src" >&2; exit 1; }
   [ -f "$dest/$marker" ] || { echo "$name: $marker not in $src" >&2; exit 1; }
   echo "$name: $n file(s) into $dest"
-  if [ "$name" = adrenotools ]; then strip_debug "$name" "${copied[@]}"; fi
+  strip_debug "$name" "${copied[@]}"
 }
 
 # strip_debug <name> <files...>: drop the .debug_* sections (llvm-strip
 # --strip-debug keeps the symbol tables, so crash logs still name
 # functions). The libadrenotools build's two libraries with the Rust layer
-# come with Rust std's debug info, 6 MB of each file's 8 MB. STRIP=0 keeps
-# the files as downloaded; without an llvm-strip they are kept too (GNU
-# strip on a non-arm64 host can't read them).
+# come with Rust std's debug info, 6 MB of each file's 8 MB; nihui's Turnip
+# 26.3.1 carries 1.2 MB of its 17.6 MB (the PanVK release is stripped
+# already, so nothing happens to it). STRIP=0 keeps the files as
+# downloaded; without an llvm-strip they are kept too (GNU strip on a
+# non-arm64 host can't read them).
 strip_debug() {
   local name="$1"; shift
   [ "${STRIP:-1}" != "0" ] || { echo "$name: STRIP=0, debug info kept"; return; }
@@ -194,7 +220,12 @@ fetch_file() {
 fetch adrenotools "$ADRENOTOOLS_ZIP" "$ADRENOTOOLS_SHA256" libadrenotools.so
 fetch turnip "$TURNIP_ZIP" "$TURNIP_SHA256" libvulkan_freedreno.so
 if [ "${PANVK:-1}" != "0" ]; then
-  fetch_file panvk "$PANVK_SO" "$PANVK_SHA256" libvulkan_panfrost.so
+  # A zip (the release: the .so, its meta.json and notices; only the .so
+  # goes in) or a bare .so (a build of your own).
+  case "$PANVK_ZIP" in
+    *.so) fetch_file panvk "$PANVK_ZIP" "$PANVK_SHA256" libvulkan_panfrost.so ;;
+    *) fetch panvk "$PANVK_ZIP" "$PANVK_SHA256" libvulkan_panfrost.so ;;
+  esac
 else
   echo "panvk: PANVK=0, not fetched (Mali devices keep their driver)"
 fi

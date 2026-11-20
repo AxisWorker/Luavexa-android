@@ -685,6 +685,40 @@ fn view_url(url: &str, custom_tab: bool) -> Result<()> {
     })
 }
 
+// ---------------------------------------------------------- relaunch
+
+/// `startActivity(getPackageManager().getLaunchIntentForPackage(getPackageName()))`
+/// with `FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK`: a fresh copy
+/// of the editor's activity, which the system hosts in a new process once
+/// this one has exited (the caller exits right after; a process whose GPU
+/// device is lost can draw nothing more). If the system doesn't, the
+/// user's next tap on the icon starts it, and the report written before
+/// says what happened and where the place was saved.
+pub fn relaunch() -> Result<()> {
+    with_activity(|env, activity| {
+        let pm = env
+            .call_method(activity, jni_str!("getPackageManager"), jni_sig!("()Landroid/content/pm/PackageManager;"), &[])?
+            .l()?;
+        let pkg = env.call_method(activity, jni_str!("getPackageName"), jni_sig!("()Ljava/lang/String;"), &[])?.l()?;
+        let intent = env
+            .call_method(
+                &pm,
+                jni_str!("getLaunchIntentForPackage"),
+                jni_sig!("(Ljava/lang/String;)Landroid/content/Intent;"),
+                &[JValue::Object(&pkg)],
+            )?
+            .l()?;
+        if intent.is_null() {
+            return Err(jni::errors::Error::NullPtr("no launch intent for this package"));
+        }
+        // NEW_TASK | CLEAR_TASK | CLEAR_TOP
+        let flags = 0x1000_0000 | 0x0000_8000 | 0x0400_0000;
+        env.call_method(&intent, jni_str!("addFlags"), jni_sig!("(I)Landroid/content/Intent;"), &[JValue::Int(flags)])?;
+        env.call_method(activity, jni_str!("startActivity"), jni_sig!("(Landroid/content/Intent;)V"), &[JValue::Object(&intent)])?;
+        Ok(())
+    })
+}
+
 // ---------------------------------------------------------- clipboard
 
 /// A clipboard read's answer, once the main thread has made it (`None`: no

@@ -54,22 +54,22 @@ on:
       turnip_zip:
         description: "Turnip driver zip URL (libvulkan_freedreno.so inside; nihui/mesa-turnip-android-driver release)"
         required: false
-        default: "https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.0/mesa-turnip-android-26.3.0.zip"
+        default: "https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.1/mesa-turnip-android-26.3.1.zip"
         type: string
       adrenotools_zip:
         description: "libadrenotools zip URL (libadrenotools.so + hook libraries inside; a TouseefX/libadrenotools-native release or CI artifact via nightly.link)"
         required: false
-        default: "https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44383713561/libadrenotools-arm64-v8a.zip"
+        default: "https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44679007919/libadrenotools-arm64-v8a.zip"
         type: string
       panvk:
-        description: "Also ship the PanVK (Mesa) Vulkan driver for Mali GPUs (35 MB more APK; needs turnip on)"
+        description: "Also ship the PanVK (Mesa) Vulkan driver for Mali GPUs (18 MB more APK; needs turnip on)"
         required: false
         default: true
         type: boolean
-      panvk_so:
-        description: "PanVK driver URL (a bare .so built for Android on ARM's kbase; zenithblue-oss/panvk-kbase-android release)"
+      panvk_zip:
+        description: "PanVK driver URL (a zip with libvulkan_panfrost.so inside — a JimVulkan/mali-panvk release, Mesa PanVK on the stock Arm kbase driver — or a bare .so of your own)"
         required: false
-        default: "https://github.com/zenithblue-oss/panvk-kbase-android/releases/download/panvk-kbase-v26.3.1/libvulkan_panfrost-android-aarch64.so"
+        default: "https://github.com/JimVulkan/mali-panvk/releases/download/v1.6.0/mali-panvk-27.0.0-devel-r10.zip"
         type: string
 
 concurrency:
@@ -86,19 +86,22 @@ env:
   # builds; a manual run's inputs above can name others or leave them
   # out). tools/android/fetch-turnip.sh checks these against pinned
   # SHA-256 sums; docs/ANDROID.md "Turnip driver". The libadrenotools
-  # build is the fork's CI artifact of 2026-11-18 19:46 (commit ca1ad33,
-  # run 44383713561: the driver.cpp rewrite of 4d4d482 — HyperOS' vendor
+  # build is the fork's CI artifact of 2026-11-20 05:08 (commit 8c7d9f5,
+  # run 44679007919: the driver.cpp rewrite of 4d4d482 — HyperOS' vendor
   # Vulkan paths, its own initialisation switchable off, which the app
   # does, a working PanVK path — plus the 2026-11-18 fixes for
   # whole-device reboots with Turnip: the GSL free hook's bad
-  # IOCTL_KGSL_GPUOBJ_FREE, the KGSL_PROP_PWRCTRL ioctl at init) through
+  # IOCTL_KGSL_GPUOBJ_FREE, the KGSL_PROP_PWRCTRL ioctl at init; and
+  # noubwc in its TU_DEBUG default for an Adreno 6xx, the UBWC restarts —
+  # the app switches UBWC off there itself, src/android/turnip.rs) through
   # nightly.link; GitHub keeps artifacts for 90 days — a release of the
   # fork replaces it then (the script's comments name the last one,
-  # V0.7). The script strips the Rust debug info out of its two large
-  # libraries with llvm-strip (the `llvm` package above).
-  TURNIP_ZIP_URL: https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.0/mesa-turnip-android-26.3.0.zip
-  ADRENOTOOLS_ZIP_URL: https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44383713561/libadrenotools-arm64-v8a.zip
-  PANVK_SO_URL: https://github.com/zenithblue-oss/panvk-kbase-android/releases/download/panvk-kbase-v26.3.1/libvulkan_panfrost-android-aarch64.so
+  # V0.7). The script strips the debug info out of the libraries that
+  # carry some (libadrenotools' two Rust ones, Turnip) with llvm-strip
+  # (the `llvm` package above).
+  TURNIP_ZIP_URL: https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.1/mesa-turnip-android-26.3.1.zip
+  ADRENOTOOLS_ZIP_URL: https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44679007919/libadrenotools-arm64-v8a.zip
+  PANVK_ZIP_URL: https://github.com/JimVulkan/mali-panvk/releases/download/v1.6.0/mali-panvk-27.0.0-devel-r10.zip
 
 jobs:
   apk:
@@ -178,13 +181,13 @@ jobs:
           # A manual run's inputs, else the pinned releases (env above).
           TURNIP_ZIP: ${{ github.event.inputs.turnip_zip || env.TURNIP_ZIP_URL }}
           ADRENOTOOLS_ZIP: ${{ github.event.inputs.adrenotools_zip || env.ADRENOTOOLS_ZIP_URL }}
-          PANVK_SO: ${{ github.event.inputs.panvk_so || env.PANVK_SO_URL }}
+          PANVK_ZIP: ${{ github.event.inputs.panvk_zip || env.PANVK_ZIP_URL }}
           PANVK: ${{ github.event.inputs.panvk == 'false' && '0' || '1' }}
         run: |
           set -euo pipefail
           echo "Turnip driver: $TURNIP_ZIP"
           echo "libadrenotools: $ADRENOTOOLS_ZIP"
-          echo "PanVK driver: $PANVK_SO (PANVK=$PANVK)"
+          echo "PanVK driver: $PANVK_ZIP (PANVK=$PANVK)"
           bash tools/android/fetch-turnip.sh
 
       - name: Build APK
@@ -276,5 +279,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: android-desktop-check
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev
+      # (libudev-dev: gilrs, the gamepad crate, links libudev on Linux)
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libudev-dev
       - run: cargo check --workspace --all-targets

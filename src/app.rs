@@ -2152,6 +2152,12 @@ impl eframe::App for RustudioApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.cpu_usage = frame.info().cpu_usage;
+        // (a lost GPU device or one out of memory: save and restart,
+        // src/android/mod.rs gpu_watch)
+        #[cfg(target_os = "android")]
+        if crate::android::gpu_watch(&mut self.ed) {
+            return;
+        }
         self.frame(ui);
     }
 }

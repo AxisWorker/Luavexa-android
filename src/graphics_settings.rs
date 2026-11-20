@@ -258,7 +258,7 @@ fn turnip_switches(ui: &mut egui::Ui) {
             turnip::reset_debug_flags();
         }
     });
-    ui.small(RichText::new("LRZ is off by default (Mesa 26.3.0 lost terrain chunks with it on an Adreno 650). For other missing or flickering geometry: try the rest top down, one at a time; the ones marked take effect at the next start.").weak());
+    ui.small(RichText::new("LRZ is off by default (Mesa 26.3.0 lost terrain chunks with it on an Adreno 650); on an Adreno 6xx bandwidth compression is off too (with it, Turnip's first frame restarted a Snapdragon 865 phone outright). For other missing or flickering geometry: try the rest top down, one at a time; the ones marked take effect at the next start.").weak());
     let flags = turnip::debug_flags();
     for s in turnip::SWITCHES {
         let mut on = flags.iter().any(|f| f == s.flag);

@@ -48,15 +48,16 @@
 //! for the ordinary start, `settle_system_loader`).
 //!
 //! PanVK for Mali. The same shim opens Mesa's PanVK driver
-//! (`libvulkan_panfrost.so`: zenithblue-oss's panvk-kbase-android build,
-//! Mesa 26.3 on ARM's kbase kernel driver, the one Android's Mali devices
-//! have; the fork's own `init_panvk_driver` opens the same file name) on
+//! (`libvulkan_panfrost.so`: JimVulkan's mali-panvk build, Mesa 27.0-devel
+//! on the stock Arm kbase kernel driver, the one Android's Mali devices
+//! have — no root, no custom kernel; the fork's own `init_panvk_driver`
+//! opens the same file name) on
 //! devices whose GPU is a Mali (`ro.hardware.vulkan` / `ro.hardware.egl`
 //! "mali", or `/dev/mali0`) with the kbase node `/dev/mali0` and a
 //! Bifrost or newer core (`Mali-G…` per the kbase sysfs `gpuinfo`; the
 //! Midgard `Mali-T…` and Utgard `Mali-4xx` are out: PanVK has no code for
 //! them), the file in the APK (tools/android/fetch-turnip.sh `PANVK=1`,
-//! the default; 35 MB) and Android 12+. Everything else below —
+//! the default; 18 MB) and Android 12+. Everything else below —
 //! `adrenotools_open_libvulkan`, the probe, [`wgpu_setup`], the markers,
 //! the window's switch — is the same path with the other file name
 //! ([`Mesa`]). The shim's constructor tells a Mali the same way
@@ -100,9 +101,11 @@
 //! lists the useful ones ([`SWITCHES`]: LRZ, binning, tiled rendering,
 //! …) and keeps them in `files/turnip/debug`, which the driver watches
 //! (Mesa's `TU_DEBUG_FILE`: the ones Mesa can change while running change
-//! at once, the others at the next start; `nolrz` is on by default, see
-//! [`SWITCHES`]); `RUSTUDIO_TU_DEBUG=<flags>` replaces the start-time set
-//! the fork's constructor would leave ([`TU_DEBUG_BASE`]).
+//! at once, the others at the next start; `nolrz` is on by default, and
+//! on an Adreno 6xx `noubwc` — with UBWC on, Turnip's first frame
+//! restarted a Snapdragon 865 phone outright — see [`default_switches`]);
+//! `RUSTUDIO_TU_DEBUG=<flags>` replaces the start-time set the fork's
+//! constructor would leave ([`TU_DEBUG_BASE`]).
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
@@ -300,12 +303,51 @@ pub const SWITCHES: &[Switch] = &[
     Switch { flag: "sysmem", name: "Tiled rendering off", hint: "Render passes draw straight to memory instead of tile by tile: slower, fewer moving parts (no tile loads, stores, resolves).", live: true },
     Switch { flag: "flushall", name: "Flush caches after every draw", hint: "Slow. Tells a cache or synchronisation bug (fixed by this) from the rest (not).", live: true },
     Switch { flag: "dynamic", name: "Passes through dynamic rendering", hint: "libadrenotools' default: Turnip runs the renderer's (classic Vulkan) render passes through Mesa's dynamic-rendering path. Off: Turnip's own render pass code.", live: false },
-    Switch { flag: "noubwc", name: "Bandwidth compression off", hint: "No UBWC on textures and render targets.", live: false },
+    Switch { flag: "noubwc", name: "Bandwidth compression off", hint: "No UBWC on textures and render targets. On by default on an Adreno 6xx: with UBWC, Turnip's first frame restarted a Galaxy S20 FE (Snapdragon 865, Adreno 650) outright — a fatal bus error in the chip (TZBSP_ERR_FATAL_NOC_ERROR), the finding of WindWakerHD-Android-Plus v1.7 with Mesa 26.0 to 26.3, where turning UBWC off cost nothing measurable. Untick only on a 6xx that has proved it can take it. Adreno 7xx and up keep compression.", live: false },
 ];
 
-/// The switches on by default: the fork's `dynamic` (the first device
-/// runs were with it) and `nolrz` (the terrain chunks, above).
+/// The switches on by default everywhere: the fork's `dynamic` (the
+/// first device runs were with it) and `nolrz` (the terrain chunks,
+/// above). [`default_switches`] adds the GPU's own.
 pub const DEFAULT_SWITCHES: &[&str] = &["dynamic", "nolrz"];
+
+/// The switches on by default on this device: [`DEFAULT_SWITCHES`] and,
+/// on an Adreno 6xx (650, 660, …), `noubwc`. With UBWC (the GPU's
+/// bandwidth compression of textures and render targets) on, Turnip's
+/// first frame took a Galaxy S20 FE (Snapdragon 865, Adreno 650) down to
+/// a restart of the whole phone — a fatal bus error in the chip,
+/// `TZBSP_ERR_FATAL_NOC_ERROR` — which WindWakerHD-Android-Plus v1.7
+/// found with Mesa 26.0 to 26.3 and fixed with `noubwc` on Adreno 6xx
+/// (at no measurable cost there: 18.2 against 19.5 ms of GPU time per
+/// frame). A Snapdragon 865 device here restarted the same way with the
+/// fork's reboot fixes of 2026-11-18 already in, so those were not the
+/// whole story. libadrenotools-native 8c7d9f5's constructor defaults
+/// `TU_DEBUG=noconform,noubwc,nolrz` on a 6xx as well, but only when
+/// nothing set `TU_DEBUG` before it runs — this module does
+/// ([`TU_DEBUG_BASE`]), so the
+/// switch goes through the switches file instead, which Mesa reads at
+/// start-up (`tu_env_init_once`: the file's start-time flags join
+/// `start_debug`). Adreno 7xx and up keep compression: no such report,
+/// and it is worth bandwidth there.
+pub fn default_switches() -> Vec<&'static str> {
+    let mut v = DEFAULT_SWITCHES.to_vec();
+    if adreno_6xx() {
+        v.push("noubwc");
+    }
+    v
+}
+
+static ADRENO_MODEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// The Adreno model (650, 740, …; 0 when unknown or not an Adreno), as
+/// [`Device::adreno_model`] reads it, once.
+pub fn adreno_model() -> u32 {
+    *ADRENO_MODEL.get_or_init(|| Device::read().adreno_model())
+}
+
+fn adreno_6xx() -> bool {
+    (600..700).contains(&adreno_model())
+}
 
 /// Mesa's `TU_DEBUG_FILE`: the options on, comma-separated, in the app's
 /// files folder. Readable and writable from a shell too
@@ -326,11 +368,11 @@ pub fn debug_flags() -> Vec<String> {
     g.get_or_insert_with(|| std::fs::read_to_string(debug_file()).map(|s| parse_flags(&s)).unwrap_or_default()).clone()
 }
 
-/// The file holds exactly the defaults.
+/// The file holds exactly the defaults ([`default_switches`]).
 pub fn debug_flags_default() -> bool {
     let mut a = debug_flags();
     a.sort();
-    let mut d: Vec<String> = DEFAULT_SWITCHES.iter().map(|s| s.to_string()).collect();
+    let mut d: Vec<String> = default_switches().iter().map(|s| s.to_string()).collect();
     d.sort();
     a == d
 }
@@ -347,7 +389,27 @@ pub fn set_debug_flag(flag: &str, on: bool) {
 }
 
 pub fn reset_debug_flags() {
-    write_debug_flags(DEFAULT_SWITCHES.iter().map(|s| s.to_string()).collect());
+    write_debug_flags(default_switches().iter().map(|s| s.to_string()).collect());
+}
+
+/// A switch that joined the defaults after the file was first written
+/// goes in once: a marker beside the file (`files/turnip/default-<flag>`)
+/// remembers, so unticking it afterwards holds. Nothing happens where it
+/// isn't a default ([`default_switches`]).
+fn add_default_once(flag: &str) {
+    if !default_switches().iter().any(|f| *f == flag) {
+        return;
+    }
+    let marker = dir().join(format!("default-{flag}"));
+    if marker.exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(dir());
+    let _ = std::fs::write(&marker, b"");
+    if !debug_flags().iter().any(|f| f == flag) {
+        log::info!("turnip: {flag} joins the switches on by default on this GPU (Adreno {}); Graphics Settings > GPU driver unticks it", adreno_model());
+        set_debug_flag(flag, true);
+    }
 }
 
 fn write_debug_flags(flags: Vec<String>) {
@@ -830,6 +892,7 @@ fn try_activate() -> Result<Status, Status> {
     }
     let sdk = super::AndroidApp::sdk_version();
     let dev = Device::read();
+    let _ = ADRENO_MODEL.set(dev.adreno_model());
     log::info!("turnip: device: {}; Android API {sdk}", dev.describe());
     // Which Mesa driver this device gets: PanVK on a Mali, Turnip on an
     // Adreno (RUSTUDIO_TURNIP=force takes the same choice without the
@@ -941,8 +1004,13 @@ fn try_activate() -> Result<Status, Status> {
     // time, so that its content is the whole of it). PanVK reads neither
     // (its own switches are PANVK_DEBUG and PANVK_KBASE_*; the shim's
     // constructor sets PAN_MESA_DEBUG=kbase besides, Mesa's GL side's).
-    if mesa == Mesa::Turnip && !debug_file().exists() {
-        reset_debug_flags();
+    if mesa == Mesa::Turnip {
+        if !debug_file().exists() {
+            reset_debug_flags();
+        }
+        // (the UBWC default came after the first builds; files written
+        // by those get it once)
+        add_default_once("noubwc");
     }
     let tu_debug = std::env::var("RUSTUDIO_TU_DEBUG").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).unwrap_or_else(|| TU_DEBUG_BASE.to_string());
     let switches_file = debug_file();

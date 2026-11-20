@@ -95,10 +95,11 @@ xbuild quirks worth knowing (commit e67b501):
 | Activity destroyed | — | `onDestroy` hook: close request, then `process::exit(0)`; `android_main` always leaves the process when the loop ends (`lifecycle.rs`): status 0 for a close, 2 for an eframe error, 101 for a panic (named in logcat with its crash report) |
 | "Open with rustudio" while it runs | Finder's hand-over (`macos::take_opened`) | a second instance of the activity per VIEW intent (`launchMode` `standard`), caught at the library's entry point: its file is copied in and queued for the editor's next frame, the editor's task comes to the front, the new activity finishes unseen (`src/android/intent.rs`). A place the last start died within 20 s of opening by itself isn't opened again by itself (`state/opening`, `storage.rs`) |
 | UI zoom | 1.0 of the display's scale | first run: the zoom that fits ~1100 points across (0.8 … 1.6 of the density), then View > Zoom In / Out as saved |
-| GPU driver | the system's | the device's Vulkan driver, or on Snapdragon phones the Turnip (Mesa) driver shipped in the APK, swapped in before wgpu starts (`src/android/turnip.rs`; "Turnip driver" below); OpenGL ES as the fallback either way |
+| GPU driver | the system's | the device's Vulkan driver, or on Snapdragon phones the Turnip (Mesa) driver shipped in the APK, swapped in before wgpu starts (`src/android/turnip.rs`; "Turnip driver" below) — on an Adreno 6xx with its bandwidth compression (UBWC) off, which restarted a Snapdragon 865 phone outright ("UBWC and the whole-device restarts" below); OpenGL ES as the fallback either way |
 | Graphics quality | level 10 (Studio's defaults) | Automatic from level 3: the 3D view at 0.7 scale (0.5 while the camera moves, scaled up by EASU + RCAS) with 512² textures, 900 studs of view distance, the lite shader, no anisotropic filtering, no MSAA, one shadow cascade, no frame-rate cap (View > Graphics Settings, the 1–10 bar; "Graphics quality" below); saved with the layout |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
-| Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root). Same `crates/rustudio-core/src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`) |
+| Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root). Same `crates/rustudio-core/src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`). A report ends with the last 24 notes (`crash::note`): the GPU errors wgpu reported, a lost device, so it says what led up to it |
+| GPU device lost, GPU out of memory | wgpu's default: a panic | The device gets an uncaptured-error handler and a device-lost callback (`android/mod.rs install_gpu_error_handler`): errors go to logcat and the report notes, the frame goes on. The vendored egui-wgpu (`vendor/egui-wgpu/PATCHES.md`) skips a frame whose index/vertex upload the device refuses instead of panicking (`renderer.rs:984 Failed to create staging buffer for index data` — what a reset Adreno driver looked like). A lost device, or out-of-memory errors every frame for 5 s, ends the run in order (`gpu_watch`): the open place is written to `Android/data/dev.rustudio.studio/files/recovery/<name>-<stamp>.rbxl`, a report says so for the next start, and the activity is relaunched (`jni::relaunch`) |
 | Studio content download | ureq + rustls (ring) | the same, three packages at a time; Play can use the content once the packages are in (the retired textures and View Selector follow in the background). Without a network at start (ConnectivityManager, INTERNET capability — not VALIDATED, which some networks never get) it starts when one comes. A `network check: …` line in Output (and logcat) at every start says how Roblox's servers are reached, phase by phase — DNS, a TCP connect to the first IPv4 and the first IPv6 address, an HTTPS GET — with the time each took; `rustudio --network-check` prints the same on a desktop. Every agent resolves a host IPv4 first (`rustudio_account::http`): a network that advertises an IPv6 that doesn't route — some phones' Wi-Fi and mobile networks — otherwise cost every new connection a connect timeout, and the app "worked, but very slowly". Connects time out after 10 s; one agent (connection pool) per purpose for the process, so an asset doesn't pay DNS, TCP and TLS twice over |
 | Login keyring | `keyring` 4 (Secret Service / Keychain / Credential Manager) | `keyring-core` + `android-native-keyring-store` (SharedPreferences + Android Keystore) behind the same `Entry` API (`crates/rustudio-account/src/store.rs`) |
 | TLS roots (`rustudio-account` MessagingService socket) | OS store (`rustls-native-certs`) | Mozilla's (`webpki-roots`, enabled alongside): Android's CA store isn't in a form `rustls-native-certs` reads; `ureq` already used `webpki-roots` |
@@ -854,9 +855,9 @@ until then).
 The arm64 APK carries Mesa's open-source Adreno Vulkan driver, **Turnip**
 (`libvulkan_freedreno.so`, [nihui's Android
 builds](https://github.com/nihui/mesa-turnip-android-driver), MIT), Mesa's
-Mali driver **PanVK** (`libvulkan_panfrost.so`, [zenithblue-oss's
-panvk-kbase-android](https://github.com/zenithblue-oss/panvk-kbase-android)
-build on ARM's kbase kernel driver, MIT; optional, 35 MB), and
+Mali driver **PanVK** (`libvulkan_panfrost.so`, [JimVulkan's
+mali-panvk](https://github.com/JimVulkan/mali-panvk) build on the stock
+Arm kbase kernel driver — no root, no custom kernel — MIT; optional, 18 MB), and
 **libadrenotools** ([TouseefX's
 libadrenotools-native](https://github.com/TouseefX/libadrenotools-native),
 a fork of bylaws/libadrenotools for apps without Java of their own,
@@ -871,14 +872,24 @@ present paths don't.
 
 **Where the files come from.** The pinned downloads (SHA-256 checked by
 the script; `android.yml`'s `TURNIP_ZIP_URL` / `ADRENOTOOLS_ZIP_URL` /
-`PANVK_SO_URL` and the manual run's `turnip_zip` / `adrenotools_zip` /
-`panvk_so` inputs name the same three):
+`PANVK_ZIP_URL` and the manual run's `turnip_zip` / `adrenotools_zip` /
+`panvk_zip` inputs name the same three):
 
-- libadrenotools: <https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44383713561/libadrenotools-arm64-v8a.zip>
+- libadrenotools: <https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44679007919/libadrenotools-arm64-v8a.zip>
   (`libadrenotools.so`, `libhook_impl.so`, `libmain_hook.so`,
   `libfile_redirect_hook.so`, `libgsl_alloc_hook.so`, `libshadowhook.so`,
   `libshadowhook_nothing.so`, `libbytehook.so`) — the fork's CI build of
-  commit ca1ad33 (2026-11-18 19:46, workflow run 44383713561). It has
+  commit 8c7d9f5 (2026-11-20 05:08, workflow run 44679007919; SHA-256
+  `94aacd0a59fa3b23c361ad33a4809018374bcbb0d71564d2f5afc277b114c34c`).
+  Over the build before it (ca1ad33, run 44383713561) its constructor's
+  per-generation Turnip defaults (`applyTurnipOptimizations`; the
+  generation is the GPU model after "Adreno" in kgsl's `gpu_model`,
+  three digits for a 6xx, so an SoC number such as SM8250 can't pass
+  for an 8xx) give an Adreno 6xx `TU_DEBUG=noconform,noubwc,nolrz` —
+  the UBWC whole-device restarts, "Turnip's own switches" below — when
+  nothing set `TU_DEBUG` before it ran; rustudio does, so it switches
+  UBWC off there through the switches file itself, and takes the build
+  for parity. It has
   the `driver.cpp` rewrite of 4d4d482 (2026-11-17), which looks for the system's Vulkan loader
   under the vendor paths too (`/system/lib64`, `/system/vendor/lib64`,
   `/vendor/lib64`, `/odm/lib64`, `/product/lib64`, `/system_ext/lib64`:
@@ -928,22 +939,32 @@ the script; `android.yml`'s `TURNIP_ZIP_URL` / `ADRENOTOOLS_ZIP_URL` /
   `ADRENOTOOLS_DISABLE` strings) and logs it: `turnip: libadrenotools in
   this APK: vendor loader paths yes, own initialisation switchable off
   (ADRENOTOOLS_DISABLE)`.
-- Turnip driver: <https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.0/mesa-turnip-android-26.3.0.zip>
-  (`libvulkan_freedreno.so`, Mesa 26.3.0, Adreno 6xx/7xx/8xx)
-- PanVK driver: <https://github.com/zenithblue-oss/panvk-kbase-android/releases/download/panvk-kbase-v26.3.1/libvulkan_panfrost-android-aarch64.so>
-  (one bare `.so`, 35 MB, put in as `libvulkan_panfrost.so`: Mesa
-  26.3.0-devel's PanVK built for Android as a Vulkan HAL module — it
-  exports `HMI`, which is how the loader's copy opens it — on ARM's
-  **kbase** kernel driver, the one Android's Mali devices ship, rather
-  than the mainline panfrost DRM driver; its device table runs from the
-  Bifrost Mali-G31/G52/G72/G76 through the Valhall G57/G77/G78/G610/G710
-  to the 5th-generation G720/G925). `PANVK=0` (the workflow's `panvk`
-  input off) leaves it out: a 35 MB smaller APK on which Mali devices
-  keep their driver.
+- Turnip driver: <https://github.com/nihui/mesa-turnip-android-driver/releases/download/26.3.1/mesa-turnip-android-26.3.1.zip>
+  (`libvulkan_freedreno.so`, Mesa 26.3.1-lto of 2026-11-19, Adreno
+  6xx/7xx/8xx; SHA-256
+  `9f38529b5f5f6640c1d600a398cc5218cdf7706066e68e8d2fbc7cbde644a8c0`;
+  17.6 MB, of which 1.2 MB is debug info the script strips the same
+  way, to 16.5 MB)
+- PanVK driver: <https://github.com/JimVulkan/mali-panvk/releases/download/v1.6.0/mali-panvk-27.0.0-devel-r10.zip>
+  (release r10 of 2026-11-04, SHA-256
+  `7e97db4d79d81ec9461d1e0676b62a865561cb56e21c151693aa25ffbe749f1c`:
+  `libvulkan_panfrost.so`, 18 MB, with a `meta.json` and the notices —
+  only the `.so` goes in. Mesa 27.0.0-devel's PanVK (git 58f2c55) built
+  for Android as a Vulkan HAL module — it exports `HMI`, which is how
+  the loader's copy opens it — on the **stock Arm kbase** kernel driver
+  (`/dev/mali0`), the one Android's Mali devices ship: no root and no
+  custom kernel, where the earlier panvk-kbase-android build needed one.
+  Vulkan 1.4 on the Bifrost Mali-G31/G51/G52/G71/G72/G76, the Valhall
+  G57/G68/G77/G78 and the command-stream G610/G615/G710/G715/G720/
+  Immortalis-G925/Mali-G1 (1.3 on cores with fewer than 8 colour
+  attachments, the G71 among them; G610/G710/G715 untested by its
+  author); Android 12+). `PANVK=0` (the workflow's `panvk` input off)
+  leaves it out: an 18 MB smaller APK on which Mali devices keep their
+  driver.
 
 Another build goes in with `TURNIP_ZIP=<url or file>` /
-`ADRENOTOOLS_ZIP=<url or file>` / `PANVK_SO=<url or file>` (a `*_SHA256`
-beside it is checked when given), or by dropping the `.so` files into
+`ADRENOTOOLS_ZIP=<url or file>` / `PANVK_ZIP=<url or file, zip or bare .so>`
+(a `*_SHA256` beside it is checked when given), or by dropping the `.so` files into
 `crates/rustudio-android/libs/arm64-v8a/` by hand (kept unless `FORCE=1`).
 
 **How the swap works.** `tools/android/fetch-turnip.sh` (run by the
@@ -1078,7 +1099,8 @@ default, below), **LRZ fast clear off** (`nolrzfc`), **Binning off**
 (`nobin`), **Tiled rendering off** (`sysmem`), **Flush caches after
 every draw** (`flushall`), and, at the next start, **Passes through
 dynamic rendering** (`dynamic`, on by default: libadrenotools' own
-setting) and **Bandwidth compression off** (`noubwc`). They are kept in
+setting) and **Bandwidth compression off** (`noubwc`; on by default on
+an Adreno 6xx — 650, 660 —, below). They are kept in
 `files/turnip/debug` (comma-separated flag names), which is handed to
 the driver as `TU_DEBUG_FILE`: Mesa reads it at start-up and watches it
 (inotify), so a flag of its runtime set (`tu_runtime_debug_flags` in
@@ -1086,7 +1108,36 @@ the driver as `TU_DEBUG_FILE`: Mesa reads it at start-up and watches it
 `gmem`, `forcebin`, `syncdraw`, …) changes the running driver the moment
 the box is ticked — the renderer needs no restart, and a chunk that was
 missing comes back (or doesn't) on the spot. The file persists, so a fix
-found this way stays; "Default" writes `dynamic,nolrz` back.
+found this way stays; "Default" writes `dynamic,nolrz` back (on an
+Adreno 6xx `dynamic,nolrz,noubwc`).
+
+*UBWC and the whole-device restarts.* With UBWC (the GPU's bandwidth
+compression of textures and render targets, Turnip's default) on,
+Turnip's first frame took a Galaxy S20 FE (Snapdragon 865, Adreno 650)
+down to a restart of the whole phone: a fatal bus error in the chip,
+`TZBSP_ERR_FATAL_NOC_ERROR`, the finding of
+[WindWakerHD-Android-Plus v1.7](https://github.com/Nycolazs/WindWakerHD-Android-Plus/releases/tag/v1.7)
+with Mesa 26.0 to 26.3 ("above 1x resolution"; it turns UBWC off for
+Turnip on Adreno 6xx by itself, at no measurable cost there: 18.2
+against 19.5 ms of GPU time per frame). A Snapdragon 865 device here
+restarted the same way with the libadrenotools build that had the
+fork's reboot fixes of 2026-11-18 (the GSL free hook, the PWRCTRL
+ioctl) in, so those were not the whole story. rustudio puts `noubwc`
+in the switches file on an Adreno 6xx (`turnip::default_switches`:
+the file's first write, and once for a file written by an earlier
+build — `files/turnip/default-noubwc` beside it remembers, so unticking
+it afterwards holds); Mesa reads the file's start-time flags at
+`tu_env_init_once` (`start_debug |= file_flags & ~tu_runtime_debug_flags`),
+so it is in force from the first frame of the next start. Adreno 7xx
+and up keep compression: no such report, and it is worth bandwidth
+there. libadrenotools-native 8c7d9f5's constructor defaults
+`TU_DEBUG=noconform,noubwc,nolrz` on a 6xx as well, but only when
+nothing set `TU_DEBUG` before it ran, which rustudio does
+(`TU_DEBUG_BASE`); the switch here does not depend on it. The logcat line: `turnip: TU_DEBUG=…;
+switches (…/files/turnip/debug): dynamic,nolrz,noubwc` (and, the first
+time, `turnip: noubwc joins the switches on by default on this GPU
+(Adreno 650)`). A 6xx that has proved it can take UBWC — a long session
+at the full 3D render scale — can have it back by unticking the box.
 
 **LRZ is off by default** (`turnip::DEFAULT_SWITCHES`). Found on the
 S20 Ultra with Mesa 26.3.0: a flat terrain drew, then whole chunks of it

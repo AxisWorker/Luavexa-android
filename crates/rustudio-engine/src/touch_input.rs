@@ -742,7 +742,8 @@ impl Touch {
             painter.text(
                 j.center(),
                 egui::Align2::CENTER_CENTER,
-                "⤒",
+                // (U+2B06, in the bundled fonts; tests/ui_glyphs.rs)
+                "⬆",
                 egui::FontId::proportional(26.0),
                 Color32::from_rgba_unmultiplied(255, 255, 255, 190),
             );

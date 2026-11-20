@@ -157,6 +157,11 @@ mlua = { path = "vendor/mlua" }
 # egui 0.36.2 patched (text_selection/, scroll_area.rs): double/
 # triple click select on the press, not the release, like Studio.
 egui = { path = "vendor/egui" }
+# egui-wgpu 0.36.2 + one change (renderer.rs, marked rustudio): a frame
+# whose index or vertex staging buffer the queue refuses (GPU memory
+# refused, device lost) is skipped, where egui-wgpu panicked — on a phone
+# whose driver reset the GPU, the end of the process and the open place.
+egui-wgpu = { path = "vendor/egui-wgpu" }
 # egui_dock 0.21.1 + a pop-out button next to each tab's close × (TabViewer::
 # show_pop_out_button / on_pop_out, marked rustudio): src/panels.rs.
 egui_dock = { path = "vendor/egui_dock" }

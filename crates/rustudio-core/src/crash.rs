@@ -73,6 +73,38 @@ fn header(kind: &str) -> String {
 /// The report this process wrote (the panic hook's), if any.
 static LAST_REPORT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
+/// The last [`NOTES_KEPT`] notes (`note`), oldest first.
+static NOTES: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+const NOTES_KEPT: usize = 24;
+
+/// Keeps `line` for the crash report: the panic hook's report ends with
+/// the last [`NOTES_KEPT`] notes, so a report says what led up to it — a
+/// GPU error or a lost device (src/android/mod.rs install_gpu_error_handler),
+/// a memory warning. (The fatal-signal report can't: it takes no locks.)
+pub fn note(line: impl Into<String>) {
+    if let Ok(mut n) = NOTES.lock() {
+        if n.len() >= NOTES_KEPT {
+            n.pop_front();
+        }
+        n.push_back(format!("{} {}", chrono::Local::now().format("%H:%M:%S%.3f"), line.into()));
+    }
+}
+
+fn notes_block() -> String {
+    match NOTES.try_lock() {
+        Ok(n) if !n.is_empty() => {
+            let mut s = String::from("\nrecent notes (oldest first):\n");
+            for l in n.iter() {
+                s.push_str(l);
+                s.push('\n');
+            }
+            s
+        }
+        _ => String::new(),
+    }
+}
+
 fn write_report(body: &str) -> Option<PathBuf> {
     let d = dir();
     std::fs::create_dir_all(&d).ok()?;
@@ -83,6 +115,13 @@ fn write_report(body: &str) -> Option<PathBuf> {
         *l = Some(path.clone());
     }
     Some(path)
+}
+
+/// A report of a fatal event that is neither a panic nor a signal — the
+/// GPU device lost under the editor (src/android/mod.rs `gpu_watch`) —
+/// with the recent notes; the next start lists it like the others.
+pub fn write_event(kind: &str, body: &str) -> Option<PathBuf> {
+    write_report(&format!("{}{body}\n{}", header(kind), notes_block()))
 }
 
 /// The report this process's panic hook wrote, if a panic happened (the
@@ -117,8 +156,9 @@ pub fn install() {
                 .unwrap_or_default();
             let bt = Backtrace::force_capture();
             let body = format!(
-                "{}panic in thread '{name}' at {loc}:\n{msg}\n\nbacktrace:\n{bt}\n",
-                header("panic")
+                "{}panic in thread '{name}' at {loc}:\n{msg}\n\nbacktrace:\n{bt}\n{}",
+                header("panic"),
+                notes_block()
             );
             if let Some(p) = write_report(&body) {
                 eprintln!("rustudio: crash report written to {}", p.display());

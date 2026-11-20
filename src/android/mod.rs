@@ -302,21 +302,122 @@ pub fn run(app: AndroidApp) {
 pub fn install_gpu_error_handler(device: &egui_wgpu::wgpu::Device) {
     device.on_uncaptured_error(std::sync::Arc::new(|e: egui_wgpu::wgpu::Error| {
         let n = GPU_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if matches!(e, egui_wgpu::wgpu::Error::OutOfMemory { .. }) {
+            GPU_OOM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if n <= GPU_ERRORS_LOGGED {
             log::error!("rustudio: wgpu error {n} (the frame goes on): {e}");
+            rustudio_core::crash::note(format!("wgpu error {n}: {e}"));
         } else if n == GPU_ERRORS_LOGGED + 1 {
             log::error!("rustudio: wgpu error {n}: {e} — further ones are counted, not logged");
+            rustudio_core::crash::note(format!("wgpu error {n}: {e} (further ones counted)"));
         }
     }));
+    // The driver reset the GPU (a hang, a fault, the system reclaiming it):
+    // every call on this device fails from here on. wgpu says so only here.
+    device.set_device_lost_callback(|reason, message| {
+        let line = format!(
+            "rustudio: the GPU device is lost ({reason:?}: {message}); nothing more can be drawn with it — the open place is saved to the recovery folder and rustudio restarts"
+        );
+        log::error!("{line}");
+        rustudio_core::crash::note(line);
+        GPU_LOST.store(true, std::sync::atomic::Ordering::Release);
+    });
 }
 
 /// How many GPU errors' texts go to logcat in full.
 pub const GPU_ERRORS_LOGGED: usize = 20;
 static GPU_ERRORS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static GPU_OOM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static GPU_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The GPU errors so far this run (`install_gpu_error_handler`).
 pub fn gpu_errors() -> usize {
     GPU_ERRORS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Of them, the out-of-memory ones.
+pub fn gpu_oom_errors() -> usize {
+    GPU_OOM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether wgpu reported the device lost (`install_gpu_error_handler`).
+pub fn gpu_lost() -> bool {
+    GPU_LOST.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Once a frame, before the editor draws: a lost GPU device, or GPU
+/// out-of-memory errors every frame for [`OOM_PATIENCE`], end the run in
+/// order — the open place is written to `<data>/recovery/`, a report
+/// says so for the next start, and the activity is relaunched (jni::relaunch)
+/// — instead of a process that draws nothing until the system kills it.
+/// (The vendored egui-wgpu skips a frame whose upload the device refuses,
+/// vendor/egui-wgpu/PATCHES.md; a single refused frame recovers by
+/// itself.) Returns true when the frame should draw nothing.
+pub fn gpu_watch(ed: &mut crate::app::Editor) -> bool {
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    const OOM_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+    static LAST_OOM: std::sync::Mutex<(usize, Option<Instant>)> = std::sync::Mutex::new((0, None));
+    static HANDLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if HANDLED.load(Ordering::Relaxed) {
+        return true;
+    }
+    let why = if gpu_lost() {
+        Some("the GPU device was lost (the graphics driver reset it)".to_string())
+    } else {
+        let oom = gpu_oom_errors();
+        let mut g = LAST_OOM.lock().unwrap_or_else(|e| e.into_inner());
+        let (seen, since) = *g;
+        *g = if oom > seen {
+            (oom, Some(since.unwrap_or_else(Instant::now)))
+        } else {
+            (oom, None)
+        };
+        match g.1 {
+            Some(t) if t.elapsed() >= OOM_PATIENCE => Some(format!(
+                "the GPU ran out of memory for {} s ({oom} out-of-memory errors)",
+                OOM_PATIENCE.as_secs()
+            )),
+            _ => None,
+        }
+    };
+    let Some(why) = why else { return false };
+    HANDLED.store(true, Ordering::Relaxed);
+    // The open place, if one is (the Start Page's empty document isn't).
+    let open = !(ed.start.visible && ed.game.doc.id == ed.start.doc_id);
+    let saved = if open {
+        let dir = rustudio_core::android_dirs::data_dir().join("recovery");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut name: String = ed
+            .game
+            .doc
+            .title
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .take(60)
+            .collect();
+        if name.is_empty() {
+            name = "place".into();
+        }
+        let path = dir.join(format!("{name}-{}.rbxl", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+        match ed.game.doc.encode_all(false).and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string())) {
+            Ok(()) => format!("The open place was saved to {}", path.display()),
+            Err(e) => format!("The open place could not be saved ({e})"),
+        }
+    } else {
+        "No place was open".to_string()
+    };
+    let line = format!("rustudio: {why}; nothing more can be drawn. {saved}. rustudio restarts; open the saved copy from Recent or the recovery folder.");
+    log::error!("{line}");
+    eprintln!("{line}");
+    let _ = rustudio_core::crash::write_event(&why, &line);
+    if let Err(e) = jni::relaunch() {
+        log::error!("rustudio: relaunch: {e}");
+    }
+    // (the report and the save are on disk; the relaunch intent is queued)
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::process::exit(0);
 }
 
 /// Touch-first settings for the egui chrome: bigger hit targets, a wider

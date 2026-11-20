@@ -37,6 +37,8 @@ fn collect(tokens: TokenStream, path: &Path, glyphs: &mut BTreeMap<char, BTreeSe
                             | ("globals_parity.rs", '\u{200d}')
                         // The Output stack marker is stripped before display.
                             | ("runtime.rs" | "ui_shots.rs", '\u{2063}')
+                        // The Android clipboard's seed text is never shown.
+                            | ("clipboard.rs", '\u{200b}')
                     ) {
                         continue;
                     }
