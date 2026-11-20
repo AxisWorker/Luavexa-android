@@ -103,7 +103,7 @@ pub struct UiState {
     pub show_gui: bool,
     pub grid_size: f32,
     pub about: bool,
-    /// View > Graphics Settings (src/graphics_settings.rs).
+    /// View > GPU Driver (src/graphics_settings.rs).
     pub graphics_settings: bool,
     /// File > Studio Settings (src/studio_settings.rs).
     pub studio_settings: crate::studio_settings::Dialog,
@@ -260,25 +260,10 @@ pub const VIEW: &[M] = &[
     I("Zoom In", "Ctrl+=", "zoom_in"),
     I("Zoom Out", "Ctrl+-", "zoom_out"),
     I("Full Screen", "F11", "full_screen"),
-    // The 3D view's graphics quality (crates/rustudio-render/src/graphics.rs): Studio's 1–10 bar
-    // (view distance, textures, MSAA, the scene's format, shadows, the
-    // post passes) or Automatic, by the frame rate; the window has the
-    // bar and each setting apart from it (src/graphics_settings.rs).
-    I("Graphics Settings...", "", "graphics_settings"),
-    Sub("Graphics Quality", &[
-        I("Automatic", "", "quality_auto"),
-        S,
-        I("1 (fastest)", "", "quality_1"),
-        I("2", "", "quality_2"),
-        I("3", "", "quality_3"),
-        I("4", "", "quality_4"),
-        I("5", "", "quality_5"),
-        I("6", "", "quality_6"),
-        I("7", "", "quality_7"),
-        I("8", "", "quality_8"),
-        I("9", "", "quality_9"),
-        I("10 (best)", "", "quality_10"),
-    ]),
+    // Which adapter and driver draw the 3D view; on Android the Mesa
+    // driver switch (src/graphics_settings.rs). The quality settings are
+    // File > Studio Settings > rustudio > Performance.
+    I("GPU Driver...", "", "graphics_settings"),
     S,
     I("Show View Selector", "", "view_selector"),
     I("Show Wind Direction", "", "wind_direction"),
@@ -300,6 +285,7 @@ pub const VIEW: &[M] = &[
     I("Toggle Comment", "Ctrl+/", "toggle_comment"),
     S,
     I("Screenshot", "", "screenshot"),
+    I("MicroProfiler", "Ctrl+F6", "microprofiler"),
     S,
     I("Mute", "", "mute"),
 ];
@@ -347,6 +333,7 @@ pub const TEST: &[M] = &[
 
 pub const WINDOW: &[M] = &[
     I("Toolbox", "", "toolbox"),
+    I("File Sync", "", "file_sync"),
     I("Properties", "", "panel_properties"),
     I("Explorer", "Alt+X", "panel_explorer"),
     I("Output", "", "panel_output"),
@@ -367,7 +354,7 @@ pub const WINDOW: &[M] = &[
     Sub("Localization", &[I("Localization Tools", "", "localization_tools")]),
     Sub("Performance Summary", &[
         I("Performance Diagnostics", "", "perf_diagnostics"),
-        I("MicroProfiler", "Ctrl+Alt+F6", "microprofiler"),
+        I("MicroProfiler", "Ctrl+F6", "microprofiler"),
         I("Network Summary", "Ctrl+Shift+F3", "net_summary"),
         I("Performance Summary", "Ctrl+Shift+F5", "perf_summary"),
         I("Physics", "Ctrl+Shift+F4", "physics_stats"),
@@ -485,6 +472,13 @@ pub fn menu_shortcuts() -> Vec<(KeyboardShortcut, &'static str)> {
     for (_, items) in MENUS {
         walk(items, &mut out);
     }
+    // An action listed in two menus (MicroProfiler: View and Window) binds once.
+    let mut seen = Vec::new();
+    out.retain(|(k, a)| {
+        let dup = seen.contains(&(*k, *a));
+        seen.push((*k, *a));
+        !dup
+    });
     out.sort_by_key(|(k, _)| {
         std::cmp::Reverse(k.modifiers.command as u8 + k.modifiers.shift as u8 + k.modifiers.alt as u8)
     });

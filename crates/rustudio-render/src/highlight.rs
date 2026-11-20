@@ -125,7 +125,7 @@ pub struct HighlightPass {
     target: Option<([u32; 2], wgpu::TextureView, wgpu::TextureView, wgpu::BindGroup)>,
 }
 
-pub const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg8Unorm;
+pub(crate) const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg8Unorm;
 const PARAMS_STRIDE: u64 = std::mem::size_of::<Params>() as u64;
 
 impl HighlightPass {
@@ -286,7 +286,7 @@ impl HighlightPass {
     }
 
     /// Draws the highlights over `display`: per highlight, the meshes
-    /// (vertex buffer, vertex count, instance) of its parts.
+    /// (mesh, instance) of its parts.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
@@ -297,7 +297,7 @@ impl HighlightPass {
         depth: &wgpu::TextureView,
         display: &wgpu::TextureView,
         view_proj: Mat4,
-        list: &[(&HighlightDraw, Vec<(&wgpu::Buffer, u32, Inst)>)],
+        list: &[(&HighlightDraw, Vec<(&crate::render::Mesh, Inst)>)],
     ) {
         if list.is_empty() {
             return;
@@ -317,10 +317,8 @@ impl HighlightPass {
                     })
                     .create_view(&Default::default())
             };
-            // (without MSAA — a quality setting, graphics.rs — the masks are
-            // drawn straight into the resolved one)
             let one = tex("highlight mask", 1, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
-            let ms = if samples > 1 { tex("highlight mask msaa", samples, wgpu::TextureUsages::RENDER_ATTACHMENT) } else { one.clone() };
+            let ms = if samples == 1 { one.clone() } else { tex("highlight mask msaa", samples, wgpu::TextureUsages::RENDER_ATTACHMENT) };
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("highlight"),
                 layout: &self.layout,
@@ -343,7 +341,7 @@ impl HighlightPass {
             self.inst_cap = n_inst.next_power_of_two();
             self.insts = Self::inst_buf(device, self.inst_cap);
         }
-        let insts: Vec<Inst> = list.iter().flat_map(|(_, m)| m.iter().map(|x| x.2)).collect();
+        let insts: Vec<Inst> = list.iter().flat_map(|(_, m)| m.iter().map(|x| x.1)).collect();
         if !insts.is_empty() {
             queue.write_buffer(&self.insts, 0, bytemuck::cast_slice(&insts));
         }
@@ -367,10 +365,9 @@ impl HighlightPass {
             let draw_meshes = |pass: &mut wgpu::RenderPass| {
                 pass.set_bind_group(0, &self.params_bg, &off);
                 pass.set_vertex_buffer(1, self.insts.slice(..));
-                for (k, (vbuf, count, _)) in meshes.iter().enumerate() {
-                    pass.set_vertex_buffer(0, vbuf.slice(..));
+                for (k, (mesh, _)) in meshes.iter().enumerate() {
                     let n = range.start + k as u32;
-                    pass.draw(0..*count, n..n + 1);
+                    mesh.draw(pass, n..n + 1);
                 }
             };
             {

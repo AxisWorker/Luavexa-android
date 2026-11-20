@@ -122,6 +122,8 @@ pub fn run<A: eframe::App>(
     } else {
         None
     };
+    let atlas_device_limit = rs.as_ref().map(|rs| rs.device.limits().max_texture_dimension_2d as usize);
+    let mut font_limit = None;
     let size = [opts.size[0].max(1), opts.size[1].max(1)];
     let frame = rs.as_ref().map(|rs| target(rs, size));
     let mut app = make(&ctx, rs.clone());
@@ -137,6 +139,7 @@ pub fn run<A: eframe::App>(
             )),
             time: Some(start.elapsed().as_secs_f64()),
             predicted_dt: 1.0 / 60.0,
+            max_texture_side: font_limit,
             focused: true,
             events: std::mem::take(&mut events),
             ..Default::default()
@@ -150,7 +153,21 @@ pub fn run<A: eframe::App>(
             v.monitor_size = Some(egui::vec2(size[0] as f32, size[1] as f32));
         }
         app.raw_input_hook(&ctx, &mut raw);
-        let mut out = ctx.run_ui(raw, |ui| draw(&mut app, ui));
+        let mut out = ctx.run_ui(raw, |ui| {
+            draw(&mut app, ui);
+            // RawInput defaults to a 2048 atlas offscreen. Keep its packing
+            // for small scenes, but grow to the device limit when epaint
+            // would otherwise discard the full atlas and start over.
+            if font_limit.is_none() {
+                if let Some(limit) = atlas_device_limit {
+                    if ctx.fonts(|fonts| {
+                        fonts.options().max_texture_side < limit && fonts.font_atlas_fill_ratio() > 0.8
+                    }) {
+                        font_limit = Some(limit);
+                    }
+                }
+            }
+        });
         // (epaint's debug builds assert that a TexturesDelta was handled
         // before it is dropped: applied below where there is a GPU, and
         // there is nothing to apply it to without one)
@@ -240,6 +257,12 @@ pub fn run<A: eframe::App>(
     }
 }
 
+/// The interactive window presents in mailbox mode (Settings > rustudio >
+/// Performance > Presentation, `RUSTUDIO_PERF_PRESENT=fifo` forces Fifo).
+pub fn interactive_mailbox() -> bool {
+    rustudio_core::rustudio_settings::performance_value("present") != "fifo"
+}
+
 /// eframe's wgpu setup, shared by the desktop window, the player and the
 /// Android activity: the renderer samples up to 24 textures in one draw
 /// (render.rs), vsync unless measuring. On Android the backends are Vulkan
@@ -267,9 +290,22 @@ pub fn wgpu_options_with(
                     egui_wgpu::wgpu::Backends::VULKAN | egui_wgpu::wgpu::Backends::GL;
             }
             let descriptor = setup.device_descriptor.clone();
+            // A real GPU before a software one, a native API before
+            // OpenGL (gpu_caps::rank_adapters): on Windows an HD 4600's GL
+            // driver before WARP, its only DX12 adapter. The vendored
+            // egui-wgpu tries the next one when a device can't be made.
+            setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters, surface| {
+                rustudio_render::gpu_caps::rank_adapters(adapters, surface)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| format!("no graphics adapter can draw to this window ({} found)", adapters.len()))
+            }));
             setup.device_descriptor = std::sync::Arc::new(move |adapter| {
                 let mut d = descriptor(adapter);
-                d.required_limits.max_sampled_textures_per_shader_stage = 24;
+                // Only what the adapter offers (gpu_caps.rs): unchanged on a
+                // capable GPU; OpenGL's 16 texture units, WARP's limits and
+                // the like get the renderer's reduced binding set.
+                d.required_limits = rustudio_render::gpu_caps::required_limits(&adapter.limits());
                 // Studio HBAO writes its full-resolution R8 visibility UAV.
                 d.required_features |= adapter.features() & egui_wgpu::wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
                 // RUSTUDIO_GPU_TIMING: timestamp queries (gpu_timing.rs).
@@ -283,18 +319,6 @@ pub fn wgpu_options_with(
                 // RUSTUDIO_GPU_MEMORY=performance: wgpu's default blocks.
                 if std::env::var("RUSTUDIO_GPU_MEMORY").ok().as_deref() != Some("performance") {
                     d.memory_hints = egui_wgpu::wgpu::MemoryHints::MemoryUsage;
-                }
-                // The 32-bit float scene target of the Low / non-HDR
-                // settings (graphics.rs scene_format), and the driver's
-                // pipeline cache the renderer keeps on disk so a second
-                // start compiles no shaders (render.rs PipelineCache).
-                let want = egui_wgpu::wgpu::Features::RG11B10UFLOAT_RENDERABLE | egui_wgpu::wgpu::Features::PIPELINE_CACHE;
-                d.required_features |= adapter.features() & want;
-                // GPU timestamps for the perf log's line (render::GpuTimer),
-                // where the device has them.
-                if rustudio_render::perf_log::on() {
-                    let want = egui_wgpu::wgpu::Features::TIMESTAMP_QUERY | egui_wgpu::wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-                    d.required_features |= adapter.features() & want;
                 }
                 d
             });
@@ -310,8 +334,21 @@ pub fn wgpu_options_with(
     }
 }
 
-/// The swapchain's present mode: vsync (`AutoVsync`: FIFO, relaxed where
-/// the driver has it) unless `no_vsync`. `RUSTUDIO_PRESENT_MODE` overrides
+/// The swapchain's present mode: no vsync when measuring (`no_vsync`);
+/// else the Presentation setting's — Mailbox (Studio presents without
+/// waiting for the refresh, its D3D11 frames run past the display rate
+/// with a higher TaskSchedulerTargetFps, and paces them with its own
+/// frame cap; composited, so nothing tears; Mailbox is the tear-free
+/// equivalent, the vendored egui-wgpu falls back to Fifo on a surface
+/// without it, and native_loop.rs paces redraws; FIFO blocked a low-end
+/// laptop's main thread on the GPU, a test place 24.6 -> 30.5 fps with
+/// mailbox) or `AutoVsync` (FIFO, relaxed where the driver has it) for
+/// "Wait for vsync". On Android it is `AutoVsync` whatever the setting:
+/// the activity runs eframe's own loop (src/android/mod.rs), with no
+/// native_loop to pace Mailbox frames to the refresh, and an unpaced
+/// Mailbox loop on a phone draws as fast as the GPU allows — heat and
+/// battery for frames the display never shows (the standalone player
+/// keeps vsync for the same reason). `RUSTUDIO_PRESENT_MODE` overrides
 /// for measuring — `fifo`, `relaxed`, `mailbox`, `immediate`, `vsync`,
 /// `novsync`; a mode the surface lacks falls back to FIFO in wgpu, with a
 /// warning in its log.
@@ -325,14 +362,9 @@ pub fn present_mode(no_vsync: bool) -> egui_wgpu::wgpu::PresentMode {
         Some("vsync") => PresentMode::AutoVsync,
         Some("novsync") => PresentMode::AutoNoVsync,
         _ if no_vsync => PresentMode::AutoNoVsync,
+        _ if interactive_mailbox() && cfg!(not(target_os = "android")) => PresentMode::Mailbox,
         _ => PresentMode::AutoVsync,
     }
-}
-
-/// The present mode's name for the perf log (the editor's: never the
-/// bench's or the control harness's).
-pub fn present_mode_name() -> String {
-    format!("{:?}", present_mode(false))
 }
 
 /// Frames the presentation engine may hold ahead of the one being drawn:

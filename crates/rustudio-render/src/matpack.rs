@@ -399,25 +399,6 @@ impl Maps {
     }
 }
 
-/// A pack of flat maps (one colour, flat normal, no emission), held, for
-/// the renderer's tests.
-#[cfg(test)]
-pub(crate) fn test_maps(pack: u64, rgb: [u8; 3]) -> Arc<Maps> {
-    let n = (LAYER_SIZE * LAYER_SIZE) as usize;
-    let mut albedo = vec![255u8; n * 4];
-    for px in albedo.chunks_exact_mut(4) {
-        px[..3].copy_from_slice(&rgb);
-    }
-    let pixels = Pixels {
-        albedo: mip_chain(&albedo, true),
-        surface: mip_chain(&vec![128u8; n * 4], false),
-        height: height_chain(None),
-        emissive: mip_chain(&vec![0u8; n * 4], false).into_iter().step_by(4).collect(),
-        _held: Held::new(),
-    };
-    Arc::new(Maps::new(pack, [true, true, false, false, false], 0, pixels))
-}
-
 /// Builds a released pack's maps again (nothing when they are held or
 /// already on their way); `generation` changes when they are back.
 pub fn request_pixels(maps: &Maps) {

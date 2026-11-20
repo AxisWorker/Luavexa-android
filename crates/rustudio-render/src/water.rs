@@ -40,11 +40,7 @@ pub const FRAMES: u32 = 25;
 const SIZE: u32 = 256;
 
 pub struct WaterPass {
-    /// The pipeline's layout (globals, textures, this pass's group); the
-    /// renderer makes the pipeline itself on first use (render.rs
-    /// `Pipe::Water`: vs_water / fs_water of the viewport shader, the
-    /// scene's colour format and sample count).
-    pub layout: wgpu::PipelineLayout,
+    pub pipeline: wgpu::RenderPipeline,
     pub bgl: wgpu::BindGroupLayout,
     pub buf: wgpu::Buffer,
     normals: wgpu::TextureView,
@@ -53,13 +49,16 @@ pub struct WaterPass {
 }
 
 impl WaterPass {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        shader: &wgpu::ShaderModule,
         globals: &wgpu::BindGroupLayout,
         textures: &wgpu::BindGroupLayout,
+        buffers: &[Option<wgpu::VertexBufferLayout>],
+        hdr: wgpu::TextureFormat,
         samples: u32,
-        anisotropy: u16,
     ) -> Self {
         let frag = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
             binding,
@@ -98,7 +97,7 @@ impl WaterPass {
                 frag(
                     4,
                     wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
+                        sample_type: crate::gpu_caps::depth_sample_type(device),
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: samples > 1,
                     },
@@ -109,6 +108,41 @@ impl WaterPass {
             label: Some("water"),
             bind_group_layouts: &[Some(globals), Some(textures), Some(&bgl)],
             immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("water"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_water"),
+                compilation_options: Default::default(),
+                buffers,
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: samples,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_water"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: hdr,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
         });
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("water"),
@@ -123,15 +157,13 @@ impl WaterPass {
             address_mode_v: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            // Mipmapped: far ripples average out instead of shimmering
-            // (the quality settings' anisotropy, mech::TEXTURE_ANISOTROPY
-            // at the top).
+            // Mipmapped: far ripples average out instead of shimmering.
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            anisotropy_clamp: anisotropy.max(1),
+            anisotropy_clamp: rustudio_core::mech::TEXTURE_ANISOTROPY,
             ..Default::default()
         });
         WaterPass {
-            layout,
+            pipeline,
             bgl,
             buf,
             normals,
@@ -207,6 +239,9 @@ fn load_normals(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::TextureVie
     if frames.len() != FRAMES as usize {
         // Flat: x, y at 0.5 (.wy), smooth.
         frames = vec![[0u8, 128, 128, 128].repeat((SIZE * SIZE) as usize)];
+        if crate::gpu_caps::single_layer_arrays_break(device) {
+            frames.push(frames[0].clone());
+        }
     }
     let layers = frames.len() as u32;
     let mips = 32 - SIZE.leading_zeros();

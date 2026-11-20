@@ -274,6 +274,31 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
   Roblox's phase 2 (early 2027) makes Default mean Enabled
   (`input_action_system_on`; test
   `player_scripts_layout_follows_the_rollout_flag`).
+- **A place's own PlayerModule never ran without Studio's content.**
+  The classic loader, PlayerModule and RbxCharacterSounds come from
+  Studio's content folder, and without it (a phone before the download,
+  an offline desktop) `insert_player_scripts` added nothing — not even
+  the loader — so a place with its own `PlayerModule` fork in
+  StarterPlayerScripts (LBG: the shift lock's MouseLockController, its
+  camera and touch controls) never had it required; the engine's
+  keyboard stand-in moved the character instead. `default_scripts.rs`
+  now carries a loader of its own (`PLAYER_SCRIPTS_LOADER`: require the
+  module once, as Roblox's does) and inserts it when a place has a
+  PlayerModule but no loader, content or not (`insert_own_loader`; test
+  `own_player_module_gets_a_loader_without_studio_content`).
+- **`GuiService.TopbarInset` was an empty Rect for ever.** TopbarPlus
+  (`IconNew`, `TopbarPlusGui`) and LBG's ClientRenderer read
+  `TopbarInset.Height`, wait on `GetPropertyChangedSignal("TopbarInset")`
+  while it is 0 and only then build their icons — a wait nothing ended.
+  In Play it is now the top bar's free area as Roblox's reference
+  describes it — from the end of the menu and chat buttons (`play_game.rs
+  top_bar`: 128 px with the chat button, 72 without) to the viewport's
+  right edge, 58 high (the new topbar; the old one's 36 is what
+  TopbarPlus tests for) — an empty Rect in the edit DataModel, and
+  `gui_input.luau` `step_topbar` publishes the change when the viewport
+  or the chat button changes (test
+  `topbar_inset_is_the_bar_and_follows_the_viewport`). The left edge is
+  this build's bar, not a measurement of Roblox's unibar.
 - **UIListLayout's flex settings were ignored**: `Wraps`, `HorizontalFlex`
   / `VerticalFlex` (UIFlexAlignment Fill / SpaceAround / SpaceBetween /
   SpaceEvenly) and `ItemLineAlignment`. A wrapping list (90 of LBG's 250
@@ -315,21 +340,46 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
   done: the unibar's other icons (captures, emotes, leaderboard,
   inventory), the health bar, notifications; a hidden bar keeps the 58 px
   GuiInset (Roblox drops it to 0 — ScreenGuis then start at the top).
+- **A joined place's meshes and values were named after their class**:
+  the replication stream leaves `Name` out of a NewInstance whose Name is
+  still the constructor's, and `rustudio_net` filled the gap with the
+  class name for every class but five (Event, Function, Wedge,
+  CornerWedge, Union) — so a `SpecialMesh` the file calls `Mesh` arrived
+  as `SpecialMesh`, a `StringValue` called `Value` as `StringValue`, and
+  `part.Mesh` / `folder.Value` raised "Mesh is not a valid member of Part"
+  in a place opened from Roblox while the same .rbxl opened from a file
+  ran clean (LBG's `Wind1` on a cloned `ring`, its `MeshGroup.BeanWind.Mesh`).
+  Now `default_instance_name` — one table, in
+  `rustudio_core::doc` and again in `rustudio_net::model` (the net crate
+  doesn't depend on core; `live_sync.rs` `default_name_tables_agree`
+  keeps the copies equal) — holds Studio's constructor names (meshes
+  "Mesh", the twelve ValueBase classes "Value", Lighting's effects
+  "Bloom" / "Blur" / "ColorCorrection" / "ColorGrading" / "SunRays" /
+  "DepthOfField", "Truss", "NegativePart", "Body Colors", "Shirt
+  Graphic"; services keep their class name — `game.RunService` resolves
+  by child name here); a Team Create join names what arrives by it, and
+  `Instance.new` and Insert Object name new instances by it too
+  (`part.Mesh` after `Instance.new("SpecialMesh", part)`). Not done:
+  names only known from Studio itself for classes not in this list — a
+  class that arrives as its class name but should not is a missing table
+  row (tests `default_instance_names_are_studios`,
+  `default_names_apply_to_direct_and_parked_children`,
+  `instance_new_gives_studios_constructor_names`,
+  `default_name_tables_agree`).
 - **A short Team Create join played as if whole**: `rustudio_net`'s
   `Ready` is 1.5 s without an instance batch, not the server's end of
   transfer, and a child parked for a parent that never arrived, or
   instances still streaming when the server dropped the session, left no
-  trace — a game then fails on a missing child (LBG's
-  `MeshGroup.BeanWind.Mesh` in a place opened from Roblox: 154,702
-  instances joined, the saved file has 160,078, the stream reset 3.5 s
-  after Ready; from the file the same handler runs clean). The Output now
-  counts the parked instances at Ready (a few named) and, at a
-  disconnect, the instances that came after Ready or that the join never
-  finished, each asking to reopen the place or open a saved .rbxl before
-  playing (`model.rs` `parked_count`, `cloud_ui.rs` `ready_count`). Not
-  done: the protocol's own end-of-join signal; a join that stalls under
-  QUIC flow control while the phone is busy applying batches can still
-  pass for quiet.
+  trace. The Output now counts the parked instances at Ready (a few
+  named) and, at a disconnect, the instances that came after Ready or
+  that the join never finished, each asking to reopen the place or open a
+  saved .rbxl before playing (`model.rs` `parked_count`, `cloud_ui.rs`
+  `ready_count`). (The LBG `BeanWind.Mesh` failure once blamed on this was
+  the default-name gap above: the saved file holds 154,682 instances, not
+  the 160,078 claimed, so the join had been complete.) Not done: the
+  protocol's own end-of-join signal; a join that stalls under QUIC flow
+  control while the phone is busy applying batches can still pass for
+  quiet.
 
 ## Coverage of Studio's API
 
@@ -389,19 +439,6 @@ Round 12 fidelity scores (render, settled shots): Place A 49.5, demo 69.3
   a Studio calibration scene (transparency steps over light and dark).
 - **Place A chapel brightness** (Soft spot lights) and the **skybox / stud scale**
   remain open.
-- **Graphics quality levels** (the Android port; `crates/rustudio-render/src/graphics.rs`):
-  `settings().Rendering.EditQualityLevel` now does what Studio's does —
-  Automatic or Level01–21 onto a 1–10 bar of view distance, part detail,
-  texture size, texture filtering, the lite shader (no normal maps,
-  ambient-cube reflections, one material read at levels 1–3), MSAA, scene
-  format, render scale and the scale while the camera moves (the frame
-  brought up to the panel by FSR 1.0's EASU and RCAS), Play's frame-rate
-  cap, shadows and the post passes (docs/ANDROID.md "Graphics quality").
-  A computer starts at level 10, Studio's defaults — full shading, 8×
-  anisotropy, no motion scale, no cap — which is what every fidelity
-  figure above is measured at; a shot at a lower level diverges by
-  design. Open at the low levels: compressed (ASTC) material textures,
-  deferred for want of an on-device encoder (docs/ANDROID.md).
 
 Round 13 fidelity (`fidelity.py run --round 13`): render Place A 49.5, demo
 69.3, control 68.5 (unchanged), all gates pass (MAE 32.4 / 21.7 / 23.1).

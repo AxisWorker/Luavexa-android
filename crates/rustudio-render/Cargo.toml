@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+log = "0.4"
 rustudio-core = { path = "../rustudio-core" }
 # matpack's KTX2 pack fetch asks assetdelivery as the editor's session does
 # (agent(), PLACE_CONTEXT), the same way assets does; core already depends on
@@ -14,8 +15,6 @@ rustudio-account = { path = "../rustudio-account" }
 # wgpu comes through egui-wgpu (`use egui_wgpu::wgpu`), the same wgpu the
 # editor's eframe surface uses: one wgpu in the graph, not a second copy.
 egui-wgpu = "0.36"
-# The perf log's line (perf_log.rs): `log::info!`, so logcat on Android.
-log = "0.4"
 # egui's TextureId / Rect / Pos2 / Context, which the renderer's API already
 # takes (render.rs, world_gui.rs, vf_render.rs, effects.rs, lighting.rs,
 # camera.rs, grass_temporal.rs).
@@ -24,8 +23,6 @@ glam = { version = "0.30", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
 rbx_dom_weak = "4"
 rustc-hash = "2"
-# graphics.rs's Overrides, saved with the window layout (serde).
-serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # matpack's KTX2 / packed-map decoding, and grass_temporal's frame dumps.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

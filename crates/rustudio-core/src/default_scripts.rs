@@ -374,9 +374,43 @@ fn input_action_system_on(doc: &Document) -> bool {
 /// the names inserted.
 pub fn insert_player_scripts(doc: &mut Document) -> Result<Vec<&'static str>, String> {
     let Some(root_dir) = studio_dir() else {
-        return Ok(Vec::new());
+        return Ok(insert_own_loader(doc));
     };
     insert_player_scripts_from(doc, &root_dir)
+}
+
+/// Roblox's PlayerScriptsLoader in rustudio's words: the client puts this
+/// LocalScript next to PlayerModule, and all it does is require the module
+/// once, which starts its CameraModule and ControlModule. Used when Studio's
+/// content (the real loader) isn't at hand but a PlayerModule is: a place
+/// with its own fork of the module in StarterPlayerScripts (LBG) got no
+/// loader at all without the content, nothing required the fork, and its
+/// MouseLockController (shift lock), camera and controls never ran while
+/// the engine's keyboard stand-in moved the character.
+pub const PLAYER_SCRIPTS_LOADER: &str = "\
+-- rustudio: stands in for Roblox's PlayerScriptsLoader, which the client\n\
+-- adds beside PlayerModule. Requiring the module once starts its camera\n\
+-- and control modules.\n\
+local playerModule = script.Parent:WaitForChild(\"PlayerModule\")\n\
+require(playerModule)\n";
+
+/// Without Studio's content: the loader for a place's own PlayerModule in
+/// StarterPlayerScripts (the names Roblox's client checks), when none is
+/// there. A place without a module gets nothing (the stand-in controls).
+fn insert_own_loader(doc: &mut Document) -> Vec<&'static str> {
+    let root = doc.dom.root_ref();
+    let Some(sps) = doc
+        .find_child(root, "StarterPlayer")
+        .and_then(|sp| doc.find_child(sp, "StarterPlayerScripts"))
+    else {
+        return Vec::new();
+    };
+    if child_named(doc, sps, "PlayerModule").is_none() || child_named(doc, sps, "PlayerScriptsLoader").is_some() {
+        return Vec::new();
+    }
+    let r = doc.dom.insert(sps, script("LocalScript", "PlayerScriptsLoader", PLAYER_SCRIPTS_LOADER.to_string()));
+    doc.mark_tree(r);
+    vec!["PlayerScriptsLoader"]
 }
 
 fn insert_player_scripts_from(doc: &mut Document, root_dir: &Path) -> Result<Vec<&'static str>, String> {
@@ -443,6 +477,11 @@ fn insert_player_scripts_from(doc: &mut Document, root_dir: &Path) -> Result<Vec
             .map(|s| script("LocalScript", "PlayerScriptsLoader", s)),
     );
     add(doc, "PlayerModule", player_module(root_dir));
+    // Studio's loader file missing (a partial content folder) with a
+    // module to load: rustudio's own loader.
+    if child_named(doc, sps, "PlayerModule").is_some() {
+        add(doc, "PlayerScriptsLoader", Some(script("LocalScript", "PlayerScriptsLoader", PLAYER_SCRIPTS_LOADER.to_string())));
+    }
     let sounds = read(&base.join("StarterPlayerScriptsCommon/RbxCharacterSounds.lua")).map(|s| {
         let mut b = script("LocalScript", "RbxCharacterSounds", s);
         if let Some(ab) =
@@ -561,6 +600,30 @@ mod tests {
                         "Keyboard": {"$className": "InputBinding", "$properties": {"KeyCode": "Space"}}}}
             }}
         }"#);
+    }
+
+    /// No Studio content: a place's own PlayerModule in StarterPlayerScripts
+    /// (LBG's fork) still gets a PlayerScriptsLoader, rustudio's, so the
+    /// fork runs; a place without a module, or with its own loader, gets
+    /// nothing; a second call adds nothing.
+    #[test]
+    fn own_player_module_gets_a_loader_without_studio_content() {
+        let mut d = Document::new_place();
+        assert!(insert_own_loader(&mut d).is_empty());
+        let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
+        let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
+        d.dom.insert(sps, InstanceBuilder::new("ModuleScript").with_name("PlayerModule"));
+        assert_eq!(insert_own_loader(&mut d), vec!["PlayerScriptsLoader"]);
+        let loader = child_named(&d, sps, "PlayerScriptsLoader").unwrap();
+        assert_eq!(d.class_of(loader).as_deref(), Some("LocalScript"));
+        assert!(matches!(d.prop(loader, "Source"), Some(Variant::String(s)) if s.contains("require(playerModule)")));
+        assert!(insert_own_loader(&mut d).is_empty());
+        let mut own = Document::new_place();
+        let sp = own.find_child(own.dom.root_ref(), "StarterPlayer").unwrap();
+        let sps = own.find_child(sp, "StarterPlayerScripts").unwrap();
+        own.dom.insert(sps, InstanceBuilder::new("ModuleScript").with_name("PlayerModule"));
+        own.dom.insert(sps, InstanceBuilder::new("LocalScript").with_name("PlayerScriptsLoader"));
+        assert!(insert_own_loader(&mut own).is_empty());
     }
 
     /// Which layout a place gets is Workspace.PlayerScriptsUseInputActionSystem:

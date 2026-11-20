@@ -20,74 +20,6 @@ pub const CASCADES: usize = 4;
 const PASS_STRIDE: u64 = 256;
 const ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// Texels across, as a fraction of Studio's sizes (`mech::SUN_CASCADE_TILES`,
-/// the atlas, the depth map): the quality settings' `shadow_scale`
-/// (graphics.rs: 1 at High, 0.75 at Medium, on a phone's Low
-/// `mech::SUN_SHADOW_TEXEL_SCALE_PHONE`, a quarter of the shadow fill and
-/// blur work for cascades whose texels are still finer than the view's
-/// pixels; `RUSTUDIO_SHADOW_SCALE` overrides). The blur stays the same
-/// width in studs (`Cascade::level` counts texels).
-pub fn texel_scale() -> f32 {
-    f32::from_bits(SCALE.load(std::sync::atomic::Ordering::Relaxed))
-}
-
-/// The scale in force: 1 until the renderer sets it from the quality
-/// settings (`RenderSettings::shadow_scale`: the low graphics levels' is
-/// mech::SUN_SHADOW_TEXEL_SCALE_PHONE; RUSTUDIO_SHADOW_SCALE overrides).
-static SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f80_0000);
-
-/// Sets the scale (render.rs, before its shadow atlas is made or remade;
-/// the cascades planned afterwards take it).
-pub fn set_texel_scale(scale: f32) {
-    let scale = if scale.is_finite() { scale.clamp(0.25, 1.0) } else { 1.0 };
-    SCALE.store(scale.to_bits(), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// `v` texels at `scale`, rounded down to a multiple of 16 (so the scaled
-/// tiles still pack without overlapping), at least 16.
-fn scaled_at(v: u32, scale: f32) -> u32 {
-    (((v as f32 * scale).floor() as u32) & !15).max(16)
-}
-
-/// `v` texels at [`texel_scale`].
-fn scaled(v: u32) -> u32 {
-    scaled_at(v, texel_scale())
-}
-
-/// Texels across each cascade's tile at `scale`.
-fn tiles_at(scale: f32) -> [u32; CASCADES] {
-    mech::SUN_CASCADE_TILES.map(|t| scaled_at(t, scale))
-}
-
-/// Texels across each cascade's tile.
-pub fn tiles() -> [u32; CASCADES] {
-    tiles_at(texel_scale())
-}
-
-/// Each tile's corner in the atlas at `scale` (a corner at 0 stays there:
-/// `scaled_at`'s floor of 16 is for the tiles).
-fn origins_at(scale: f32) -> [[u32; 2]; CASCADES] {
-    mech::SUN_CASCADE_ORIGINS.map(|o| o.map(|v| if v == 0 { 0 } else { scaled_at(v, scale) }))
-}
-
-/// Each tile's corner in the atlas.
-pub fn origins() -> [[u32; 2]; CASCADES] {
-    origins_at(texel_scale())
-}
-
-/// The atlas: what the scaled tiles reach (Studio's 3200 × 2048 at scale 1).
-pub fn atlas() -> [u32; 2] {
-    let (t, o) = (tiles(), origins());
-    let reach = |axis: usize| (0..CASCADES).map(|i| o[i][axis] + t[i]).max().unwrap_or(16).next_multiple_of(16);
-    [reach(0), reach(1)]
-}
-
-/// The square depth map the cascades are drawn into one at a time
-/// (render.rs): the largest tile across.
-pub fn depth_texels() -> u32 {
-    scaled(mech::SHADOW_MAP_TEXELS).max(tiles().into_iter().max().unwrap_or(16))
-}
-
 /// Kernel tables by blur level − 1 (levels 1..24). Across: the centre weight
 /// and one per texel either side (.data Studio, 9 floats a row; shader
 /// ShadowEvsmHBlurDFS_3..17 by table Studio). Down: the centre weight
@@ -209,16 +141,11 @@ fn light_basis(travel: Vec3) -> (Vec3, Vec3) {
 /// camera; the others snap to a grid of radius / 4 in light space,
 /// so they stay put while the camera moves a little.
 pub fn cascades(cam: Vec3, forward: Vec3, tan_half: [f32; 2], sun: Vec3, softness: f32) -> [Cascade; CASCADES] {
-    cascades_at(texel_scale(), cam, forward, tan_half, sun, softness)
-}
-
-/// `cascades` with the tiles at `scale` (the renderer's is [`texel_scale`]).
-fn cascades_at(scale: f32, cam: Vec3, forward: Vec3, tan_half: [f32; 2], sun: Vec3, softness: f32) -> [Cascade; CASCADES] {
     let travel = -sun.normalize_or(Vec3::Y);
     let (right, up) = light_basis(travel);
     let blur = softness * mech::SHADOW_SOFTNESS_BLUR[0] + mech::SHADOW_SOFTNESS_BLUR[1];
     let hyp = (tan_half[0] * tan_half[0] + tan_half[1] * tan_half[1]).sqrt();
-    let (origins, tiles) = (origins_at(scale), tiles_at(scale));
+    let origins = mech::SUN_CASCADE_ORIGINS;
     std::array::from_fn(|i| {
         let (near, far) = (mech::SUN_CASCADE_SPLITS[i], mech::SUN_CASCADE_SPLITS[i + 1]);
         let to_far = far * hyp;
@@ -236,7 +163,7 @@ fn cascades_at(scale: f32, cam: Vec3, forward: Vec3, tan_half: [f32; 2], sun: Ve
             let s: DVec3 = snap(right) + snap(up) + snap(travel);
             s.as_vec3()
         };
-        let tile = tiles[i];
+        let tile = mech::SUN_CASCADE_TILES[i];
         // The blur's reach in texels, the blur width through
         // the cascade's projection (1 / radius) times its tile, rounded.
         let level = ((tile as f32 * blur / radius + 0.5) as u32).clamp(1, EVSM_H_WEIGHTS.len() as u32);
@@ -280,7 +207,7 @@ impl Cascade {
 
     /// The tile in the atlas: corner and size in UV.
     pub fn rect(&self) -> [f32; 4] {
-        let [w, h] = atlas().map(|v| v as f32);
+        let [w, h] = mech::SUN_SHADOW_ATLAS.map(|v| v as f32);
         let t = self.tile as f32;
         [self.origin[0] as f32 / w, self.origin[1] as f32 / h, t / w, t / h]
     }
@@ -411,8 +338,8 @@ impl SunShadows {
                 })
                 .create_view(&Default::default())
         };
-        let side = tiles().into_iter().max().unwrap_or(16);
-        let atlas_view = tex("sun shadow atlas", atlas());
+        let side = mech::SUN_CASCADE_TILES.iter().copied().max().unwrap_or(1);
+        let atlas_view = tex("sun shadow atlas", mech::SUN_SHADOW_ATLAS);
         let temp_view = tex("sun shadow blur", [side, side]);
         let pass_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sun shadow passes"),
@@ -455,7 +382,7 @@ impl SunShadows {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
+                        sample_type: crate::gpu_caps::depth_sample_type(device),
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -506,11 +433,11 @@ impl SunShadows {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sun shadow blur"),
             source: wgpu::ShaderSource::Wgsl(
-                format!(
+                crate::gpu_caps::shader_for(device, &format!(
                     "const EVSM_POS_EXP: f32 = {:?};\nconst EVSM_NEG_EXP: f32 = {:?};\n{BLUR_WGSL}",
                     mech::EVSM_POS_EXP,
                     mech::EVSM_NEG_EXP
-                )
+                ))
                 .into(),
             ),
         });
@@ -602,21 +529,14 @@ impl SunShadows {
     pub fn blur(&self, encoder: &mut wgpu::CommandEncoder, c: &Cascade, i: usize) {
         let offset = [(i as u64 * PASS_STRIDE) as u32];
         let t = c.tile as f32;
-        // The pass across writes the scratch texture, so nothing in it is
-        // kept: cleared, not loaded (a tiler loads a whole attachment it is
-        // told to keep, the scratch's every tile, before the first draw;
-        // a clear is free). The atlas keeps the other cascades' tiles.
-        fn begin<'a>(encoder: &'a mut wgpu::CommandEncoder, view: &wgpu::TextureView, keep: bool) -> wgpu::RenderPass<'a> {
+        fn begin<'a>(encoder: &'a mut wgpu::CommandEncoder, view: &wgpu::TextureView) -> wgpu::RenderPass<'a> {
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sun shadow blur"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: if keep { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) },
-                        store: wgpu::StoreOp::Store,
-                    },
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -625,14 +545,14 @@ impl SunShadows {
             })
         }
         {
-            let mut pass = begin(encoder, &self.temp_view, false);
+            let mut pass = begin(encoder, &self.temp_view);
             pass.set_viewport(0.0, 0.0, t, t, 0.0, 1.0);
             pass.set_scissor_rect(0, 0, c.tile, c.tile);
             pass.set_pipeline(&self.h_pipe);
             pass.set_bind_group(0, &self.h_bg, &offset);
             pass.draw(0..3, 0..1);
         }
-        let mut pass = begin(encoder, &self.atlas_view, true);
+        let mut pass = begin(encoder, &self.atlas_view);
         pass.set_viewport(c.origin[0] as f32, c.origin[1] as f32, t, t, 0.0, 1.0);
         pass.set_scissor_rect(c.origin[0], c.origin[1], c.tile, c.tile);
         pass.set_pipeline(&self.v_pipe);
@@ -646,21 +566,6 @@ impl SunShadows {
 mod tests {
     use super::*;
 
-    #[test]
-    fn at_full_scale_the_tiles_pack_studios_atlas() {
-        assert_eq!(tiles_at(1.0), mech::SUN_CASCADE_TILES);
-        assert_eq!(origins_at(1.0), mech::SUN_CASCADE_ORIGINS);
-        // (half the texels: the corners at 0 stay, the tiles halve)
-        assert_eq!(tiles_at(0.5), [192, 384, 512, 1024]);
-        assert_eq!(origins_at(0.5), [[1408, 512], [1024, 512], [1024, 0], [0, 0]]);
-        if texel_scale() == 1.0 {
-            // (the atlas and depth map read the scale in force: another
-            // test's renderer may have set one)
-            assert_eq!(atlas(), mech::SUN_SHADOW_ATLAS);
-            assert_eq!(depth_texels(), mech::SHADOW_MAP_TEXELS);
-        }
-    }
-
     /// A running Studio (a test place, ShadowSoftness 0.2): Globals
     /// spheres of radius 22.322 / 50.716 / 158.609 / 681.042, blur kernels
     /// of levels 7 / 6 / 3 / 1, cascade matrices 109.43 / 166.22 / 382.00 /
@@ -672,8 +577,7 @@ mod tests {
         let tx = (1.13571f32 * 1.13571 - ty * ty).sqrt();
         let sun = Vec3::new(-0.474_896, 0.822_544, 0.312_882);
         let cam = Vec3::new(40.0, 150.0, 300.0);
-        // (Studio's tile sizes: the blur levels count texels)
-        let c = cascades_at(1.0, cam, Vec3::new(0.9, -0.3, 0.1).normalize(), [tx, ty], sun, 0.2);
+        let c = cascades(cam, Vec3::new(0.9, -0.3, 0.1).normalize(), [tx, ty], sun, 0.2);
         let want_r = [22.322, 50.716, 158.609, 681.042];
         let want_depth = [109.43, 166.22, 382.00, 1426.87];
         for i in 0..CASCADES {

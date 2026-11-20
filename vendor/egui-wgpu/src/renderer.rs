@@ -233,14 +233,6 @@ impl Default for RendererOptions {
     }
 }
 
-/// rustudio patch: whether this refused frame is logged — the first few,
-/// then one in 300 (a device that stays lost refuses every frame).
-fn starved_log() -> bool {
-    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    n < 5 || n % 300 == 0
-}
-
 /// Renderer for a egui based GUI.
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
@@ -250,6 +242,10 @@ pub struct Renderer {
 
     uniform_buffer: wgpu::Buffer,
     previous_uniform_buffer_content: UniformBuffer,
+    /// rustudio: the last `update_buffers` could not stage its vertex or
+    /// index data (device lost, out of memory): `render` draws nothing
+    /// instead of panicking.
+    upload_failed: bool,
     uniform_bind_group: wgpu::BindGroup,
     texture_bind_group_layout: wgpu::BindGroupLayout,
 
@@ -261,14 +257,6 @@ pub struct Renderer {
     samplers: HashMap<epaint::textures::TextureOptions, wgpu::Sampler>,
 
     options: RendererOptions,
-
-    /// rustudio patch: the last `update_buffers` got no staging buffer from
-    /// the queue (the GPU refused the memory, or the device is lost), so
-    /// this frame's meshes were not uploaded and `render` draws none of
-    /// them. The frame goes on; the caller's uncaptured-error handler saw
-    /// wgpu's error. Without this the renderer panicked, which on a phone
-    /// whose driver reset the GPU ended the process and the user's work.
-    starved: bool,
 
     /// Storage for resources shared with all invocations of [`CallbackTrait`]'s methods.
     ///
@@ -472,13 +460,13 @@ impl Renderer {
             uniform_buffer,
             // Buffers on wgpu are zero initialized, so this is indeed its current state!
             previous_uniform_buffer_content: UniformBuffer::zeroed(),
+            upload_failed: false,
             uniform_bind_group,
             texture_bind_group_layout,
             textures: HashMap::default(),
             next_user_texture_id: 0,
             samplers: HashMap::default(),
             options,
-            starved: false,
             callback_resources: CallbackResources::default(),
         }
     }
@@ -501,13 +489,12 @@ impl Renderer {
     ) {
         profiling::function_scope!();
 
-        let pixels_per_point = screen_descriptor.pixels_per_point;
-        let size_in_pixels = screen_descriptor.size_in_pixels;
-
-        // rustudio patch: nothing was uploaded for this frame (see `starved`).
-        if self.starved {
+        if self.upload_failed {
             return;
         }
+
+        let pixels_per_point = screen_descriptor.pixels_per_point;
+        let size_in_pixels = screen_descriptor.size_in_pixels;
 
         // Whether or not we need to reset the render pass because a paint callback has just
         // run.
@@ -943,9 +930,8 @@ impl Renderer {
         screen_descriptor: &ScreenDescriptor,
     ) -> Vec<wgpu::CommandBuffer> {
         profiling::function_scope!();
-
-        // rustudio patch: a new frame, a new try (see `starved`).
-        self.starved = false;
+        let was_failing = self.upload_failed;
+        self.upload_failed = false;
 
         let screen_size_in_points = screen_descriptor.screen_size_in_points();
 
@@ -1006,15 +992,20 @@ impl Renderer {
             );
 
             let Some(mut index_buffer_staging) = index_buffer_staging else {
-                // rustudio patch: was a panic (see `starved`).
-                if starved_log() {
+                // rustudio: wgpu refuses the staging buffer when the device
+                // is lost or out of memory. Skip this frame's egui draw
+                // (logged once per failure run) rather than panic; the
+                // device-lost callback reports why.
+                if !was_failing {
                     log::error!(
-                        "egui-wgpu: no staging buffer for index data (GPU memory refused or device lost); this frame's UI is not drawn. Index count: {index_count}. Required index buffer size: {required_index_buffer_size}. Actual size {} and capacity: {} (bytes)",
-                        self.index_buffer.buffer.size(),
-                        self.index_buffer.capacity
+                        "Failed to create staging buffer for index data. Index count: {index_count}. Required index buffer size: {required_index_buffer_size}. Actual size {} and capacity: {} (bytes)",
+                    self.index_buffer.buffer.size(),
+                    self.index_buffer.capacity
                     );
                 }
-                self.starved = true;
+                self.upload_failed = true;
+                self.index_buffer.slices.clear();
+                self.vertex_buffer.slices.clear();
                 return Vec::new();
             };
 
@@ -1057,15 +1048,20 @@ impl Renderer {
             );
 
             let Some(mut vertex_buffer_staging) = vertex_buffer_staging else {
-                // rustudio patch: was a panic (see `starved`).
-                if starved_log() {
+                // rustudio: wgpu refuses the staging buffer when the device
+                // is lost or out of memory. Skip this frame's egui draw
+                // (logged once per failure run) rather than panic; the
+                // device-lost callback reports why.
+                if !was_failing {
                     log::error!(
-                        "egui-wgpu: no staging buffer for vertex data (GPU memory refused or device lost); this frame's UI is not drawn. Vertex count: {vertex_count}. Required vertex buffer size: {required_vertex_buffer_size}. Actual size {} and capacity: {} (bytes)",
-                        self.vertex_buffer.buffer.size(),
-                        self.vertex_buffer.capacity
+                        "Failed to create staging buffer for vertex data. Vertex count: {vertex_count}. Required vertex buffer size: {required_vertex_buffer_size}. Actual size {} and capacity: {} (bytes)",
+                    self.vertex_buffer.buffer.size(),
+                    self.vertex_buffer.capacity
                     );
                 }
-                self.starved = true;
+                self.upload_failed = true;
+                self.index_buffer.slices.clear();
+                self.vertex_buffer.slices.clear();
                 return Vec::new();
             };
 

@@ -10,17 +10,22 @@ thread_local! {
 }
 
 /// Adds the time until the guard drops to section `name`.
+/// Also a profiler scope (`profiler::scope`, category from the name) while
+/// the profiler records.
 pub struct Scope {
     name: &'static str,
     t0: Instant,
     i0: u64,
+    _prof: crate::profiler::Guard,
 }
 
+#[track_caller]
 pub fn scope(name: &'static str) -> Scope {
     Scope {
         name,
         t0: Instant::now(),
         i0: if instr_on() { instructions() } else { 0 },
+        _prof: crate::profiler::scope(name, crate::profiler::Cat::Auto),
     }
 }
 
@@ -127,6 +132,11 @@ thread_local! {
 
 pub fn lua_prof_on() -> bool {
     LUA_ON.with(|c| c.get())
+}
+
+/// A Play worker follows the display thread's benchmark window.
+pub fn set_lua_profiling(on: bool) {
+    LUA_ON.with(|c| c.set(on));
 }
 
 /// Times one resume of Lua code under `key`, labelled by `label` the first
@@ -310,7 +320,7 @@ fn take_api() -> Vec<(String, f64, u64)> {
 }
 
 /// Lua totals by label, slowest first: (label, ms, calls).
-fn take_lua() -> Vec<(String, f64, u64)> {
+pub fn take_lua() -> Vec<(String, f64, u64)> {
     let m = LUA.with(|m| std::mem::take(&mut *m.borrow_mut()));
     let mut by: std::collections::HashMap<String, (f64, u64)> = std::collections::HashMap::new();
     for (_, (l, ms, n)) in m {
@@ -375,13 +385,9 @@ pub fn section_total(name: &str) -> (f64, u64) {
     })
 }
 
-fn take_sections() -> Vec<(&'static str, f64, u64)> {
+/// Drain the current thread's section totals for merging into a frame report.
+pub fn take_sections() -> Vec<(&'static str, f64, u64)> {
     SECTIONS.with(|s| std::mem::take(&mut *s.borrow_mut()))
-}
-
-/// The sections gathered since they were last taken (src/perf_log.rs).
-pub fn drain_sections() -> Vec<(&'static str, f64, u64)> {
-    take_sections()
 }
 
 /// CPU time this thread has used, in ms (not the time it waited for a core:
@@ -528,6 +534,20 @@ impl Bench {
             return false;
         }
         let mut frame_sections = take_sections();
+        // The renderer's last frame counts (perf::draw): draw calls and
+        // thousands of triangles per pass, averaged like the sections.
+        let pf = perf::frame();
+        for (i, name) in [
+            "count: scene draws", "count: scene ktris", "count: shadow draws", "count: shadow ktris",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let v = pf.n[i] as f64 / if i % 2 == 1 { 1000.0 } else { 1.0 };
+            if v > 0.0 {
+                frame_sections.push((name, v, 1));
+            }
+        }
         // GPU spans that finished since the last frame (a frame or two late),
         // in GPU milliseconds whatever the bench's unit.
         let (gpu, gpu_totals) = gpu_take();
@@ -742,6 +762,22 @@ pub mod perf {
         let mut f = Frame { n: [0; 8], cpu_s, gpu_s };
         for (i, a) in ACC.iter().enumerate() {
             f.n[i] = a.swap(0, Relaxed);
+        }
+        if crate::profiler::active() {
+            use crate::profiler::{counter, counter_unit, Cat, Unit};
+            const NAMES: [&str; 8] = [
+                "scene draw calls", "scene triangles", "shadow draw calls", "shadow triangles",
+                "UI 2D draw calls", "UI 2D triangles", "UI 3D draw calls", "UI 3D triangles",
+            ];
+            for (i, n) in NAMES.iter().enumerate() {
+                counter(n, Cat::Render, f.n[i] as f64);
+            }
+            counter("draw calls (all)", Cat::Render, (f.n[0] + f.n[2] + f.n[4] + f.n[6]) as f64);
+            counter("triangles (all)", Cat::Render, (f.n[1] + f.n[3] + f.n[5] + f.n[7]) as f64);
+            counter_unit("render CPU encode", Cat::Render, Unit::Ms, cpu_s * 1000.0);
+            if gpu_s > 0.0 {
+                counter_unit("GPU frame", Cat::Gpu, Unit::Ms, gpu_s * 1000.0);
+            }
         }
         if let Ok(mut l) = LAST.lock() {
             *l = f;

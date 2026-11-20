@@ -15,6 +15,10 @@ use std::sync::Arc;
 struct SurfaceState {
     surface: wgpu::Surface<'static>,
     alpha_mode: wgpu::CompositeAlphaMode,
+    // rustudio: the surface's present modes, so a Mailbox request falls back
+    // to Fifo where the surface has no mailbox (wgpu refuses a mode the
+    // surface doesn't list unless it is one of the Auto modes).
+    present_modes: Vec<wgpu::PresentMode>,
     width: u32,
     height: u32,
     resizing: bool,
@@ -116,6 +120,21 @@ impl Painter {
 
         let width = surface_state.width;
         let height = surface_state.height;
+        // rustudio: Mailbox where the surface offers it, otherwise Fifo.
+        let present_mode = if present_mode == wgpu::PresentMode::Mailbox
+            && !surface_state.present_modes.contains(&wgpu::PresentMode::Mailbox)
+        {
+            wgpu::PresentMode::Fifo
+        } else {
+            present_mode
+        };
+        static SHOWN: std::sync::Once = std::sync::Once::new();
+        SHOWN.call_once(|| {
+            eprintln!(
+                "rustudio: present mode {present_mode:?} (surface offers {:?})",
+                surface_state.present_modes
+            );
+        });
 
         let mut surf_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -288,10 +307,19 @@ impl Painter {
                 wgpu::CompositeAlphaMode::Auto
             }
         };
+        let present_modes = {
+            let render_state = self
+                .render_state
+                .as_ref()
+                .expect("install_surface called before render_state initialization");
+            surface.get_capabilities(&render_state.adapter).present_modes
+        };
+        log::info!("surface present modes: {present_modes:?}");
         self.surfaces.insert(
             viewport_id,
             SurfaceState {
                 surface,
+                present_modes,
                 width,
                 height,
                 alpha_mode,

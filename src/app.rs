@@ -61,6 +61,11 @@ pub enum Tab {
     TerrainEditor,
     /// Studio's Toolbox (Home / View > Toolbox): src/toolbox.
     Toolbox,
+    /// File Sync (src/file_sync): the project attached to the place.
+    FileSync,
+    /// View > MicroProfiler (Ctrl+F6): the profiler window
+    /// (crates/rustudio-profiler-ui), its own OS window by default.
+    Profiler,
     /// A script open in the code editor.
     Script(Ref),
     /// A plugin's DockWidgetPluginGui (src/plugin_host/widgets_ui.rs: the
@@ -78,6 +83,8 @@ impl Tab {
             Tab::AvatarSettings => "Avatar Settings",
             Tab::TerrainEditor => "Terrain Editor",
             Tab::Toolbox => "Toolbox",
+            Tab::FileSync => "File Sync",
+            Tab::Profiler => "MicroProfiler",
             Tab::Script(_) => "Script",
             Tab::Plugin(_) => "Plugin",
         }
@@ -143,6 +150,7 @@ impl Harness {
                 screenshot_requested: false,
                 start_play: false,
                 bench: None,
+                profile: None,
                 camera: None,
                 shots: Vec::new(),
                 shot_next: 0,
@@ -208,16 +216,19 @@ pub struct Editor {
     pub clean_view: bool,
     pub clipboard: Option<Vec<u8>>,
     pub hover: Option<Ref>,
+    pub(crate) hover_pick: crate::viewport::HoverPick,
     pub drag: Option<GizmoDrag>,
     pub marquee: Option<egui::Pos2>,
     /// The selection when the box started (Shift / Ctrl add to it).
     pub marquee_base: Vec<Ref>,
+    pub(crate) marquee_centres: crate::viewport::MarqueeCentres,
     /// The Output panel's toolbar choices (src/output_panel.rs).
     pub output_view: crate::output_panel::OutputState,
     /// Dragging parts with the Select / Move tool (src/part_drag.rs).
     pub part_drag: Option<crate::part_drag::PartDrag>,
     pub explorer: ExplorerState,
     pub props: PropertiesState,
+    pub(crate) panel_cache: crate::panel_cache::Panels,
     /// The character builder window (Home / Avatar → Character).
     pub chars: crate::char_builder::CharBuilder,
     /// Places stored on Roblox: File > Open from Roblox, Save to Roblox.
@@ -240,10 +251,17 @@ pub struct Editor {
     /// RUSTUDIO_CONTROL: the comparison-capture socket (src/control.rs).
     #[cfg(unix)]
     pub control: Option<crate::control::Control>,
+    /// The built-in MCP server and its panel (src/mcp).
+    pub mcp: crate::mcp::Mcp,
+    /// File Sync: a project folder attached to the open place (src/file_sync).
+    pub file_sync: crate::file_sync::FileSync,
     /// The Terrain Editor's tools and settings.
     pub terrain_ed: crate::terrain_editor::TerrainEditor,
     /// The Toolbox panel's state (src/toolbox), kept while it is hidden.
     pub toolbox: crate::toolbox::Toolbox,
+    /// The MicroProfiler window while its tab is open (recording runs while
+    /// it exists; dropping it stops recording).
+    pub profiler: Option<rustudio_profiler_ui::ProfilerWindow>,
     /// This frame's Toolbox preview ViewportFrames (drawn with the GUI's).
     pub toolbox_vf: std::collections::HashMap<rbx_dom_weak::types::Ref, rustudio_render::render::vf::Request>,
     /// Physical key positions held (movement keys; src/keys.rs).
@@ -263,7 +281,7 @@ pub struct Editor {
     pub selection_outline_refs: std::cell::RefCell<(u64, Vec<rbx_dom_weak::types::Ref>, Vec<rbx_dom_weak::types::Ref>)>,
     /// The view selector's meshes for the current view.
     pub selector_cache: crate::viewport::SelectorCache,
-    pub hover_outline_refs: (Option<(rbx_dom_weak::types::Ref, u64)>, Vec<rbx_dom_weak::types::Ref>),
+    pub hover_outline_refs: (Option<(rbx_dom_weak::types::Ref, u64, u64)>, Vec<rbx_dom_weak::types::Ref>),
     /// Android: the points of the window's bottom the soft keyboard lies
     /// over while a game TextBox is typed into (`RustudioApp::frame`; the
     /// panels are not laid out above it then: `Editor::keyboard_pan`).
@@ -278,25 +296,10 @@ pub struct Editor {
     pub confirm_discard: Option<PendingAction>,
     /// Selection as of the last Explorer sync.
     pub last_selection: Vec<Ref>,
-    /// The 3D view's graphics quality (View > Graphics Settings;
-    /// crates/rustudio-render/src/graphics.rs): the level 1–10, Automatic,
-    /// and the settings set apart from the level. Phones start in
-    /// Automatic at level 3, computers at 10; `RUSTUDIO_QUALITY` overrides.
-    pub graphics: rustudio_render::graphics::Graphics,
-    /// Automatic quality's frame-rate watch (graphics.rs).
-    pub quality_auto: rustudio_render::graphics::Auto,
-    /// Studio Settings > Rendering > Editor Quality Level as last seen:
-    /// a change there (the dialog, `settings()` from Luau) sets `graphics`
-    /// (`Editor::quality_tick`).
-    pub quality_studio_seen: u32,
     /// The first frame picks the UI zoom from the screen (Android, a fresh
     /// layout: android::touch::auto_zoom).
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub auto_zoom: bool,
-    /// Play's frame-rate cap (graphics.rs `fps_cap`): when the next frame
-    /// may go out, and how long the last one waited for its turn (s).
-    pub cap_next: Option<Instant>,
-    pub cap_wait: f32,
     /// CPU time of the last frame's update + draw submission (ms).
     pub last_work_ms: f32,
     /// The open project folder (files are the truth; src/project_sync.rs).
@@ -339,10 +342,9 @@ pub enum PendingAction {
 pub struct RustudioApp {
     watchdog: crate::frame_watchdog::Watchdog,
     updater: crate::update::Updater,
+    pub(crate) last_ui_frame: Option<Instant>,
     last_plugin_tick: Instant,
     plugins_ticked_between_frames: bool,
-    /// Frame times to the log every few seconds (src/perf_log.rs).
-    perf: rustudio_render::perf_log::PerfLog,
     pub dock: DockState<Tab>,
     pub ed: Editor,
     /// Keeps the dock, window and view settings (src/layout_store.rs).
@@ -361,13 +363,14 @@ pub struct RustudioApp {
     #[cfg(target_os = "android")]
     text_bar: crate::android::text_bar::TextBar,
     /// The display's refresh rate in Hz (0 unknown): the frame budget the
-    /// CPU governor is told (src/android/perf_hint.rs), the perf log's
-    /// line, the frame-rate cap's lead.
+    /// CPU governor is told (src/android/perf_hint.rs).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     refresh_hz: f32,
     /// eframe's CPU time of the frame before (`eframe::Frame::info`, the
     /// wait for the display left out), kept by `ui` for `frame`: the
-    /// governor's hint, automatic quality's cost, the perf log. None
-    /// offscreen (src/offscreen.rs) and before the first frame.
+    /// governor's hint. None offscreen (src/offscreen.rs) and before the
+    /// first frame.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     cpu_usage: Option<f32>,
 }
 
@@ -412,13 +415,8 @@ impl RustudioApp {
         rustudio_engine::ti::install(egui_ctx);
         theme::apply(egui_ctx);
         rustudio_engine::mouse_lock::note_window(wayland);
-        // (the renderer is made below, once the saved layout has said
-        // which graphics level it is for: Game::new(None) leaves it out)
-        let graphics = rustudio_render::graphics::Graphics::platform_default();
-        let mut game = Game::new(None);
-        game.render_state = render_state;
         let mut ed = Editor {
-            game,
+            game: Game::new(render_state),
             dialogs: crate::file_dialog::Dialogs::new(egui_ctx.clone()),
             tool: Tool::Select,
             collisions: mech::COLLISIONS_ON_BY_DEFAULT,
@@ -431,13 +429,16 @@ impl RustudioApp {
             clean_view: false,
             clipboard: None,
             hover: None,
+            hover_pick: Default::default(),
             drag: None,
             marquee: None,
             marquee_base: Vec::new(),
+            marquee_centres: Default::default(),
             output_view: Default::default(),
             part_drag: None,
             explorer: ExplorerState::default(),
             props: PropertiesState::default(),
+            panel_cache: Default::default(),
             chars: Default::default(),
             cloud: crate::cloud_ui::CloudUi::new(),
             account_destination: None,
@@ -450,8 +451,11 @@ impl RustudioApp {
             plugin_bar: Default::default(),
             #[cfg(unix)]
             control: None,
+            mcp: Default::default(),
+            file_sync: Default::default(),
             terrain_ed: Default::default(),
             toolbox: Default::default(),
+            profiler: None,
             toolbox_vf: Default::default(),
             fly_held: 0.0,
             fly_idle: 0.0,
@@ -470,12 +474,7 @@ impl RustudioApp {
             fps: 0.0,
             confirm_discard: None,
             last_selection: Vec::new(),
-            graphics,
-            quality_auto: Default::default(),
-            quality_studio_seen: graphics.studio_level(),
             auto_zoom: false,
-            cap_next: None,
-            cap_wait: 0.0,
             last_work_ms: 0.0,
             project: None,
             project_choice: None,
@@ -507,7 +506,7 @@ impl RustudioApp {
         for line in crate::android::storage::take_notices() {
             ed.error(line);
         }
-        if ed.game.render_state.is_none() && !ed.harness.run.no_render {
+        if ed.game.renderer.is_none() && !ed.harness.run.no_render {
             ed.error("No wgpu renderer available; the 3D viewport is disabled.");
         }
         let open_none = open.is_none();
@@ -599,33 +598,12 @@ impl RustudioApp {
             // (plugin widgets' restore state beside layout.json)
             crate::plugin_host::widgets_ui::set_persist_dir(Some(rustudio_core::paths::config().join("rustudio")));
         }
-        // (the saved layout's graphics choice, or the platform's, into
-        // Studio Settings > Rendering > Editor Quality Level)
-        ed.quality_studio_seen = ed.graphics.studio_level();
-        crate::studio_settings::set_edit_quality_level(ed.quality_studio_seen);
-        let settings = ed.render_settings();
         // (a GPU validation error is a logcat line, not the end of the
         // process: src/android/mod.rs install_gpu_error_handler)
         #[cfg(target_os = "android")]
         if let Some(rs) = ed.game.render_state.as_ref() {
             crate::android::install_gpu_error_handler(&rs.device);
         }
-        ed.game.renderer = ed.game.render_state.as_ref().map(|rs| {
-            if rustudio_render::perf_log::on() {
-                eprintln!("render settings: {}", settings.describe(settings.scene_format(&rs.device)));
-                // (the compressed texture formats the device could hold the
-                // material arrays in: docs/ANDROID.md "Material textures")
-                let f = rs.adapter.features();
-                let has = |name: &str, feature: egui_wgpu::wgpu::Features| if f.contains(feature) { name.to_string() } else { format!("no {name}") };
-                eprintln!(
-                    "texture compression: {}, {}, {}",
-                    has("ASTC", egui_wgpu::wgpu::Features::TEXTURE_COMPRESSION_ASTC),
-                    has("ETC2", egui_wgpu::wgpu::Features::TEXTURE_COMPRESSION_ETC2),
-                    has("BC", egui_wgpu::wgpu::Features::TEXTURE_COMPRESSION_BC)
-                );
-            }
-            rustudio_render::render::Renderer::new(&rs.device, &rs.queue, Some(&rs.adapter.get_info()), rustudio_render::render::Renderer::msaa_support_of(&rs.adapter), settings.clone())
-        });
         // Comparison captures (src/control.rs) want the 3D view as big as the
         // other program's: the view alone, no Explorer / Properties / Output.
         #[cfg(unix)]
@@ -640,9 +618,9 @@ impl RustudioApp {
         RustudioApp {
             watchdog: crate::frame_watchdog::Watchdog::new(egui_ctx.clone()),
             updater: crate::update::Updater::start(),
+            last_ui_frame: None,
             last_plugin_tick: Instant::now(),
             plugins_ticked_between_frames: false,
-            perf: Default::default(),
             dock,
             ed,
             layout,
@@ -686,6 +664,12 @@ fn display_refresh_hz() -> f32 {
 
 impl Editor {
     pub fn push_log(&mut self, level: Level, text: impl Into<String>) {
+        let text = text.into();
+        match level {
+            Level::Info => log::info!(target: "rustudio::editor", "{text}"),
+            Level::Warn => log::warn!(target: "rustudio::editor", "{text}"),
+            Level::Error => log::error!(target: "rustudio::editor", "{text}"),
+        }
         self.game.push_log(level, text);
         self.flush_output_changes();
     }
@@ -789,82 +773,12 @@ impl Editor {
 // ------------------------------------------------------------------ actions
 
 impl Editor {
-    /// What the 3D view draws with: the graphics level's settings, the
-    /// settings set apart from it (View > Graphics Settings, the saved
-    /// layout), then the run's `RUSTUDIO_*` switches over them (a device
-    /// run's comparison wins over the saved choices).
-    pub fn render_settings(&self) -> rustudio_render::graphics::RenderSettings {
-        self.graphics.settings()
-    }
-
     /// A Roblox TextBox has the keyboard: the game's in Play, or a plugin
     /// GUI's (a widget's, CoreGui's). The soft keyboard comes up for it
     /// (src/android/keyboard.rs).
     #[cfg(target_os = "android")]
     pub fn textbox_focused(&self) -> bool {
         (self.game.play.is_some() && self.game.gui.focus.is_some()) || self.plugin_ui.has_text_focus()
-    }
-
-    /// Chooses the graphics level (`Some(1..=10)`) or Automatic (`None`,
-    /// from the level it is at), as the View menu, the Graphics Settings
-    /// window, the saved layout and Studio Settings do.
-    pub fn set_quality(&mut self, choice: Option<u8>) {
-        let before = self.graphics;
-        self.graphics.apply_choice(choice);
-        if self.graphics != before {
-            self.quality_auto.reset();
-            self.quality_changed(true);
-        }
-    }
-
-    /// After a graphics change: the log, and (`mirror`) the level into
-    /// Studio Settings > Rendering > Editor Quality Level.
-    pub fn quality_changed(&mut self, mirror: bool) {
-        if mirror {
-            self.quality_studio_seen = self.graphics.studio_level();
-            crate::studio_settings::set_edit_quality_level(self.quality_studio_seen);
-        }
-        if rustudio_render::perf_log::on() {
-            let s = self.render_settings();
-            let format = match self.game.render_state.as_ref() {
-                Some(rs) => s.scene_format(&rs.device),
-                None => egui_wgpu::wgpu::TextureFormat::Rgba16Float,
-            };
-            eprintln!("graphics quality{}: {}", if self.graphics.auto { " (automatic)" } else { "" }, s.describe(format));
-        }
-    }
-
-    /// Once a frame: Studio Settings' Editor Quality Level changed by the
-    /// dialog or Luau (`settings().Rendering.EditQualityLevel`) sets the
-    /// graphics; Automatic quality steps the level by the frame rate while
-    /// the 3D view is drawn frame after frame (graphics.rs `Auto`).
-    pub fn quality_tick(&mut self, now: Instant, dt: f32, cost: f32) {
-        let studio = crate::studio_settings::edit_quality_level();
-        if studio != self.quality_studio_seen {
-            // (Studio's value stays as set: Level05 reads back as Level05,
-            // though the bar shows 3)
-            self.quality_studio_seen = studio;
-            let before = self.graphics;
-            self.graphics.apply_choice(rustudio_render::graphics::level_from_studio(studio));
-            if self.graphics != before {
-                self.quality_auto.reset();
-                self.quality_changed(false);
-            }
-        }
-        if !self.graphics.auto {
-            return;
-        }
-        // (a frame shown again, not drawn, says nothing about drawing)
-        let drawn = self.hud.viewport_drawn && !self.game.view_reuse.reused_now;
-        let step = if drawn { self.quality_auto.frame(now, dt, cost, self.graphics.level) } else { None };
-        if let Some(step) = step {
-            match step {
-                rustudio_render::graphics::Step::Down => self.graphics.level = self.graphics.level.saturating_sub(1).max(1),
-                rustudio_render::graphics::Step::Up => self.graphics.level = (self.graphics.level + 1).min(rustudio_render::graphics::LEVELS),
-            }
-            // (Automatic stays Automatic in Studio's enum: no mirror)
-            self.quality_changed(false);
-        }
     }
 
     pub fn set_document(&mut self, doc: Document) {
@@ -1077,6 +991,7 @@ impl Editor {
                 self.save_local_plugin_to(path);
             }
             Purpose::TerrainImage { height } => self.load_import_image(path, height),
+            Purpose::FileSyncProject => self.file_sync.pick = path.display().to_string(),
             Purpose::ProjectParent => {
                 if let Some(d) = self.project_export.as_mut() {
                     d.parent = path.display().to_string();
@@ -1187,17 +1102,11 @@ impl Editor {
         if std::env::var_os("RUSTUDIO_PICK_TRACE").is_some() {
             eprintln!("[pick selection] {:?}", self.game.doc.selection.iter().map(|r| self.game.doc.dom.get_by_ref(*r).map(|i| (&i.name, &i.class))).collect::<Vec<_>>());
         }
-        let added: Vec<Ref> = self.game
-            .doc
-            .selection
-            .iter()
-            .copied()
-            .filter(|r| !self.last_selection.contains(r))
-            .collect();
+        let last_added = self.game.doc.selection.iter().rev().find(|r| !self.last_selection.contains(r));
         for &r in &self.game.doc.selection {
             self.explorer.expand_ancestors(&self.game.doc, r);
         }
-        if let Some(&r) = added.last().or(self.game.doc.selection.last()) {
+        if let Some(&r) = last_added.or(self.game.doc.selection.last()) {
             self.explorer.scroll_to = Some(r);
         }
         self.last_selection = self.game.doc.selection.clone();
@@ -1379,7 +1288,9 @@ impl Editor {
             }
             return;
         }
-        let mut b = InstanceBuilder::new(class).with_name(class);
+        // Studio's Insert Object names it as its constructor does (a
+        // SpecialMesh "Mesh", a StringValue "Value").
+        let mut b = InstanceBuilder::new(class).with_name(doc::default_instance_name(class));
         if doc::is_a(class, "BasePart") {
             let size = Vec3::from(mech::NEW_PART_SIZE);
             let pos = self.spawn_point(size);
@@ -1407,6 +1318,13 @@ impl Editor {
         }
         let r = self.game.doc.insert(parent, b);
         self.select(vec![r]);
+    }
+
+    pub(crate) fn has_selected_parts(&self) -> bool {
+        self.game.doc.selection.iter().any(|&r| {
+            self.game.scene.get(r).is_some()
+                || self.game.doc.dom.descendants_of(r).any(|d| self.game.scene.get(d.referent()).is_some())
+        })
     }
 
     pub fn selected_parts(&self) -> Vec<Ref> {
@@ -1646,7 +1564,8 @@ impl Editor {
 
     /// Asks before throwing away unsaved changes.
     pub fn request(&mut self, action: PendingAction) {
-        if self.game.doc.dirty() && self.harness.selftest.is_none() {
+        // A live Team Create document asks only for what the server lacks.
+        if self.leave_check() != crate::cloud_ui::live_status::Leave::Free && self.harness.selftest.is_none() {
             self.confirm_discard = Some(action);
         } else {
             self.perform(action);
@@ -1705,6 +1624,7 @@ impl Editor {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         self.hud.status_drawn = true;
         ui.horizontal(|ui| {
+            self.live_status_ui(ui);
             let sel = self.game.doc.selection.len();
             if let Some(s) = self.game.play_status() {
                 ui.label(RichText::new(format!("● {s}")).color(theme::ERROR).strong());
@@ -1733,6 +1653,8 @@ impl Editor {
     /// Opens requested scripts as tabs next to the viewport (or focuses
     /// them, in a panel window too).
     fn open_script_tabs(&mut self, dock: &mut DockState<Tab>, panels: &mut crate::panels::Panels) {
+        // Open In Editor: File Sync's scripts go to the OS editor instead.
+        self.file_sync_open_external();
         // Tabs plugins closed, then the open script tabs as
         // ScriptEditorService documents (a tab the person closed closes its
         // document; the front one is StudioService.ActiveScript).
@@ -1780,7 +1702,31 @@ impl Editor {
             return;
         };
         let mut decided: Option<bool> = None;
+        let leave = self.leave_check();
         egui::Modal::new(egui::Id::new("confirm_discard")).show(ctx, |ui| {
+            if let crate::cloud_ui::live_status::Leave::Ask { lacking, note } = &leave {
+                if !note.is_empty() {
+                    ui.label(RichText::new("Leave without these edits?").strong());
+                    ui.label(note);
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        for item in lacking {
+                            ui.label(format!("• {item}"));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Save As…").clicked() {
+                            self.save_as();
+                        }
+                        if ui.button("Close anyway").clicked() {
+                            decided = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            decided = Some(false);
+                        }
+                    });
+                    return;
+                }
+            }
             ui.label(RichText::new("Discard unsaved changes?").strong());
             ui.label(format!(
                 "{} has changes that are not saved.",
@@ -1849,17 +1795,34 @@ impl TabViewer for Viewer<'_> {
             Tab::Explorer => "explorer",
             Tab::Properties => "properties",
             Tab::Output => "output",
+            Tab::Script(_) => "script_editor",
             _ => "other_tab",
         });
         match tab {
             Tab::Viewport => self.ed.viewport_ui(ui),
+            Tab::Explorer if self.window.is_none() => self.ed.docked_panel(ui, *tab, Editor::explorer_ui),
             Tab::Explorer => self.ed.explorer_ui(ui),
+            Tab::Properties if self.window.is_none() => self.ed.docked_panel(ui, *tab, Editor::properties_ui),
             Tab::Properties => self.ed.properties_ui(ui),
+            Tab::Output if self.window.is_none() => self.ed.docked_panel(ui, *tab, Editor::output_ui),
             Tab::Output => self.ed.output_ui(ui),
             Tab::AvatarSettings => self.ed.avatar_settings_ui(ui),
             Tab::TerrainEditor => self.ed.terrain_editor_ui(ui),
             Tab::Plugin(n) => self.ed.plugin_widget_ui(ui, *n),
             Tab::Toolbox => self.ed.toolbox_ui(ui),
+            Tab::FileSync => self.ed.file_sync_panel_ui(ui),
+            Tab::Profiler => {
+                let rect = ui.available_rect_before_wrap();
+                let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                c.set_clip_rect(rect);
+                let p = self.ed.profiler.get_or_insert_with(rustudio_profiler_ui::ProfilerWindow::new);
+                p.can_open_scripts = true;
+                p.show(&mut c);
+                if let Some((path, line)) = p.take_open_script() {
+                    self.ed.open_script_named(&path, line);
+                }
+                ui.allocate_rect(rect, egui::Sense::hover());
+            }
             Tab::Script(r) => {
                 if !self.ed.document_tabs_reset {
                     self.ed.script_tab_ui(ui, *r);
@@ -2151,6 +2114,8 @@ impl eframe::App for RustudioApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        rustudio_render::gpu_health::check();
+        self.last_ui_frame = Some(Instant::now());
         self.cpu_usage = frame.info().cpu_usage;
         // (a lost GPU device or one out of memory: save and restart,
         // src/android/mod.rs gpu_watch)
@@ -2195,6 +2160,17 @@ impl RustudioApp {
 
     /// One frame, in eframe's window or offscreen (src/offscreen.rs).
     pub fn frame(&mut self, ui: &mut egui::Ui) {
+        // A display frame ends here and the next begins (the profiler gathers
+        // every thread's records at this boundary).
+        #[cfg(not(target_os = "android"))]
+        let native_frames = crate::native_loop::NATIVE_FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+        // (the Android activity runs eframe's own loop, src/android/mod.rs:
+        // no native_loop to mark the frames, so they are marked here)
+        #[cfg(target_os = "android")]
+        let native_frames = false;
+        if !native_frames {
+            rustudio_core::profiler::frame(rustudio_core::profiler::FrameKind::Render);
+        }
         // (the whole frame, for --bench: the editor's and --no-ui's alike)
         let _frame_scope = rustudio_core::bench::scope("frame");
         rustudio_core::sim_clock::advance();
@@ -2253,21 +2229,19 @@ impl RustudioApp {
         let frame_start = Instant::now();
         // The CPU governor's frame hint (src/android/perf_hint.rs): the
         // last frame's time on the CPU (eframe's, without the wait for the
-        // display) against this frame's budget — the display's period, or
-        // the frame-rate cap's while a game is capped.
+        // display) against this frame's budget, the display's period.
+        // (Performance > Editor frame limit is native_loop.rs's pacing,
+        // which the activity's eframe loop hasn't: vsync sets the rate on
+        // a phone.)
         #[cfg(target_os = "android")]
         if let Some(cpu) = self.cpu_usage {
-            let cap = if ed.game.play.is_some() { ed.render_settings().fps_cap } else { 0 };
-            let hz = if cap > 0 { cap as f32 } else if self.refresh_hz > 1.0 { self.refresh_hz } else { 60.0 };
+            let hz = if self.refresh_hz > 1.0 { self.refresh_hz } else { 60.0 };
             crate::android::perf_hint::frame(
                 std::time::Duration::from_secs_f32(cpu.max(0.0)),
                 std::time::Duration::from_secs_f32(1.0 / hz),
             );
         }
         let causes = ctx.repaint_causes();
-        if rustudio_render::perf_log::on() {
-            self.perf.repaint_causes(&causes);
-        }
         let now = Instant::now();
         let dt = now.duration_since(ed.last_frame).as_secs_f32();
         ed.last_frame = now;
@@ -2278,8 +2252,10 @@ impl RustudioApp {
         // the first after an idle pause: eframe draws on request, and on a
         // phone, where no pointer hovers, a still editor's few frames a
         // second are its idleness, not its frame rate.
+        // (a frame longer than this follows an idle pause, not slow drawing)
+        const IDLE_PAUSE_S: f32 = 0.1;
         let timed = !ctx.requested_repaint_last_pass() && !causes.is_empty();
-        if dt > 0.0 && dt < mech::QUALITY_AUTO_IDLE_MS / 1000.0 && !timed {
+        if dt > 0.0 && dt < IDLE_PAUSE_S && !timed {
             ed.fps = ed.fps * 0.9 + (1.0 / dt) * 0.1;
         }
         ed.hud = HudStats::default();
@@ -2303,6 +2279,7 @@ impl RustudioApp {
         }
         self.watchdog.stage("plugins", "project and scene synchronization");
         ed.project_tick();
+        ed.file_sync_tick();
         ed.plugins_tick();
         ed.toolbox_tick(&ctx);
         ed.toolbox_harness_tick();
@@ -2344,7 +2321,7 @@ impl RustudioApp {
         }
 
         if ctx.input(|i| i.viewport().close_requested())
-            && ed.game.doc.dirty()
+            && ed.leave_check() != crate::cloud_ui::live_status::Leave::Free
             && ed.harness.run.screenshot.is_none()
             && ed.harness.selftest.is_none()
             && ed.harness.run.bench.is_none()
@@ -2361,7 +2338,7 @@ impl RustudioApp {
             self.panels = crate::panels::Panels::default();
             self.dock = default_dock();
             for t in popped {
-                if self.dock.find_tab(&t).is_none() && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::Toolbox) {
+                if self.dock.find_tab(&t).is_none() && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::Toolbox | Tab::FileSync) {
                     crate::panels::place(&mut self.dock, t, &self.panels.homes);
                 }
             }
@@ -2377,6 +2354,9 @@ impl RustudioApp {
             ed.confirm_ui(&ctx);
             ed.account_window(&ctx);
             ed.cloud_windows(&ctx);
+            ed.mcp_windows(&ctx);
+            ed.file_sync_popover_ui(&ctx);
+            ed.mcp_tick(&ctx);
             if ed.harness.run.screenshot.is_some() {
                 ed.harness_tick(&ctx);
                 ctx.request_repaint();
@@ -2390,34 +2370,46 @@ impl RustudioApp {
         self.watchdog.stage("scene synchronization", "dock UI and GPU viewport preparation");
         ed.shortcuts(&ctx);
 
-        egui::Panel::top("menu")
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::MENU_BAR)
-                    .inner_margin(egui::Margin::symmetric(6, 2)),
-            )
-            .show(ui, |ui| ed.studio_menu_bar(ui));
-        egui::Panel::top("testbar")
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::PANEL)
-                    .inner_margin(egui::Margin::symmetric(8, 4)),
-            )
-            .show(ui, |ui| ed.studio_top_row(ui));
-        egui::Panel::top("toolbar")
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::PANEL)
-                    .inner_margin(egui::Margin::symmetric(6, 4)),
-            )
-            .show(ui, |ui| ed.studio_ribbon(ui));
-        egui::Panel::bottom("status")
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::PANEL_DARK)
-                    .inner_margin(egui::Margin::symmetric(8, 3)),
-            )
-            .show(ui, |ui| ed.status_bar(ui));
+        {
+            let _p = rustudio_core::bench::scope("editor_chrome");
+            egui::Panel::top("menu")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::MENU_BAR)
+                        .inner_margin(egui::Margin::symmetric(6, 2)),
+                )
+                .show(ui, |ui| {
+                    let _p = rustudio_core::bench::scope("menu_bar");
+                    ed.studio_menu_bar(ui);
+                });
+            egui::Panel::top("testbar")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::PANEL)
+                        .inner_margin(egui::Margin::symmetric(8, 4)),
+                )
+                .show(ui, |ui| {
+                    let _p = rustudio_core::bench::scope("test_toolbar");
+                    ed.studio_top_row(ui);
+                });
+            egui::Panel::top("toolbar")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::PANEL)
+                        .inner_margin(egui::Margin::symmetric(6, 4)),
+                )
+                .show(ui, |ui| {
+                    let _p = rustudio_core::bench::scope("ribbon");
+                    ed.studio_ribbon(ui);
+                });
+            egui::Panel::bottom("status")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::PANEL_DARK)
+                        .inner_margin(egui::Margin::symmetric(8, 3)),
+                )
+                .show(ui, |ui| ed.status_bar(ui));
+        }
 
         // Editor::start_run requests this when a playtest begins.
         if std::mem::take(&mut self.ed.switch_to_viewport) {
@@ -2499,6 +2491,13 @@ impl RustudioApp {
                         if let Some(w) = self.dock.get_window_state_mut(surface) {
                             w.set_position(at).set_size(size);
                         }
+                    } else if tab == Tab::Profiler && std::env::var_os("RUSTUDIO_PROFILER_DOCKED").is_some() {
+                        // (checks: docked under the 3D view so a window shot shows both)
+                        crate::panels::place(&mut self.dock, tab, &self.panels.homes);
+                    } else if tab == Tab::Profiler {
+                        // (the mockup's size, smaller on a small screen)
+                        let size = egui::vec2(1440.0, 900.0).min(ctx.content_rect().size() * 0.92);
+                        self.panels.pop_out(tab, [size.x, size.y], None);
                     } else if crate::panels::placement(tab.key()).floats {
                         self.panels.pop_out(tab, [420.0, 520.0], None);
                     } else {
@@ -2530,11 +2529,17 @@ impl RustudioApp {
             (Tab::AvatarSettings, "Avatar Settings"),
             (Tab::TerrainEditor, "Terrain Editor"),
             (Tab::Toolbox, "Toolbox"),
+            (Tab::FileSync, "File Sync"),
+            (Tab::Profiler, "MicroProfiler"),
         ]
         .into_iter()
         .filter(|(t, _)| self.panels.locate(&self.dock, t).is_some())
         .map(|(_, n)| n)
         .collect();
+        // Closing the MicroProfiler stops recording.
+        if self.ed.profiler.is_some() && !self.ed.ui.panels_open.contains("MicroProfiler") {
+            self.ed.profiler = None;
+        }
         let ed = &mut self.ed;
         ed.open_script_tabs(&mut self.dock, &mut self.panels);
         crate::panels::record_homes(&self.dock, &mut self.panels.homes);
@@ -2564,6 +2569,8 @@ impl RustudioApp {
         ed.account_window(&ctx);
         ed.character_builder_window(&ctx);
         ed.cloud_windows(&ctx);
+        ed.mcp_windows(&ctx);
+        ed.file_sync_popover_ui(&ctx);
         self.watchdog.stage("dock UI", "harness and screenshot readback");
         self.finish_frame(&ctx, frame_start, dt);
         // The soft keyboard follows what there is to type into; egui-winit
@@ -2601,27 +2608,26 @@ impl RustudioApp {
         ed.harness_tick(&ctx);
         #[cfg(unix)]
         ed.control_tick(&ctx);
+        ed.mcp_tick(&ctx);
         ed.ui_shots_tick(&ctx);
         let work_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
         ed.last_work_ms = work_ms;
+        if rustudio_core::profiler::active() {
+            rustudio_player::profiler_counters::sample(&ed.game);
+            thread_local! { static TC: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) }; }
+            TC.with(|tc| {
+                let (mut s, mut r) = tc.get();
+                use std::sync::atomic::Ordering::Relaxed;
+                use rustudio_core::profiler::Cat;
+                rustudio_player::profiler_counters::rate_from_total("Team Create sent", Cat::Network, rustudio_net::rtcio::BYTES_SENT.load(Relaxed), &mut s);
+                rustudio_player::profiler_counters::rate_from_total("Team Create received", Cat::Network, rustudio_net::rtcio::BYTES_RECEIVED.load(Relaxed), &mut r);
+                tc.set((s, r));
+            });
+        }
         // RUSTUDIO_GPU_TIMING: resolve this frame's GPU timestamps, collect finished ones.
         if let Some(rs) = ed.game.render_state.as_ref() {
             rustudio_render::gpu_timing::end_frame(&rs.device, &rs.queue);
         }
-        // Automatic quality judges a frame by its work, not by what it
-        // waited: the frame's CPU time (eframe's, the frame before, the
-        // wait for the display left out) against the renderer's GPU time
-        // per 3D frame where the device times it — a frame held back by
-        // the swapchain or the display's pacing would otherwise take the
-        // level down for nothing. Without GPU timestamps the interval is
-        // all there is (a frame's wait for the frame-rate cap isn't
-        // slowness either way).
-        let interval = (dt - ed.cap_wait).max(0.0);
-        let cost = match (self.cpu_usage, ed.game.renderer.as_ref().and_then(|r| r.gpu_last_frame_ms())) {
-            (Some(cpu), Some(gpu_ms)) => cpu.max(gpu_ms / 1000.0).max(work_ms / 1000.0).min(interval),
-            _ => interval,
-        };
-        ed.quality_tick(Instant::now(), interval, cost);
         if ed.harness.run.bench_frame(&mut ed.game, &ctx, work_ms, dt) {
             ed.finish_run(&ctx, "bench");
         }
@@ -2643,55 +2649,6 @@ impl RustudioApp {
             crate::android::clipboard::after_frame(&ctx);
             self.text_menu.end_frame(&ctx);
         }
-        if rustudio_render::perf_log::on() {
-            let (renderer, render_state) = (&self.ed.game.renderer, &self.ed.game.render_state);
-            let view_reuse = &mut self.ed.game.view_reuse;
-            let refresh_hz = self.refresh_hz;
-            self.perf.frame(
-                work_ms,
-                self.cpu_usage,
-                ctx.requested_repaint_last_pass(),
-                renderer.as_ref().and_then(|r| r.gpu_totals()),
-                || {
-                    let r = ctx.viewport_rect();
-                    let ppp = ctx.pixels_per_point();
-                    let view = renderer.as_ref().and_then(|r| r.target_size()).unwrap_or([0, 0]);
-                    let (drawn, reused) = view_reuse.take_counts();
-                    #[cfg(target_os = "android")]
-                    let gpu_errors = match crate::android::gpu_errors() {
-                        0 => String::new(),
-                        n => format!(", GPU errors {n}"),
-                    };
-                    #[cfg(not(target_os = "android"))]
-                    let gpu_errors = String::new();
-                    format!(
-                        "window {}x{} px at {ppp:.2} px/pt, 3D view {}x{} px ({}), 3D frames drawn {drawn} / shown again {reused}{gpu_errors}",
-                        (r.width() * ppp).round(),
-                        (r.height() * ppp).round(),
-                        view[0],
-                        view[1],
-                        renderer.as_ref().map_or_else(|| "no renderer".to_string(), |r| r.describe()),
-                    )
-                },
-                || {
-                    let rs = render_state.as_ref()?;
-                    let i = rs.adapter.get_info();
-                    Some(format!(
-                        "GPU {} ({:?}, {} {}), {:?}; surface {:?}, {}, frame latency {} (swapchain images less one); display {}",
-                        i.name,
-                        i.backend,
-                        i.driver,
-                        i.driver_info,
-                        i.device_type,
-                        rs.target_format,
-                        crate::offscreen::present_mode_name(),
-                        crate::offscreen::frame_latency(),
-                        if refresh_hz > 1.0 { format!("{refresh_hz:.0} Hz") } else { "rate unknown".to_string() },
-                    ))
-                },
-            );
-        }
-        self.cap_frame_rate();
         self.watchdog.complete();
     }
 
@@ -2763,38 +2720,6 @@ impl Editor {
             ("toolbox", self.toolbox.result_json()),
         ]);
         self.harness.run.finish_run(&self.game, ctx, reason, extras.into_iter().flatten());
-    }
-}
-
-impl RustudioApp {
-    /// Play's frame-rate cap (graphics.rs `fps_cap`: none by level,
-    /// `RUSTUDIO_FPS_CAP` or the Play Frame Rate setting; under FIFO vsync
-    /// a cap below the display's rate lands frames on every second or
-    /// third refresh by turns, so it is the player's choice, for heat and
-    /// battery): a frame that comes early waits out the period
-    /// before eframe presents it, so a phone drawing a game at a low level
-    /// draws fewer frames and runs cooler for longer. The editor isn't
-    /// capped (it repaints on input). The wait stays out of Automatic
-    /// quality's frame time (`Editor::quality_tick`) and out of the perf
-    /// log's editor time; it shows in the frame interval.
-    fn cap_frame_rate(&mut self) {
-        let ed = &mut self.ed;
-        ed.cap_wait = 0.0;
-        let cap = if ed.game.play.is_some() { ed.render_settings().fps_cap } else { 0 };
-        if cap == 0 {
-            ed.cap_next = None;
-            return;
-        }
-        let period = std::time::Duration::from_secs_f64(1.0 / cap as f64);
-        let now = Instant::now();
-        if let Some(next) = ed.cap_next.filter(|n| *n > now) {
-            std::thread::sleep(next - now);
-            ed.cap_wait = (next - now).as_secs_f32();
-        }
-        // (a frame late by more than a period restarts the beat: no burst
-        // of frames to catch up)
-        let base = ed.cap_next.map_or(now, |n| n.max(now - period));
-        ed.cap_next = Some(base + period);
     }
 }
 

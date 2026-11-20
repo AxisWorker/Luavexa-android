@@ -38,6 +38,8 @@ pub enum Purpose {
     ProjectParent,
     /// Terrain Editor > Import: a heightmap (true) or colormap image.
     TerrainImage { height: bool },
+    /// File Sync: the project to attach.
+    FileSyncProject,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

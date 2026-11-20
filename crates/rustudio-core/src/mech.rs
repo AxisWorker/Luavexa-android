@@ -182,13 +182,26 @@ pub fn setter_clamp(class: &str, prop: &str, v: f32) -> Option<f32> {
 pub fn clock_time(v: f32) -> f32 {
     (v.clamp(0.0, CLOCK_TIME_MAX) * SECONDS_PER_HOUR).trunc() / SECONDS_PER_HOUR
 }
+/// Lighting.TimeOfDay "HH:MM:SS" as hours (missing fields are 0).
+pub fn parse_time_of_day(s: &str) -> Option<f32> {
+    let mut p = s.split(':').map(|x| x.trim().parse::<f32>().ok());
+    let h = p.next()??;
+    let m = p.next().flatten().unwrap_or(0.0);
+    let sec = p.next().flatten().unwrap_or(0.0);
+    Some(h + m / 60.0 + sec / 3600.0)
+}
+/// Hours as Lighting.TimeOfDay writes them: clamped to [0, 24], whole seconds.
+pub fn format_time_of_day(hours: f32) -> String {
+    let secs = (clock_time(hours) * SECONDS_PER_HOUR).round() as u32;
+    format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
+}
 pub const MAX_LIGHTS: usize = 256; // nearest lights drawn per frame
 pub const SHADOW_MAP_TEXELS: u32 = 2048; // the depth map the sun's cascades are drawn into one at a time: the largest tile (SUN_CASCADE_TILES)
 pub const SHADOW_LOD_SCALE: f32 = 2.0; // casters can be this much smaller on screen than drawn parts before they're skipped
 pub const ENV_SPEC_ROUGHNESS: f32 = 0.5; // the roughness of every material for the sky reflection and the sun highlight (Studio: 0.089 + 0.911 × a per-material vertex value, VARYING4.w; the table isn't read yet; estimated from Place B Newer's N1 road)
 pub const ENV_SPEC_LOD_SPAN: f32 = 5.0; // the sky reflection reads the skybox at mip (coarsest − this × (1 − roughness)); Studio's part FS reads its prefiltered cube at roughness × 5 (ShadowMap part FS)
 pub const ENV_DIFFUSE_GAIN: f32 = 1.0; // EnvironmentDiffuseScale × skybox irradiance × this (calibrated against Studio)
-pub const TEXTURE_ANISOTROPY: u16 = 8; // part textures at the top graphics quality levels (QUALITY_ANISOTROPY): mipmapped, trilinear, 8× anisotropic, no mip bias. Studio binds material maps with filter 2 and anisotropy 0 = the device default, which a running offline Studio holds at 8; Vulkan's sampler has mipLodBias 0
+pub const TEXTURE_ANISOTROPY: u16 = 8; // part textures: mipmapped, trilinear, 8× anisotropic, no mip bias. Studio binds material maps with filter 2 and anisotropy 0 = the device default, which a running offline Studio holds at 8; Vulkan's sampler has mipLodBias 0
 pub const LIGHT_TEST_TOLERANCE: u8 = 8; // self-test: lit colours within this many levels (0-255) of Studio's
 // Light grid skylight (lightgrid.rs; Studio measurements "Light grid
 // (skylight)"): read from Studio and a running Studio.
@@ -197,7 +210,7 @@ pub const LIGHTGRID_NORMAL_OFFSET: f32 = 6.0; // studs out along the normal the 
 pub const LIGHTGRID_BORDER: f32 = 0.4921875; // the shaders take the grid only within this share of its size from its centre, per axis, and open sky beyond (CB0 LightConfig3, read from memory: 0.5 − 1/128)
 pub const LIGHTGRID_MOVES_REFRESH_S: f32 = 1.5; // ...and after parts only moved (characters, enemies) at most this often
 pub const LIGHTGRID_REFRESH_S: f32 = 0.25; // rebuild after a part or terrain edit at most this often (Studio updates the touched chunks over a few frames)
-pub const LIGHTGRID_LOCAL_PATCH_MAX: usize = 400_000; // voxels the lights that changed in a frame may reach for an in-frame re-light of just their boxes (a Range-12 muzzle flash reaches ~1.3k; past this the whole local channel is re-lit on a worker)
+pub const LIGHTGRID_LOCAL_PATCH_MAX: usize = 16_384; // bound synchronous light accumulation plus filter voxels; larger updates run on a worker
 // Local lights blocked by parts (round 26, lightocc.rs; corpus lightwall-soft
 // / lightwall-real, docs/MECHANICS.md "Round 26"). Studio: Shadows on blocks them
 // (Future: shadow maps, hard; Soft: its 4-stud lighting voxels, which a
@@ -384,6 +397,7 @@ pub const TERRAIN_COLLIDER_CELL: f32 = 64.0; // studs per side of one terrain tr
 pub const TERRAIN_FRICTION: f32 = 0.4; // terrain collider friction, one value for all materials (estimated)
 pub const TERRAIN_ELASTICITY: f32 = 0.1; // terrain collider elasticity, one value for all materials (estimated)
 pub const CLICK_DISTANCE: f32 = 32.0; // ClickDetector.MaxActivationDistance default (Roblox docs)
+pub const CLICK_SEE_THROUGH: f32 = 0.95; // a ClickDetector click passes parts above this Transparency that have no detector (Studio probe: 0.95 blocks, 0.96 passes)
 pub const MOVE_TO_REACHED: f32 = 1.0; // Humanoid:MoveTo counts as reached within this many studs (estimated)
 pub const MOVE_TO_TIMEOUT_S: f32 = 8.0; // Humanoid:MoveTo gives up after 8 s (Roblox docs)
 pub const EXPLOSION_PUSH: f32 = 0.0004; // speed change per (BlastPressure / mass) for unanchored parts hit (estimated)
@@ -661,40 +675,6 @@ pub const SUN_CASCADE_UP_FLIP: f32 = 0.7; // light space's up turns from +Y to +
 pub const SHADOW_SOFTNESS_BLUR: [f32; 2] = [1.71, 0.05]; // the blur's reach in studs = ShadowSoftness × [0] + [1] (as Studio); also what a cascade's sphere gives up for the shader's test
 pub const SUN_SHADOW_ATLAS: [u32; 2] = [3200, 2048]; // rustudio's atlas for the four tiles (Studio shares a 4096 × 7680 one with the local lights)
 pub const SUN_CASCADE_ORIGINS: [[u32; 2]; 4] = [[2816, 1024], [2048, 1024], [2048, 0], [0, 0]]; // each tile's corner in that atlas
-pub const SUN_SHADOW_TEXEL_SCALE_PHONE: f32 = 0.5; // the low graphics quality levels' cascade tiles, atlas and depth map at this fraction of the texels across (a quarter of the shadow fill and blur work; RUSTUDIO_SHADOW_SCALE overrides) (estimated; a phone GPU has a tenth of a desktop card's bandwidth)
-// Graphics quality levels (graphics.rs; docs/MECHANICS.md "Graphics quality levels"): Studio's
-// Settings slider, 1 (cheapest) to 10, each a row of these tables (index = level − 1). Studio's
-// QualityLevel enum spans Level01..Level21 behind the same slider; level 10 is Studio's defaults.
-pub const QUALITY_LEVELS: u8 = 10;
-pub const QUALITY_VIEW_DISTANCE: [f32; 10] = [500.0, 700.0, 900.0, 1200.0, 1500.0, 2500.0, 4000.0, 6000.0, 10000.0, f32::INFINITY]; // studs: parts and terrain chunks wholly farther from the camera aren't drawn (Studio: about 500 studs at Level01, 100000 at Level21; estimated)
-pub const QUALITY_DETAIL_PX: [f32; 10] = [6.0, 4.0, 3.0, 2.0, 1.5, 1.2, 1.0, 1.0, 1.0, 1.0]; // a part whose bounding radius covers fewer pixels than this is skipped (LOD_MIN_PX at the top; Studio's low levels drop small distant parts first; estimated)
-pub const QUALITY_TEXTURE_TEXELS: [u32; 10] = [256, 256, 512, 512, 512, 1024, 1024, 1024, 1024, 1024]; // the material texture arrays' side (matpack::LAYER_SIZE at most): a quarter of the GPU memory and bandwidth per halving (Studio's low levels halve its texture resolution; estimated)
-pub const QUALITY_MSAA: [u32; 10] = [1, 1, 1, 1, 1, 2, 2, 2, 4, 4]; // scene multisampling (Studio: MSAA from Level19)
-pub const QUALITY_HDR_FROM: u8 = 5; // levels from this one draw the scene in 64-bit float (Rgba16Float); below, 32-bit Rg11b10Ufloat
-pub const QUALITY_RENDER_SCALE: [f32; 10] = [0.5, 0.6, 0.7, 0.8, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]; // the 3D view's pixels per panel pixel: the first phone measurements fell well under 60 Hz at full resolution (estimated)
-pub const QUALITY_MOTION_SCALE: [f32; 10] = [0.5, 0.5, 0.5, 0.6, 0.7, 0.8, 1.0, 1.0, 1.0, 1.0]; // the 3D view's pixels per panel pixel while the camera moves and while playing (the lesser of this and the render scale; viewport.rs): the moving frames are the ones that can't be shown again, and at a phone's density a half-resolution frame scaled up by EASU reads well in motion (estimated)
-pub const QUALITY_MOTION_HOLD_S: f32 = 0.25; // the camera still for this long draws the view at the render scale again (estimated: a flick's settling time)
-pub const UPSCALE_SHARPNESS: f32 = 0.2; // RCAS's sharpness after EASU scales the 3D view up (shader.wgsl fs_rcas): 0 the sharpest, 2 the least; AMD's recommended setting for FSR 1.0's Quality mode
-pub const QUALITY_ANISOTROPY: [u16; 10] = [1, 1, 1, 2, 2, 2, 2, 4, TEXTURE_ANISOTROPY, TEXTURE_ANISOTROPY]; // the material maps' and part textures' anisotropic filter: 8 taps per sample at a grazing angle were a fifth of a phone's material cost; none at the phone levels 1–3, where the frame is drawn at half scale (Roblox: better filtering from Level07, the most from Level09; estimated)
-pub const QUALITY_LITE: [u32; 10] = [7, 7, 7, 0, 0, 0, 0, 0, 0, 0]; // the lite shader's bits (shader.wgsl LITE_*: 1 no normal maps, 2 reflections from the ambient cube, 4 one material read; 8 and 16, diagnostics, off): a separate shader build (RenderSettings::build_key), as Studio's LQ variants are separate programs below Level04 (estimated)
-pub const QUALITY_FPS_CAP: [u32; 10] = [0; 10]; // frames per second at most while playing (0: none, the display's rate): Roblox's phone client runs at the display's rate at every level (its own cap setting is the player's, 60 by default); a cap below the display's rate under FIFO vsync lands frames on every second or third refresh by turns — 30 asked on a 60 Hz panel showed ~20 fps on the first phone — so none is set by the levels; RUSTUDIO_FPS_CAP / the setting are the player's choice for heat and battery (estimated)
-pub const QUALITY_SUN_CASCADES: [u32; 10] = [0, 1, 1, 2, 2, 2, 3, 4, 4, 4]; // sun shadow cascades drawn (0: the voxel sun alone, as Studio below Level04)
-pub const QUALITY_SHADOW_SCALE: [f32; 10] = [0.5, 0.5, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0, 1.0]; // the cascades' texels as a fraction of Studio's (SUN_SHADOW_TEXEL_SCALE_PHONE at the bottom)
-pub const QUALITY_LIGHT_SHADOWS_FROM: u8 = 5; // local lights' shadow maps from this level (Studio: ShadowMap from Level04, Future from Level05)
-pub const QUALITY_SSAO_FROM: u8 = 8; // screen-space ambient occlusion from this level (Studio: Level21)
-pub const QUALITY_BLOOM_LEVELS: [u32; 10] = [0, 0, 0, 3, 3, 3, 5, 5, 5, 5]; // bloom pyramid levels (Studio: bloom from Level06)
-pub const QUALITY_DOF_FROM: u8 = 8; // depth of field from this level (Studio: Level17)
-pub const QUALITY_CLOUDS_FROM: u8 = 5; // Terrain.Clouds from this level
-pub const QUALITY_ENV_PROBE_FROM: u8 = 5; // the scene environment probe from this level
-pub const QUALITY_DEFAULT_PHONE: u8 = 3; // Android starts here, in Automatic (a computer at 10, as Studio's Level21 default)
-pub const QUALITY_AUTO_FRAME_MS: f32 = 16.7; // Automatic quality's frame budget: one 60 Hz refresh
-pub const QUALITY_AUTO_SLOW: f32 = 1.35; // the median frame longer than this × the budget for QUALITY_AUTO_DOWN_S: a level down (estimated)
-pub const QUALITY_AUTO_DOWN_S: f32 = 2.0; // seconds of slow frames before a step down
-pub const QUALITY_AUTO_FAST: f32 = 1.1; // the median frame within this × the budget (vsync holds it at 1.0) for QUALITY_AUTO_UP_S: a level up (estimated)
-pub const QUALITY_AUTO_UP_S: f32 = 20.0; // seconds of fast frames before a step up
-pub const QUALITY_AUTO_HOLD_S: f32 = 90.0; // after a step down, the level left isn't gone back up to for this long (estimated)
-pub const QUALITY_AUTO_SETTLE_S: f32 = 0.5; // frames in the first this many seconds after a level change aren't counted: pipelines and render targets are remade then (estimated)
-pub const QUALITY_AUTO_IDLE_MS: f32 = 100.0; // a frame longer than this follows an idle pause (the editor repaints on input), not slow drawing: left out
 pub const SUN_DIST: f32 = 580.0; // Globals.sunDist: the sun's map hands off to the voxel sun from here, over 1 / HYBRID_LERP_SLOPE studs
 pub const LIGHT_INNER: f32 = 0.71; // light record m1 = Range × 1000 + this: full brightness to this × Range (all lights read)
 

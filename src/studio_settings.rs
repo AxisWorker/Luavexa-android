@@ -62,6 +62,48 @@ pub enum Dflt {
     Live,
 }
 
+/// The settings rustudio acts on (camera, selection, Output, script editor,
+/// plugins, audio, physics sleep, script timeout…). Every other row is
+/// greyed out in the dialog. Read-only Diagnostics rows always count.
+const HAS_EFFECT: &[(&str, &str)] = &[
+    ("Studio", "Camera Speed"),
+    ("Studio", "Camera Pan Speed"),
+    ("Studio", "Camera Shift Speed"),
+    ("Studio", "Camera Mouse Wheel Speed"),
+    ("Studio", "Camera Zoom to Mouse Position"),
+    ("Studio", "PluginsDir"),
+    ("Studio", "ReloadLocalPluginsOnChange"),
+    ("Studio", "Theme"),
+    ("Studio", "Clear Output On Start"),
+    ("Studio", "Output Font"),
+    ("Studio", "Maximum Output Lines"),
+    ("Studio", "ScriptTimeoutLength"),
+    ("Studio", "Main Volume"),
+    ("Studio", "Show Core GUI in Explorer while Playing"),
+    ("Studio", "Show Plugin GUI Service in Explorer"),
+    ("Studio", "DraggerSoftSnapMarginFactor"),
+    ("Studio", "Show Hover Over"),
+    ("Studio", "Select Color"),
+    ("Studio", "Hover Over Color"),
+    ("Studio", "Selection Line Thickness"),
+    ("Studio", "Hover Line Thickness"),
+    ("Studio", "Font"),
+    ("Studio", "Text Wrapping"),
+    ("Studio", "Text Color"),
+    ("Studio", "Background Color"),
+    ("Studio", "Keyword Color"),
+    ("Studio", "Built-in Function Color"),
+    ("Studio", "String Color"),
+    ("Studio", "Number Color"),
+    ("Studio", "Comment Color"),
+    ("Studio", "Operator Color"),
+    ("PhysicsSettings", "AllowSleep"),
+];
+
+pub fn has_effect(d: &Def) -> bool {
+    matches!(d.kind, Kind::ReadOnly) || HAS_EFFECT.contains(&(d.class, d.prop))
+}
+
 pub struct Def {
     pub page: &'static str,
     pub cat: &'static str,
@@ -301,29 +343,11 @@ pub fn reset_all() {
 }
 
 /// Pushes a value into the engine parts that keep their own copy.
-/// (Rendering > Editor Quality Level is read by the editor each frame
-/// instead: `edit_quality_level`, app.rs `quality_tick`.)
 fn apply(i: usize) {
     let d = &DEFS[i];
     if (d.class, d.prop) == ("Studio", "Main Volume") {
         rustudio_engine::audio::set_studio_main(num("Studio", "Main Volume", 1.0) as f32);
     }
-}
-
-/// Rendering > Editor Quality Level (`settings().Rendering.EditQualityLevel`):
-/// Studio's QualityLevel value, 0 Automatic, 1..=21 Level01..Level21
-/// (graphics.rs maps it onto the 1–10 bar).
-pub fn edit_quality_level() -> u32 {
-    match get("RenderSettings", "EditQualityLevel") {
-        Some(Val::Enum(e)) => e.min(21),
-        _ => 21,
-    }
-}
-
-/// The editor's graphics choice back into Rendering > Editor Quality Level
-/// (the View menu, the Graphics Settings window, the saved layout).
-pub fn set_edit_quality_level(level: u32) {
-    set("RenderSettings", "EditQualityLevel", Val::Enum(level.min(21)));
 }
 
 fn apply_all() {
@@ -623,7 +647,7 @@ impl Dialog {
 
     fn matches_opt(&self, o: &rustudio_core::rustudio_settings::Opt) -> bool {
         let q = self.search.trim().to_lowercase();
-        q.is_empty() || o.label.to_lowercase().contains(&q) || RUSTUDIO_PAGE_NAME.contains(&q)
+        q.is_empty() || (o.key == "resolution" && "quality preset".contains(&q)) || o.cat.to_lowercase().contains(&q) || o.label.to_lowercase().contains(&q) || RUSTUDIO_PAGE_NAME.contains(&q)
     }
 
     pub fn ui(&mut self, ctx: &egui::Context) {
@@ -829,6 +853,19 @@ impl Dialog {
     }
 
     fn row(&mut self, ui: &mut egui::Ui, i: usize, w: f32, col: f32) {
+        let top = ui.cursor().min;
+        self.row_inner(ui, i, w, col);
+        if !has_effect(&DEFS[i]) {
+            // Greyed: stored and readable from settings() in Luau, but nothing
+            // in rustudio acts on it yet.
+            let r = Rect::from_min_size(top, Vec2::new(w, ROW_H - 1.0));
+            ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha(110));
+            ui.interact(r, egui::Id::new(("studio_settings_noeffect", i)), Sense::hover())
+                .on_hover_text("No effect in rustudio yet (scripts can still read it through settings())");
+        }
+    }
+
+    fn row_inner(&mut self, ui: &mut egui::Ui, i: usize, w: f32, col: f32) {
         let d = &DEFS[i];
         let (r, resp) = ui.allocate_exact_size(Vec2::new(w, ROW_H), Sense::click());
         let inner = Rect::from_min_max(r.min, Pos2::new(r.max.x, r.max.y - 1.0));
@@ -985,6 +1022,42 @@ impl Dialog {
                         self.collapsed.remove(&(self.page, cat));
                     }
                 }
+            }
+            if o.key == "resolution" && !self.collapsed.contains(&(self.page, o.cat)) {
+                // Each row lists its Low, Medium, and High values. Frame pacing is independent.
+                let qualities = [
+                    ("resolution", ["50", "75", "100"]),
+                    ("detail", ["low", "medium", "high"]),
+                    ("ssao", ["off", "on", "on"]),
+                    ("shadows", ["reduced", "reduced", "full"]),
+                    ("grass", ["reduced", "reduced", "full"]),
+                    ("bloom", ["off", "on", "on"]),
+                    ("idle", ["pause", "animate", "animate"]),
+                ];
+                let labels = ["Low", "Medium", "High"];
+                let selected = (rs::performance_value("quality") == "manual").then(|| (0..labels.len()).find(|&level| qualities.iter().all(|(key, values)| {
+                    let OptKind::Choice(items) = rs::opt(key).kind else { return false };
+                    items[rs::performance_choice(key)].0 == values[level]
+                }))).flatten();
+                ui.horizontal(|ui| {
+                    ui.label("Quality preset");
+                    egui::ComboBox::from_id_salt("performance_quality_preset")
+                        .selected_text(selected.map_or("Custom", |level| labels[level]))
+                        .show_ui(ui, |ui| {
+                            for (level, label) in labels.iter().enumerate() {
+                                if ui.selectable_label(selected == Some(level), *label).clicked() {
+                                    rs::set_choice("quality", "manual", "manual");
+                                    for (key, values) in qualities {
+                                        let option = rs::opt(key);
+                                        if rs::overridden_by(option).is_some() { continue; }
+                                        if let OptKind::Choice(items) = option.kind {
+                                            rs::set_choice(key, values[level], items[0].0);
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                });
             }
             if self.collapsed.contains(&(self.page, o.cat)) {
                 continue;
@@ -1256,6 +1329,13 @@ fn enum_from_lua(v: &mlua::Value, en: &str, items: &[(&str, u32, &str)]) -> Opti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn has_effect_names_exist() {
+        for (c, p) in super::HAS_EFFECT {
+            assert!(super::index(c, p).is_some(), "{c}.{p}");
+        }
+    }
+
     use super::*;
 
     #[test]

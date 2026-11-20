@@ -93,6 +93,8 @@ pub(super) struct HumFrameOut {
     pub floor_changed: Option<u32>,
     /// A state change: the Humanoid sets its limbs' CanCollide false again.
     pub limbs_off: bool,
+    /// This batch advances a local movement or jump request.
+    pub active_input: bool,
 }
 
 impl Default for HumFrameOut {
@@ -107,6 +109,7 @@ impl Default for HumFrameOut {
             running_speed: None,
             floor_changed: None,
             limbs_off: false,
+            active_input: false,
         }
     }
 }
@@ -169,6 +172,56 @@ impl Game {
             }
             rt.dispatch();
         });
+    }
+
+    /// The owning client's writes to its character that the world steps take:
+    /// AssemblyLinearVelocity / AssemblyAngularVelocity a client script set (Place A's own
+    /// jump), and the client's movers on the character (Place A's LinearVelocity and
+    /// AlignOrientation) plus what else the player owns. Read in `hum_pre` and again
+    /// after Stepped / PreSimulation (play.rs): Studio solves a value a script wrote
+    /// there in that frame's world steps (probe T26_presim_echo: PostSimulation reads
+    /// the PreSimulation write back the same frame). Read only before PreSimulation,
+    /// Place A' Movement (pmove from AssemblyLinearVelocity each PreSimulation into a
+    /// planar LinearVelocity) got every value one frame late: each speed showed on two
+    /// frames and friction stopped the player at half rate (T26_presim_pmove: below 20
+    /// u/s 0.55 s after release where Studio takes 0.27).
+    pub(super) fn hum_client_writes(&mut self, model: Ref) {
+        let s = self.play.as_mut().expect("playing");
+        let model_c = s.map.s2c.get(&model).copied();
+        let reqs: Vec<(Ref, Vec3)> = match s.client.as_mut().and_then(|c| c.world.as_mut()) {
+            Some(w) => {
+                let mine: Vec<(Ref, Vec3)> = w
+                    .velocity_requests
+                    .iter()
+                    .filter(|(r, _)| s.map.c2s.get(r).is_some_and(|sr| s.physics.hums.of_part.get(sr) == Some(&model)))
+                    .copied()
+                    .collect();
+                w.velocity_requests.retain(|(r, _)| !s.map.c2s.get(r).is_some_and(|sr| s.physics.hums.of_part.get(sr) == Some(&model)));
+                mine
+            }
+            None => Vec::new(),
+        };
+        if let Some((_, v)) = reqs.last() {
+            s.physics.set_humanoid_velocity(model, Some(*v), None);
+        }
+        // … and AssemblyAngularVelocity (T16: a Ragdoll given a spin).
+        if let Some(cid) = s.other_doc.as_ref().map(|d| d.id) {
+            let spins = rustudio_physics::physics::live::take_spin_sets_of(cid, |r| {
+                s.map.c2s.get(&r).is_some_and(|sr| s.physics.hums.of_part.get(sr) == Some(&model))
+            });
+            if let Some((_, w)) = spins.last() {
+                s.physics.set_humanoid_velocity(model, None, Some(*w));
+            }
+        }
+        // The client's own movers on the character.
+        if let (Some(cd), Some(mc)) = (s.other_doc.as_ref(), model_c) {
+            s.physics.set_client_movers(cd, &s.map.c2s, mc);
+            // What the player owns besides its character: parts a script
+            // gave it, the seat it sits in.
+            let mut owned = rustudio_engine::runtime::domains::world::part::player_owned_roots(self.doc.id);
+            owned.extend(s.character.as_ref().and_then(|c| c.seat));
+            s.physics.set_owned_movers(cd, &s.map.s2c, &s.map.c2s, &owned);
+        }
     }
 
     /// RotationType CameraRelative (shift lock, first person): the root
@@ -280,7 +333,10 @@ impl Game {
         };
         out.humanoid = humanoid;
         out.char_part = touch_part;
-        self.ensure_hum_body(model, root);
+        {
+            let _scope = rustudio_core::bench::scope("hum_body_refresh");
+            self.ensure_hum_body(model, root);
+        }
         // A script moved the root (PivotTo, CFrame, either side): the body
         // goes there (Roblox moves the whole assembly).
         {
@@ -297,46 +353,16 @@ impl Game {
                     ch.last_root = Some(xf);
                 }
             }
+            // An Anchored root (either side) holds the body where it is.
+            let anchored = |d: &doc::Document, r: Ref| matches!(d.prop(r, "Anchored"), Some(Variant::Bool(true)));
+            let held = anchored(&self.doc, root)
+                || s.map.s2c.get(&root).is_some_and(|c| s.other_doc.as_ref().is_some_and(|cd| anchored(cd, *c)));
+            let at = if held { ch.last_root.or_else(|| rustudio_render::scene::xform_of(&self.doc, root)) } else { None };
+            s.physics.anchor_humanoid(model, at);
         }
-        // AssemblyLinearVelocity a client script gave its character (Place A's own jump).
-        {
-            let s = self.play.as_mut().expect("playing");
-            let model_c = s.map.s2c.get(&model).copied();
-            let reqs: Vec<(Ref, Vec3)> = match s.client.as_mut().and_then(|c| c.world.as_mut()) {
-                Some(w) => {
-                    let mine: Vec<(Ref, Vec3)> = w
-                        .velocity_requests
-                        .iter()
-                        .filter(|(r, _)| s.map.c2s.get(r).is_some_and(|sr| s.physics.hums.of_part.get(sr) == Some(&model)))
-                        .copied()
-                        .collect();
-                    w.velocity_requests.retain(|(r, _)| !s.map.c2s.get(r).is_some_and(|sr| s.physics.hums.of_part.get(sr) == Some(&model)));
-                    mine
-                }
-                None => Vec::new(),
-            };
-            if let Some((_, v)) = reqs.last() {
-                s.physics.set_humanoid_velocity(model, Some(*v), None);
-            }
-            // … and AssemblyAngularVelocity (T16: a Ragdoll given a spin).
-            if let Some(cid) = s.other_doc.as_ref().map(|d| d.id) {
-                let spins = rustudio_physics::physics::live::take_spin_sets_of(cid, |r| {
-                    s.map.c2s.get(&r).is_some_and(|sr| s.physics.hums.of_part.get(sr) == Some(&model))
-                });
-                if let Some((_, w)) = spins.last() {
-                    s.physics.set_humanoid_velocity(model, None, Some(*w));
-                }
-            }
-            // The client's own movers on the character.
-            if let (Some(cd), Some(mc)) = (s.other_doc.as_ref(), model_c) {
-                s.physics.set_client_movers(cd, &s.map.c2s, mc);
-                // What the player owns besides its character: parts a script
-                // gave it, the seat it sits in.
-                let mut owned = rustudio_engine::runtime::domains::world::part::player_owned_roots(self.doc.id);
-                owned.extend(s.character.as_ref().and_then(|c| c.seat));
-                s.physics.set_owned_movers(cd, &s.map.s2c, &s.map.c2s, &owned);
-            }
-        }
+        // What the client's PreAnimation / RenderStepped wrote (again after PreSimulation:
+        // `hum_client_writes`).
+        self.hum_client_writes(model);
         // The client's Humanoid values (it owns the character).
         let speed = self.owned_humanoid_f32(humanoid, "WalkSpeed", mech::WALK_SPEED);
         let use_power = matches!(self.owned_humanoid_prop(humanoid, "UseJumpPower"), Some(Variant::Bool(true)));
@@ -466,6 +492,7 @@ impl Game {
         // Sensors (Studio, per frame): the floor rays, the ladder.
         let state = hd.hum.state;
         let rot = glam::Quat::from_mat3(&root_xf.rot);
+        let sensors = rustudio_core::bench::scope("hum_sensors");
         let floor: Option<(Floor, Option<Ref>)> = if senses_floor(state) {
             s.physics.humanoid_floor(doc, model, root_xf.pos, rot, &shape, hd.had_floor, &own)
         } else {
@@ -498,6 +525,7 @@ impl Game {
         }
         let ladder = senses_ladder(state) && ch.ladder.is_some() && !states_off.contains("Climbing");
         let in_water = !states_off.contains("Swimming") && s.physics.water_at(root_xf.pos) > mech::SWIM_ENTER_WATER;
+        drop(sensors);
         // The full hip: ½ root.Size.Y, R6's longer leg, HipHeight.
         let full_hip = shape.root_size.y * 0.5 + legs + hip_height;
         let inp = FrameIn {
@@ -525,6 +553,8 @@ impl Game {
             root_w,
             torso_up: Some(root_xf.rot.y_axis),
         };
+        out.active_input = !anchored && health > 0.0 && (mag > 0.0 || jump_req);
+        let controller = rustudio_core::bench::scope("hum_controller");
         // A forced state (ChangeState) replaces this frame's transition.
         let forced = forced_req.filter(|n| !states_off.contains(n)).and_then(|n| State::from_name(&n));
         let change = match forced {
@@ -554,6 +584,7 @@ impl Game {
                 }
             }
         };
+        drop(controller);
         out.state_change = change;
         if change.is_some() {
             out.limbs_off = true;
@@ -898,5 +929,145 @@ impl Game {
             self.record(RepOp::Prop(humanoid, "Health".into()));
             self.kill_character();
         }
+    }
+}
+
+#[cfg(test)]
+mod anchored_root_tests {
+    use crate::game::Game;
+    use rustudio_engine::runtime::{RunMode, Side};
+
+    /// Studio 0.747: a server PivotTo of the player's character with its
+    /// HumanoidRootPart Anchored stays where it was put (5 studs up, in
+    /// Freefall) while anchored; unanchored it falls back to the floor. The
+    /// controller used to drop it (and walk it) regardless of Anchored.
+    #[test]
+    fn anchored_root_holds_the_character() {
+        let mut game = Game::new(None);
+        game.start_play(RunMode::Play, &mut (), false, None);
+        assert!(game.is_playing());
+        let ctx = egui::Context::default();
+        let tick = |game: &mut Game, n: usize| {
+            for _ in 0..n {
+                game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+            }
+        };
+        tick(&mut game, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                assert(plr, "no player")
+                if not plr.Character then plr:LoadCharacter() end
+            "#),
+            None
+        );
+        tick(&mut game, 120);
+        let found = game.run_luau(Side::Server, r#"
+            local plr = game:GetService("Players"):GetPlayers()[1]
+            local ch = plr and plr.Character
+            assert(ch and ch:FindFirstChild("HumanoidRootPart"), "no character")
+            local root = ch.HumanoidRootPart
+            _G.anch = { root = root, y0 = root.Position.Y }
+            root.Anchored = true
+            ch:PivotTo(root.CFrame + Vector3.new(30, 5, 0))
+            _G.anch.y1 = root.Position.Y
+        "#);
+        assert_eq!(found, None);
+        tick(&mut game, 90);
+        assert_eq!(
+            game.run_luau(Side::Server, "local a = _G.anch; assert(math.abs(a.root.Position.Y - a.y1) < 1e-3, 'moved to ' .. a.root.Position.Y)"),
+            None
+        );
+        assert_eq!(game.run_luau(Side::Server, "_G.anch.root.Anchored = false"), None);
+        tick(&mut game, 120);
+        assert_eq!(
+            game.run_luau(Side::Server, "local a = _G.anch; assert(a.root.Position.Y < a.y1 - 4, 'stayed at ' .. a.root.Position.Y)"),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod presim_mover_tests {
+    use crate::game::Game;
+    use rustudio_engine::runtime::{RunMode, Side};
+
+    /// Studio (probe T26_presim_echo, Studio 2026-11-19): a client's LinearVelocity on
+    /// its character, set in RunService.PreSimulation, is solved in that frame's world
+    /// steps: PostSimulation reads the write back (6 / 12 on alternate frames, 12.2 /
+    /// 6.15 with the Humanoid's floor forces). rustudio read the client's movers before
+    /// PreSimulation fired, so it solved the frame before's write (12 → 6.35, 6 →
+    /// 11.65), which made Place A' pmove friction act at half rate.
+    #[test]
+    fn presimulation_mover_write_is_solved_that_frame() {
+        let mut game = Game::new(None);
+        game.start_play(RunMode::Play, &mut (), false, None);
+        assert!(game.is_playing());
+        let ctx = egui::Context::default();
+        let tick = |game: &mut Game, n: usize| {
+            for _ in 0..n {
+                game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+            }
+        };
+        tick(&mut game, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                assert(plr, "no player")
+                if not plr.Character then plr:LoadCharacter() end
+            "#),
+            None
+        );
+        tick(&mut game, 120);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local RunService = game:GetService("RunService")
+                local ch = game:GetService("Players").LocalPlayer.Character
+                assert(ch and ch:FindFirstChild("HumanoidRootPart"), "no character")
+                local root = ch.HumanoidRootPart
+                ch:FindFirstChildOfClass("Humanoid").WalkSpeed = 0
+                local att = Instance.new("Attachment")
+                att.Parent = root
+                local lv = Instance.new("LinearVelocity")
+                lv.Attachment0 = att
+                lv.RelativeTo = Enum.ActuatorRelativeTo.World
+                lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Plane
+                lv.PrimaryTangentAxis = Vector3.xAxis
+                lv.SecondaryTangentAxis = Vector3.zAxis
+                lv.ForceLimitsEnabled = false
+                lv.Parent = root
+                local k, wrote = 0, 0
+                _G.echo = {}
+                RunService.PreSimulation:Connect(function()
+                    k += 1
+                    wrote = if k % 2 == 0 then 12 else 6
+                    lv.PlaneVelocity = Vector2.new(0, -wrote)
+                end)
+                RunService.PostSimulation:Connect(function()
+                    if k > 0 then
+                        table.insert(_G.echo, { k, wrote, -root.AssemblyLinearVelocity.Z })
+                    end
+                end)
+            "#),
+            None
+        );
+        tick(&mut game, 40);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local rows = _G.echo
+                assert(#rows >= 30, "only " .. #rows .. " frames")
+                local near, bad = 0, {}
+                for i = 2, #rows do
+                    local w, prev, got = rows[i][2], rows[i - 1][2], rows[i][3]
+                    if math.abs(got - w) < math.abs(got - prev) and math.abs(got - w) < 1 then
+                        near += 1
+                    elseif #bad < 4 then
+                        table.insert(bad, string.format("frame %d wrote %g read %.3f", rows[i][1], w, got))
+                    end
+                end
+                assert(near == #rows - 1, near .. " / " .. (#rows - 1) .. " frames read their own write; " .. table.concat(bad, ", "))
+            "#),
+            None
+        );
     }
 }

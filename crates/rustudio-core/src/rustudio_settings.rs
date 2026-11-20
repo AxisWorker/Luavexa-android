@@ -76,6 +76,16 @@ pub struct Opt {
 pub const SOLVERS: &[(&str, &str)] = &[("studio", "Studio solver (default)"), ("rapier", "Legacy (rapier)")];
 
 pub const OPTS: &[Opt] = &[
+    Opt { key: "quality", cat: "Performance", label: "Graphics quality", desc: "Automatic adjusts the viewport quality level using recent frame times. Manual uses the settings below.", env: "RUSTUDIO_PERF_QUALITY", kind: OptKind::Choice(&[("manual", "Manual"), ("automatic", "Automatic")]) },
+    Opt { key: "resolution", cat: "Performance", label: "3D resolution", desc: "Scales the 3D scene while keeping editor text sharp. The biggest saving on a weak graphics chip: 50% draws a quarter of the pixels.", env: "RUSTUDIO_PERF_RESOLUTION", kind: OptKind::Choice(&[("100", "100%"), ("75", "75%"), ("50", "50%"), ("33", "33%"), ("25", "25%")]) },
+    Opt { key: "detail", cat: "Performance", label: "Shading detail", desc: "Medium drops sky reflections and extra lighting work; Low also drops material maps, the light grid, local lights and multisample anti-aliasing (as Studio's lower quality levels do), keeping sun, shadow and ambient. The biggest saving on a weak graphics chip.", env: "RUSTUDIO_PERF_DETAIL", kind: OptKind::Choice(&[("high", "High"), ("medium", "Medium"), ("low", "Low")]) },
+    Opt { key: "ssao", cat: "Performance", label: "Ambient occlusion", desc: "Darkens creases and corners. Off skips the screen-space pass, which costs several milliseconds a frame on a weak graphics chip.", env: "RUSTUDIO_PERF_SSAO", kind: OptKind::Choice(&[("on", "On"), ("off", "Off")]) },
+    Opt { key: "shadows", cat: "Performance", label: "Shadow quality", desc: "Reduced draws smaller sun shadow tiles. Off also disables local light shadows.", env: "RUSTUDIO_PERF_SHADOWS", kind: OptKind::Choice(&[("full", "Full"), ("reduced", "Reduced"), ("off", "Off")]) },
+    Opt { key: "grass", cat: "Performance", label: "Grass detail", desc: "Reduced grows fewer blades over a shorter distance.", env: "RUSTUDIO_PERF_GRASS", kind: OptKind::Choice(&[("full", "Full"), ("reduced", "Reduced"), ("off", "Off")]) },
+    Opt { key: "bloom", cat: "Performance", label: "Glow effects", desc: "Controls the bloom glow around bright surfaces.", env: "RUSTUDIO_PERF_BLOOM", kind: OptKind::Choice(&[("on", "On"), ("off", "Off")]) },
+    Opt { key: "fps", cat: "Performance", label: "Editor frame limit", desc: "Limits scheduled editor and playtest redraws. Input and window changes can redraw immediately.", env: "RUSTUDIO_PERF_FPS", kind: OptKind::Choice(&[("unlimited", "Unlimited"), ("60", "60 FPS"), ("30", "30 FPS")]) },
+    Opt { key: "present", cat: "Performance", label: "Presentation", desc: "Low latency shows each finished frame at the next screen refresh without waiting for one, like Studio, and paces redraws to the frame limit (the screen's refresh rate when Unlimited). Wait for vsync blocks each frame on the refresh. Applies after a restart.", env: "RUSTUDIO_PERF_PRESENT", kind: OptKind::Choice(&[("mailbox", "Low latency"), ("fifo", "Wait for vsync")]) },
+    Opt { key: "idle", cat: "Performance", label: "Idle grass animation", desc: "Pauses grass animation redraws while the editor is idle.", env: "RUSTUDIO_PERF_IDLE", kind: OptKind::Choice(&[("animate", "Animate"), ("pause", "Pause when idle")]) },
     Opt {
         key: "solver",
         cat: "Physics",
@@ -187,6 +197,12 @@ pub fn init(persist: bool) {
 
 fn saved(key: &str) -> Option<Value> {
     STORE.read().unwrap().vals.as_ref()?.get(key).cloned()
+}
+
+/// A saved value that isn't one of the dialog's options (the profiler's
+/// settings and layout keep a JSON object each).
+pub fn saved_value(key: &str) -> Option<Value> {
+    saved(key)
 }
 
 /// The dialog: a new value (None = back to the default). Kept in memory for
@@ -429,8 +445,58 @@ pub enum Shown {
     Path(String),
 }
 
+static WEAK_GPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Weak-GPU mode (rustudio-render gpu_caps.rs: software adapters, OpenGL,
+/// old Intel graphics, RUSTUDIO_LOWEND=1): Graphics quality defaults to
+/// Automatic, which then starts at its lowest level.
+pub fn set_weak_gpu(on: bool) {
+    WEAK_GPU.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn weak_gpu() -> bool {
+    WEAK_GPU.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A Performance row's default when nothing is saved or set.
+fn choice_default(key: &str) -> Option<&'static str> {
+    choice_default_for(key, weak_gpu(), cfg!(target_os = "android"))
+}
+
+/// `choice_default` by its inputs: Graphics quality is Automatic on a weak
+/// GPU (and every phone counts as one: gpu_caps.rs `weak_reason`); on
+/// Android the 3D resolution starts at 75% — the first phone measurements
+/// fell well under the display's rate at full resolution, and at a phone's
+/// pixel density three quarters reads as sharp — until the dialog says
+/// otherwise.
+fn choice_default_for(key: &str, weak: bool, android: bool) -> Option<&'static str> {
+    match key {
+        "quality" if weak => Some("automatic"),
+        "resolution" if android => Some("75"),
+        _ => None,
+    }
+}
+
+pub fn performance_choice(key: &str) -> usize {
+    let o = opt(key);
+    let OptKind::Choice(items) = o.kind else { return 0 };
+    let value = env(o.env)
+        .or_else(|| saved(key)?.as_str().map(str::to_owned))
+        .or_else(|| choice_default(key).map(str::to_owned));
+    items.iter().position(|(id, _)| Some(*id) == value.as_deref()).unwrap_or(0)
+}
+
+/// The selected choice's saved id for a Performance row ("50", "low", "off"),
+/// so code reads the value it means rather than an index into the list.
+pub fn performance_value(key: &str) -> &'static str {
+    let o = opt(key);
+    let OptKind::Choice(items) = o.kind else { return "" };
+    items.get(performance_choice(key)).map_or("", |(id, _)| *id)
+}
+
 pub fn shown(o: &Opt) -> Shown {
     match o.key {
+        key if o.cat == "Performance" => Shown::Choice(performance_choice(key)),
         "solver" => Shown::Choice(if solver_now() == SolverKind::Rapier { 1 } else { 0 }),
         "spin_guard" => Shown::Bool(spin_guard_now()),
         "client_link" => Shown::Bool(client_link_now()),
@@ -458,6 +524,7 @@ pub fn set_bool(key: &str, b: bool) {
 }
 
 pub fn set_choice(key: &str, v: &str, default: &str) {
+    let default = choice_default(key).unwrap_or(default);
     set(key, (v != default).then(|| Value::String(v.to_string())));
 }
 
@@ -470,6 +537,27 @@ pub fn set_path(key: &str, v: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The Performance rows' platform defaults: Automatic quality on a weak
+    /// GPU, 75% 3D resolution on a phone, the first choice otherwise.
+    #[test]
+    fn performance_defaults_follow_the_platform() {
+        assert_eq!(choice_default_for("quality", false, false), None);
+        assert_eq!(choice_default_for("quality", true, false), Some("automatic"));
+        assert_eq!(choice_default_for("quality", true, true), Some("automatic"));
+        assert_eq!(choice_default_for("resolution", false, false), None);
+        assert_eq!(choice_default_for("resolution", false, true), Some("75"));
+        assert_eq!(choice_default_for("detail", true, true), None);
+        // Every default is one of its row's choices.
+        for key in ["quality", "resolution"] {
+            let OptKind::Choice(items) = opt(key).kind else { panic!("{key} is a choice") };
+            for (weak, android) in [(false, false), (true, false), (false, true), (true, true)] {
+                if let Some(d) = choice_default_for(key, weak, android) {
+                    assert!(items.iter().any(|(id, _)| *id == d), "{key}: {d}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn env_beats_saved_beats_default() {

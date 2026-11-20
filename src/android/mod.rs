@@ -140,10 +140,12 @@ pub(crate) fn system_property(name: &str) -> String {
 pub fn run(app: AndroidApp) {
     logcat::install();
     log::info!(
-        "rustudio {} starting (Android API {}; {})",
+        "rustudio {} starting (Android API {}; {} build, {} {})",
         env!("CARGO_PKG_VERSION"),
         AndroidApp::sdk_version(),
-        rustudio_render::perf_log::build()
+        if cfg!(debug_assertions) { "debug" } else { "release" },
+        std::env::consts::ARCH,
+        std::env::consts::OS,
     );
     if APP.set(app.clone()).is_err() {
         // (not expected: the entry point keeps any activity after the
@@ -352,7 +354,7 @@ pub fn gpu_lost() -> bool {
 /// says so for the next start, and the activity is relaunched (jni::relaunch)
 /// — instead of a process that draws nothing until the system kills it.
 /// (The vendored egui-wgpu skips a frame whose upload the device refuses,
-/// vendor/egui-wgpu/PATCHES.md; a single refused frame recovers by
+/// renderer.rs `upload_failed`; a single refused frame recovers by
 /// itself.) Returns true when the frame should draw nothing.
 pub fn gpu_watch(ed: &mut crate::app::Editor) -> bool {
     use std::sync::atomic::Ordering;
@@ -438,9 +440,9 @@ pub mod touch {
     pub const FIT_POINTS: f32 = 1100.0;
     pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.8..=1.6;
 
-    /// (The 3D view's first-run render scale, view distance, textures,
-    /// MSAA, shadows and passes are graphics level 3's, in Automatic:
-    /// src/graphics.rs, app.rs `Editor::graphics`.)
+    /// (The 3D view's first-run quality is Automatic from the lowest
+    /// level, in weak-GPU mode, at 75% 3D resolution: gpu_caps.rs
+    /// `weak_reason`, rustudio_settings.rs `choice_default`.)
     pub fn setup(app: &mut crate::app::RustudioApp, ctx: &egui::Context) {
         let saved = crate::layout_store::load();
         // (the window's size isn't known until the first frame: auto_zoom)

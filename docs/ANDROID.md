@@ -10,8 +10,8 @@ library (src/lib.rs) — inside a `NativeActivity`. What differs is in
 work on any system with a touch screen or a device's sensors live in the
 workspace's crates like the rest of the engine: `touch_input.rs` and
 `device_sensors.rs` in rustudio-engine (the sensors behind a `Source` the
-Android entry point installs), `touch_gestures.rs` in rustudio-player,
-`graphics.rs` and `perf_log.rs` in rustudio-render. Targets:
+Android entry point installs), `touch_gestures.rs` in rustudio-player.
+Targets:
 `aarch64-linux-android` (arm64-v8a, every phone and tablet) and
 `x86_64-linux-android` (the emulator).
 
@@ -54,8 +54,8 @@ adb logcat -s rustudio RustStdoutStderr
 editor at opt-level 1 with debug assertions and overflow checks in every
 crate (Cargo's dev profile): several times slower in the physics, the Luau
 runtime and the renderer's CPU side, and a phone shows it first. The
-start line in logcat and the first `perf:` line say which one is running
-(`debug build, aarch64 android` / `release build, …`).
+start line in logcat says which one is running (`rustudio … starting
+(Android API 33; debug build, aarch64 android)` / `release build, …`).
 
 `x build` without `--pem` signs with xbuild's debug key (installs with
 adb). A release key goes in as `--pem key.pem` or the `X_PEM` environment
@@ -117,10 +117,10 @@ xbuild quirks worth knowing (commit e67b501):
 | "Open with rustudio" while it runs | Finder's hand-over (`macos::take_opened`) | a second instance of the activity per VIEW intent (`launchMode` `standard`), caught at the library's entry point: its file is copied in and queued for the editor's next frame, the editor's task comes to the front, the new activity finishes unseen (`src/android/intent.rs`). A place the last start died within 20 s of opening by itself isn't opened again by itself (`state/opening`, `storage.rs`) |
 | UI zoom | 1.0 of the display's scale | first run: the zoom that fits ~1100 points across (0.8 … 1.6 of the density), then View > Zoom In / Out as saved |
 | GPU driver | the system's | the device's Vulkan driver, or on Snapdragon phones the Turnip (Mesa) driver shipped in the APK, swapped in before wgpu starts (`src/android/turnip.rs`; "Turnip driver" below) — on an Adreno 6xx with its bandwidth compression (UBWC) off, which restarted a Snapdragon 865 phone outright ("UBWC and the whole-device restarts" below); OpenGL ES as the fallback either way |
-| Graphics quality | level 10 (Studio's defaults) | Automatic from level 3: the 3D view at 0.7 scale (0.5 while the camera moves, scaled up by EASU + RCAS) with 512² textures, 900 studs of view distance, the lite shader, no anisotropic filtering, no MSAA, one shadow cascade, no frame-rate cap (View > Graphics Settings, the 1–10 bar; "Graphics quality" below); saved with the layout |
+| Graphics quality (File > Studio Settings > rustudio > Performance) | Manual at the full profile, 100% 3D resolution; Automatic from level 5 | weak-GPU mode (`gpu_caps.rs`: every Android device): Automatic from level 1 — no shadows, SSAO, clouds, bloom, DoF, probe or grass until the frame times allow — and 75% 3D resolution (`rustudio_settings::choice_default`); "Frame time on a phone" below. View > GPU Driver names the adapter and holds the Mesa driver switch |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
 | Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root). Same `crates/rustudio-core/src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`). A report ends with the last 24 notes (`crash::note`): the GPU errors wgpu reported, a lost device, so it says what led up to it |
-| GPU device lost, GPU out of memory | wgpu's default: a panic | The device gets an uncaptured-error handler and a device-lost callback (`android/mod.rs install_gpu_error_handler`): errors go to logcat and the report notes, the frame goes on. The vendored egui-wgpu (`vendor/egui-wgpu/PATCHES.md`) skips a frame whose index/vertex upload the device refuses instead of panicking (`renderer.rs:984 Failed to create staging buffer for index data` — what a reset Adreno driver looked like). A lost device, or out-of-memory errors every frame for 5 s, ends the run in order (`gpu_watch`): the open place is written to `Android/data/dev.rustudio.studio/files/recovery/<name>-<stamp>.rbxl`, a report says so for the next start, and the activity is relaunched (`jni::relaunch`) |
+| GPU device lost, GPU out of memory | wgpu's default: a panic | The device gets an uncaptured-error handler and a device-lost callback (`android/mod.rs install_gpu_error_handler`): errors go to logcat and the report notes, the frame goes on. The vendored egui-wgpu (upstream's `renderer.rs` `upload_failed`, since 0.3.3-alpha.2) skips a frame whose index/vertex upload the device refuses instead of panicking (`renderer.rs:984 Failed to create staging buffer for index data` — what a reset Adreno driver looked like). A lost device, or out-of-memory errors every frame for 5 s, ends the run in order (`gpu_watch`): the open place is written to `Android/data/dev.rustudio.studio/files/recovery/<name>-<stamp>.rbxl`, a report says so for the next start, and the activity is relaunched (`jni::relaunch`) |
 | Studio content download | ureq + rustls (ring) | the same, three packages at a time; Play can use the content once the packages are in (the retired textures and View Selector follow in the background). Without a network at start (ConnectivityManager, INTERNET capability — not VALIDATED, which some networks never get) it starts when one comes. A `network check: …` line in Output (and logcat) at every start says how Roblox's servers are reached, phase by phase — DNS, a TCP connect to the first IPv4 and the first IPv6 address, an HTTPS GET — with the time each took; `rustudio --network-check` prints the same on a desktop. Every agent resolves a host IPv4 first (`rustudio_account::http`): a network that advertises an IPv6 that doesn't route — some phones' Wi-Fi and mobile networks — otherwise cost every new connection a connect timeout, and the app "worked, but very slowly". Connects time out after 10 s; one agent (connection pool) per purpose for the process, so an asset doesn't pay DNS, TCP and TLS twice over |
 | Login keyring | `keyring` 4 (Secret Service / Keychain / Credential Manager) | `keyring-core` + `android-native-keyring-store` (SharedPreferences + Android Keystore) behind the same `Entry` API (`crates/rustudio-account/src/store.rs`) |
 | TLS roots (`rustudio-account` MessagingService socket) | OS store (`rustls-native-certs`) | Mozilla's (`webpki-roots`, enabled alongside): Android's CA store isn't in a form `rustls-native-certs` reads; `ureq` already used `webpki-roots` |
@@ -182,7 +182,7 @@ provides or still has to.
 | `HapticService.IsVibrationSupported / IsMotorSupported / SetMotor / GetMotor` | gamepad-only flags, in-memory motor table (`gui_input.luau` 1796-1845) | `jni::vibrator_info()` (hasVibrator, hasAmplitudeControl) and `jni::vibrate(ms, strength)` — **wiring to do**: `UserInputType.Touch` supported, `VibrationMotor.Large` (and `Small` when amplitude control exists) |
 | `HapticEffect:Play / Stop`, `HapticEffect.Type` presets | simulated durations (UIHover .035 s, UIClick .055, UINotification .4, GameplayCollision .3, GameplayExplosion .8) | `jni::vibrate_pattern` (VibrationEffect.createWaveform) — **mapping of each preset to do** |
 | `ContextActionService.BindAction(..., createTouchButton)`, `GetButton / SetTitle / SetImage / SetPosition` | bindings stored, priority dispatch (`library.luau` 671-767); buttons never drawn | **to do**: draw the buttons in the play viewport (`ContextActionGui` ScreenGui as Roblox does: 70×70 ImageButton, default positions right of the thumbstick), route taps to the bound function with `UserInputType.Touch` |
-| `GuiService:GetGuiInset()`, `TopbarInset`, `GetInsetArea`, `ScreenGui.ScreenInsets` (`None / DeviceSafeInsets / CoreUISafeInsets / TopbarSafeInsets`), `ScreenGui.SafeAreaCompatibility` | `(0, 58)` constant (`mech::GUI_TOP_INSET`), `TopbarInset` zero rect, inset root in `gui_input.rs` ~498 | `jni::window_insets()` (system bars + display cutout; the 4 sides) — **wiring to do**: DeviceSafeInsets = those, CoreUISafeInsets = those + topbar, TopbarSafeInsets = topbar only |
+| `GuiService:GetGuiInset()`, `TopbarInset`, `GetInsetArea`, `ScreenGui.ScreenInsets` (`None / DeviceSafeInsets / CoreUISafeInsets / TopbarSafeInsets`), `ScreenGui.SafeAreaCompatibility` | `(0, 58)` constant (`mech::GUI_TOP_INSET`); `TopbarInset` in Play is the top bar's free area — from the end of the menu and chat buttons (128 px with the chat button, 72 without: `play_game.rs top_bar`) to the viewport's right edge, 58 high — and `GetPropertyChangedSignal("TopbarInset")` fires when the viewport or the chat button changes (`gui_input.luau topbar_inset / step_topbar`; LBG's ClientRenderer and TopbarPlus wait on it); an empty Rect in the edit DataModel; inset root in `gui_input.rs` ~498 | `jni::window_insets()` (system bars + display cutout; the 4 sides) — **wiring to do**: DeviceSafeInsets = those, CoreUISafeInsets = those + topbar, TopbarSafeInsets = topbar only |
 | `StarterGui.ScreenOrientation`, `PlayerGui.ScreenOrientation / CurrentScreenOrientation` | stored (`start_page/builtin.rs` 144); `CurrentScreenOrientation = LandscapeLeft` | `jni::set_requested_orientation` + `jni::current_orientation()` — **wiring to do**: apply at Play start, restore `sensorLandscape` at stop |
 | `Player:GetMouse()`, `Mouse` while playing | desktop pointer | **to do**: the first touch stands in (as Roblox does) |
 | `VRService`, gamepads | stubs | unchanged |
@@ -444,7 +444,13 @@ compressed, 13 packages plus a hundred or so retired textures fetched one
 by one; `crates/rustudio-core/src/studio_content.rs`) into the app's files folder
 (`…/files/rustudio/studio`). That takes a few minutes on a phone. Until
 it is there, Play spawns rustudio's stand-in character — plain blocks, no
-face, no animation — and no camera or movement script follows it; Output
+face, no animation — and no camera or movement script follows it unless
+the place brings its own: a place with a `PlayerModule` of its own in
+StarterPlayerScripts (LBG's fork, with its shift lock, camera and touch
+controls) gets the engine's `PlayerScriptsLoader` with or without the
+content (`default_scripts.rs insert_own_loader`,
+`PLAYER_SCRIPTS_LOADER`), so the fork runs as on Roblox; without one,
+the engine's keyboard stand-in moves the character. Output
 says so at the spawn (`Studio's content isn't installed yet…`), lists
 each package as it comes (`Studio content: downloading …zip (3/13)…`)
 and ends with `Studio content <version> installed in …` or an error. Stop
@@ -456,368 +462,103 @@ the app removes the content with its data; `adb install -r` keeps it.
 
 ## Frame time on a phone
 
-Every few seconds the editor logs a line like
+The renderer and its quality system are upstream's, unchanged on Android
+(the port's own graphics system — a 1–10 quality bar with its tables, a
+lite shader, a motion scale with EASU + RCAS, frame reuse, a frame-rate
+cap, a perf log — was dropped when the port was rebased onto
+0.3.3-alpha.2, which brought its own: `crates/rustudio-render/src/quality.rs`,
+`gpu_caps.rs`, `gpu_timing.rs`, the Performance page of File > Studio
+Settings > rustudio, and the MicroProfiler). What a phone gets from it:
 
-```
-perf: 136 frames in 5.0 s: 36.9 ms apart (p95 72.3, worst 89), 120 back to back 33.4 ms apart = 6.4 ms CPU + 27.0 ms GPU/display wait, 16 after a pause; editor 5.2 ms + egui 1.2 ms on the CPU; 3D GPU 9.8 ms per drawn frame = shadows 3.1 + probe 0.0 + scene 4.2 + see-through 0.0 + ssao 1.1 + bloom/dof 0.4 + post 1.0 (68 measured); window 1550x720 px at 1.40 px/pt, 3D view 816x310 px (scale 0.70, AO off, shadow maps x0.50), 3D frames drawn 68 / shown again 68; sections (ms/frame): dock_panels 4.3, viewport 3.4, vp_render 3.0, vpr_scene 1.1, vpr_submit 0.8, vpr_cull 0.6; frames asked by: app.rs:2531 x120, viewport.rs:2113 x16
-```
-
-(`crates/rustudio-render/src/perf_log.rs`; `adb logcat -s rustudio`, or `RUSTUDIO_PERF_LOG=1` on
-a desktop). eframe draws a frame when the frame before asked for one
-(`request_repaint`) or input arrives, so the frames split in two: the
-"back to back" ones, asked for at once by the frame before
-(`egui::Context::requested_repaint_last_pass`), whose interval is CPU
-work plus the wait for the GPU and the display and nothing else; and the
-frames "after a pause", whose interval is mostly the editor sleeping — a
-still editor at 5 frames a second is not slow, it is idle. "editor" is
-`App::ui`'s own time, "egui" the layout and painting eframe adds, the
-"wait" what is left of a back-to-back interval (the GPU, the display's
-pacing). "3D GPU" is the renderer's own GPU time by timestamp
-queries (`render::GpuTimer`, where the device has them), per frame drawn
-afresh and by section — the shadow maps, the environment probe's faces,
-the scene pass (sky, parts, decals, terrain, lines), the see-through
-passes (water, glass, see-through parts; only when the scene splits),
-SSAO, clouds + bloom + DoF, post (tone map, EASU, RCAS); every mark sits
-between two passes, since a tiling GPU's timestamp inside a pass reads as
-the whole pass; what the wait holds beyond it is egui's own GPU pass and
-vsync. Where "scene" alone is most of the frame for a few parts (a
-baseplate at 60+ ms), the span is not the drawing: `RUSTUDIO_GPU_BISECT=1`
-(below) says what it is. The sections are the editor's own (`bench::scope`); the
-`vp_*` ones split the viewport panel's CPU time (`viewport`) into the
-input and camera (`vp_input`), the scene sync (`vp_scene_sync`), the
-hover pick (`vp_pick`), the draw lists (`vp_sync_draws`), terrain, the
-grid and the settings (`vp_prepare`), the frame's lighting (`lighting`),
-the 3D frame (`vp_render`) and what follows it — the GUIs, the HUD, the
-world GUI pass (`vp_after`); the `vpr_*` ones split the 3D frame into the
-visibility and draw lists (`vpr_cull`), the passes' encoding
-(`vpr_shadows`, `vpr_scene`, `vpr_post`) and the driver taking the frame
-(`vpr_submit`). "frames asked by" names the `request_repaint` call sites
-of the frame before each (`egui::Context::repaint_causes`), with how many
-frames each asked for, and "input/other" the frames nobody asked for
-(touches, the first ones): which code keeps a still editor drawing — a
-spinner, a poll, a pointer that never lifted — shows there. The first
-line names the GPU and the wgpu backend (Vulkan is the one wanted; a GL
-fallback is slow), the surface format, the present mode and frame latency
-asked for, and the display's refresh rate (`Display.getRefreshRate`: a
-phone that switches between 60 and 120 Hz says which it is on). An idle
-editor logs nothing: no input, no frames.
-
-Reading it: the display's period is the budget (16.7 ms at 60 Hz, 8.3 at
-120), and only the back-to-back frames are measured against it (the
-status bar's fps counts the frames that followed the frame before at
-once — asked for, or brought by a touch — and leaves out the ones a
-timer woke the editor for and the first after a pause, for the same
-reason). "editor + egui" over
-the budget is a CPU-bound frame (the sections say
-where; in Play `play_tick` and its `p6_client_lua` / `rt_domains_step` /
-`animate_step` are the game's scripts, runtime and animations). "3D GPU"
-over it is a GPU-bound one (the quality level's knobs: scale, shadows,
-MSAA). A wait far over both, with the view small and the CPU idle, is
-pacing: the swapchain (`RUSTUDIO_FRAME_LATENCY`, `RUSTUDIO_PRESENT_MODE`
-below), a frame-rate cap beating against vsync, or a build without the
-governor's hint (below). And "debug build" in the first line is the
-answer before any of that: the debug APK runs the editor at opt-level 1
-with debug assertions in every crate, several times slower than the
-release APK.
+- **Weak-GPU mode on every Android device** (`gpu_caps.rs` `weak_reason`:
+  software adapters, OpenGL and old Intel graphics on a computer; a
+  phone's GPU is a tiler with a tenth of a desktop card's bandwidth and a
+  thermal budget). Graphics quality defaults to Automatic
+  (`rustudio_settings::choice_default`) and Automatic starts at its lowest
+  level (`quality::WEAK_START_LEVEL`: no SSAO, no sun or light shadows,
+  no clouds, depth of field, bloom or scene probe, no grass) and climbs as
+  the frame times allow (Studio's Windows profile, `quality::TARGET_MS`).
+  `RUSTUDIO_LOWEND=0` turns the mode off for a run, `=1` forces it on a
+  computer; `RUSTUDIO_AUTO_QUALITY_LEVEL=N` pins Automatic's level (1–21)
+  and `RUSTUDIO_QUALITY_TRACE=1` logs each step.
+- **3D resolution 75 % by default on Android** (the same
+  `choice_default`): the first phone measurements fell well under the
+  display's rate at full resolution, and at a phone's pixel density three
+  quarters reads as sharp. The dialog's choice (100 / 75 / 50 / 33 / 25 %)
+  is saved as on a desktop.
+- **The rest of the Performance page** — Shading detail, Ambient
+  occlusion, Shadow quality, Grass detail, Glow effects, Idle grass
+  animation — works as on a desktop and is saved in the settings file
+  (`files/config/…`). Presentation and Editor frame limit don't apply:
+  both are `src/native_loop.rs`'s (the desktop window's own event loop,
+  which paces Mailbox frames to the refresh or the limit), and the
+  activity runs eframe's loop; the swapchain is vsync (`AutoVsync`:
+  `offscreen::present_mode`, as the standalone player's) and the display
+  sets the rate. Each row has an
+  environment switch (`RUSTUDIO_PERF_QUALITY`, `RUSTUDIO_PERF_RESOLUTION`,
+  `RUSTUDIO_PERF_DETAIL`, `RUSTUDIO_PERF_SSAO`, `RUSTUDIO_PERF_SHADOWS`,
+  `RUSTUDIO_PERF_GRASS`, `RUSTUDIO_PERF_BLOOM`, `RUSTUDIO_PERF_FPS`,
+  `RUSTUDIO_PERF_PRESENT`, `RUSTUDIO_PERF_IDLE`; the values are the
+  dialog's ids, `rustudio_settings.rs` `OPTS`) that wins over the saved
+  choice for the run.
+- **View > GPU Driver** (`src/graphics_settings.rs`) names the adapter,
+  backend and driver the 3D view runs on (Vulkan is the one wanted; a GL
+  fallback is slow), says when weak-GPU mode is on and why, and on Android
+  holds the Mesa driver switch ("Turnip driver" below).
+- **Measuring**: the status bar's fps (`RustudioApp::ui`) counts the
+  frames that followed the frame before at once — asked for, or brought by
+  a touch — and leaves out the first after a pause (a still editor at 5
+  frames a second is idle, not slow). The MicroProfiler (View >
+  MicroProfiler; docs/PROFILING.md) is the same window as on a desktop and
+  reads `.rsprof` captures; `RUSTUDIO_GPU_TIMING=1` adds the GPU time per
+  pass group from timestamp queries where the driver has them inside
+  encoders (`gpu_timing.rs`; Adreno and Mali do, through Turnip and PanVK
+  too). And "debug build" in the start-up line (`rustudio … starting`) is
+  the answer before any of that: the debug APK runs the editor at
+  opt-level 1 with debug assertions in every crate, several times slower
+  than the release APK.
 
 Switches for a device, which has no shell environment to launch from:
 
 ```
-adb shell setprop debug.rustudio.env "RUSTUDIO_SUN_SHADOWS=0 RUSTUDIO_VIEW_REUSE=0"
+adb shell setprop debug.rustudio.env "RUSTUDIO_PERF_SSAO=off RUSTUDIO_PERF_RESOLUTION=50"
 ```
 
 then relaunch (`setprop debug.rustudio.env ""` clears). Space-separated
-`RUSTUDIO_*=value` pairs, 91 characters at most (`android::export_env`;
-the renderer's are read by `graphics::RenderSettings::with_env`):
-`RUSTUDIO_QUALITY=auto|1..10` (`low` / `medium` / `high` = 3 / 6 / 10)
-and the single settings over the level — `RUSTUDIO_VIEW_DISTANCE`
-(studs, 0 unlimited), `RUSTUDIO_DETAIL_PX` (the smallest part drawn, in
-pixels), `RUSTUDIO_TEXTURE_TEXELS` (256, 512, 1024), `RUSTUDIO_MSAA`
-(1, 2, 4), `RUSTUDIO_HDR` (0|1), `RUSTUDIO_RENDER_SCALE` (0.25 to 1),
-`RUSTUDIO_SUN_SHADOWS` (0: the sun's shadow maps off, as
-Lighting.GlobalShadows false), `RUSTUDIO_SUN_CASCADES` (0 to 4),
-`RUSTUDIO_SHADOW_SCALE` (the shadow maps' texels across, 0.25 to 1; see
-below), `RUSTUDIO_LIGHT_SHADOWS` (0|1), `RUSTUDIO_SSAO` (0|1),
-`RUSTUDIO_BLOOM` (levels, 0 off), `RUSTUDIO_DOF` (0|1), `RUSTUDIO_CLOUDS`
-(0|1), `RUSTUDIO_NO_ENV_PROBE`, `RUSTUDIO_MOTION_SCALE` (the render scale
-while the camera moves or a game runs, 0.25 to 1), `RUSTUDIO_UPSCALE` (0:
-egui's bilinear blit in place of EASU + RCAS), `RUSTUDIO_ANISOTROPY` (the
-texture samplers' taps: 1, 2, 4, 8, 16), `RUSTUDIO_LITE` (the lite
-shader's bits, 0 to 31; below), `RUSTUDIO_FPS_CAP` (Play's frames per
-second at most, 0 none) — and `RUSTUDIO_VIEW_REUSE` (0|1),
-`RUSTUDIO_FRAME_LATENCY` (swapchain images less one, 1 to 3; see below),
-`RUSTUDIO_PRESENT_MODE` (`fifo`, `relaxed`, `mailbox`, `immediate`,
-`vsync`, `novsync`; a mode the surface lacks falls back to FIFO),
-`RUSTUDIO_NO_PERF_HINT` (no ADPF hint session for the frame thread;
-below), `RUSTUDIO_NO_PIPELINE_CACHE`, `RUSTUDIO_NO_PIPELINE_WARMUP`
-(below), `RUSTUDIO_ONE_SUBMIT` (0|1; below), `RUSTUDIO_GPU_BISECT` (1;
-below), `RUSTUDIO_TURNIP` (0|1|force), `RUSTUDIO_GPU_TURBO` (1),
-`RUSTUDIO_TU_DEBUG` (Turnip's flags; "Turnip driver" below),
-`RUSTUDIO_SYSTEM_BARS` (1: the navigation and status bars stay, instead
-of immersive mode). A switch wins over the saved Graphics Settings choice
-for the run.
+`RUSTUDIO_*=value` pairs, 91 characters at most (`android::export_env`):
+the `RUSTUDIO_PERF_*` rows above, `RUSTUDIO_LOWEND`,
+`RUSTUDIO_AUTO_QUALITY_LEVEL`, `RUSTUDIO_QUALITY_TRACE`,
+`RUSTUDIO_GPU_TIMING`, `RUSTUDIO_FRAME_LATENCY` (swapchain images less
+one, 1 to 3; below), `RUSTUDIO_PRESENT_MODE` (`fifo`, `relaxed`,
+`mailbox`, `immediate`, `vsync`, `novsync`; a mode the surface lacks falls
+back to FIFO), `RUSTUDIO_NO_PERF_HINT` (no ADPF hint session for the
+frame thread; below), `RUSTUDIO_TURNIP` (0|1|force), `RUSTUDIO_GPU_TURBO`
+(1), `RUSTUDIO_TU_DEBUG` (Turnip's flags; "Turnip driver" below),
+`RUSTUDIO_SYSTEM_BARS` (1: the navigation and status bars stay, instead of
+immersive mode).
 
-**One submit a frame** (`render.rs` `one_submit_wanted`,
-`submit_callback`; on by default on a phone, `RUSTUDIO_ONE_SUBMIT=0`
-off, `=1` on anywhere): the 3D frame's commands are not submitted by the
-renderer but handed to egui's own submit of the same frame through a
-paint callback (`egui_wgpu::CallbackTrait::prepare`; egui puts them in
-front of its pass), so a frame is one `vkQueueSubmit` instead of two —
-on a tiling GPU every submit ends in a flush of the tiles and an idle
-gap before the next, and the driver's own work per submit is not small.
-Anything that must draw over the frame or read it first (world GUIs and
-effects, a screenshot) submits the kept frame itself (`flush_deferred`).
+### The frame's pacing on Android
 
-**GPU bisection** (`render.rs` `bisect`, with the perf log):
-`RUSTUDIO_GPU_BISECT=1` draws the 3D view with one thing left out, a
-different one with each perf line (so 5 s each, in a cycle of 11; the
-line's "GPU bisect step n" names it): everything; no lines; no sky; no
-parts; the scene pass empty; no scene pass; no post passes; nothing
-encoded but the timestamps; everything then the CPU waiting for the GPU
-(`vpr_gpu_sync` in the sections: the frame's wall time on the GPU); the
-frame submitted the other way (its own submit on a phone, egui's
-elsewhere); no 3D frame at all. Keep the camera moving so frames are
-drawn (a still view is shown again, not drawn), and read the "3D GPU"
-figures against the steps: a step that drops "scene" names the cost; a
-"scene" that stays at 60 ms with nothing encoded is not the GPU's work
-but a wait the timestamps straddle (the display's pacing, the driver's),
-and the "no 3D frame" step's interval is the editor's own.
-
-### Graphics quality (`crates/rustudio-render/src/graphics.rs`, `src/graphics_settings.rs`)
-
-The 3D view's per-frame fixed costs on the device — the 4× MSAA
-Rgba16Float scene and its resolve, a full-resolution Rgba16Float copy of
-it for glass and water, the five-level bloom pyramid, the half-resolution
-SSAO chain, two full- and eleven quarter-resolution depth-of-field
-targets, the sun's four cascades, the local lights' shadow atlas and the
-cloud layer — were paid whatever the scene held: an empty baseplate took
-31–37 ms of GPU a frame at 0.7 scale; and the scene's own costs — every
-part in the frustum drawn however far and small, every material at 1024²
-— grew with the place. View > Graphics Settings has Studio's bar, a level
-from 1 (fastest) to 10 (Studio's defaults; the tables are `QUALITY_*` in
-`crates/rustudio-core/src/mech.rs`), or Automatic, and each setting apart from the level
-("Auto" follows it); View > Graphics Quality has the same levels as a
-menu. A phone starts in Automatic at level 3, a computer at 10
-(`Graphics::platform_default`); the choices are kept in the saved layout
-and the level mirrors Studio Settings > Rendering > Editor Quality Level
-(`settings().Rendering.EditQualityLevel`: Automatic or Level01–21, two
-Studio levels per bar step), set from either side.
-
-| Level | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| View distance (studs) | 500 | 700 | 900 | 1200 | 1500 | 2500 | 4000 | 6000 | 10000 | all |
-| Smallest part drawn (px) | 6 | 4 | 3 | 2 | 1.5 | 1.2 | 1 | 1 | 1 | 1 |
-| Material textures | 256² | 256² | 512² | 512² | 512² | 1024² | 1024² | 1024² | 1024² | 1024² |
-| MSAA | off | off | off | off | off | 2× | 2× | 2× | 4× | 4× |
-| Scene format | RG11B10F | RG11B10F | RG11B10F | RG11B10F | RGBA16F | RGBA16F | RGBA16F | RGBA16F | RGBA16F | RGBA16F |
-| Render scale | 0.5 | 0.6 | 0.7 | 0.8 | 1 | 1 | 1 | 1 | 1 | 1 |
-| Scale while the camera moves | 0.5 | 0.5 | 0.5 | 0.6 | 0.7 | 0.8 | 1 | 1 | 1 | 1 |
-| Texture filtering (anisotropic taps) | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 4 | 8 | 8 |
-| Lite shader (bits, below) | 7 | 7 | 7 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| Play frame-rate cap | — | — | — | — | — | — | — | — | — | — |
-| Sun shadow cascades | 0 (voxel sun) | 1 | 1 | 2 | 2 | 2 | 3 | 4 | 4 | 4 |
-| Shadow texel scale | 0.5 | 0.5 | 0.5 | 0.5 | 0.75 | 0.75 | 1 | 1 | 1 | 1 |
-| Local light shadows | off | off | off | off | on | on | on | on | on | on |
-| SSAO | off | off | off | off | off | off | off | on | on | on |
-| Bloom levels | 0 | 0 | 0 | 3 | 3 | 3 | 5 | 5 | 5 | 5 |
-| Depth of field | off | off | off | off | off | off | off | on | on | on |
-| Clouds, environment probe | off | off | off | off | on | on | on | on | on | on |
-
-(Rg11b10Ufloat where the device renders to it, else Rgba16Float. The MSAA
-row is what a level asks for: Vulkan and WebGPU promise 1 and 4 samples
-only, and a device without 2× — llvmpipe, some Malis — gets the nearest
-count it has (`graphics::MsaaSupport`, `Renderer::msaa_support_of`,
-`RenderSettings::fitted`: 2× → off, a missing 4× → 2×); a texture asked
-for at a count the device lacks is otherwise a validation error, which is
-a crash. Roblox's own levels for the view distance: about 500 studs at
-Level01, 100000 at Level21; the rest of the table is an estimate until
-the next device run measures it.)
-
-**Automatic** (`graphics::Auto`; Studio's QualityLevel.Automatic) watches
-the frames the 3D view draws back to back (frames shown again from the
-last one and frames after an idle pause don't count): the median frame
-over the last 2 s longer than 1.35 × a 60 Hz refresh → a level down; 20 s
-of frames at the refresh (within 1.1 ×) → a level up, but not back into a
-level left in the last 90 s; the half second after a change, pipelines
-and targets being remade, isn't counted. A frame is judged by its work,
-not by what it waited for: the greater of its CPU time (eframe's, the
-wait for the display left out) and the renderer's GPU time per 3D frame
-(`render::GpuTimer`) where the device has timestamps — a frame held back
-by the swapchain or the display's pacing took the level down for nothing
-before; where it has none, the interval is all there is. Each step logs
-`graphics quality (automatic): level N: …` with the settings in effect.
-
-The individual settings (the window's rows; `graphics::Overrides`): Render
-Distance (500 to 10,000 studs or Unlimited), Part Detail (Low / Medium /
-High: parts under 4 / 2 / 1 px skipped), Texture Quality (256² / 512² /
-1024²), Texture Filtering (trilinear, or 2× to 16× anisotropic), Shading
-(Simple: the lite shader, bits 7; Full), Anti-aliasing (off, 2×, 4×), HDR
-Scene (32- or 64-bit), Render Scale (50–100 %), Scale While Moving
-(40–100 %, never above the render scale), Play Frame Rate (uncapped, 30,
-45, 60), Sun Shadows (Off / Low: one cascade at half texels / Medium: two
-at 0.75 / High: Studio's four), Light Shadows, Ambient Occlusion, Bloom,
-Depth of Field, Clouds, Reflections (the scene environment probe). "All
-Auto" clears them, "Restore Defaults" the platform's start.
-
-What the renderer does with the settings (`render.rs`):
-
-- **View distance and part detail** (`Renderer::render`): a static batch
-  cell, a moving part or a terrain chunk wholly farther than the view
-  distance from the camera is not drawn, and a part whose bounding radius
-  covers fewer pixels than the detail threshold (`mech::LOD_MIN_PX` at
-  level 7 and up) is skipped — what a 2–3× density phone screen never
-  showed at a stud or two a pixel. The sun's casters keep the cascades'
-  own reach.
-- **Texture quality** (`MaterialArrays`, `remake_materials`): the three
-  material arrays (albedo, surface, emission; 12 MB a 1024² layer with
-  mips, a quarter of that per halving) are made at the setting's size and
-  take each pack's mip chain from the level of that size; a change remakes
-  them from the packs kept in memory. The terrain shader's "never finer
-  than Studio's 512²" clamp reads the array's size (`textureDimensions`)
-  and stands down for smaller arrays.
-
-- **The scale while the camera moves, and the frame scaled up**
-  (`viewport::Motion`, `RenderSettings::scale_now`, `Pipe::Easu`,
-  `Pipe::Rcas`, `Target::upscale`): a frame is drawn at the motion scale
-  while the camera's view matrix changed within the last 0.25 s
-  (`mech::QUALITY_MOTION_HOLD_S`) or a game runs, at the render scale
-  otherwise, and a camera come to rest gets its frame at the render scale
-  once the hold is over (the viewport asks for that repaint). What the
-  pixels don't show while things move, they don't have to be drawn — the
-  phone's 0.5 scale is a quarter of the fragments. A frame drawn under
-  the panel's size is brought up to it by AMD's FidelityFX Super
-  Resolution 1.0 written in WGSL (`shader.wgsl` "upscaling": EASU, the
-  edge-adaptive 12-tap kernel, then RCAS, the contrast-adaptive sharpening
-  at `mech::UPSCALE_SHARPNESS`), two full-screen passes over the
-  tone-mapped image into panel-sized textures, in place of the bilinear
-  blit egui's image did (`RUSTUDIO_UPSCALE=0` brings that back); egui
-  shows RCAS's output.
-- **The lite shader** (`RenderSettings::lite`, shader constant `LITE`;
-  levels 1 to 3 build with bits 7, `RUSTUDIO_LITE=0..31` chooses): the
-  part and terrain fragment shaders compiled without what a phone screen
-  at 0.5 scale doesn't show — bit 1 no normal maps (parts' material and
-  SurfaceAppearance normals, the terrain's normal blend; the geometric
-  normal stands), bit 2 reflections from the ambient cube instead of the
-  environment probe (`env_reflect`; the probe isn't drawn below level 5
-  either way), bit 4 a single read per material (no detiling's second,
-  rotated read, no Wang tiling's four), bit 8 no material maps at all
-  (the part's colour, roughness and metalness from the material's
-  constants), bit 16 no studs (the legacy surface atlas). Every varying
-  the fragment shader doesn't interpolate (`PartOut`'s per-instance
-  values) is `@interpolate(flat)` in every build. The lite bits are part
-  of the build key: a change rebuilds the pipelines.
-- **Texture filtering** (`RenderSettings::anisotropy`, `repeat_sampler`,
-  `WaterPass::new`): the part textures', material maps' and water
-  normals' samplers take the level's anisotropic taps — none at levels
-  1–3, 2 to level 7 (Studio's own default is `mech::TEXTURE_ANISOTROPY`
-  = 8), 8 at the top; a phone GPU's anisotropic filtering costs a tap
-  per sample per degree, and at 0.5 scale no one tells. A change remakes the samplers and
-  the part textures' bind groups (the key holds it).
-- **Play's frame-rate cap** (`RustudioApp::cap_frame_rate`,
-  `RenderSettings::fps_cap`; none at any level, `RUSTUDIO_FPS_CAP` or the
-  Play Frame Rate setting turn one on): while a game runs, a frame that
-  comes early waits out its period before eframe presents it — fewer
-  frames drawn, less heat, longer battery; the editor isn't capped (it
-  repaints on input). The wait is kept out of Automatic quality's frame
-  time (`Editor::quality_tick`): a capped frame isn't a slow one. The
-  levels used to cap 30 fps at 1 to 3; under FIFO vsync a cap below the
-  display's rate lands frames on every second or third refresh by turns
-  (30 asked on a 60 Hz panel showed ~20 fps), and Roblox's phone client
-  runs at the display's rate at every level, so none is set now.
-- **Compressed material textures** (not done): the material arrays are
-  RGBA8 (12 MB a 1024² layer; 3 MB at 512²); ASTC 4×4 would be a quarter
-  of that and half the bandwidth, and every Vulkan phone GPU has it (the
-  perf log's first lines say `texture compression: ASTC, ETC2, no BC` for
-  the device). The packs are decoded from Studio's PNG/DDS at load, so
-  compressing them needs an ASTC encoder on the device (a minute of CPU
-  for 30 packs at 1024²) or a cached, pre-encoded pack set; neither is in
-  this port. The 256² and 512² levels and the skipped mips cut the memory
-  the same way for now.
-- **Pipelines and targets only for what is on** (`Pipe::wanted`,
-  `Target`): the SSAO, bloom, depth-of-field, glass, water, cloud and
-  light-shadow targets exist, and their passes run, only at a level that
-  uses them; the sun's atlas holds the level's cascades (shader
-  constant `SUN_CASCADES` hands the rest to the voxel sun); without MSAA
-  the scene is drawn straight into the resolved texture (`MSAA_SAMPLES`
-  1; `render::msaa_wgsl` turns the shaders' multisampled depth reads
-  into plain ones). 0.2.0's see-through encoded blend (upstream
-  `SeeThrough`) is part of this: its five encoded part pipelines and the
-  encode / decode passes are `Pipe` variants (`Pipe::encoded`,
-  `Pipe::SeeEncode` / `SeeDecode`) built per level and sample count;
-  `Target` carries the encoded copy of the scene at the scene's sample
-  count — always Rgba16Float, since the "covered" marker is its alpha and
-  the 32-bit scene format of levels 1–4 has none — and without MSAA the
-  encode reads the scene texture itself. 0.2.0's ViewportFrame targets
-  (`crates/rustudio-render/src/vf_render.rs`) and highlight masks (`crates/rustudio-render/src/highlight.rs`) follow
-  the level's sample count and format the same way (no multisampled
-  texture and no resolve at 1 sample).
-- **Pipelines compiled when first needed** (`Pipes`, `Renderer::pipe`),
-  the first frame's set in the background right after the shader module
-  (`warm_pipelines`; `RUSTUDIO_NO_PIPELINE_WARMUP=1` leaves it all to
-  first use), and Vulkan's pipeline cache kept across runs in the app's
-  cache directory (`DiskCache`, keyed by adapter and driver;
-  `RUSTUDIO_NO_PIPELINE_CACHE=1`): the ~10 s black screen between
-  adapter selection and the first frame was one shader module and some
-  forty pipelines compiled in a row before anything was drawn.
-- **A settings change rebuilds only what the key covers**
-  (`RenderSettings::build_key`: MSAA, format, shadow scale, light
-  shadows, the lite bits, the anisotropy → `Renderer::rebuild`); the rest
-  — passes on or off, the render and motion scales, the cascade count,
-  the frame-rate cap — applies to the next frame.
-- The perf line (every 5 s) names the level and the settings in effect
-  and how many pipelines are built of those wanted.
-
-First measurements (a Galaxy Note20 Ultra, Adreno 650 on Vulkan, release
-APK, the window 1550 × 720 px at 60 Hz, the 3D view 816 × 310): 5–14 ms
-of CPU a frame and 30–50 ms of "wait" with the camera still as with it
-moving, 20–27 fps; a frame that drew the 3D view afresh cost about 10 ms
-more than one that showed the last one again. The "3D GPU" figure above
-is what the next run has to show (it is an illustration until then).
-
-What the port does about it:
-
-- **Three swapchain images** (`offscreen::frame_latency`, crates/rustudio-player; `RUSTUDIO_FRAME_LATENCY`
-  1 to 3 overrides): egui's low-latency default asks for one frame of
-  latency, two images. Android's compositor keeps the image on screen
-  until it has latched the next one, so with two images every frame first
-  waits for that — a vsync of nothing before any drawing, half the
-  refresh rate at best, which is the ~31 ms "wait" above with the camera
-  still (egui notes the same halving on iOS and leaves the default there).
-  With a third image the next frame starts while the last one is still
-  queued, and the CPU's work overlaps the GPU's.
-- **Level 3 on a first run, in Automatic** (the table above): the 3D
-  view at 0.7 of the panel's pixels, 512² textures, 900 studs of view
-  distance, no MSAA, one shadow cascade, the passes an empty baseplate
-  paid for off — and a level down after two seconds of slow frames.
-- **Half-size sun shadow maps** (`sun_shadow::texel_scale`; the level's
-  `shadow_scale`, `RUSTUDIO_SHADOW_SCALE` overrides): Studio's four
-  cascades are 384 / 768 / 1024 / 2048 texels
-  across in a 3200 × 2048 atlas, and a cascade that moved with the camera
-  is drawn into the depth map and then blurred twice (EVSM) over its whole
-  tile — the far cascade alone is 2048² × 8 bytes read five times and
-  written twice, which a phone GPU's bandwidth pays for in frames rather
-  than fractions of one. On Android the tiles, atlas and depth map are
-  half as many texels across (a quarter of the fill and blur); the blur
-  keeps its width in studs (`Cascade::level` counts texels), and a cascade
-  whose texels are still finer than the view's pixels looks the same.
-  `cargo test sun_shadow` keeps the full-scale layout at Studio's numbers.
-- **Ambient occlusion off** below level 8 (Graphics Settings > Ambient
-  Occlusion; `RUSTUDIO_SSAO`): Studio's SSAO is five passes over the view
-  for a darkening in corners a phone's screen barely shows.
-- **The last 3D frame shown again** while nothing in it changed
-  (`viewport::ViewReuse`; `RUSTUDIO_VIEW_REUSE=0|1`, on by default on
-  Android only): the frame's inputs are hashed (`render::frame_key`), the
-  renderer counts its own changes (`Renderer::generation`, bumped by
-  every mesh, texture, item, terrain, sky and grid upload), and a frame
-  is drawn afresh when either moved, when time shows (a game running,
-  terrain water, Terrain.Clouds drifting, the scene environment probe's
-  frames of GPU work, world GUIs and effects, the test harness) and at
-  least every 500 ms. With a still camera the chrome then redraws at egui's
-  own pace — taps and scrolls in the Explorer and Properties no longer
-  wait for a 3D frame each. (The first device run showed exactly every
-  other frame reused: the effects system hands over a frame of effects
-  whether or not it holds any, and an empty one counted as "effects on a
-  reused frame", which asks for a fresh one.)
+- **Three swapchain images** (`offscreen::frame_latency`,
+  crates/rustudio-player; `RUSTUDIO_FRAME_LATENCY` 1 to 3 overrides):
+  egui's low-latency default asks for one frame of latency, two images.
+  Android's compositor keeps the image on screen until it has latched the
+  next one, so with two images every frame first waits for that — a vsync
+  of nothing before any drawing, half the refresh rate at best, which was
+  a ~31 ms wait per frame at 60 Hz on the first phone whether the camera
+  moved or not (egui notes the same halving on iOS and leaves the default
+  there). With a third image the next frame starts while the last one is
+  still queued, and the CPU's work overlaps the GPU's.
+- **Vsync** (`offscreen::present_mode`): `AutoVsync` on Android whatever
+  Performance > Presentation says — a desktop's Mailbox ("Low latency")
+  is paced to the refresh by `src/native_loop.rs`, which the activity's
+  eframe loop hasn't, and an unpaced Mailbox loop on a phone draws as
+  fast as the GPU allows, heat and battery for frames the display never
+  shows (the standalone player keeps vsync for the same reason).
+  `RUSTUDIO_PRESENT_MODE=mailbox` for a measurement. The display's
+  refresh rate (`Display.getRefreshRate`, `app.rs display_refresh_hz`: a
+  phone that switches between 60 and 120 Hz says which it is on) is the
+  governor hint's budget.
 - **The CPU governor told the frame budget** (`src/android/perf_hint.rs`;
   `RUSTUDIO_NO_PERF_HINT` turns it off): Android's performance hints
   (ADPF, `PerformanceHintManager`, API 31+). A frame loop that works for
@@ -826,7 +567,7 @@ What the port does about it:
   frame misses its vsync and waits for the next, and looks idler still.
   The session is opened for eframe's thread (the editor, egui and the
   renderer's encoding all run on it) with the display's period as the
-  target, or the frame-rate cap's while a game is capped, and every frame
+  target, and every frame
   reports the last frame's CPU time (eframe's, without the wait for the
   display); the governor raises the clocks when the work runs close to the
   budget and lowers them when it has slack. This is what Android's games
@@ -841,20 +582,6 @@ What the port does about it:
   log says `frame thread N: display priority` and `perf hints: session
   for thread N at 16.7 ms a frame`, or why not (API 30 and below, or a
   vendor that returns no session).
-- **No frame-rate cap by level** (`mech::QUALITY_FPS_CAP`, all 0; the
-  first phone round capped Play at 30 fps on levels 1 to 3): under FIFO
-  vsync a cap below the display's rate puts frames on every second or
-  third refresh by turns — the 30 asked for showed ~20 fps — and Roblox's
-  phone client runs at the display's rate at every level. The cap stays
-  as the player's choice (`RUSTUDIO_FPS_CAP`, the Play Frame Rate
-  setting), for heat and battery.
-- **The shadow blur's scratch texture cleared, not loaded**
-  (`SunShadows::blur`): a tiler asked to keep an attachment loads every
-  tile of it before the first draw; the pass across rewrites the scratch
-  whole, so it is cleared (free) and only the atlas, which keeps the
-  other cascades' tiles, is loaded. Every other attachment was already
-  cleared or discarded where it can be (the MSAA colour is resolved and
-  discarded; the depth is kept for the world GUI pass).
 - **No cursor commands in Play.** `mouse_lock::note_window` took the
   Android window for one that can't lock the cursor, so a game's
   LockCenter grab fell back to Confined and sent a cursor position every
@@ -862,14 +589,16 @@ What the port does about it:
 - The release APK is built with thin LTO (`CARGO_PROFILE_RELEASE_LTO` in
   android.yml; the workspace profile is unchanged for desktops).
 
-Still to do, with measurements from the line above: a phone tier for the
-light grid's size, the sun's far cascades redrawn less often while the
-camera moves (levels 7 and up), the terrain's grass and detail passes
-thinned at the low levels, particle limits and a leaner default layout
-for small screens (every panel open at once is most of the CPU time on a
-phone). The next device run's perf lines at each level against the ones
-above are what sizes the tables' next step (their numbers are estimates
-until then).
+What the port's own renderer had and upstream's hasn't yet, in case a
+device run asks for it back on top of `quality.rs`: a lower render scale
+while the camera moves (upscaled by EASU + RCAS), the last 3D frame shown
+again while nothing in it changed, a lite shader for the lowest levels
+(no normal maps, no reflections, one light), smaller material texture
+arrays, half-size sun shadow tiles at the low levels, one `vkQueueSubmit`
+a frame through egui's paint callback, a per-frame perf line in logcat.
+The measurements that motivated each are in the port's previous patch,
+the one against 0.3.2 (its `crates/rustudio-render/src/graphics.rs` and
+this file's "Graphics quality" section there).
 
 ## Turnip driver (Snapdragon) and PanVK (Mali): `src/android/turnip.rs`
 
@@ -1070,8 +799,8 @@ API version), `wgpu_hal::vulkan::Instance::from_raw`,
 same device descriptor the ordinary start uses — handed to eframe as
 `egui_wgpu::WgpuSetup::Existing`. The log line is `turnip: wgpu: Turnip
 Adreno (TM) 650 — turnip Mesa driver …`; egui_wgpu's "Using wgpu
-adapter" line and the perf line's adapter name say the same, as does
-View > Graphics Settings > GPU Driver ("Renderer on: …"). wgpu itself is
+adapter" line says the same, as does View > GPU Driver ("Renderer on:
+…"). wgpu itself is
 unchanged; window surfaces and swapchains come from the loader copy's
 own swapchain code (Mesa's Android builds leave them to the loader, as
 the vendor driver does).
@@ -1104,7 +833,7 @@ the shim honours that, and with an older shim run but not relied on
 falls back to the device's driver, so that wgpu's own loading sees the
 vendor's loader uniformly).
 
-**Switches.** Graphics Settings > GPU Driver has the checkbox (a marker
+**Switches.** View > GPU Driver has the checkbox (a marker
 file `files/turnip/off`; takes effect at the next start). From adb:
 `RUSTUDIO_TURNIP=0` keeps the device's driver, `=1` ignores the window's
 choice and the failed-start marker, `=force` also skips the device checks
@@ -1222,17 +951,18 @@ it, which these prebuilt ones may not be — the loader then refuses them
 and the device's driver stays.
 
 `adb shell setprop debug.rustudio.env "RUSTUDIO_TURNIP=0"` is the quick
-A/B against the vendor's driver; the `perf:` lines (`RUSTUDIO_PERF_LOG=1`)
-name the adapter in their first line.
+A/B against the vendor's driver; egui_wgpu's "Using wgpu adapter" line
+and View > GPU Driver name the adapter.
 
 *Something draws wrong* (geometry missing, flickering, a pass's result
 stale) — in this order, each a minute: (1) is it the driver? logcat
-(`adb logcat -s rustudio AdrenoToolsPatch mesa`) for `graphics quality
-(automatic): …` lines while it happens — Automatic quality stepping down
-shortens the view distance (500–900 studs at levels 1–3,
-`QUALITY_VIEW_DISTANCE`), and parts and terrain chunks wholly beyond it
-aren't drawn on either driver; a fixed level in the window, or
-`RUSTUDIO_VIEW_DISTANCE=0`, tells. (2) `RUSTUDIO_TURNIP=0`: the same on
+(`adb logcat -s rustudio AdrenoToolsPatch mesa`) with
+`RUSTUDIO_QUALITY_TRACE=1` for `render quality N -> M` lines while it
+happens — Automatic quality stepping down shortens the draw distance
+(500–1200 studs at levels 1–3, `quality.rs` `DRAW_DISTANCE`), and parts
+and terrain chunks wholly beyond it aren't drawn on either driver;
+Graphics quality Manual in the Performance settings, or
+`RUSTUDIO_AUTO_QUALITY_LEVEL=21`, tells. (2) `RUSTUDIO_TURNIP=0`: the same on
 the vendor's driver means the renderer, not Turnip. (3) Turnip's
 switches, top down, one at a time, watching the scene (LRZ off is already
 on by default; with a Turnip build that has it off, LRZ off fixing it
@@ -1254,10 +984,11 @@ in the present wait; Turnip (Mesa 26.3.0) on the same build runs it at a
 steady 120 fps. The first run with the `from_raw` hand-over logged
 `turnip: wgpu: Turnip Adreno (TM) 650 — turnip Mesa driver …` and no
 `AdrenoVK-0` line, as expected. Second round, same device, LRZ off: the
-baseplate holds 120 fps at quality level 10 (4× MSAA, four shadow
-cascades, SSAO, bloom, depth of field, clouds); a flat terrain at level
-10 runs at 20 fps — the terrain shader, its shadow cascades and the
-full-resolution post passes, not the driver — and in Automatic mode
+baseplate holds 120 fps at the port's then top quality level (4× MSAA,
+four shadow cascades, SSAO, bloom, depth of field, clouds); a flat
+terrain at that level runs at 20 fps — the terrain shader, its shadow
+cascades and the full-resolution post passes, not the driver — and in
+Automatic mode
 (level 3 to start) the chunks beyond the level's view distance are
 expected to go (the "Something draws wrong" ladder above).
 
@@ -1304,7 +1035,7 @@ Mali hasn't), and the shader cache folder is `panvk_shader_cache`. The
 probe counts PanVK as answering when
 `VK_KHR_driver_properties` says `MESA_PANVK` or the names say "panvk" /
 "Panfrost" (`turnip: probe: Mali-G610 (PanVK) — panvk Mesa …`); the
-`pending` / `failed` markers and Graphics Settings > GPU Driver ("PanVK
+`pending` / `failed` markers and View > GPU Driver ("PanVK
 (Mesa) Vulkan driver") work as for Turnip. No Mali device was at hand
 for this: it is the untested half, gated to fail safe — a start that
 doesn't reach its second frame turns it off, and the device's driver is
@@ -1317,10 +1048,10 @@ and here. What a report from a device should carry: `adb logcat -s
 rustudio` filtered to `soft keyboard` (each height change, the focus
 release), `clipboard` (each copy put on the system clipboard, each read
 and its length, or "no clip"), `text menu` (open, cut, copy, paste,
-select all), `graphics quality` (each level change with the settings in
-effect), `memory:` (the resident size each 256 MB it grows, with the
-place being opened: `src/android/memory.rs`) and the perf lines (every
-5 s). For a crash: `adb logcat -b crash -d` (debuggerd's tombstone: the
+select all), `render quality` (each Automatic level change, with
+`RUSTUDIO_QUALITY_TRACE=1`) and `memory:` (the resident size each 256 MB
+it grows, with the place being opened: `src/android/memory.rs`). For a
+crash: `adb logcat -b crash -d` (debuggerd's tombstone: the
 signal, an abort's message — `memory allocation of N bytes failed` for
 one out of memory — and every thread's stack) and `adb shell dumpsys
 activity exit-info dev.rustudio.studio` (the reason and the memory at the
@@ -1352,10 +1083,10 @@ also echoed to logcat at the next start.
   `lifecycle::hook`).
 - **Heavy lag.** The 3D view rendered at the panel's full pixel size — a
   phone's 2–3× density screen is more pixels than a laptop's — plus debug
-  builds. First run now renders the view at 0.7 scale (graphics level 3;
-  View > Graphics Settings), and `x build --release` (or the `profiling`
-  profile) is the build to judge speed by; `RUSTUDIO_RENDER_SCALE`
-  overrides.
+  builds. A first run now renders the view at 75% resolution in weak-GPU
+  mode (Performance settings; "Frame time on a phone"), and `x build
+  --release` (or the `profiling` profile) is the build to judge speed by;
+  `RUSTUDIO_PERF_RESOLUTION` overrides.
 - **Clipboard.** egui-winit has no Android clipboard, and the soft
   keyboard has no Ctrl: the long-press menu on text fields
   (`android/text_menu.rs`) and the mirror in `android/clipboard.rs`.
@@ -1428,11 +1159,10 @@ also echoed to logcat at the next start.
 - **Lag on a Baseplate with a release APK.** The chrome redrew the 3D
   view every frame it drew itself; see "Frame time on a phone".
 - **The 3D view lags while the camera moves, the chrome less so.** The
-  perf lines showed ~31 ms of wait a frame with the camera still (the 3D
-  view shown again, not drawn), so the frame itself, not the 3D pass, was
-  the floor: two swapchain images under Android's compositor (see "Frame
-  time on a phone", three images now), with the shadow cascades at half
-  the texels on top for the frames that do draw.
+  first round's measurements showed ~31 ms of wait a frame with the
+  camera still, so the frame itself, not the 3D pass, was the floor: two
+  swapchain images under Android's compositor (see "Frame time on a
+  phone", three images now).
 - **~30 fps on the baseplate whatever the settings (Snapdragon 865).**
   The vendor's Vulkan driver, not the renderer: 35–49 ms of each frame in
   the present wait. The Turnip driver ("Turnip driver (Snapdragon)"
@@ -1440,12 +1170,12 @@ also echoed to logcat at the next start.
 - **Terrain chunks vanishing under Turnip.** A flat terrain drew, then
   whole chunks went missing while their neighbours stayed. Turnip's LRZ
   (its low-resolution depth pre-pass) culling draws it shouldn't;
-  "LRZ off" in Graphics Settings > GPU driver > Turnip switches brought
-  them back on the spot and is the default now (the "LRZ is off by
-  default" paragraph above has the renderer-side check). Not to be
-  confused with Automatic quality stepping down and shortening the view
-  distance, which also drops far chunks — on either driver, logged as
-  `graphics quality (automatic)`.
+  "LRZ off" in View > GPU Driver > Turnip switches brought them back on
+  the spot and is the default now (the "LRZ is off by default" paragraph
+  above has the renderer-side check). Not to be confused with Automatic
+  quality stepping down and shortening the draw distance, which also
+  drops far chunks — on either driver, logged as `render quality N -> M`
+  with `RUSTUDIO_QUALITY_TRACE=1`.
 
 - **Dead taps on GUI buttons, the keyboard flapping.** Not the Luau VM:
   the lift's `PointerGone` in the same frame as the release (see
@@ -1537,8 +1267,7 @@ also echoed to logcat at the next start.
      write. On Android the device now has an uncaptured-error handler
      (`android::install_gpu_error_handler`): the error's text goes to
      logcat under `rustudio` (the first 20 in full, a count after that),
-     `perf: … GPU errors N` counts them when the perf log is on, and the
-     frame goes on. Desktop keeps wgpu's default (the panic names the
+     and the frame goes on. Desktop keeps wgpu's default (the panic names the
      bug while developing).
 - **Status 101 again (S20 Ultra, 11-18 06:07, pss 1.7 GB, LBG).** With
   the GPU error handler in, a 101 is a Rust panic proper (an index,
@@ -1579,8 +1308,9 @@ also echoed to logcat at the next start.
 3. Haptics (`HapticService`, `HapticEffect`) through `jni::vibrate*`.
 4. ~~Soft keyboard for a game's TextBoxes~~ (`OnScreenKeyboardVisible /
    Position / Size`, `ReturnPressedFromOnScreenKeyboard`, the view
-   sliding up to the box: "Text: the soft keyboard"). Left: insets
-   (`GuiService.TopbarInset`, `ScreenInsets`), orientation; a selection
+   sliding up to the box: "Text: the soft keyboard"). Left: the device
+   insets (`ScreenInsets` from the system bars and cutout; `TopbarInset`
+   is done), orientation; a selection
    in a game's TextBox (the text bar's Copy takes the whole text, its
    Cut and Select all are for egui fields).
 5. `ContextActionService` touch buttons (`createTouchButton`).

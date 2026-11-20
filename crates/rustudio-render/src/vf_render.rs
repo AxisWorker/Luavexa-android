@@ -23,7 +23,7 @@ use rbx_dom_weak::types::Ref;
 
 use super::{
     draw_key, pass_of, radius_of, shows, sphere_visible, frustum, to_raw, transparent_order, Globals,
-    InstanceRaw, Pass, Pipe, Renderer, TexMode, DEPTH_FORMAT,
+    InstanceRaw, Pass, Renderer, TexMode, DEPTH_FORMAT, HDR_FORMAT, SAMPLES,
 };
 use rustudio_core::math::Xform;
 
@@ -110,15 +110,9 @@ struct Prep {
 struct Target {
     size: [u32; 2],
     id: egui::TextureId,
-    /// The multisampled scene, resolved into `resolve`; None without MSAA
-    /// (the quality settings', as the world's: the parts draw into
-    /// `resolve` directly).
-    msaa: Option<wgpu::TextureView>,
+    msaa: wgpu::TextureView,
     depth: wgpu::TextureView,
     resolve: wgpu::TextureView,
-    /// The scene's sample count and format the target was made for: a
-    /// settings change (`Renderer::rebuild`) remakes it.
-    build: (u32, wgpu::TextureFormat),
     out: wgpu::Texture,
     blit_bg: wgpu::BindGroup,
     globals_buf: wgpu::Buffer,
@@ -158,8 +152,6 @@ impl Renderer {
         if old == layer {
             return;
         }
-        // (into or out of the world's lists: ViewReuse)
-        self.generation += 1;
         match old {
             Some(o) => {
                 self.items.remove(&r);
@@ -282,7 +274,7 @@ impl Renderer {
         for (&vf, req) in reqs {
             let gen = self.vf.gen.get(&vf).copied().unwrap_or(0);
             let size = [req.size[0].clamp(1, 4096), req.size[1].clamp(1, 4096)];
-            if self.vf.targets.get(&vf).is_none_or(|t| t.size != size || t.build != (self.samples, self.scene_format)) {
+            if self.vf.targets.get(&vf).is_none_or(|t| t.size != size) {
                 if let Some(old) = self.vf.targets.remove(&vf) {
                     rs.renderer.write().free_texture(&old.id);
                     crate::world_gui::unregister_native(old.id);
@@ -317,11 +309,9 @@ impl Renderer {
             })
         };
         let att = wgpu::TextureUsages::RENDER_ATTACHMENT;
-        // (the scene's sample count and format: the world's pipelines draw here)
-        let (samples, scene_format) = (self.samples, self.scene_format);
-        let msaa = (samples > 1).then(|| tex("viewport frame msaa", scene_format, samples, att).create_view(&Default::default()));
-        let depth = tex("viewport frame depth", DEPTH_FORMAT, samples, att).create_view(&Default::default());
-        let resolve = tex("viewport frame resolve", scene_format, 1, att | wgpu::TextureUsages::TEXTURE_BINDING)
+        let msaa = tex("viewport frame msaa", HDR_FORMAT, SAMPLES, att).create_view(&Default::default());
+        let depth = tex("viewport frame depth", DEPTH_FORMAT, SAMPLES, att).create_view(&Default::default());
+        let resolve = tex("viewport frame resolve", HDR_FORMAT, 1, att | wgpu::TextureUsages::TEXTURE_BINDING)
             .create_view(&Default::default());
         let out = tex("viewport frame", wgpu::TextureFormat::Rgba8Unorm, 1, att | wgpu::TextureUsages::TEXTURE_BINDING);
         let out_view = out.create_view(&Default::default());
@@ -346,7 +336,6 @@ impl Renderer {
             msaa,
             depth,
             resolve,
-            build: (samples, scene_format),
             out,
             blit_bg,
             globals_buf,
@@ -465,11 +454,13 @@ impl Renderer {
             &self.localgrid_view,
             &self.studs_view,
             &self.studs_sampler,
+            &self.low_material_sampler,
             &self.materials,
             &self.probe.slot_views[self.probe.cur],
             &self.probe.slot_views[self.probe.next()],
             &self.brdf_view,
             &self.lshadow,
+            self.reduced,
         );
         // The background, premultiplied, in the frame's squared space.
         let b = req.background;
@@ -478,19 +469,11 @@ impl Renderer {
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("viewport frame"),
-                color_attachments: &[Some(match t.msaa.as_ref() {
-                    Some(msaa) => wgpu::RenderPassColorAttachment {
-                        view: msaa,
-                        depth_slice: None,
-                        resolve_target: Some(&t.resolve),
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Discard },
-                    },
-                    None => wgpu::RenderPassColorAttachment {
-                        view: &t.resolve,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
-                    },
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &t.msaa,
+                    depth_slice: None,
+                    resolve_target: Some(&t.resolve),
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Discard },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &t.depth,
@@ -507,15 +490,14 @@ impl Renderer {
             let draw = |pass: &mut wgpu::RenderPass, key: (usize, usize), range: std::ops::Range<u32>| {
                 let Some(mesh) = self.meshes.get(key.0) else { return };
                 pass.set_bind_group(1, self.textures.get(key.1).unwrap_or(&self.textures[0]), &[]);
-                pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
-                pass.draw(0..mesh.count, range);
+                mesh.draw(pass, range);
             };
             for r in &opaque_runs {
-                pass.set_pipeline(self.pipe(if self.culls_back(r.0 .0) { Pipe::Opaque } else { Pipe::OpaqueTwoSided }));
+                pass.set_pipeline(if self.culls_back(r.0 .0) { &self.viewport.opaque } else { &self.viewport.opaque_two_sided });
                 draw(&mut pass, r.0, r.1..r.2);
             }
             for r in &see_runs {
-                pass.set_pipeline(self.pipe(if self.culls_back(r.0 .0) { Pipe::TransparentCulled } else { Pipe::Transparent }));
+                pass.set_pipeline(if self.culls_back(r.0 .0) { &self.viewport.transparent_culled } else { &self.viewport.transparent });
                 draw(&mut pass, r.0, r.1..r.2);
             }
         }

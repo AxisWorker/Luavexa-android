@@ -101,8 +101,8 @@ fn open(target: Duration) -> Result<Session, String> {
 
 /// Once a frame, from the frame thread: how long the last frame's work
 /// took (`actual`; the time on the CPU, not what it waited for the
-/// display) against the budget it has (`target`: the display's period, or
-/// the frame-rate cap's). Opens the session on the first call.
+/// display) against the budget it has (`target`: the display's period).
+/// Opens the session on the first call.
 pub fn frame(actual: Duration, target: Duration) {
     if !wanted() || target.is_zero() {
         return;

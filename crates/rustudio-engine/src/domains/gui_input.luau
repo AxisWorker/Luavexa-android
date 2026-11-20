@@ -4,14 +4,14 @@
 -- (checks/parity/gui_input.md). Loaded once per runtime after the library.
 local G = ...
 local fire, log = G.fire, G.log
--- The current DataModel (refreshed every step; see G.game).
+-- The current DataModel. The native helper sends changed roots since the
+-- last refresh, including when the editor replaces the whole document.
 local game = game
 local workspace = workspace
 local function refresh_game()
-    local ok, g = pcall(G.game)
-    if ok and g then
-        game = g
-        local w = g:FindFirstChildOfClass("Workspace")
+    local ok, g, w = pcall(G.world_roots)
+    if ok then
+        if g then game = g end
         if w then workspace = w end
     end
 end
@@ -110,8 +110,40 @@ end
 get["GuiService.PreferredTextSize"] = function() return Enum.PreferredTextSize.Medium end
 get["GuiService.PreferredTransparency"] = function() return 1 end
 get["GuiService.ReducedMotionEnabled"] = function() return false end
-get["GuiService.TopbarInset"] = function() return Rect.new(0, 0, 0, 0) end
 get["GuiService.ViewportDisplaySize"] = function() return Enum.DisplaySize.Medium end
+
+-- GuiService.TopbarInset: the unoccupied top-bar area, from Roblox's
+-- left-most controls to the right edge of the device safe area (its
+-- reference), published through GetPropertyChangedSignal as the controls
+-- or the viewport change. Play's bar is the 58 px one (GetGuiInset; the
+-- old bar was 36 — TopbarPlus picks its theme by `Height > 36`, and LBG's
+-- ClientRenderer waits for a Height above 0 before it builds its icons, a
+-- wait an empty rect never ended); its menu button spans 16..60 and the
+-- chat button follows 12 later (play_game.rs top_bar's Roblox constants),
+-- so the free area starts 12 past the last of them. The edit DataModel
+-- (plugins) has no bar: an empty rect, as its GetGuiInset is zeros. The
+-- left edge is this build's bar, not a measurement of Roblox's unibar.
+local topbar_seen
+local function topbar_inset()
+    if G.is_edit() then return Rect.new(0, 0, 0, 0), "" end
+    local width = G.view()
+    local chat = true
+    if G.is_client() then
+        pcall(function() chat = game:GetService("StarterGui"):GetCoreGuiEnabled(Enum.CoreGuiType.Chat) end)
+    end
+    local left = 16 + 44 + (chat and 12 + 44 or 0) + 12
+    return Rect.new(left, 0, math.max(left, width), 58), width .. (chat and "c" or "")
+end
+get["GuiService.TopbarInset"] = function() return (topbar_inset()) end
+local function step_topbar()
+    local _, key = topbar_inset()
+    if key == topbar_seen then return end
+    local first = topbar_seen == nil
+    topbar_seen = key
+    if first then return end
+    local gs = svc("GuiService")
+    if gs then changed(gs, "TopbarInset") end
+end
 
 methods["GuiService.AddSelectionParent"] = function(_, name, parent)
     gs_state.groups[tostring(name)] = { parent }
@@ -2451,6 +2483,7 @@ local function step_all(dt)
     if not G.is_client() then return end
     step_inspect()
     start_tracking()
+    step_topbar()
     step_focus()
     step_tools()
     step_pages(dt)
