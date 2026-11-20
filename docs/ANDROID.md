@@ -63,7 +63,14 @@ variable; CI reads it from the `ANDROID_SIGNING_PEM` secret when set.
 
 Without a device, `cargo check` for the target works with the same
 environment xbuild uses (sysroot, `--target=aarch64-linux-android33`, clang
-and lld) — see the `Build APK` step of the workflow for the variables.
+and lld) — see the `Build APK` step of the workflow for the variables. A
+check links nothing, though: an undefined C symbol (Luau's code generator
+calling `__clear_cache`, "Luau native code" below) only shows in a real
+link — `cargo build -p rustudio-android --target aarch64-linux-android`
+with those variables, or `x build` — which
+`crates/rustudio-android/build.rs` makes strict (`-Wl,--no-undefined`).
+The Android targets link libc++ statically (`.cargo/config.toml`, the
+reason in the same section).
 
 xbuild quirks worth knowing (commit e67b501):
 
@@ -599,6 +606,71 @@ a frame through egui's paint callback, a per-frame perf line in logcat.
 The measurements that motivated each are in the port's previous patch,
 the one against 0.3.2 (its `crates/rustudio-render/src/graphics.rs` and
 this file's "Graphics quality" section there).
+
+## Luau native code (`--!native`): `vendor/luau0-src`, `.cargo/config.toml`
+
+Upstream turned Luau's code generator on (mlua's `luau-jit`,
+crates/rustudio-engine/Cargo.toml): a `--!native` module and an
+`@native` function run as machine code, as in Roblox, which has native
+code on Android and iOS too; every other chunk stays interpreted
+(`luau_codegen_compile_native`, vendor mlua `state/raw.rs`).
+`RUSTUDIO_NO_NATIVE=1` turns it off — on a phone `adb shell setprop
+debug.rustudio.env "RUSTUDIO_NO_NATIVE=1"`, then relaunch. The phone
+build keeps it, which took three things a Rust-linked Android library
+doesn't get by itself. None of them shows on a desktop, and `cargo
+check` of the Android target is blind to all three (it links nothing):
+
+- **`__clear_cache`.** After writing machine code, Luau's `CodeAllocator`
+  flushes the instruction cache with `__builtin___clear_cache`, which on
+  AArch64 is a call into the compiler's runtime library (compiler-rt's
+  builtins: `__clear_cache`). rustc links with `-nodefaultlibs`, and the
+  NDK sysroot xbuild builds against has no
+  `libclang_rt.builtins-aarch64-android.a`, so the reference stayed
+  undefined — a shared library links anyway — and the first APK of the
+  rebased port died in `NativeActivity.onCreate`: `dlopen failed: cannot
+  locate symbol "__clear_cache" referenced by librustudio_android.so`.
+  `CodeAllocator.cpp flushInstructionCache` now does the maintenance
+  inline on Android (compiler-rt's own sequence for AArch64: `dc cvau`
+  over the data cache lines, `ic ivau` over the instruction cache lines,
+  the sizes from `CTR_EL0`, the barriers between).
+- **One unwinder.** A Luau error is a C++ exception (`luaD_throw`; mlua
+  builds Luau without `LUA_USE_LONGJMP`), and a native frame can only be
+  unwound with the unwind table Luau registers for it
+  (`CodeBlockUnwind.cpp`: `__register_frame`). Since NDK r23 every
+  library carries its own copy of libunwind with hidden symbols,
+  libc++_shared.so included (`llvm-readelf --dyn-syms` shows no
+  `_Unwind_*` there), so with the shared libc++ an exception thrown by
+  its `__cxa_throw` is unwound by *its* copy, which has never heard of
+  the tables Luau handed to the copy inside librustudio_android.so: the
+  first `error()` under a `--!native` function would have ended in
+  `std::terminate`. The Android targets therefore link libc++ statically
+  (`.cargo/config.toml` `[env]`: `CXXSTDLIB_aarch64_linux_android =
+  "c++_static"`, which the vendored luau0-src completes with libc++abi):
+  thrower, unwinder (the libunwind.a Rust's std links in) and Luau's
+  registration are one library's — the arrangement Luau itself runs
+  under on macOS, where libc++ and libunwind are the system's single
+  copies. The editor's own library no longer lists libc++_shared.so in
+  NEEDED; xbuild still copies it into the APK for any bundled library
+  that does (fetch-turnip.sh's check lets the name through for that).
+- **A strong `__register_frame`.** Luau declares it weak so a platform
+  without one runs without native code, and a weak reference pulls
+  nothing out of a static archive — native code would silently stay off
+  if nothing else dragged that member of libunwind.a in. The Android
+  build defines `LUAU_ENABLE_REGISTER_FRAME` (luau0-src `lib.rs`), and
+  `crates/rustudio-android/build.rs` links the library with
+  `-Wl,--no-undefined`: a symbol that no NEEDED library provides is a
+  build error now, not a logcat line after an install.
+
+On a device, a `--!native` Script with a hot loop should run visibly
+faster than the same code without the directive (the Script Profiler, or
+`os.clock()` around it), and `pcall(function() error("x") end)` inside a
+`--!native` function must return `false, "x"` — an abort there would
+mean the unwinder above isn't the one that threw. Without a device:
+`llvm-nm -D --undefined-only librustudio_android.so` lists what dlopen
+will look up (nothing named `__clear_cache`), `llvm-readelf -d … | grep
+NEEDED` the libraries it may look in (no libc++_shared.so), and `llvm-nm
+librustudio_android.so | grep -E ' (__register_frame|__cxa_throw|_Unwind_RaiseException)$'`
+must show all three defined (`t`/`T`) inside the library.
 
 ## Turnip driver (Snapdragon) and PanVK (Mali): `src/android/turnip.rs`
 
@@ -1298,6 +1370,16 @@ also echoed to logcat at the next start.
   `UIListLayout.Wraps` (90 of the place's 250 lists), ignored upstream —
   `crates/rustudio-engine/src/gui_walk.rs list_lines`; the glows behind its frames are
   `UIShadow` (138), now drawn (`crates/rustudio-engine/src/gui_fx.rs shadow`).
+- **Dead at start after the rebase onto v0.3.3-alpha.2 (11-20):
+  `java.lang.UnsatisfiedLinkError: … dlopen failed: cannot locate symbol
+  "__clear_cache" referenced by librustudio_android.so` in
+  `NativeActivity.onCreate`, twice (the relaunch too).** Upstream's new
+  Luau code generator (`luau-jit`): its instruction-cache flush is a
+  call into compiler-rt's builtins on AArch64, which a Rust link has no
+  copy of; the desktop builds and the arm64 `cargo check` of CI can't
+  see an undefined C symbol. Fixed in `vendor/luau0-src` and locked out
+  by `-Wl,--no-undefined` — "Luau native code" above, with the two
+  further things native code needed in this library.
 
 ## Later steps (in order)
 

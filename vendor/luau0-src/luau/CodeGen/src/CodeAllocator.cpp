@@ -133,6 +133,49 @@ static void flushInstructionCache(uint8_t* mem, size_t size)
 #ifdef __EMSCRIPTEN__
 #elif defined(__APPLE__)
     sys_icache_invalidate(mem, size);
+#elif defined(__ANDROID__) && defined(__aarch64__)
+    // rustudio: on AArch64 the builtin below is a call to __clear_cache in
+    // the compiler's runtime library (compiler-rt's builtins, libgcc), which
+    // the Rust link of the Android library has no copy of: rustc links with
+    // -nodefaultlibs, and the NDK sysroot xbuild builds against carries no
+    // libclang_rt.builtins-aarch64-android.a. The reference then stays
+    // undefined (a shared library links anyway) and the phone's dlopen
+    // refuses the whole library: "cannot locate symbol __clear_cache". The
+    // same maintenance inline, compiler-rt's clear_cache.c for AArch64:
+    // clean the data cache lines to the point of unification, invalidate the
+    // instruction cache lines, with the line sizes CTR_EL0 reports (the
+    // kernel lets user code read it) and skipping a step its IDC / DIC bits
+    // declare unnecessary.
+    uint64_t xstart = (uint64_t)(uintptr_t)mem;
+    uint64_t xend = (uint64_t)(uintptr_t)(mem + size);
+
+    static uint64_t ctr_el0 = 0;
+    if (ctr_el0 == 0)
+        __asm__ __volatile__("mrs %0, ctr_el0" : "=r"(ctr_el0));
+
+    // The DC and IC instructions take 64-bit registers.
+    uint64_t addr;
+
+    // CTR_EL0.IDC: data cache cleaning to the point of unification is not
+    // required for instruction to data coherence.
+    if (((ctr_el0 >> 28) & 0x1) == 0x0)
+    {
+        const uint64_t dcache_line_size = uint64_t(4) << ((ctr_el0 >> 16) & 15);
+        for (addr = xstart & ~(dcache_line_size - 1); addr < xend; addr += dcache_line_size)
+            __asm__ __volatile__("dc cvau, %0" ::"r"(addr));
+    }
+    __asm__ __volatile__("dsb ish");
+
+    // CTR_EL0.DIC: instruction cache invalidation to the point of
+    // unification is not required for instruction to data coherence.
+    if (((ctr_el0 >> 29) & 0x1) == 0x0)
+    {
+        const uint64_t icache_line_size = uint64_t(4) << ((ctr_el0 >> 0) & 15);
+        for (addr = xstart & ~(icache_line_size - 1); addr < xend; addr += icache_line_size)
+            __asm__ __volatile__("ic ivau, %0" ::"r"(addr));
+        __asm__ __volatile__("dsb ish");
+    }
+    __asm__ __volatile__("isb sy");
 #else
     __builtin___clear_cache((char*)mem, (char*)mem + size);
 #endif

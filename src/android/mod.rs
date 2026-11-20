@@ -100,7 +100,7 @@ fn export_env() {
     let _ = std::fs::create_dir_all(cache.join("tmp"));
     // The editor's RUSTUDIO_* switches, for a device that has no shell
     // environment to launch from:
-    //   adb shell setprop debug.rustudio.env "RUSTUDIO_SSAO=1 RUSTUDIO_VIEW_REUSE=0"
+    //   adb shell setprop debug.rustudio.env "RUSTUDIO_NO_NATIVE=1 RUSTUDIO_QUALITY_TRACE=1"
     // (space-separated KEY=VALUE pairs, 91 characters at most; read at
     // start, so relaunch after; `setprop debug.rustudio.env ""` clears).
     for pair in system_property("debug.rustudio.env").split_whitespace() {

@@ -220,8 +220,19 @@ impl Build {
                 panic!("codegen (jit) is not supported on emscripten");
             }
 
-            config
-                .clone()
+            let mut codegen = config.clone();
+            if target.contains("android") {
+                // rustudio: CodeBlockUnwind.cpp declares __register_frame /
+                // __deregister_frame weak, so that a platform without them
+                // runs without native code. On Android they live in the
+                // libunwind.a every library links statically (Rust's std
+                // brings it in), and a weak reference pulls nothing out of
+                // an archive: strong references, so the link takes them (or
+                // says so: crates/rustudio-android/build.rs --no-undefined),
+                // instead of native code silently staying off.
+                codegen.define("LUAU_ENABLE_REGISTER_FRAME", None);
+            }
+            codegen
                 .include(&codegen_include_dir)
                 .include(&vm_include_dir)
                 .include(&vm_source_dir)
@@ -363,6 +374,17 @@ impl Build {
     fn get_cpp_link_stdlib(target: &str, host: &str) -> Option<String> {
         // Try to get value from the `CXXSTDLIB` env variable
         let kind = if host == target { "HOST" } else { "TARGET" };
+        // rustudio: the Android build sets these (.cargo/config.toml [env],
+        // c++_static); a change must rerun this script, or a cached build
+        // keeps linking the other library.
+        for name in [
+            format!("CXXSTDLIB_{target}"),
+            format!("CXXSTDLIB_{}", target.replace('-', "_")),
+            format!("{kind}_CXXSTDLIB"),
+            "CXXSTDLIB".to_string(),
+        ] {
+            println!("cargo:rerun-if-env-changed={name}");
+        }
         let res = env::var(format!("CXXSTDLIB_{target}"))
             .or_else(|_| env::var(format!("CXXSTDLIB_{}", target.replace('-', "_"))))
             .or_else(|_| env::var(format!("{kind}_CXXSTDLIB")))
@@ -401,6 +423,14 @@ impl Artifacts {
         }
         if let Some(ref cpp_stdlib) = self.cpp_stdlib {
             println!("cargo:rustc-link-lib={cpp_stdlib}");
+            // rustudio: the NDK's static libc++ is two archives; libc++abi
+            // (__cxa_throw, the personality routine, typeinfo) is the part
+            // that makes a Luau error unwind inside this library, with the
+            // libunwind.a the library carries (docs/ANDROID.md "Luau native
+            // code"). The NDK's clang adds it itself; a Rust link doesn't.
+            if cpp_stdlib == "c++_static" {
+                println!("cargo:rustc-link-lib=c++abi");
+            }
         }
         if let Some(version) = self.version() {
             println!("cargo:rustc-env=LUAU_VERSION={version}");
