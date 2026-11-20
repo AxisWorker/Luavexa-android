@@ -62,7 +62,7 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - run: tools/macos/bundle.sh --universal
+      - run: bash tools/macos/bundle.sh --universal
       - name: Check the bundle
         run: |
           lipo -archs target/macos/rustudio.app/Contents/MacOS/rustudio | grep -q 'x86_64 arm64'
@@ -85,7 +85,9 @@ jobs:
       - run: cargo build --workspace --release --locked
       - name: Package
         run: |
-          tools/linux/package.sh target/release/rustudio dist/rustudio-linux-x86_64.tar.gz
+          # (through bash: a checkout whose files lost their execute bit —
+          # a copy made on Windows, a patch applied without modes — packages too)
+          bash tools/linux/package.sh target/release/rustudio dist/rustudio-linux-x86_64.tar.gz
       - name: Verify Linux installation
         run: python3 tools/linux/test-package.py dist/rustudio-linux-x86_64.tar.gz
       - uses: actions/upload-artifact@v4

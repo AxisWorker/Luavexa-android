@@ -389,7 +389,7 @@ Round 12 fidelity scores (render, settled shots): Place A 49.5, demo 69.3
   a Studio calibration scene (transparency steps over light and dark).
 - **Place A chapel brightness** (Soft spot lights) and the **skybox / stud scale**
   remain open.
-- **Graphics quality levels** (the Android port; `crates/rustudio-render/src/quality.rs`):
+- **Graphics quality levels** (the Android port; `crates/rustudio-render/src/graphics.rs`):
   `settings().Rendering.EditQualityLevel` now does what Studio's does —
   Automatic or Level01–21 onto a 1–10 bar of view distance, part detail,
   texture size, texture filtering, the lite shader (no normal maps,

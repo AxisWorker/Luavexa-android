@@ -77,9 +77,9 @@ CRATE_MODULES = {
         'render', 'gpu_timing', 'world_gui', 'sun_shadow', 'highlight', 'water',
         'clouds', 'skin', 'skin_gpu', 'wrap', 'hsr', 'lightgrid', 'lightocc',
         'matpack', 'grass_temporal', 'effects', 'lighting', 'scene', 'camera',
-        # The graphics quality levels the renderer is built for, and the
+        # The graphics quality levels the renderer is built for (graphics.rs), and the
         # perf log's line.
-        'quality', 'perf_log',
+        'graphics', 'perf_log',
     ),
     # ~80k lines: Luau runtime, API domains, replication, GUI objects, audio.
     'engine': (

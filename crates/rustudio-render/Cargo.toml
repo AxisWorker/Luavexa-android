@@ -24,7 +24,7 @@ glam = { version = "0.30", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
 rbx_dom_weak = "4"
 rustc-hash = "2"
-# quality.rs's Overrides, saved with the window layout (serde).
+# graphics.rs's Overrides, saved with the window layout (serde).
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # matpack's KTX2 / packed-map decoding, and grass_temporal's frame dumps.

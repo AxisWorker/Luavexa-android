@@ -140,10 +140,10 @@ jobs:
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 
-      - name: Build dependencies (clang / lld for the NDK targets, ALSA headers for the host build scripts)
+      - name: Build dependencies (clang / lld for the NDK targets, ALSA headers for the host build scripts, zstd for xbuild's sysroot tarball)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang lld llvm pkg-config libasound2-dev
+          sudo apt-get install -y --no-install-recommends clang lld llvm pkg-config libasound2-dev zstd
 
       - name: Cache cargo registry and the per-target build dir
         uses: Swatinem/rust-cache@v2
@@ -174,7 +174,15 @@ jobs:
       # manifest.yaml runtime_libs); the app swaps the driver in on
       # Snapdragon and kbase Mali devices at start (src/android/turnip.rs).
       # Push / PR builds take the pinned releases; a manual run can point
-      # at other builds or leave the drivers out.
+      # at other builds or leave the drivers out. The script ends with
+      # xbuild's library check: a bundled library's NEEDED names must be
+      # bundled or in xbuild's NDK sysroot (~/.cache/x/Android.ndk), else
+      # `x build` stops at the APK step ("Shared library `libhardware.so`
+      # not found" — PanVK links that system library, which the NDK
+      # doesn't export); the script fetches the sysroot tarball when the
+      # cache above didn't bring it (the same one xbuild fetches, which
+      # it then skips) and leaves an empty marker file of that name in
+      # it, nothing goes into the APK (the script's comment on it).
       - name: Mesa drivers (Turnip, PanVK) + libadrenotools (arm64-v8a)
         if: matrix.arch == 'arm64' && github.event.inputs.turnip != 'false'
         env:
@@ -219,7 +227,17 @@ jobs:
 
       - name: APK contents
         run: |
-          unzip -l "dist/rustudio-${{ matrix.arch }}-${{ matrix.profile }}.apk" | grep -E "lib/|assets/|AndroidManifest" || true
+          apk="dist/rustudio-${{ matrix.arch }}-${{ matrix.profile }}.apk"
+          unzip -l "$apk" | grep -E "lib/|assets/|AndroidManifest" || true
+          # The drivers the arm64 build fetched must have made it in.
+          if [ "${{ matrix.arch }}" = "arm64" ] && [ "${{ github.event.inputs.turnip }}" != "false" ]; then
+            for f in libadrenotools.so libhook_impl.so libmain_hook.so libvulkan_freedreno.so; do
+              unzip -l "$apk" | grep -q "lib/arm64-v8a/$f" || { echo "::error::$f is not in the APK"; exit 1; }
+            done
+            if [ "${{ github.event.inputs.panvk }}" != "false" ]; then
+              unzip -l "$apk" | grep -q "lib/arm64-v8a/libvulkan_panfrost.so" || { echo "::error::libvulkan_panfrost.so is not in the APK"; exit 1; }
+            fi
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

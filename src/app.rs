@@ -279,12 +279,12 @@ pub struct Editor {
     /// Selection as of the last Explorer sync.
     pub last_selection: Vec<Ref>,
     /// The 3D view's graphics quality (View > Graphics Settings;
-    /// crates/rustudio-render/src/quality.rs): the level 1–10, Automatic,
+    /// crates/rustudio-render/src/graphics.rs): the level 1–10, Automatic,
     /// and the settings set apart from the level. Phones start in
     /// Automatic at level 3, computers at 10; `RUSTUDIO_QUALITY` overrides.
-    pub graphics: rustudio_render::quality::Graphics,
-    /// Automatic quality's frame-rate watch (quality.rs).
-    pub quality_auto: rustudio_render::quality::Auto,
+    pub graphics: rustudio_render::graphics::Graphics,
+    /// Automatic quality's frame-rate watch (graphics.rs).
+    pub quality_auto: rustudio_render::graphics::Auto,
     /// Studio Settings > Rendering > Editor Quality Level as last seen:
     /// a change there (the dialog, `settings()` from Luau) sets `graphics`
     /// (`Editor::quality_tick`).
@@ -293,7 +293,7 @@ pub struct Editor {
     /// layout: android::touch::auto_zoom).
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub auto_zoom: bool,
-    /// Play's frame-rate cap (quality.rs `fps_cap`): when the next frame
+    /// Play's frame-rate cap (graphics.rs `fps_cap`): when the next frame
     /// may go out, and how long the last one waited for its turn (s).
     pub cap_next: Option<Instant>,
     pub cap_wait: f32,
@@ -414,7 +414,7 @@ impl RustudioApp {
         rustudio_engine::mouse_lock::note_window(wayland);
         // (the renderer is made below, once the saved layout has said
         // which graphics level it is for: Game::new(None) leaves it out)
-        let graphics = rustudio_render::quality::Graphics::platform_default();
+        let graphics = rustudio_render::graphics::Graphics::platform_default();
         let mut game = Game::new(None);
         game.render_state = render_state;
         let mut ed = Editor {
@@ -793,7 +793,7 @@ impl Editor {
     /// settings set apart from it (View > Graphics Settings, the saved
     /// layout), then the run's `RUSTUDIO_*` switches over them (a device
     /// run's comparison wins over the saved choices).
-    pub fn render_settings(&self) -> rustudio_render::quality::RenderSettings {
+    pub fn render_settings(&self) -> rustudio_render::graphics::RenderSettings {
         self.graphics.settings()
     }
 
@@ -837,7 +837,7 @@ impl Editor {
     /// Once a frame: Studio Settings' Editor Quality Level changed by the
     /// dialog or Luau (`settings().Rendering.EditQualityLevel`) sets the
     /// graphics; Automatic quality steps the level by the frame rate while
-    /// the 3D view is drawn frame after frame (quality.rs `Auto`).
+    /// the 3D view is drawn frame after frame (graphics.rs `Auto`).
     pub fn quality_tick(&mut self, now: Instant, dt: f32, cost: f32) {
         let studio = crate::studio_settings::edit_quality_level();
         if studio != self.quality_studio_seen {
@@ -845,7 +845,7 @@ impl Editor {
             // though the bar shows 3)
             self.quality_studio_seen = studio;
             let before = self.graphics;
-            self.graphics.apply_choice(rustudio_render::quality::level_from_studio(studio));
+            self.graphics.apply_choice(rustudio_render::graphics::level_from_studio(studio));
             if self.graphics != before {
                 self.quality_auto.reset();
                 self.quality_changed(false);
@@ -859,8 +859,8 @@ impl Editor {
         let step = if drawn { self.quality_auto.frame(now, dt, cost, self.graphics.level) } else { None };
         if let Some(step) = step {
             match step {
-                rustudio_render::quality::Step::Down => self.graphics.level = self.graphics.level.saturating_sub(1).max(1),
-                rustudio_render::quality::Step::Up => self.graphics.level = (self.graphics.level + 1).min(rustudio_render::quality::LEVELS),
+                rustudio_render::graphics::Step::Down => self.graphics.level = self.graphics.level.saturating_sub(1).max(1),
+                rustudio_render::graphics::Step::Up => self.graphics.level = (self.graphics.level + 1).min(rustudio_render::graphics::LEVELS),
             }
             // (Automatic stays Automatic in Studio's enum: no mirror)
             self.quality_changed(false);
@@ -2767,7 +2767,7 @@ impl Editor {
 }
 
 impl RustudioApp {
-    /// Play's frame-rate cap (quality.rs `fps_cap`: none by level,
+    /// Play's frame-rate cap (graphics.rs `fps_cap`: none by level,
     /// `RUSTUDIO_FPS_CAP` or the Play Frame Rate setting; under FIFO vsync
     /// a cap below the display's rate lands frames on every second or
     /// third refresh by turns, so it is the player's choice, for heat and

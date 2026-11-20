@@ -712,7 +712,7 @@ impl Editor {
         {
             scene::grid_lines(&mut lines, self.ui.grid_size);
         }
-        // The graphics settings (quality.rs: the level, the settings set
+        // The graphics settings (graphics.rs: the level, the settings set
         // apart from it, RUSTUDIO_* switches). The view is drawn at the
         // render scale, or the motion scale while the camera moves or a
         // game runs (`Motion`), and the renderer scales it up to the panel

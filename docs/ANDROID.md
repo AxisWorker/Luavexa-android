@@ -11,7 +11,7 @@ work on any system with a touch screen or a device's sensors live in the
 workspace's crates like the rest of the engine: `touch_input.rs` and
 `device_sensors.rs` in rustudio-engine (the sensors behind a `Source` the
 Android entry point installs), `touch_gestures.rs` in rustudio-player,
-`quality.rs` and `perf_log.rs` in rustudio-render. Targets:
+`graphics.rs` and `perf_log.rs` in rustudio-render. Targets:
 `aarch64-linux-android` (arm64-v8a, every phone and tablet) and
 `x86_64-linux-android` (the emulator).
 
@@ -34,8 +34,10 @@ cargo install --git https://github.com/rust-mobile/xbuild \
   --rev e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1 xbuild
 x doctor                                   # what it found; nothing here fails
 
-# the Turnip (Mesa) Vulkan driver + libadrenotools into the arm64 APK's
-# lib/arm64-v8a ("Turnip driver" below); skip it for a plain APK
+# the Mesa Vulkan drivers (Turnip, PanVK) + libadrenotools into the arm64
+# APK's lib/arm64-v8a ("Turnip driver" below); skip it for a plain APK.
+# Needs llvm-readobj (the llvm package; xbuild needs it too): it ends
+# with xbuild's library check, below under "xbuild quirks"
 tools/android/fetch-turnip.sh
 
 # an APK (xbuild fetches its NDK sysroot and android.jar into ~/.cache/x)
@@ -75,6 +77,25 @@ xbuild quirks worth knowing (commit e67b501):
   *[3/3] Create apk — invalid digit found in string*. The GLES fallback
   doesn't depend on the declaration (wgpu picks it at run time), and every
   API 26 device has GLES 3.0, so the manifest declares Vulkan only.
+- Before *[3/3] Create apk*, xbuild reads every bundled library's NEEDED
+  list (`llvm-readobj --needed-libs`; the `runtime_libs` files included)
+  and wants each name either bundled too or present in its NDK sysroot
+  (`~/.cache/x/Android.ndk/usr/lib/aarch64-linux-android/` and the
+  `26/` folder under it, the minSdk's), else it stops: *Failed to
+  collect all required libraries for `…/libvulkan_panfrost.so` … Shared
+  library `libhardware.so` not found*. PanVK links `libhardware.so`
+  (Mesa's Android gralloc path) and `libc++.so` — system libraries every
+  device has (`/system/lib64`, VNDK-SP) that the NDK doesn't export, and
+  which the driver reaches at run time because libadrenotools loads it
+  in a namespace cloned from the system Vulkan loader's own
+  (`hook_impl.cpp`, which links `libc++.so` over by name). xbuild only
+  reads the *names* in its sysroot folders, so `fetch-turnip.sh` ends by
+  leaving an empty marker file of each such name there (it fetches the
+  sysroot tarball first when xbuild hasn't yet — the same file, which
+  xbuild then skips; `X_CACHE_DIR` names another cache folder,
+  `XBUILD_SYSROOT=0` skips the step) and prints which; nothing is added
+  to the APK. A stub in `libs/arm64-v8a/` would be shipped and would
+  shadow the real library in the driver's namespace — don't.
 
 ## What is where
 
@@ -507,7 +528,7 @@ adb shell setprop debug.rustudio.env "RUSTUDIO_SUN_SHADOWS=0 RUSTUDIO_VIEW_REUSE
 
 then relaunch (`setprop debug.rustudio.env ""` clears). Space-separated
 `RUSTUDIO_*=value` pairs, 91 characters at most (`android::export_env`;
-the renderer's are read by `quality::RenderSettings::with_env`):
+the renderer's are read by `graphics::RenderSettings::with_env`):
 `RUSTUDIO_QUALITY=auto|1..10` (`low` / `medium` / `high` = 3 / 6 / 10)
 and the single settings over the level — `RUSTUDIO_VIEW_DISTANCE`
 (studs, 0 unlimited), `RUSTUDIO_DETAIL_PX` (the smallest part drawn, in
@@ -562,7 +583,7 @@ figures against the steps: a step that drops "scene" names the cost; a
 but a wait the timestamps straddle (the display's pacing, the driver's),
 and the "no 3D frame" step's interval is the editor's own.
 
-### Graphics quality (`crates/rustudio-render/src/quality.rs`, `src/graphics_settings.rs`)
+### Graphics quality (`crates/rustudio-render/src/graphics.rs`, `src/graphics_settings.rs`)
 
 The 3D view's per-frame fixed costs on the device — the 4× MSAA
 Rgba16Float scene and its resolve, a full-resolution Rgba16Float copy of
@@ -605,14 +626,14 @@ Studio levels per bar step), set from either side.
 (Rg11b10Ufloat where the device renders to it, else Rgba16Float. The MSAA
 row is what a level asks for: Vulkan and WebGPU promise 1 and 4 samples
 only, and a device without 2× — llvmpipe, some Malis — gets the nearest
-count it has (`quality::MsaaSupport`, `Renderer::msaa_support_of`,
+count it has (`graphics::MsaaSupport`, `Renderer::msaa_support_of`,
 `RenderSettings::fitted`: 2× → off, a missing 4× → 2×); a texture asked
 for at a count the device lacks is otherwise a validation error, which is
 a crash. Roblox's own levels for the view distance: about 500 studs at
 Level01, 100000 at Level21; the rest of the table is an estimate until
 the next device run measures it.)
 
-**Automatic** (`quality::Auto`; Studio's QualityLevel.Automatic) watches
+**Automatic** (`graphics::Auto`; Studio's QualityLevel.Automatic) watches
 the frames the 3D view draws back to back (frames shown again from the
 last one and frames after an idle pause don't count): the median frame
 over the last 2 s longer than 1.35 × a 60 Hz refresh → a level down; 20 s
@@ -626,7 +647,7 @@ by the swapchain or the display's pacing took the level down for nothing
 before; where it has none, the interval is all there is. Each step logs
 `graphics quality (automatic): level N: …` with the settings in effect.
 
-The individual settings (the window's rows; `quality::Overrides`): Render
+The individual settings (the window's rows; `graphics::Overrides`): Render
 Distance (500 to 10,000 studs or Unlimited), Part Detail (Low / Medium /
 High: parts under 4 / 2 / 1 px skipped), Texture Quality (256² / 512² /
 1024²), Texture Filtering (trilinear, or 2× to 16× anisotropic), Shading
@@ -976,8 +997,11 @@ and, since xbuild stores libraries compressed and the manifest doesn't
 say `extractNativeLibs=false`, the installer unpacks them into the app's
 native library folder (`ApplicationInfo.nativeLibraryDir`) as real
 files. That folder is where libadrenotools must find its hook libraries
-and the driver. At start, in `android_main` before eframe exists — while
-the launch screen is up — `turnip::activate()`:
+and the driver. (xbuild checks the bundled libraries' NEEDED names
+against its NDK sysroot before packing; PanVK's `libhardware.so` isn't
+there, so the script marks it — "xbuild quirks worth knowing" above.)
+At start, in `android_main` before eframe exists — while the launch
+screen is up — `turnip::activate()`:
 
 1. Decides whether the device qualifies and which driver it gets
    (`turnip::Mesa`: PanVK when `ro.hardware.vulkan` / `ro.hardware.egl`

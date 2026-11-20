@@ -285,7 +285,7 @@ pub fn wgpu_options_with(
                     d.memory_hints = egui_wgpu::wgpu::MemoryHints::MemoryUsage;
                 }
                 // The 32-bit float scene target of the Low / non-HDR
-                // settings (quality.rs scene_format), and the driver's
+                // settings (graphics.rs scene_format), and the driver's
                 // pipeline cache the renderer keeps on disk so a second
                 // start compiles no shaders (render.rs PipelineCache).
                 let want = egui_wgpu::wgpu::Features::RG11B10UFLOAT_RENDERABLE | egui_wgpu::wgpu::Features::PIPELINE_CACHE;

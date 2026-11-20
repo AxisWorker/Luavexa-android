@@ -99,15 +99,15 @@ pub struct Layout {
     /// Where each panel sat last in the main window.
     pub homes: HashMap<String, Home>,
     pub zoom: Option<f32>,
-    /// The 3D view's graphics quality (View > Graphics Quality; quality.rs
+    /// The 3D view's graphics quality (View > Graphics Quality; graphics.rs
     /// `parse_level`: "auto", "1".."10", or the older "low" / "medium" /
     /// "high").
     #[serde(default)]
     pub quality: Option<String>,
     /// The graphics settings set apart from the level (View > Graphics
-    /// Settings; quality.rs `Overrides`).
+    /// Settings; graphics.rs `Overrides`).
     #[serde(default)]
-    pub graphics: Option<rustudio_render::quality::Overrides>,
+    pub graphics: Option<rustudio_render::graphics::Overrides>,
     pub ribbon_tab: Option<String>,
     pub run_type: Option<String>,
     pub show_grid: Option<bool>,
@@ -234,8 +234,8 @@ impl Layout {
         }
         // (RUSTUDIO_QUALITY, a device run's comparison, wins over the
         // saved level)
-        if let Some(q) = self.quality.as_deref().and_then(rustudio_render::quality::parse_level) {
-            if rustudio_render::quality::Graphics::env_level().is_none() {
+        if let Some(q) = self.quality.as_deref().and_then(rustudio_render::graphics::parse_level) {
+            if rustudio_render::graphics::Graphics::env_level().is_none() {
                 ed.set_quality(q);
             }
         }

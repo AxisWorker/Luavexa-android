@@ -21,7 +21,7 @@ use rustudio_core::math::Xform;
 
 /// The scene is lit in linear light into a target of the quality
 /// settings' format (`Renderer::scene_format`: Rgba16Float, or the 32-bit
-/// Rg11b10Ufloat without HDR, quality.rs)...
+/// Rg11b10Ufloat without HDR, graphics.rs)...
 /// ...and the post pass writes display values (gamma 2.0) here.
 const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Depth of field's targets keep the circle of confusion in alpha
@@ -29,7 +29,7 @@ const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DOF_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// The see-through encoding's copy of the scene (SeeThrough): its alpha
 /// marks the pixels a layer covered, which the 32-bit scene format
-/// (Rg11b10Ufloat, quality.rs) has no channel for; so always this one.
+/// (Rg11b10Ufloat, graphics.rs) has no channel for; so always this one.
 const SEE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// EVSM moments of the local light shadow maps (Studio's warps of 5.54 keep
@@ -515,7 +515,7 @@ mod gpu_tests {
         limits.max_sampled_textures_per_shader_stage = 24;
         limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() })).unwrap();
-        let mut renderer = Renderer::new(&device, &queue, None, Renderer::msaa_support_of(&adapter), crate::quality::RenderSettings::level(crate::quality::LEVELS));
+        let mut renderer = Renderer::new(&device, &queue, None, Renderer::msaa_support_of(&adapter), crate::graphics::RenderSettings::level(crate::graphics::LEVELS));
         let mut vox = rustudio_core::terrain::Voxels::empty();
         // Same FillBlock: x,z in [0,32), y in [-16,0), full Grass voxels.
         for x in 0..8 { for y in -4..0 { for z in 0..8 { vox.set([x,y,z],2,1.0); } } }
@@ -556,15 +556,15 @@ mod gpu_tests {
         let desc = wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() };
         let (device, queue) = pollster::block_on(adapter.request_device(&desc))
             .unwrap_or_else(|e| panic!("{} ({:?}) refused rustudio's limits: {e}", info.name, info.backend));
-        // Every quality level's build (quality.rs): the multisampled
+        // Every quality level's build (graphics.rs): the multisampled
         // shaders and the plain one, the HDR scene format and (where the
         // device has it) the 32-bit one, the light shadow atlas on and off,
         // the lite shader of the low levels and (RUSTUDIO_LITE=31) the
         // litest one, the samplers' anisotropy.
-        let mut builds: Vec<(String, crate::quality::RenderSettings)> =
-            (1..=crate::quality::LEVELS).map(|level| (format!("level {level}"), crate::quality::RenderSettings::level(level))).collect();
-        let mut litest = crate::quality::RenderSettings::level(1);
-        litest.lite = crate::quality::LITE_ALL;
+        let mut builds: Vec<(String, crate::graphics::RenderSettings)> =
+            (1..=crate::graphics::LEVELS).map(|level| (format!("level {level}"), crate::graphics::RenderSettings::level(level))).collect();
+        let mut litest = crate::graphics::RenderSettings::level(1);
+        litest.lite = crate::graphics::LITE_ALL;
         builds.push(("level 1, RUSTUDIO_LITE=31".to_string(), litest.normalized()));
         let mut built = std::collections::HashSet::new();
         for (name, settings) in builds {
@@ -605,7 +605,7 @@ mod gpu_tests {
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         // A phone's starting level (512² arrays), then more materials than
         // the arrays' first capacity, one per pack.
-        let settings = crate::quality::RenderSettings::level(rustudio_core::mech::QUALITY_DEFAULT_PHONE).normalized();
+        let settings = crate::graphics::RenderSettings::level(rustudio_core::mech::QUALITY_DEFAULT_PHONE).normalized();
         let mut r = Renderer::new(&device, &queue, None, Renderer::msaa_support_of(&adapter), settings);
         let packs: Vec<_> = (1..=9u64).map(|p| crate::matpack::test_maps(p, [p as u8 * 20, 90, 60])).collect();
         for (i, m) in packs[..6].iter().enumerate() {
@@ -617,7 +617,7 @@ mod gpu_tests {
         assert!(r.materials.capacity >= 6);
         // Larger arrays (the level went up): made aside, filled as the
         // maps come back; new materials go to both.
-        let up = crate::quality::RenderSettings::level(crate::quality::LEVELS);
+        let up = crate::graphics::RenderSettings::level(crate::graphics::LEVELS);
         r.set_settings(&device, &queue, &up);
         assert_eq!(r.texture_size(), 1024);
         assert!(r.materials_next.is_some() && r.materials_next_pending.len() == 6);
@@ -626,7 +626,7 @@ mod gpu_tests {
         r.materials_tick(&device, &queue);
         // Smaller arrays (the level went down): the layers copied from the
         // matching level, then more materials.
-        let down = crate::quality::RenderSettings::level(1);
+        let down = crate::graphics::RenderSettings::level(1);
         r.set_settings(&device, &queue, &down);
         assert_eq!((r.materials.size, r.materials.cpu.len()), (256, 7));
         assert!(r.materials_next.is_none());
@@ -1285,7 +1285,7 @@ struct Target {
     display: wgpu::Texture,
     display_view: wgpu::TextureView,
     /// The panel's size in pixels: the display image is scaled up to it
-    /// when it differs from `size` (quality.rs `render_scale`,
+    /// when it differs from `size` (graphics.rs `render_scale`,
     /// `motion_scale`).
     out_size: [u32; 2],
     /// EASU then RCAS from `display` to the panel's size, when the frame
@@ -1578,7 +1578,7 @@ pub enum Pipe {
     /// One of the near field's passes (NEAR_ENTRIES).
     Near(usize),
     Post,
-    /// The frame scaled up to the panel (quality.rs `upscale`): EASU, then RCAS.
+    /// The frame scaled up to the panel (graphics.rs `upscale`): EASU, then RCAS.
     Easu,
     Rcas,
 }
@@ -1692,7 +1692,7 @@ impl Pipe {
 
     /// Whether the settings can draw with this pipeline at all (the
     /// warm-up skips the others; turned on later they compile on first use).
-    fn wanted(self, s: &crate::quality::RenderSettings) -> bool {
+    fn wanted(self, s: &crate::graphics::RenderSettings) -> bool {
         match self {
             Pipe::Shadow | Pipe::TerrainShadow => s.sun_cascades > 0,
             Pipe::TerrainShadowBack => false, // (a diagnostic: RUSTUDIO_CULL_BACK)
@@ -1750,7 +1750,7 @@ impl DiskCache {
 }
 
 /// What every pipeline is made from: the shader module, the layouts, the
-/// scene's format and sample count (quality.rs).
+/// scene's format and sample count (graphics.rs).
 struct PipeFactory {
     device: wgpu::Device,
     shader: wgpu::ShaderModule,
@@ -2047,7 +2047,7 @@ impl Pipes {
 
     /// Makes every pipeline `settings` can use (all of them with None),
     /// then writes the driver's cache to disk.
-    pub fn build_all(&self, settings: Option<&crate::quality::RenderSettings>) {
+    pub fn build_all(&self, settings: Option<&crate::graphics::RenderSettings>) {
         for p in Pipe::all() {
             if self.dropped.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
@@ -2074,15 +2074,15 @@ pub struct Renderer {
     highlight: Option<crate::highlight::HighlightPass>,
     /// The last frame's view-projection (Highlights draw with it).
     last_view_proj: Mat4,
-    /// The quality settings in force (quality.rs; `set_settings`), fitted
+    /// The quality settings in force (graphics.rs; `set_settings`), fitted
     /// to the device's multisampling (`msaa_support`).
-    settings: crate::quality::RenderSettings,
-    /// The sample counts the device has (quality::MsaaSupport): settings
+    settings: crate::graphics::RenderSettings,
+    /// The sample counts the device has (graphics::MsaaSupport): settings
     /// asking for others are fitted to these, in `new` and `set_settings`.
-    msaa_support: crate::quality::MsaaSupport,
+    msaa_support: crate::graphics::MsaaSupport,
     /// The settings the pipelines, layouts and atlases were built for
     /// (`RenderSettings::build_key`): a change rebuilds them.
-    built_key: crate::quality::BuildKey,
+    built_key: crate::graphics::BuildKey,
     /// The scene's sample count and colour format, from the settings.
     samples: u32,
     scene_format: wgpu::TextureFormat,
@@ -2241,16 +2241,16 @@ impl egui_wgpu::CallbackTrait for SubmitDeferred {
 
 impl Renderer {
     /// The sample counts `adapter` multisamples every one of the renderer's
-    /// formats at: the two scene formats (quality.rs scene_format), the
+    /// formats at: the two scene formats (graphics.rs scene_format), the
     /// depth, the see-through copy (SEE_FORMAT) and the highlight masks.
-    pub fn msaa_support_of(adapter: &wgpu::Adapter) -> crate::quality::MsaaSupport {
+    pub fn msaa_support_of(adapter: &wgpu::Adapter) -> crate::graphics::MsaaSupport {
         let mut formats = vec![wgpu::TextureFormat::Rgba16Float, DEPTH_FORMAT, SEE_FORMAT, crate::highlight::MASK_FORMAT];
         // (the 32-bit scene format only where the device renders to it, as
-        // quality.rs scene_format picks it; elsewhere it has no counts at all)
+        // graphics.rs scene_format picks it; elsewhere it has no counts at all)
         if adapter.features().contains(wgpu::Features::RG11B10UFLOAT_RENDERABLE) {
             formats.push(wgpu::TextureFormat::Rg11b10Ufloat);
         }
-        crate::quality::MsaaSupport::of(adapter, &formats)
+        crate::graphics::MsaaSupport::of(adapter, &formats)
     }
 
     /// `info`: the adapter, for the pipeline cache kept on disk (None: no
@@ -2260,7 +2260,7 @@ impl Renderer {
     /// `build_all_pipelines` makes them all now.
     pub fn new(
         device: &wgpu::Device, queue: &wgpu::Queue, info: Option<&wgpu::AdapterInfo>,
-        msaa_support: crate::quality::MsaaSupport, settings: crate::quality::RenderSettings,
+        msaa_support: crate::graphics::MsaaSupport, settings: crate::graphics::RenderSettings,
     ) -> Self {
         let asked = settings.normalized();
         let settings = asked.fitted(msaa_support);
@@ -2949,7 +2949,7 @@ impl Renderer {
     /// format, the shadow scale and the light shadow atlas
     /// (`RenderSettings::build_key`) rebuild the pipelines, the shadow
     /// atlases and the environment probe (its capture starts over).
-    pub fn set_settings(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, settings: &crate::quality::RenderSettings) {
+    pub fn set_settings(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, settings: &crate::graphics::RenderSettings) {
         let asked = settings.normalized();
         let settings = asked.fitted(self.msaa_support);
         if settings == self.settings {
@@ -4555,7 +4555,7 @@ impl Renderer {
             }
             globals.env_spec[3] = pf.blend;
         }
-        // The quality settings' pass switches (quality.rs): a pass that is
+        // The quality settings' pass switches (graphics.rs): a pass that is
         // off has no targets and nothing reads them; the globals tell the
         // shaders so.
         let settings = self.settings.clone();
@@ -4637,7 +4637,7 @@ impl Renderer {
         let section = rustudio_core::bench::scope("vpr_cull");
         let planes = frustum(frame.cull_view_proj);
         // A part whose bounding radius covers less than `detail_px` pixels
-        // is skipped (quality.rs: mech::LOD_MIN_PX at the top level), and
+        // is skipped (graphics.rs: mech::LOD_MIN_PX at the top level), and
         // so is anything wholly beyond the view distance.
         let focal = size[1] as f32 * 0.5 / (frame.fov_y * 0.5).tan().max(1e-3);
         let lod_k = settings.detail_px / focal;
@@ -6270,12 +6270,12 @@ fn to_raw(p: &PartDraw, bias: f32) -> InstanceRaw {
 /// settings' constants (MSAA_SAMPLES, SUN_CASCADES, the lite shader's
 /// LITE bits, RCAS_SHARPNESS) and shader.wgsl, its multisampled depth
 /// bindings made plain ones when MSAA is off.
-fn shader_source(settings: &crate::quality::RenderSettings) -> String {
+fn shader_source(settings: &crate::graphics::RenderSettings) -> String {
     let quality = format!(
         "const MSAA_SAMPLES: i32 = {};\nconst SUN_CASCADES: i32 = {};\nconst LITE: u32 = {}u;\nconst RCAS_SHARPNESS: f32 = {:?};\n",
         settings.msaa.max(1),
         settings.sun_cascades.min(crate::sun_shadow::CASCADES as u32),
-        settings.lite & crate::quality::LITE_ALL,
+        settings.lite & crate::graphics::LITE_ALL,
         rustudio_core::mech::UPSCALE_SHARPNESS
     );
     let grass = format!("const GRASS_RADIUS: f32 = {:?};\nconst GRASS_FADE_LEN: f32 = {:?};\nconst GRASS_NEAR_RADIUS: f32 = {:?};\nconst GRASS_NEAR_FADE_LEN: f32 = {:?};\n", rustudio_core::mech::GRASS_RADIUS, rustudio_core::mech::GRASS_FADE_LEN, rustudio_core::mech::GRASS_NEAR_RADIUS, rustudio_core::mech::GRASS_NEAR_FADE_LEN);

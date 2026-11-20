@@ -312,7 +312,7 @@ impl Editor {
             "graphics_settings" => self.ui.graphics_settings = !self.ui.graphics_settings,
             "quality_auto" => self.set_quality(None),
             q if q.strip_prefix("quality_").and_then(|n| n.parse::<u8>().ok()).is_some() => {
-                let n: u8 = q["quality_".len()..].parse().unwrap_or(rustudio_render::quality::LEVELS);
+                let n: u8 = q["quality_".len()..].parse().unwrap_or(rustudio_render::graphics::LEVELS);
                 self.set_quality(Some(n));
             }
             "full_screen" => {

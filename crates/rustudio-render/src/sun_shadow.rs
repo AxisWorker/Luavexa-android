@@ -22,7 +22,7 @@ const ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// Texels across, as a fraction of Studio's sizes (`mech::SUN_CASCADE_TILES`,
 /// the atlas, the depth map): the quality settings' `shadow_scale`
-/// (quality.rs: 1 at High, 0.75 at Medium, on a phone's Low
+/// (graphics.rs: 1 at High, 0.75 at Medium, on a phone's Low
 /// `mech::SUN_SHADOW_TEXEL_SCALE_PHONE`, a quarter of the shadow fill and
 /// blur work for cascades whose texels are still finer than the view's
 /// pixels; `RUSTUDIO_SHADOW_SCALE` overrides). The blur stays the same

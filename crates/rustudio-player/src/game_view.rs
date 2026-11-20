@@ -2102,7 +2102,7 @@ impl Game {
 
     /// The 3D view: the frame drawn (or the last one shown again,
     /// `ViewReuse`) and put on `painter`. `settings` are the graphics
-    /// settings (quality.rs: the level, the settings set apart from it,
+    /// settings (graphics.rs: the level, the settings set apart from it,
     /// RUSTUDIO_* switches): the view is drawn at their render scale, or
     /// the motion scale while the camera moves or a game runs (`Motion`),
     /// and the renderer scales it up to the panel. `live`: time shows on
@@ -2116,7 +2116,7 @@ impl Game {
         mut lines: Vec<LineVertex>,
         overlay: &[PartDraw],
         started: std::time::Instant,
-        settings: &rustudio_render::quality::RenderSettings,
+        settings: &rustudio_render::graphics::RenderSettings,
         live: bool,
     ) {
         let vp_prepare = rustudio_core::bench::scope("vp_prepare");
@@ -3352,7 +3352,7 @@ impl Game {
         self.sync_view_draws(&ctx);
         // (the standalone player: the graphics settings from the
         // environment alone, no Graphics Settings window)
-        let settings = rustudio_render::quality::Graphics::platform_default().settings();
+        let settings = rustudio_render::graphics::Graphics::platform_default().settings();
         self.draw_world(&ctx, &painter, rect, Vec::new(), &[], started, &settings, false);
         let gui_took = self.draw_view_gui(&ctx, &painter, rect, &resp, true, &[]);
         self.render_viewport_frames(&Default::default());

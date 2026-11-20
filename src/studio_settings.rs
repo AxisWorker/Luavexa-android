@@ -312,7 +312,7 @@ fn apply(i: usize) {
 
 /// Rendering > Editor Quality Level (`settings().Rendering.EditQualityLevel`):
 /// Studio's QualityLevel value, 0 Automatic, 1..=21 Level01..Level21
-/// (quality.rs maps it onto the 1–10 bar).
+/// (graphics.rs maps it onto the 1–10 bar).
 pub fn edit_quality_level() -> u32 {
     match get("RenderSettings", "EditQualityLevel") {
         Some(Val::Enum(e)) => e.min(21),

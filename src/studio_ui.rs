@@ -260,7 +260,7 @@ pub const VIEW: &[M] = &[
     I("Zoom In", "Ctrl+=", "zoom_in"),
     I("Zoom Out", "Ctrl+-", "zoom_out"),
     I("Full Screen", "F11", "full_screen"),
-    // The 3D view's graphics quality (src/quality.rs): Studio's 1–10 bar
+    // The 3D view's graphics quality (crates/rustudio-render/src/graphics.rs): Studio's 1–10 bar
     // (view distance, textures, MSAA, the scene's format, shadows, the
     // post passes) or Automatic, by the frame rate; the window has the
     // bar and each setting apart from it (src/graphics_settings.rs).

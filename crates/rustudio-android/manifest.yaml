@@ -164,6 +164,8 @@ android:
   # it builds, so libs/x86_64 exists too, empty. The libraries are stored
   # compressed, so the installer extracts them to the app's native library
   # folder (no extractNativeLibs=false), which is where libadrenotools has
-  # to find its hook libraries and the driver.
+  # to find its hook libraries and the driver. xbuild checks their NEEDED
+  # names against its NDK sysroot; fetch-turnip.sh marks the system
+  # libraries the NDK doesn't export (docs/ANDROID.md, "xbuild quirks").
   runtime_libs:
     - libs

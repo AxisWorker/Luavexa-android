@@ -79,9 +79,37 @@
 #                                          one is found; kept as they are
 #                                          otherwise)
 #   FORCE=1                                replace files already there
+#   X_CACHE_DIR=<dir>                      xbuild's cache, for the sysroot
+#                                          markers (below; default
+#                                          $XDG_CACHE_HOME/x, ~/.cache/x,
+#                                          ~/Library/Caches/x on macOS)
+#   XBUILD_SYSROOT=0                       no sysroot markers (packaging
+#                                          with something other than
+#                                          xbuild)
 # Files already in libs/arm64-v8a/ are kept unless FORCE=1, so a build of
 # your own can be dropped in by hand (git ignores the .so files; `git add
 # -f` to commit them).
+#
+# xbuild's library check, last: before it packs the APK, xbuild reads
+# every bundled library's NEEDED list (llvm-readobj) and wants each name
+# either bundled too or in its NDK sysroot (~/.cache/x/Android.ndk/usr/lib/
+# aarch64-linux-android and the minSdk's folder under it), else it stops:
+# "Failed to collect all required libraries for libvulkan_panfrost.so …
+# Shared library `libhardware.so` not found" (xbuild/src/command/build.rs
+# at the workflow's XBUILD_REV). PanVK links libhardware.so (Mesa's
+# Android gralloc path) and libc++.so: system libraries every device has
+# (/system/lib64; VNDK-SP) that the NDK doesn't export. The app doesn't
+# link them — libadrenotools loads the driver in a namespace cloned from
+# the system Vulkan loader's own (hook_impl.cpp, where libc++.so is linked
+# over by name), which reaches them. xbuild only reads the *names* in its
+# sysroot folders, so an empty marker file there makes it treat the
+# library as one the device provides, which it is; nothing is added to
+# the APK (a stub in libs/ would be, and would shadow the real library in
+# the driver's namespace). xbuild fetches its sysroot during the first
+# `x build`, after cargo's half hour and before this check, so when the
+# folder isn't there yet the same tarball goes in first (the xbuild
+# release artifact the pinned commit names, download.rs
+# WorkItem::VERSION; xbuild sees the folder and skips its download).
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -165,19 +193,8 @@ fetch() {
 strip_debug() {
   local name="$1"; shift
   [ "${STRIP:-1}" != "0" ] || { echo "$name: STRIP=0, debug info kept"; return; }
-  local tool=""
-  if command -v llvm-strip >/dev/null 2>&1; then
-    tool="$(command -v llvm-strip)"
-  else
-    local ndk
-    for ndk in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}" "${ANDROID_NDK_LATEST_HOME:-}"; do
-      [ -n "$ndk" ] || continue
-      local cand
-      for cand in "$ndk"/toolchains/llvm/prebuilt/*/bin/llvm-strip; do
-        if [ -x "$cand" ]; then tool="$cand"; break 2; fi
-      done
-    done
-  fi
+  local tool
+  tool="$(llvm_tool llvm-strip)"
   if [ -z "$tool" ]; then
     echo "$name: no llvm-strip found (PATH, ANDROID_NDK_HOME / ANDROID_NDK_ROOT / ANDROID_NDK_LATEST_HOME); debug info kept"
     return
@@ -189,6 +206,100 @@ strip_debug() {
     after=$(stat -c %s "$f")
     [ "$after" -eq "$before" ] || echo "$name: $(basename "$f") $before -> $after bytes (debug info stripped)"
   done
+}
+
+# llvm_tool <name...>: the first of the named LLVM tools found on PATH or
+# in an NDK named by ANDROID_NDK_HOME / ANDROID_NDK_ROOT /
+# ANDROID_NDK_LATEST_HOME; prints its path, or nothing.
+llvm_tool() {
+  local name ndk cand
+  for name in "$@"; do
+    if command -v "$name" >/dev/null 2>&1; then
+      command -v "$name"
+      return
+    fi
+  done
+  for ndk in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}" "${ANDROID_NDK_LATEST_HOME:-}"; do
+    [ -n "$ndk" ] || continue
+    for name in "$@"; do
+      for cand in "$ndk"/toolchains/llvm/prebuilt/*/bin/"$name"; do
+        if [ -x "$cand" ]; then echo "$cand"; return; fi
+      done
+    done
+  done
+}
+
+# needed_libs <reader> <file>: the file's NEEDED entries, one per line
+# (llvm-readobj's --needed-libs listing, or readelf -d's).
+needed_libs() {
+  case "$1" in
+    *llvm-readobj*) "$1" --needed-libs "$2" | sed -n '/^NeededLibraries \[/,/^\]/{/^  */s/^ *//p;}' ;;
+    *) "$1" -d "$2" | sed -n 's/.*(NEEDED).*\[\(.*\)\].*/\1/p' ;;
+  esac
+}
+
+# xbuild_sysroot_markers: the marker files xbuild's library check needs
+# for the bundled libraries (the comment at the top). The bundled set and
+# xbuild's two sysroot folders count as provided; every other NEEDED name
+# gets an empty file in the sysroot folder, and is named here.
+xbuild_sysroot_markers() {
+  if [ "${XBUILD_SYSROOT:-1}" = "0" ]; then
+    echo "xbuild: XBUILD_SYSROOT=0, no sysroot markers"
+    return
+  fi
+  local reader
+  reader="$(llvm_tool llvm-readobj llvm-readelf readelf)"
+  if [ -z "$reader" ]; then
+    echo "xbuild: no llvm-readobj / readelf found (PATH, ANDROID_NDK_HOME / ANDROID_NDK_ROOT / ANDROID_NDK_LATEST_HOME): the libraries' NEEDED lists weren't checked against xbuild's sysroot. If \`x build\` stops with \"Shared library \`<name>\` not found\", that is a system library the NDK doesn't export: \`touch ~/.cache/x/Android.ndk/usr/lib/aarch64-linux-android/<name>\` (the script's comment on the check)" >&2
+    return
+  fi
+  local xcache="${X_CACHE_DIR:-}"
+  if [ -z "$xcache" ]; then
+    case "$(uname -s)" in
+      Darwin) xcache="$HOME/Library/Caches/x" ;;
+      MINGW*|MSYS*|CYGWIN*) xcache="${LOCALAPPDATA:-$HOME/AppData/Local}/x" ;;
+      *) xcache="${XDG_CACHE_HOME:-$HOME/.cache}/x" ;;
+    esac
+  fi
+  local sysroot="$xcache/Android.ndk/usr/lib/aarch64-linux-android"
+  if [ ! -d "$sysroot" ]; then
+    # xbuild's own sysroot tarball (download.rs: WorkItem::xbuild_release
+    # of VERSION v0.1.0+3 at the pinned commit), unpacked where xbuild
+    # unpacks it, so its first `x build` finds the folder and goes on.
+    local url="https://github.com/rust-mobile/xbuild/releases/download/v0.1.0%2B3/Android.ndk.tar.zst"
+    if ! command -v unzstd >/dev/null 2>&1; then
+      echo "xbuild: its NDK sysroot isn't in $xcache yet and there is no unzstd to unpack it with: no sysroot markers. Install zstd and run this script again, or run \`x build\` once (it fetches the sysroot; the build then stops at the library check) and this script after it" >&2
+      return
+    fi
+    echo "xbuild: its NDK sysroot isn't in $xcache yet; fetching $url (70 MB) — xbuild would fetch the same at the next build"
+    mkdir -p "$xcache/download"
+    curl -fsSL --retry 3 -o "$xcache/download/Android.ndk.tar.zst" "$url"
+    tar --use-compress-program=unzstd -xf "$xcache/download/Android.ndk.tar.zst" -C "$xcache"
+    [ -d "$sysroot" ] || { echo "xbuild: $sysroot still missing after unpacking $url" >&2; exit 1; }
+  fi
+  local min_sdk
+  min_sdk="$(sed -n 's/^[[:space:]]*min_sdk_version:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$root/crates/rustudio-android/manifest.yaml" 2>/dev/null | head -n 1 || true)"
+  [ -n "$min_sdk" ] || min_sdk=26
+  local f need
+  local -a added=()
+  for f in "$dest"/*.so; do
+    [ -f "$f" ] || continue
+    while IFS= read -r need; do
+      [ -n "$need" ] || continue
+      # libc++_shared.so xbuild copies out of the NDK itself.
+      [ "$need" != "libc++_shared.so" ] || continue
+      if [ -e "$dest/$need" ] || [ -e "$sysroot/$need" ] || [ -e "$sysroot/$min_sdk/$need" ]; then
+        continue
+      fi
+      : > "$sysroot/$need"
+      added+=("$need (for $(basename "$f"))")
+    done < <(needed_libs "$reader" "$f")
+  done
+  if [ "${#added[@]}" -eq 0 ]; then
+    echo "xbuild: every NEEDED library of the bundle is bundled or in its sysroot ($sysroot); nothing to mark"
+  else
+    echo "xbuild: system libraries the bundle needs that the NDK doesn't export, marked as provided in $sysroot (empty files; not in the APK): ${added[*]}"
+  fi
 }
 
 # fetch_file <name> <url-or-path> <sha256-or-empty> <file name in dest>
@@ -237,3 +348,4 @@ for f in libadrenotools.so libhook_impl.so libmain_hook.so libvulkan_freedreno.s
   [ -f "$dest/$f" ] || { echo "missing $dest/$f" >&2; exit 1; }
 done
 ls -l "$dest"
+xbuild_sysroot_markers

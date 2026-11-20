@@ -662,7 +662,7 @@ pub const SHADOW_SOFTNESS_BLUR: [f32; 2] = [1.71, 0.05]; // the blur's reach in 
 pub const SUN_SHADOW_ATLAS: [u32; 2] = [3200, 2048]; // rustudio's atlas for the four tiles (Studio shares a 4096 × 7680 one with the local lights)
 pub const SUN_CASCADE_ORIGINS: [[u32; 2]; 4] = [[2816, 1024], [2048, 1024], [2048, 0], [0, 0]]; // each tile's corner in that atlas
 pub const SUN_SHADOW_TEXEL_SCALE_PHONE: f32 = 0.5; // the low graphics quality levels' cascade tiles, atlas and depth map at this fraction of the texels across (a quarter of the shadow fill and blur work; RUSTUDIO_SHADOW_SCALE overrides) (estimated; a phone GPU has a tenth of a desktop card's bandwidth)
-// Graphics quality levels (quality.rs; docs/MECHANICS.md "Graphics quality levels"): Studio's
+// Graphics quality levels (graphics.rs; docs/MECHANICS.md "Graphics quality levels"): Studio's
 // Settings slider, 1 (cheapest) to 10, each a row of these tables (index = level − 1). Studio's
 // QualityLevel enum spans Level01..Level21 behind the same slider; level 10 is Studio's defaults.
 pub const QUALITY_LEVELS: u8 = 10;

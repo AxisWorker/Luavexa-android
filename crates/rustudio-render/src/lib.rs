@@ -12,7 +12,7 @@
 
 pub mod render;
 pub mod gpu_timing;
-pub mod quality;
+pub mod graphics;
 pub mod perf_log;
 pub mod world_gui;
 pub mod sun_shadow;

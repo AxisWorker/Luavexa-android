@@ -440,7 +440,7 @@ pub mod touch {
 
     /// (The 3D view's first-run render scale, view distance, textures,
     /// MSAA, shadows and passes are graphics level 3's, in Automatic:
-    /// src/quality.rs, app.rs `Editor::graphics`.)
+    /// src/graphics.rs, app.rs `Editor::graphics`.)
     pub fn setup(app: &mut crate::app::RustudioApp, ctx: &egui::Context) {
         let saved = crate::layout_store::load();
         // (the window's size isn't known until the first frame: auto_zoom)

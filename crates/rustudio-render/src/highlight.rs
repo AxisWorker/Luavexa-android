@@ -317,7 +317,7 @@ impl HighlightPass {
                     })
                     .create_view(&Default::default())
             };
-            // (without MSAA — a quality setting, quality.rs — the masks are
+            // (without MSAA — a quality setting, graphics.rs — the masks are
             // drawn straight into the resolved one)
             let one = tex("highlight mask", 1, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
             let ms = if samples > 1 { tex("highlight mask msaa", samples, wgpu::TextureUsages::RENDER_ATTACHMENT) } else { one.clone() };

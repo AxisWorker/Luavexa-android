@@ -128,7 +128,7 @@ impl Game {
         // graphics settings: app.rs; this is the player's, at the
         // platform's default level)
         let renderer = render_state.as_ref().map(|rs| {
-            let settings = rustudio_render::quality::Graphics::platform_default().settings();
+            let settings = rustudio_render::graphics::Graphics::platform_default().settings();
             Renderer::new(&rs.device, &rs.queue, Some(&rs.adapter.get_info()), Renderer::msaa_support_of(&rs.adapter), settings)
         });
         Self {

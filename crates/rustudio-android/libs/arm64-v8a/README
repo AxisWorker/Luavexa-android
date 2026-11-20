@@ -4,3 +4,6 @@
 # libvulkan_panfrost.so (the PanVK driver, for Mali; PANVK=0 leaves it out)
 # here before `x build`. The .so files are git-ignored; an empty folder
 # builds a plain APK.
+# xbuild checks each library's NEEDED names against its NDK sysroot
+# before packing; the script marks the system libraries it doesn't export
+# (PanVK's libhardware.so) there — docs/ANDROID.md, "xbuild quirks".

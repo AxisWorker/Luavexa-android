@@ -4,7 +4,7 @@
 //! anti-aliasing, the scene's format, render scale and the scale while the
 //! camera moves, Play's frame-rate cap, the sun's and the lights' shadows,
 //! ambient occlusion, bloom, depth of field, clouds, reflections — each
-//! "Auto" (from the level) unless chosen (src/quality.rs `Graphics`,
+//! "Auto" (from the level) unless chosen (crates/rustudio-render/src/graphics.rs `Graphics`,
 //! `Overrides`). The choices
 //! live in the saved layout (layout_store.rs); the level mirrors Studio
 //! Settings > Rendering > Editor Quality Level. Built for a thumb: one
@@ -13,7 +13,7 @@
 use egui::{ComboBox, Grid, RichText, Slider};
 
 use crate::app::Editor;
-use rustudio_render::quality::{Overrides, RenderSettings, Shadows, LEVELS};
+use rustudio_render::graphics::{Overrides, RenderSettings, Shadows, LEVELS};
 
 impl Editor {
     /// The window, while View > Graphics Settings has it open.
@@ -116,7 +116,7 @@ impl Editor {
                 &mut o.lite,
                 lite(lv.lite),
                 &[(true, "Simple"), (false, "Full")],
-                |v| lite(if *v { rustudio_render::quality::LITE_PHONE } else { 0 }).to_string(),
+                |v| lite(if *v { rustudio_render::graphics::LITE_PHONE } else { 0 }).to_string(),
             );
             choice(
                 ui,
@@ -179,7 +179,7 @@ impl Editor {
                 g.over = Overrides::default();
             }
             if ui.button("Restore Defaults").clicked() {
-                *g = rustudio_render::quality::Graphics::platform_default();
+                *g = rustudio_render::graphics::Graphics::platform_default();
             }
         });
         ui.separator();
@@ -189,7 +189,7 @@ impl Editor {
             None => egui_wgpu::wgpu::TextureFormat::Rgba16Float,
         };
         ui.small(format!("Drawing at {}", s.describe(scene)));
-        if rustudio_render::quality::Graphics::env_level().is_some() {
+        if rustudio_render::graphics::Graphics::env_level().is_some() {
             ui.small(RichText::new("RUSTUDIO_QUALITY is set for this run: it overrides the level.").weak());
         }
         #[cfg(target_os = "android")]
