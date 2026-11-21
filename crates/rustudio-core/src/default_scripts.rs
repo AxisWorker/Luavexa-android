@@ -54,7 +54,9 @@
 //!   R6 `content/avatar/scripts/humanoidAnimatePlayEmote.rbxm`).
 //!
 //! A place's own script of the same name (in StarterPlayerScripts or
-//! StarterCharacterScripts) wins, as in Studio.
+//! StarterCharacterScripts) wins, as in Studio; a place that forked the old
+//! character `Sound` script (StarterCharacterScripts) keeps its sounds and
+//! gets no RbxCharacterSounds (`own_character_sounds`).
 
 use std::path::{Path, PathBuf};
 
@@ -115,6 +117,24 @@ pub fn child_named(doc: &Document, parent: Ref, name: &str) -> Option<Ref> {
         .iter()
         .copied()
         .find(|c| doc.dom.get_by_ref(*c).is_some_and(|i| i.name == name))
+}
+
+/// Whether the place brought its own character sounds, so Roblox's
+/// RbxCharacterSounds stays out: a `RbxCharacterSounds` of its own in
+/// StarterPlayerScripts (Roblox's rule: a same-named object there replaces
+/// the default) or in StarterCharacterScripts (a game that put it there
+/// meant the same, and both would play every sound twice), or a fork of the
+/// old character `Sound` script in StarterCharacterScripts or its
+/// StarterCharacter — "you won't get the new system if you forked the old
+/// one" (Roblox staff, devforum "Sound script changes", t/373132).
+pub fn own_character_sounds(doc: &Document, sp: Ref, sps: Ref) -> bool {
+    if child_named(doc, sps, "RbxCharacterSounds").is_some() {
+        return true;
+    }
+    let scs = doc.find_child(sp, "StarterCharacterScripts");
+    let starter = child_named(doc, sp, "StarterCharacter");
+    scs.is_some_and(|scs| ["RbxCharacterSounds", "Sound"].iter().any(|n| child_named(doc, scs, n).is_some()))
+        || starter.is_some_and(|m| child_named(doc, m, "Sound").is_some())
 }
 
 fn read(path: &Path) -> Option<String> {
@@ -443,6 +463,9 @@ fn insert_player_scripts_from(doc: &mut Document, root_dir: &Path) -> Result<Vec
             for child in tree.children {
                 if child.name == "StarterPlayerScripts" {
                     for c in child.children {
+                        if c.name == "RbxCharacterSounds" && own_character_sounds(doc, sp, sps) {
+                            continue;
+                        }
                         if child_named(doc, sps, &c.name).is_none() {
                             added.push(if c.name == "RbxCharacterSounds" { "RbxCharacterSounds" } else { "StarterPlayerScripts" });
                             let r = doc.dom.insert(sps, c.builder());
@@ -491,7 +514,9 @@ fn insert_player_scripts_from(doc: &mut Document, root_dir: &Path) -> Result<Vec
         }
         b
     });
-    add(doc, "RbxCharacterSounds", sounds);
+    if !own_character_sounds(doc, sp, sps) {
+        add(doc, "RbxCharacterSounds", sounds);
+    }
     Ok(added)
 }
 
@@ -692,6 +717,67 @@ mod tests {
             ),
         );
         check(d, &["PlayerScriptsLoader", "RbxCharacterSounds"], true);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A place with character sounds of its own gets no RbxCharacterSounds,
+    /// in either layout: its own RbxCharacterSounds in StarterPlayerScripts
+    /// or StarterCharacterScripts, or a fork of the old character `Sound`
+    /// script in StarterCharacterScripts or its StarterCharacter (Roblox:
+    /// "you won't get the new system if you forked the old one").
+    #[test]
+    fn own_character_sounds_keep_roblox_s_out() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("rustudio-own-sounds-{}-{unique}", std::process::id()));
+        install_with_both_layouts(&root);
+        // A place whose `holder` (one of StarterPlayer's children) holds an
+        // instance named `name`.
+        let place = |flag: u32, holder: &str, name: &str| {
+            let mut d = place_with_flag(flag);
+            let root_ref = d.dom.root_ref();
+            let folder = |n: &str| {
+                let class = if n == "StarterCharacter" { "Model" } else { n };
+                let mut b = InstanceBuilder::new(class).with_name(n);
+                if n == holder {
+                    let script_class = if name == "Sound" { "Script" } else { "LocalScript" };
+                    b = b.with_child(InstanceBuilder::new(script_class).with_name(name));
+                }
+                b
+            };
+            d.dom.insert(
+                root_ref,
+                InstanceBuilder::new("StarterPlayer")
+                    .with_name("StarterPlayer")
+                    .with_child(folder("StarterPlayerScripts"))
+                    .with_child(folder("StarterCharacterScripts"))
+                    .with_child(folder("StarterCharacter")),
+            );
+            d
+        };
+        let roblox_sounds = |d: &Document| {
+            let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
+            let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
+            child_named(d, sps, "RbxCharacterSounds").filter(|r| child_named(d, *r, "AtomicBinding").is_some())
+        };
+        for flag in [0, 2] {
+            for (holder, name) in [
+                ("StarterPlayerScripts", "RbxCharacterSounds"),
+                ("StarterCharacterScripts", "RbxCharacterSounds"),
+                ("StarterCharacterScripts", "Sound"),
+                ("StarterCharacter", "Sound"),
+            ] {
+                let mut d = place(flag, holder, name);
+                let added = insert_player_scripts_from(&mut d, &root).unwrap();
+                assert!(!added.contains(&"RbxCharacterSounds"), "{flag} {holder}.{name}: {added:?}");
+                assert!(roblox_sounds(&d).is_none(), "{flag} {holder}.{name}");
+            }
+            // Without any of its own: Roblox's.
+            let mut d = place(flag, "StarterCharacterScripts", "Health");
+            let added = insert_player_scripts_from(&mut d, &root).unwrap();
+            assert!(added.contains(&"RbxCharacterSounds"), "{flag}: {added:?}");
+            assert!(roblox_sounds(&d).is_some(), "{flag}");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

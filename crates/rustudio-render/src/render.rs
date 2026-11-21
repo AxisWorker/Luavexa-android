@@ -441,6 +441,18 @@ pub mod gpu_check {
         globals.view_proj = (proj * view).to_cols_array_2d();
         let sun = Vec3::new(0.3, 0.8, 0.2).normalize();
         let cascades = crate::sun_shadow::cascades(cam, -cam.normalize(), [0.5, 0.9], sun, 0.2);
+        // A projected decal can have no triangles on its chosen face.
+        let mut doc = rustudio_core::doc::Document::new_place();
+        let mut scene = crate::scene::Scene::default();
+        scene.sync(&mut doc);
+        let empty_mesh = r.add_mesh(&device, &[], &[], &[]);
+        let empty_draw = PartDraw {
+            xf: Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY },
+            size: Vec3::splat(4.0),
+            custom_mesh: Some(empty_mesh),
+            ..scene.parts[0].draw
+        };
+        r.set_item(Ref::new(), vec![empty_draw]);
         for quality in [None, Some(crate::quality::Profile::at(1)), Some(crate::quality::Profile::at(17))] {
             let frame = Frame {
                 globals,
@@ -607,6 +619,80 @@ mod gpu_tests {
         limits.max_storage_buffer_binding_size = 128 << 20;
         limits.max_uniform_buffer_binding_size = 64 << 10;
         build_and_draw(&instance, &adapter, Some(limits));
+    }
+
+    /// A mesh over max_buffer_size uploads empty instead of panicking in
+    /// wgpu (a 3.2M-triangle mesh against 256 MiB, issue #28); one whose
+    /// corners are over it but whose indexed form fits is still drawn.
+    #[test]
+    fn oversized_mesh_uploads_empty() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+            eprintln!("no GPU adapter: oversized_mesh_uploads_empty skipped");
+            return;
+        };
+        let limits = wgpu::Limits { max_buffer_size: 1 << 16, ..wgpu::Limits::downlevel_defaults() };
+        let desc = wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() };
+        let (device, _queue) = pollster::block_on(adapter.request_device(&desc)).unwrap();
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        // All distinct, so not indexed: 2048 * 64 bytes is twice the limit.
+        let verts: Vec<Vertex> = (0..2048)
+            .map(|i| Vertex { pos: [i as f32, 0.0, 0.0], normal: [0.0, 1.0, 0.0], uv: [0.0; 2], projection: [0.0; 4], color: [0.0; 4] })
+            .collect();
+        let big = Mesh::upload(&device, "loaded mesh", &verts, wgpu::BufferUsages::VERTEX, None);
+        let small = Mesh::upload(&device, "loaded mesh", &verts[..96], wgpu::BufferUsages::VERTEX, None);
+        // One triangle 1200 times: 76,800 bytes of corners, 3 vertices indexed.
+        let repeated: Vec<Vertex> = verts[..3].iter().cycle().take(1200).copied().collect();
+        let shared = Mesh::upload(&device, "loaded mesh", &repeated, wgpu::BufferUsages::VERTEX, None);
+        // Less than 25% sharing, but both buffers fit if indexed.
+        let lightly_shared: Vec<Vertex> = verts[..950].iter().cycle().take(1200).copied().collect();
+        let lightly_shared = Mesh::upload(&device, "loaded mesh", &lightly_shared, wgpu::BufferUsages::VERTEX, None);
+        // Even perfect vertex sharing cannot make this index buffer fit.
+        let too_many_indices: Vec<Vertex> = verts[..3].iter().cycle().take((1 << 14) + 2).copied().collect();
+        let too_many_indices = Mesh::upload(&device, "loaded mesh", &too_many_indices, wgpu::BufferUsages::VERTEX, None);
+        assert!(pollster::block_on(scope.pop()).is_none());
+        assert_eq!((big.count, small.count), (0, 96));
+        assert_eq!(shared.count, 1200);
+        assert!(shared.ibuf.is_some());
+        assert_eq!(lightly_shared.count, 1200);
+        assert!(lightly_shared.ibuf.is_some());
+        assert_eq!(too_many_indices.count, 0);
+    }
+
+    /// A CPU-skinned mesh keeps its slot while oversized and draws again
+    /// when its new pose can be indexed within the buffer limit.
+    #[test]
+    fn oversized_skinned_mesh_keeps_its_slot_and_recovers() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+            eprintln!("no GPU adapter: oversized_skinned_mesh_keeps_its_slot_and_recovers skipped");
+            return;
+        };
+        let max = 16u64 << 20;
+        let limits = wgpu::Limits { max_buffer_size: max, ..crate::gpu_caps::required_limits(&adapter.limits()) };
+        let desc = wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() };
+        let (device, queue) = pollster::block_on(adapter.request_device(&desc)).unwrap();
+        let caps = crate::gpu_caps::GpuCaps::of_adapter(&adapter, &device);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut r = Renderer::with_caps(&device, &queue, &caps);
+        // Distinct corners, so not indexed: just over the limit.
+        let corners = (max as usize / std::mem::size_of::<Vertex>() / 3 + 1) * 3;
+        let positions: Vec<Vec3> = (0..corners).map(|i| Vec3::new(i as f32, 0.0, 0.0)).collect();
+        let normals = vec![Vec3::Y; corners];
+        let first = r.set_mesh(&device, &queue, None, &positions, &normals, &[], &[]);
+        let meshes = r.meshes.len();
+        for _ in 0..3 {
+            assert_eq!(r.set_mesh(&device, &queue, Some(first), &positions, &normals, &[], &[]), first);
+        }
+        assert_eq!(r.meshes.len(), meshes);
+        assert_eq!(r.meshes[first as usize + BUILTIN_MESHES].count, 0);
+        let shared: Vec<_> = positions[..3].iter().cycle().take(corners).copied().collect();
+        assert_eq!(r.set_mesh(&device, &queue, Some(first), &shared, &normals, &[], &[]), first);
+        assert_eq!(r.meshes.len(), meshes);
+        let recovered = &r.meshes[first as usize + BUILTIN_MESHES];
+        assert_eq!(recovered.count as usize, corners);
+        assert!(recovered.ibuf.is_some());
+        assert!(pollster::block_on(scope.pop()).is_none());
     }
 
     use super::gpu_check::build_and_draw;
@@ -1230,6 +1316,9 @@ pub(crate) struct Mesh {
 impl Mesh {
     /// Binds the mesh (slot 0, and its indices) and draws `instances`.
     pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass, instances: std::ops::Range<u32>) {
+        if self.count == 0 {
+            return;
+        }
         pass.set_vertex_buffer(0, self.vbuf.slice(..));
         match &self.ibuf {
             Some(ib) => {
@@ -1240,29 +1329,56 @@ impl Mesh {
         }
     }
 
-    /// A triangle list as shared vertices and indices, when sharing saves
-    /// at least a quarter of the vertices (None: draw it as a list).
-    fn indexed(verts: &[Vertex]) -> Option<(Vec<Vertex>, Vec<u32>)> {
-        if verts.len() < 48 {
-            return None;
-        }
-        let mut seen: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::with_capacity(verts.len());
+    /// Shares identical corners, stopping as soon as the vertex budget is exceeded.
+    fn indexed(verts: &[Vertex], max_unique: usize) -> Option<(Vec<Vertex>, Vec<u32>)> {
+        use std::collections::hash_map::Entry;
+
+        let mut seen = std::collections::HashMap::<&[u8], u32>::with_capacity(verts.len().min(max_unique));
         let mut unique: Vec<Vertex> = Vec::new();
         let mut index = Vec::with_capacity(verts.len());
         for v in verts {
-            let key: &[u8] = bytemuck::bytes_of(v);
-            let at = *seen.entry(key).or_insert_with(|| {
-                unique.push(*v);
-                unique.len() as u32 - 1
-            });
+            let at = match seen.entry(bytemuck::bytes_of(v)) {
+                Entry::Occupied(entry) => *entry.get(),
+                Entry::Vacant(entry) => {
+                    if unique.len() == max_unique {
+                        return None;
+                    }
+                    let at = unique.len() as u32;
+                    entry.insert(at);
+                    unique.push(*v);
+                    at
+                }
+            };
             index.push(at);
         }
-        (unique.len() * 4 <= verts.len() * 3).then_some((unique, index))
+        Some((unique, index))
     }
 
-    /// Uploads `verts` (a triangle list), indexed when that saves work.
+    /// Uploads a triangle list, using indices when they save work or make
+    /// the mesh fit. A mesh that exceeds the device limit draws nothing.
     fn upload(device: &wgpu::Device, label: &str, verts: &[Vertex], usage: wgpu::BufferUsages, cull: Option<bool>) -> Mesh {
-        let (vdata, ibuf, remap, count) = match Self::indexed(verts) {
+        Self::try_upload(device, label, verts, usage, cull).unwrap_or_else(|| {
+            let max = device.limits().max_buffer_size;
+            log::warn!(target: "rustudio::gpu", "{label}: {} corners cannot fit in the GPU's {max}-byte buffer limit; not drawn", verts.len());
+            Self::upload(device, label, &[], usage, cull)
+        })
+    }
+
+    fn try_upload(device: &wgpu::Device, label: &str, verts: &[Vertex], usage: wgpu::BufferUsages, cull: Option<bool>) -> Option<Mesh> {
+        let max = device.limits().max_buffer_size;
+        let indexed = if std::mem::size_of_val(verts) as u64 > max {
+            let index_bytes = verts.len() as u64 * std::mem::size_of::<u32>() as u64;
+            if index_bytes > max {
+                return None;
+            }
+            Some(Self::indexed(verts, (max / std::mem::size_of::<Vertex>() as u64) as usize)?)
+        } else if verts.len() >= 48 {
+            // Use indices for a mesh that already fits when they save at least 25% of its vertices.
+            Self::indexed(verts, verts.len() - verts.len().div_ceil(4))
+        } else {
+            None
+        };
+        let (vdata, ibuf, remap, count) = match indexed {
             Some((unique, index)) => {
                 let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some(label),
@@ -1283,7 +1399,7 @@ impl Mesh {
             let p = Vec3::from(v.pos);
             Some(b.map_or((p, p), |(lo, hi)| (lo.min(p), hi.max(p))))
         });
-        Mesh { vbuf, count, ibuf, remap, bounds, cull, storage: false }
+        Some(Mesh { vbuf, count, ibuf, remap, bounds, cull, storage: false })
     }
 
     /// `corners` (one vertex per corner, as uploaded) as this mesh's
@@ -1470,6 +1586,18 @@ struct ViewportPipelines {
     overlay: wgpu::RenderPipeline,
     see_pipes: SeePipes,
     see: SeeThrough,
+}
+
+// Some OpenGL drivers lack the color-buffer-float extension that wgpu
+// requires for 32-bit float render targets. These passes only read the
+// channels they write, so the half-float equivalents need no shader changes.
+fn post_float_formats(device: &wgpu::Device) -> (wgpu::TextureFormat, wgpu::TextureFormat) {
+    use wgpu::TextureFormat::*;
+    if device.adapter_info().backend == wgpu::Backend::Gl {
+        (R16Float, Rg16Float)
+    } else {
+        (R32Float, Rg32Float)
+    }
 }
 
 impl ViewportPipelines {
@@ -1871,11 +1999,12 @@ impl ViewportPipelines {
                 cache: None,
             })
         };
-        let glass_resolve = ssao_pipe("glass depth", "fs_glass_depth", wgpu::TextureFormat::R32Float, None);
-        let ssao_down = ssao_pipe("ssao depth", "fs_ssao_down", wgpu::TextureFormat::R32Float, None);
-        let ssao_main = ssao_pipe("ssao", "fs_ssao", wgpu::TextureFormat::Rg32Float, None);
-        let ssao_blur_x = ssao_pipe("ssao blur across", "fs_ssao_blur_x", wgpu::TextureFormat::Rg32Float, None);
-        let ssao_blur_y = ssao_pipe("ssao blur down", "fs_ssao_blur_y", wgpu::TextureFormat::Rg32Float, None);
+        let (depth_format, ao_format) = post_float_formats(device);
+        let glass_resolve = ssao_pipe("glass depth", "fs_glass_depth", depth_format, None);
+        let ssao_down = ssao_pipe("ssao depth", "fs_ssao_down", depth_format, None);
+        let ssao_main = ssao_pipe("ssao", "fs_ssao", ao_format, None);
+        let ssao_blur_x = ssao_pipe("ssao blur across", "fs_ssao_blur_x", ao_format, None);
+        let ssao_blur_y = ssao_pipe("ssao blur down", "fs_ssao_blur_y", ao_format, None);
         // SSAOApply: the scene × the occlusion.
         let ssao_apply = ssao_pipe(
             "ssao apply",
@@ -1962,8 +2091,13 @@ fn single_sample_shader(source: String) -> String {
 }
 
 pub struct Renderer {
-    viewport: ViewportPipelines,
-    lower_samples: [Option<ViewportPipelines>; 2],
+    /// The viewport's passes per sample count (`sample_slot`), each built
+    /// on first use (`ensure_pipelines`): a frame needs the set for its
+    /// quality level's samples (quality.rs `samples`: one a pixel up to
+    /// level 16, as a weak GPU's levels are) and the probe's faces the 4x
+    /// set; a set is some thirty pipelines through the driver's compiler,
+    /// a second or more of a phone's start before the first frame.
+    pipelines: [Option<ViewportPipelines>; 3],
     terrain_layout: wgpu::BindGroupLayout,
     /// Skinned parts deformed on the GPU (skin_gpu.rs).
     skin: crate::skin_gpu::SkinGpu,
@@ -2762,8 +2896,6 @@ impl Renderer {
             let bg = Self::sky_globals_group(device, &layout, &globals_buf, &sky_view, &sky_sampler);
             (layout, bg)
         });
-        let viewport = ViewportPipelines::new(device, queue, &bgl, &tex_layout, &glass_layout, &terrain_bgl, SAMPLES, reduced);
-
         let meshes = build_meshes()
             .into_iter()
             .map(|verts| Mesh::upload(device, "mesh", &verts, wgpu::BufferUsages::VERTEX, Some(true)))
@@ -2772,8 +2904,7 @@ impl Renderer {
         let instance_cap = 1024;
         let line_cap = 4096;
         let mut r = Renderer {
-            viewport,
-            lower_samples: [None, None],
+            pipelines: [None, None, None],
             terrain_layout: terrain_bgl,
             skin: crate::skin_gpu::SkinGpu::new(device, caps.compute()),
             gui_fog: ([0.0, 1e9, 0.0, 0.0], [0.0; 3]),
@@ -3762,26 +3893,33 @@ impl Renderer {
     }
 
     fn pipelines(&self, samples: u32) -> &ViewportPipelines {
-        if samples == SAMPLES {
-            &self.viewport
-        } else {
-            self.lower_samples[sample_slot(samples)].as_ref().expect("viewport pipelines")
+        self.pipelines[sample_slot(samples)].as_ref().expect("viewport pipelines made by ensure_pipelines")
+    }
+
+    /// The viewport's passes for `samples` a pixel, built on first use.
+    fn ensure_pipelines(&mut self, rs: &egui_wgpu::RenderState, samples: u32) -> &ViewportPipelines {
+        let slot = sample_slot(samples);
+        if self.pipelines[slot].is_none() {
+            let t0 = Instant::now();
+            let made = ViewportPipelines::new(
+                &rs.device, &rs.queue, &self.globals_layout, &self.tex_layout, &self.glass_layout,
+                &self.terrain_layout, samples, self.reduced,
+            );
+            if cfg!(target_os = "android") || std::env::var_os("RUSTUDIO_STARTUP_TRACE").is_some() {
+                eprintln!("[startup] viewport pipelines for {samples} sample(s) a pixel built in {} ms", t0.elapsed().as_millis());
+            }
+            self.pipelines[slot] = Some(made);
         }
+        self.pipelines[slot].as_ref().expect("just made")
     }
 
     fn ensure_target(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], samples: u32) {
         if self.target.as_ref().is_some_and(|t| t.size == size && t.samples == samples) {
             return;
         }
+        self.ensure_pipelines(rs, samples);
         let device = &rs.device;
-        let viewport = if samples == SAMPLES {
-            &self.viewport
-        } else {
-            self.lower_samples[sample_slot(samples)].get_or_insert_with(|| ViewportPipelines::new(
-                device, &rs.queue, &self.globals_layout, &self.tex_layout, &self.glass_layout,
-                &self.terrain_layout, samples, self.reduced,
-            ))
-        };
+        let viewport = self.pipelines(samples);
         let tex =
             |label: &str, format: wgpu::TextureFormat, samples: u32, usage: wgpu::TextureUsages| {
                 device.create_texture(&wgpu::TextureDescriptor {
@@ -3836,7 +3974,8 @@ impl Renderer {
         let water_depth = tex("water surface depth", DEPTH_FORMAT, samples,
             wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
         let water_bg = viewport.water.bind(device, &scene_copy.create_view(&Default::default()), &depth_view);
-        let glass_depth = tex("glass depth snapshot", wgpu::TextureFormat::R32Float, 1,
+        let (depth_format, ao_format) = post_float_formats(device);
+        let glass_depth = tex("glass depth snapshot", depth_format, 1,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
         let glass_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("glass scene snapshot"), layout: &self.glass_layout,
@@ -3941,10 +4080,10 @@ impl Renderer {
                 })
                 .create_view(&Default::default())
         };
-        let ssao_depth_view = half_float("ssao depth", wgpu::TextureFormat::R32Float);
+        let ssao_depth_view = half_float("ssao depth", depth_format);
         let ssao_views = [
-            half_float("ssao a", wgpu::TextureFormat::Rg32Float),
-            half_float("ssao b", wgpu::TextureFormat::Rg32Float),
+            half_float("ssao a", ao_format),
+            half_float("ssao b", ao_format),
         ];
         let ssao_bg = |label: &str, input: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -4214,6 +4353,9 @@ impl Renderer {
             samples = 1;
         }
         self.ensure_target(rs, size, samples);
+        if frame.probe.as_ref().is_some_and(|pf| pf.tasks.iter().any(|t| matches!(t, env_probe_gpu::Task::Face(_)))) {
+            self.ensure_pipelines(rs, SAMPLES);
+        }
         let device = &rs.device;
         let queue = &rs.queue;
         // cam_pos.w is unused by the camera math. Keep material animation
@@ -4552,7 +4694,9 @@ impl Renderer {
         };
 
         let target = self.target.as_ref()?;
-        let viewport = if samples == SAMPLES { &self.viewport } else { self.lower_samples[sample_slot(samples)].as_ref()? };
+        let viewport = self.pipelines[sample_slot(samples)].as_ref()?;
+        // (the probe's faces draw with the 4x set: below)
+        let probe_viewport = self.pipelines[sample_slot(SAMPLES)].as_ref();
         let cloud_slot = sample_slot(samples);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("viewport"),
@@ -4872,6 +5016,11 @@ impl Renderer {
         if let Some(pf) = frame.probe.as_ref() {
             for task in &pf.tasks {
                 if let env_probe_gpu::Task::Face(f) = *task {
+                    // (a face draws with the 4x set, made above for this frame)
+                    let Some(pv) = probe_viewport else {
+                        self.probe.store_face(device, &mut encoder, f);
+                        continue;
+                    };
                     let (fwd, up) = env_probe_gpu::face_basis(f);
                     let centre = pf.centre;
                     let fov = std::f32::consts::FRAC_PI_2;
@@ -4911,16 +5060,16 @@ impl Renderer {
                             if !box_visible(&face_planes, b.lo, b.hi) {
                                 continue;
                             }
-                            pass.set_pipeline(if self.culls_back(b.key.0) { &self.viewport.opaque } else { &self.viewport.opaque_two_sided });
+                            pass.set_pipeline(if self.culls_back(b.key.0) { &pv.opaque } else { &pv.opaque_two_sided });
                             draw(&mut pass, b.key, b.start..b.start + b.count, &mut calls);
                         }
                         pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                         for r in &opaque_runs {
-                            pass.set_pipeline(if self.culls_back(r.0.0) { &self.viewport.opaque } else { &self.viewport.opaque_two_sided });
+                            pass.set_pipeline(if self.culls_back(r.0.0) { &pv.opaque } else { &pv.opaque_two_sided });
                             draw(&mut pass, r.0, r.1..r.2, &mut calls);
                         }
                         if !self.terrain_chunks.is_empty() {
-                            pass.set_pipeline(&self.viewport.terrain);
+                            pass.set_pipeline(&pv.terrain);
                             pass.set_bind_group(1, &self.terrain_bg, &[]);
                             for c in self.terrain_chunks.values() {
                                 if box_visible(&face_planes, c.lo, c.hi) {
@@ -5791,8 +5940,8 @@ impl Renderer {
     ) -> u32 {
         self.mesh_gen += 1;
         let slot = index.map(|i| i as usize + BUILTIN_MESHES);
-        match slot.and_then(|s| self.meshes.get(s)) {
-            Some(m) if m.corners() as usize == positions.len() => {
+        match (index, slot.and_then(|s| self.meshes.get_mut(s))) {
+            (Some(i), Some(m)) if m.count == 0 || m.corners() as usize == positions.len() => {
                 let verts: Vec<Vertex> = positions
                     .iter()
                     .zip(normals)
@@ -5805,10 +5954,21 @@ impl Renderer {
                         color: colors.get(i).map(|c| c.to_array()).unwrap_or([0.0; 4]),
                     })
                     .collect();
+                if m.count == 0 {
+                    // A new pose can share enough corners to fit. Keep the
+                    // same slot even when the upload still exceeds the limit.
+                    if !verts.is_empty() {
+                        let usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+                        if let Some(mesh) = Mesh::try_upload(device, "loaded mesh", &verts, usage, m.cull) {
+                            *m = mesh;
+                        }
+                    }
+                    return i;
+                }
                 match m.contents(&verts) {
                     Some(verts) => {
                         queue.write_buffer(&m.vbuf, 0, bytemuck::cast_slice(&verts));
-                        index.unwrap_or(0)
+                        i
                     }
                     None => self.add_mesh_colored(device, positions, normals, uvs, colors),
                 }

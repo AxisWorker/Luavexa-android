@@ -625,6 +625,12 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         "is_edit",
         lua.create_function(|lua, ()| Ok(world(lua).is_ok_and(|w| w.mode == RunMode::Edit)))?,
     )?;
+    // core_gui_on(name): StarterGui:GetCoreGuiEnabled for this client (the
+    // top bar's chat button places GuiService.TopbarInset).
+    g.set(
+        "core_gui_on",
+        lua.create_function(|lua, name: String| Ok(world(lua).is_ok_and(|w| !w.core_gui_off.contains(&name))))?,
+    )?;
     // A handle adornment is under the mouse or held: the edit viewport's
     // selection tools leave the press to it (Studio's priority).
     g.set(

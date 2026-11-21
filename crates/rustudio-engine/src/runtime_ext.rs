@@ -287,7 +287,6 @@ pub const METHODS: &[(&str, &str)] = &[
     ("GetCoreGuiEnabled", "StarterGui"),
     ("SetCore", "StarterGui"),
     ("GetCore", "StarterGui"),
-    ("TeleportAsync", "TeleportService"),
     ("PreloadAsync", "ContentProvider"),
     ("RegisterKeyframeSequence", "KeyframeSequenceProvider"),
     ("RegisterActiveKeyframeSequence", "KeyframeSequenceProvider"),
@@ -2839,7 +2838,7 @@ fn to_json(v: &Value, depth: usize) -> mlua::Result<serde_json::Value> {
     })
 }
 
-fn from_json(lua: &Lua, v: &serde_json::Value) -> mlua::Result<Value> {
+pub(crate) fn from_json(lua: &Lua, v: &serde_json::Value) -> mlua::Result<Value> {
     Ok(match v {
         serde_json::Value::Null => Value::Nil,
         serde_json::Value::Bool(b) => Value::Boolean(*b),
@@ -3891,6 +3890,12 @@ fn gui_rect(w: &World, r: Ref, depth: usize) -> ([f32; 2], [f32; 2]) {
         return match i.class.as_str() {
             "ScreenGui" if matches!(rustudio_render::scene::enum_u32(d.prop(r, "ScreenInsets")), Some(0 | 1)) => {
                 ([0.0, -inset], screen)
+            }
+            // TopbarSafeInsets: the bar's free area, GuiService.TopbarInset
+            // (gui_input.rs roots; gui_input.luau topbar_inset).
+            "ScreenGui" if inset > 0.0 && rustudio_render::scene::enum_u32(d.prop(r, "ScreenInsets")) == Some(3) => {
+                let left = mech::gui_topbar_left(!w.core_gui_off.contains("Chat")).min(screen[0]);
+                ([left, -inset], [screen[0] - left, inset])
             }
             "ScreenGui" => ([0.0, 0.0], [screen[0], screen[1] - inset]),
             "SurfaceGui" => match d.prop(r, "CanvasSize") {
@@ -5516,13 +5521,6 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 "TopbarEnabled" => one(Value::Boolean(!world(lua)?.topbar_off)),
                 _ => one(Value::Nil),
             }
-        }
-        "TeleportAsync" => {
-            world(lua)?.output.push((
-                Level::Warn,
-                format!("{name}: teleporting to other places isn't available in rustudio"),
-            ));
-            none()
         }
         "RemoveDefaultLoadingScreen" => none(),
         "RegisterKeyframeSequence" | "RegisterActiveKeyframeSequence" => {

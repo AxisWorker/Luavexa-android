@@ -305,6 +305,11 @@ pub struct Gui {
     /// MouseEnter's x, y): None, the game's top bar (GUI_TOP_INSET); a
     /// plugin widget's or the edit viewport's CoreGui: 0.
     pub input_inset: Option<f32>,
+    /// Whether Roblox's chat button is on the top bar (the Chat CoreGui):
+    /// where the bar's free area — GuiService.TopbarInset, and a ScreenGui
+    /// with ScreenInsets TopbarSafeInsets — starts (`mech::gui_topbar_left`).
+    /// Set by the view before each draw; None reads as on (Roblox's default).
+    pub topbar_chat: Option<bool>,
     /// SurfaceGui / BillboardGui triangles (AlwaysOnTop false) for the
     /// renderer's depth-tested pass, by egui texture (round 23).
     pub world_batches: Vec<rustudio_render::world_gui::GuiBatch>,

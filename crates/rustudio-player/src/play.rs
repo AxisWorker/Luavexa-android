@@ -616,6 +616,21 @@ impl Game {
             return;
         }
         rustudio_core::load_trace::mark("play: start asked");
+        // A play-testing teleport plays its destination instead of the edit
+        // document, and its player arrives with the teleport's data.
+        let teleport = self.teleport_to.take();
+        rustudio_engine::play_teleport::clear_request();
+        rustudio_engine::play_teleport::set_in_flight(false);
+        rustudio_engine::play_teleport::set_arrival(teleport.as_ref().map(|t| t.arrival.clone()));
+        // A teleport's destination plays with its own ids (not a Team Create
+        // session's); the first Play records where the session began.
+        let live_ids = match &teleport {
+            Some(t) => Some((t.universe_id, t.place_id)),
+            None => {
+                self.play_origin = live_ids;
+                live_ids
+            }
+        };
         // rustudio's per-session physics options (solver, spin guard, client
         // link): RUSTUDIO_* env, else the saved option, read once per Play.
         let solver = rustudio_core::rustudio_settings::latch_for_play();
@@ -680,6 +695,9 @@ impl Game {
             None
         };
         rustudio_core::load_trace::mark("play: runtimes made");
+        // (the destination stands in for the edit document until the
+        // session's copy is made; the edit document is what Stop brings back)
+        let mut edit_doc = teleport.map(|t| std::mem::replace(&mut self.doc, t.doc));
         let label = if two { "Play" } else { "Run" };
         let mut server_doc = self
             .doc
@@ -755,8 +773,9 @@ impl Game {
             (None, RepMap::default())
         };
         rustudio_core::load_trace::mark("play: client DataModel replicated");
-        let saved_sel = std::mem::take(&mut self.doc.selection);
+        let saved_sel = std::mem::take(&mut edit_doc.as_mut().unwrap_or(&mut self.doc).selection);
         let saved_doc = std::mem::replace(&mut self.doc, server_doc);
+        let saved_doc = edit_doc.take().unwrap_or(saved_doc);
         let mut physics = Physics::new(&mut self.doc);
         rustudio_core::load_trace::mark("play: physics built");
         self.info(format!("Physics solver: {}", solver.name()));
@@ -945,7 +964,13 @@ impl Game {
     }
 
     pub fn stop_play(&mut self, host: &mut dyn GameHost) {
+        // (a teleport ends this session to start the destination's)
+        let teleporting = self.teleport_to.is_some() || std::mem::take(&mut self.quiet_stop);
+        if teleporting {
+            self.quiet_stop = true;
+        }
         self.stop_play_worker();
+        self.quiet_stop = false;
         // A game's orthographic camera ends with the session.
         self.cam.ortho = None;
         self.cam.stretch = 1.0;
@@ -974,7 +999,11 @@ impl Game {
         self.cam = s.saved_cam.clone();
         self.scene = rustudio_render::scene::Scene::default();
         host.document_changed(&self.doc);
-        if s.presentation.is_none() {
+        if !teleporting {
+            rustudio_engine::play_teleport::clear_request();
+            rustudio_engine::play_teleport::set_in_flight(false);
+        }
+        if s.presentation.is_none() && !teleporting {
             self.info(format!(
                 "■ Stopped after {:.1} s; the edit DataModel is back as it was",
                 s.time
@@ -2520,6 +2549,26 @@ impl Game {
         }
     }
 
+    /// One Play step while the compositor sends the window no redraws (another
+    /// workspace, minimized): nothing is drawn, and the game sees no keys, as
+    /// when Studio's window loses focus.
+    pub fn play_tick_hidden(&mut self, dt: f32, host: &mut dyn GameHost, no_ui: bool) {
+        let keyboard = PlayKeyboard {
+            focused: false,
+            blocked: true,
+            textbox: false,
+            modifiers: egui::Modifiers::default(),
+            shift_tapped: false,
+            no_ui,
+            shift: false,
+        };
+        if self.play_thread.is_some() {
+            self.threaded_step(keyboard, dt, host);
+        } else {
+            self.step_play(dt, host, &keyboard, false);
+        }
+    }
+
     pub(crate) fn step_play(&mut self, dt: f32, host: &mut dyn GameHost, keyboard: &PlayKeyboard, render_in_parallel: bool) -> bool {
         let mut dt = dt;
         if let Some(s) = self.play.as_mut() {
@@ -3132,7 +3181,10 @@ impl Game {
                 };
             // The game's fingers and their gestures (touch screens).
             let (touches, touch_gestures) = match self.play.as_mut() {
-                Some(s) => (std::mem::take(&mut s.game.touches), std::mem::take(&mut s.game.touch_gestures)),
+                Some(s) => {
+                    s.game.touches_fed = 0;
+                    (std::mem::take(&mut s.game.touches), std::mem::take(&mut s.game.touch_gestures))
+                }
                 None => Default::default(),
             };
             let gui_service = self

@@ -347,6 +347,8 @@ impl Renderer {
     }
 
     fn draw_vf(&mut self, rs: &egui_wgpu::RenderState, vf: Ref, req: &Request, size: [u32; 2], base: Globals, glass_bg: &wgpu::BindGroup) {
+        // (a frame draws at 4x: the set for it, made on first use)
+        self.ensure_pipelines(rs, SAMPLES);
         let (device, queue) = (&rs.device, &rs.queue);
         // The frame's camera: reverse-Z like the world's.
         let aspect = size[0] as f32 / size[1].max(1) as f32;
@@ -492,12 +494,13 @@ impl Renderer {
                 pass.set_bind_group(1, self.textures.get(key.1).unwrap_or(&self.textures[0]), &[]);
                 mesh.draw(pass, range);
             };
+            let viewport = self.pipelines(SAMPLES);
             for r in &opaque_runs {
-                pass.set_pipeline(if self.culls_back(r.0 .0) { &self.viewport.opaque } else { &self.viewport.opaque_two_sided });
+                pass.set_pipeline(if self.culls_back(r.0 .0) { &viewport.opaque } else { &viewport.opaque_two_sided });
                 draw(&mut pass, r.0, r.1..r.2);
             }
             for r in &see_runs {
-                pass.set_pipeline(if self.culls_back(r.0 .0) { &self.viewport.transparent_culled } else { &self.viewport.transparent });
+                pass.set_pipeline(if self.culls_back(r.0 .0) { &viewport.transparent_culled } else { &viewport.transparent });
                 draw(&mut pass, r.0, r.1..r.2);
             }
         }

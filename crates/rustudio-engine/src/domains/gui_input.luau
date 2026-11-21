@@ -122,15 +122,17 @@ get["GuiService.ViewportDisplaySize"] = function() return Enum.DisplaySize.Mediu
 -- chat button follows 12 later (play_game.rs top_bar's Roblox constants),
 -- so the free area starts 12 past the last of them. The edit DataModel
 -- (plugins) has no bar: an empty rect, as its GetGuiInset is zeros. The
--- left edge is this build's bar, not a measurement of Roblox's unibar.
+-- left edge is this build's bar, not a measurement of Roblox's unibar
+-- (mech::GUI_TOPBAR_LEFT / GUI_TOPBAR_LEFT_CHAT: the same numbers place a
+-- ScreenGui with ScreenInsets TopbarSafeInsets, which is this rect).
 local topbar_seen
 local function topbar_inset()
     if G.is_edit() then return Rect.new(0, 0, 0, 0), "" end
     local width = G.view()
-    local chat = true
-    if G.is_client() then
-        pcall(function() chat = game:GetService("StarterGui"):GetCoreGuiEnabled(Enum.CoreGuiType.Chat) end)
-    end
+    -- (G.core_gui_on, not StarterGui:GetCoreGuiEnabled through `game`: a
+    -- script reads TopbarInset before this module's first step refreshed
+    -- its `game`, and the answer must follow SetCoreGuiEnabled at once)
+    local chat = not G.is_client() or G.core_gui_on("Chat")
     local left = 16 + 44 + (chat and 12 + 44 or 0) + 12
     return Rect.new(left, 0, math.max(left, width), 58), width .. (chat and "c" or "")
 end
@@ -253,6 +255,11 @@ methods["GuiService.GetInsetArea"] = function(_, insets)
     local inset = (G.is_client() and not G.is_edit()) and 58 or 0
     if insets == Enum.ScreenInsets.CoreUISafeInsets then
         return Rect.new(0, 0, w, h - inset)
+    end
+    -- TopbarSafeInsets: the bar's free area (TopbarInset), above y = 0.
+    if insets == Enum.ScreenInsets.TopbarSafeInsets and inset > 0 then
+        local bar = topbar_inset()
+        return Rect.new(bar.Min.X, -inset, w, 0)
     end
     return Rect.new(0, -inset, w, h - inset)
 end

@@ -523,6 +523,13 @@ pub const FX_LIGHT_CLAMP: f32 = 4.5; // an effect's linear light is held to this
 
 // GUI (gui.rs)
 pub const GUI_TOP_INSET: f32 = 58.0; // GuiService:GetGuiInset() in Studio's Play (Studio, 863x675 view): ScreenGuis without IgnoreGuiInset start this far down
+pub const GUI_TOPBAR_LEFT: f32 = 72.0; // GuiService.TopbarInset.Min.X with Roblox's chat off: the free top-bar area starts past the Roblox button (ScreenSideOffset 16 in, TopBarButtonHeight 44 wide) and TopBarPadding 12 — the CoreScripts' TopBar constants play_game.rs top_bar draws the bar from (this build's bar, not a measurement of Roblox's unibar)
+pub const GUI_TOPBAR_LEFT_CHAT: f32 = 128.0; // ... with the chat button (TopBarPadding 12 + 44) before it; a ScreenGui with ScreenInsets TopbarSafeInsets (TopbarPlus) is the TopbarInset rect: it starts here and is GUI_TOP_INSET tall
+/// GuiService.TopbarInset's left edge: where the top bar's free area starts
+/// past Roblox's buttons, with or without the chat button.
+pub fn gui_topbar_left(chat: bool) -> f32 {
+    if chat { GUI_TOPBAR_LEFT_CHAT } else { GUI_TOPBAR_LEFT }
+}
 pub const GUI_FONT_EM_PER_TEXT_SIZE: f32 = 1.04; // font em = TextSize × this / (line height per em): a line is TextSize tall; the 1.04 matches TextService widths ("START GAME" in Oswald 14/18/24/32 → 46/58/78/104 px in Studio)
 pub const GUI_LEGACY_TEXT_SCALE: f32 = 1.5; // Font.Legacy (Arimo) is drawn at TextSize x this: a default TextLabel (Legacy 8) in Studio 0.747 draws "row 1" 26 px wide, 8 px tall (checks/plugins/widgets/captures/studio-wleft.png), Arimo at TextSize 12; other sizes not measured
 pub const GUI_BUTTON_HOVER_DARKEN: f32 = 0.3; // AutoButtonColor: background darkened this much under the mouse (estimated)

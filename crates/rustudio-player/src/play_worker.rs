@@ -99,6 +99,57 @@ mod tests {
         game.stop_play(&mut ());
     }
 
+    /// The game's fingers and their gestures reach the worker's client
+    /// (play.rs `__rs_touch_event` / `__rs_touch_gesture`; touch identity,
+    /// play_game.rs "Fingers in Play"), where the PlayerModule's thumbstick
+    /// and camera listen: the presentation collected them in its frame
+    /// (`Input::take`), the worker's step fires UserInputService for them.
+    /// (The presentation never drains them itself: a finger that stayed
+    /// there was fed to the gesture recognizer again every frame.)
+    #[test]
+    fn fingers_reach_the_gameplay_worker() {
+        use rustudio_engine::gui::{TouchOut, TouchState};
+        let mut game = Game::new(None);
+        game.start_play_threaded(RunMode::Play, &mut (), false, None);
+        assert!(game.is_playing());
+        assert!(game.run_luau(Side::Client, r#"
+            local uis = game:GetService("UserInputService")
+            local t = { touches = {}, taps = 0 }
+            _G.fingers = t
+            uis.TouchStarted:Connect(function(io, gpe) table.insert(t.touches, "S" .. io.Position.X .. (gpe and "g" or "")) end)
+            uis.TouchMoved:Connect(function(io) table.insert(t.touches, "M" .. io.Delta.X) end)
+            uis.TouchEnded:Connect(function(io) table.insert(t.touches, "E" .. io.Position.X) end)
+            uis.TouchTap:Connect(function(positions) t.taps += 1 end)
+            uis.InputBegan:Connect(function(io) t.last = io.UserInputType end)
+        "#).is_none());
+        let ctx = egui::Context::default();
+        let sync = |game: &mut Game| {
+            game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+            game.play_thread.as_ref().unwrap().worker.submit(|_, _| ()).unwrap().recv().unwrap();
+        };
+        sync(&mut game);
+        let finger = |state, x: f32, dx: f32| TouchOut { id: 7, state, x, y: 200.0, dx, dy: 0.0, sunk: false, began_on: Vec::new() };
+        let s = game.play.as_mut().unwrap();
+        s.game.touches.push(finger(TouchState::Begin, 100.0, 0.0));
+        s.game.touches.push(finger(TouchState::Change, 130.0, 30.0));
+        s.game.touch_gestures.push(crate::touch_gestures::Gesture::Tap { positions: vec![(100.0, 200.0)], gpe: false });
+        sync(&mut game);
+        // (taken by the step: nothing left to feed the recognizer twice)
+        assert!(game.play.as_ref().unwrap().game.touches.is_empty());
+        assert_eq!(game.play.as_ref().unwrap().game.touches_fed, 0);
+        game.play.as_mut().unwrap().game.touches.push(finger(TouchState::End, 130.0, 0.0));
+        sync(&mut game);
+        sync(&mut game);
+        let err = game.run_luau(Side::Client, r#"
+            local t = _G.fingers
+            assert(table.concat(t.touches, ",") == "S100,M30,E130", table.concat(t.touches, ","))
+            assert(t.taps == 1, t.taps)
+            assert(t.last == Enum.UserInputType.Touch, tostring(t.last))
+        "#);
+        assert!(err.is_none(), "{err:?}\n{:?}", game.log.iter().map(|l| l.text.clone()).collect::<Vec<_>>());
+        game.stop_play(&mut ());
+    }
+
     #[test]
     fn worker_mutates_the_live_world_and_publishes_to_the_view_in_order() {
         let mut game = Game::new(None);
@@ -183,6 +234,8 @@ pub(super) struct PlayView {
     pub(crate) chat: Option<ChatView>,
     pub(crate) chat_on: bool,
     pub(crate) backpack_on: bool,
+    /// GuiService.TopbarEnabled (Roblox's top bar over the game).
+    pub(crate) topbar_on: bool,
     pub(crate) hotbar: Vec<(String, String, bool)>,
     status: String,
 }
@@ -190,6 +243,9 @@ pub(super) struct PlayView {
 struct Presentation {
     snapshot: RenderSnapshot,
     view: PlayView,
+    /// StarterGui:SetCore("ChatActive") this step (the worker's client):
+    /// the presentation opens or closes its chat box.
+    chat_active: Option<bool>,
     time: f64,
     showing: Side,
     mouse_behavior: u32,
@@ -273,6 +329,11 @@ struct Input {
     leave: bool,
     key_taps: Vec<(egui::Key, bool)>,
     active: bool,
+    /// The game's fingers and their gestures (touch screens: play_game.rs
+    /// "Fingers in Play"); the presentation's GUI had them first, the
+    /// worker's scripts get them (play.rs `__rs_touch_event`).
+    touches: Vec<rustudio_engine::gui::TouchOut>,
+    touch_gestures: Vec<crate::touch_gestures::Gesture>,
     edits: EditorEdits,
 }
 
@@ -282,6 +343,7 @@ impl Input {
         let p = &mut s.game;
         let gui_layout = std::mem::take(&mut p.gui_layout_changed)
             .then(|| std::mem::take(&mut p.gui_layout));
+        p.touches_fed = 0;
         Self {
             keyboard,
             phys: game.phys.clone(),
@@ -303,6 +365,8 @@ impl Input {
             leave: std::mem::take(&mut p.leave_request),
             key_taps: std::mem::take(&mut p.key_taps),
             active: std::mem::take(&mut p.input_active),
+            touches: std::mem::take(&mut p.touches),
+            touch_gestures: std::mem::take(&mut p.touch_gestures),
             edits,
         }
     }
@@ -343,9 +407,11 @@ impl Input {
             p.reset_request |= self.reset;
             p.leave_request |= self.leave;
             p.key_taps.extend(self.key_taps);
-            if self.active {
+            if self.active || !self.touches.is_empty() {
                 p.last_activity = s.time;
             }
+            p.touches.extend(self.touches);
+            p.touch_gestures.extend(self.touch_gestures);
         }
 
         self.keyboard
@@ -477,14 +543,15 @@ impl Publication {
         } else if !updated {
             PublishedFrame::Reuse
         } else {
-            let (chat, chat_on, backpack_on) = game.with_play_side(Side::Client, |rt, _, _| {
-                let (chat_on, backpack_on) = rt.world_mut().map_or((true, true), |w| {
-                    (!w.core_gui_off.contains("Chat"), !w.core_gui_off.contains("Backpack"))
+            let (chat, chat_on, backpack_on, topbar_on) = game.with_play_side(Side::Client, |rt, _, _| {
+                let (chat_on, backpack_on, topbar_on) = rt.world_mut().map_or((true, true, true), |w| {
+                    (!w.core_gui_off.contains("Chat"), !w.core_gui_off.contains("Backpack"), !w.topbar_off)
                 });
                 let view = rustudio_engine::runtime::domains::players_chat::chat_view(&rt.lua);
-                (view, chat_on, backpack_on)
-            }).unwrap_or((None, true, true));
+                (view, chat_on, backpack_on, topbar_on)
+            }).unwrap_or((None, true, true, true));
             let status = game.play_status().unwrap_or_default();
+            let chat_active = game.play.as_mut().and_then(|s| s.game.chat_active.take());
             let s = game.play.as_ref().expect("live Play publication");
             let skip = s.physics_skip();
             let skip = match s.showing {
@@ -497,6 +564,7 @@ impl Publication {
                 chat,
                 chat_on,
                 backpack_on,
+                topbar_on,
                 hotbar: game.play_hotbar(),
                 status,
             };
@@ -507,6 +575,7 @@ impl Publication {
             PublishedFrame::Updated(Presentation {
                 snapshot,
                 view,
+                chat_active,
                 time: s.time,
                 showing: s.showing,
                 mouse_behavior: s.mouse_behavior,
@@ -563,6 +632,10 @@ impl Publication {
         s.game.clickable = frame.clickable;
         s.game.kicked = frame.kicked;
         s.game.flashes = frame.flashes;
+        if let Some(on) = frame.chat_active {
+            s.game.chat_open = on;
+            s.game.chat_focus = on;
+        }
         s.presentation = Some(frame.view);
         if replaced {
             game.scene = Default::default();
@@ -606,9 +679,14 @@ impl Game {
         let show_client = self.play_shows_client;
         let keep_game_settings = self.keep_game_settings;
         let fixed_dt = self.fixed_dt;
+        let teleport = self.teleport_to.take();
+        if teleport.is_none() {
+            self.play_origin = live_ids;
+        }
 
         let worker = match PlayWorker::spawn(host.play_worker_host(), move |game, worker_host| {
             game.doc = doc;
+            game.teleport_to = teleport;
             game.cam = cam;
             game.account = account;
             game.play_rig = play_rig;
@@ -847,7 +925,9 @@ impl Game {
         if let Some(Ok((publication, _))) = worker.pending.map(|reply| reply.recv()) {
             self.append_play_output(publication.log);
         }
-        if let Ok(Ok(logs)) = worker.worker.submit(|game, worker_host| {
+        let quiet = self.quiet_stop;
+        if let Ok(Ok(logs)) = worker.worker.submit(move |game, worker_host| {
+            game.quiet_stop = quiet;
             game.stop_play(worker_host);
             std::mem::take(&mut game.log)
         }).map(|reply| reply.recv()) {

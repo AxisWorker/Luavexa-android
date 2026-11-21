@@ -2168,6 +2168,9 @@ impl Game {
         self.gui.world_batches.clear();
         let playing = self.play.is_some();
         self.gui.pointer_override = self.lock_center_held().then(|| rect.center());
+        // (where the top bar's free area starts: after the chat button when
+        // Roblox's chat is on — TopbarSafeInsets ScreenGuis)
+        self.gui.topbar_chat = Some(!playing || self.chat_core_gui_on());
         {
             let doc_dir = self
                 .doc

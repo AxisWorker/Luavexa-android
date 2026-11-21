@@ -189,7 +189,7 @@ provides or still has to.
 | `HapticService.IsVibrationSupported / IsMotorSupported / SetMotor / GetMotor` | gamepad-only flags, in-memory motor table (`gui_input.luau` 1796-1845) | `jni::vibrator_info()` (hasVibrator, hasAmplitudeControl) and `jni::vibrate(ms, strength)` — **wiring to do**: `UserInputType.Touch` supported, `VibrationMotor.Large` (and `Small` when amplitude control exists) |
 | `HapticEffect:Play / Stop`, `HapticEffect.Type` presets | simulated durations (UIHover .035 s, UIClick .055, UINotification .4, GameplayCollision .3, GameplayExplosion .8) | `jni::vibrate_pattern` (VibrationEffect.createWaveform) — **mapping of each preset to do** |
 | `ContextActionService.BindAction(..., createTouchButton)`, `GetButton / SetTitle / SetImage / SetPosition` | bindings stored, priority dispatch (`library.luau` 671-767); buttons never drawn | **to do**: draw the buttons in the play viewport (`ContextActionGui` ScreenGui as Roblox does: 70×70 ImageButton, default positions right of the thumbstick), route taps to the bound function with `UserInputType.Touch` |
-| `GuiService:GetGuiInset()`, `TopbarInset`, `GetInsetArea`, `ScreenGui.ScreenInsets` (`None / DeviceSafeInsets / CoreUISafeInsets / TopbarSafeInsets`), `ScreenGui.SafeAreaCompatibility` | `(0, 58)` constant (`mech::GUI_TOP_INSET`); `TopbarInset` in Play is the top bar's free area — from the end of the menu and chat buttons (128 px with the chat button, 72 without: `play_game.rs top_bar`) to the viewport's right edge, 58 high — and `GetPropertyChangedSignal("TopbarInset")` fires when the viewport or the chat button changes (`gui_input.luau topbar_inset / step_topbar`; LBG's ClientRenderer and TopbarPlus wait on it); an empty Rect in the edit DataModel; inset root in `gui_input.rs` ~498 | `jni::window_insets()` (system bars + display cutout; the 4 sides) — **wiring to do**: DeviceSafeInsets = those, CoreUISafeInsets = those + topbar, TopbarSafeInsets = topbar only |
+| `GuiService:GetGuiInset()`, `TopbarInset`, `GetInsetArea`, `ScreenGui.ScreenInsets` (`None / DeviceSafeInsets / CoreUISafeInsets / TopbarSafeInsets`), `ScreenGui.SafeAreaCompatibility` | `(0, 58)` constant (`mech::GUI_TOP_INSET`); `TopbarInset` in Play is the top bar's free area — from the end of the menu and chat buttons (128 px with the chat button, 72 without: `play_game.rs top_bar`) to the viewport's right edge, 58 high — and `GetPropertyChangedSignal("TopbarInset")` fires when the viewport or the chat button changes (`gui_input.luau topbar_inset / step_topbar`; LBG's ClientRenderer and TopbarPlus wait on it); an empty Rect in the edit DataModel; a `TopbarSafeInsets` ScreenGui is that rect (TopbarPlus's icons: starts after the buttons, 58 high; `gui_input.rs` roots, `runtime_ext.rs gui_rect`) | `jni::window_insets()` (system bars + display cutout; the 4 sides) — **wiring to do**: DeviceSafeInsets = those, CoreUISafeInsets = those + topbar, TopbarSafeInsets = topbar only |
 | `StarterGui.ScreenOrientation`, `PlayerGui.ScreenOrientation / CurrentScreenOrientation` | stored (`start_page/builtin.rs` 144); `CurrentScreenOrientation = LandscapeLeft` | `jni::set_requested_orientation` + `jni::current_orientation()` — **wiring to do**: apply at Play start, restore `sensorLandscape` at stop |
 | `Player:GetMouse()`, `Mouse` while playing | desktop pointer | **to do**: the first touch stands in (as Roblox does) |
 | `VRService`, gamepads | stubs | unchanged |
@@ -281,7 +281,17 @@ fingers that land on the view go to the game raw:
    there.
 4. `play.rs` dispatches each `TouchOut` to `__rs_touch_event` and each
    gesture to `__rs_touch_gesture` (`crates/rustudio-engine/src/library.luau`) after the GUI's
-   events: `domains/gui_input.luau` "Fingers" assigns the finger to the
+   events — on the gameplay worker since 0.3.3 (`play_worker.rs`: the
+   presentation's `Input::take` carries the frame's fingers and gestures
+   over with its keys and GUI events, `Input::apply` queues them for the
+   worker's step; `GameState::touches_fed` keeps `game_viewport`, which
+   runs every frame, from feeding a finger to the recognizer twice while
+   the worker still holds the last step — the first phone build of the
+   rebase lost every finger here, and grew the list without bound, the
+   `play_worker.rs` test `fingers_reach_the_gameplay_worker` pins it;
+   what the worker's client decides for the presentation,
+   `SetCore("ChatActive")` and `GuiService.TopbarEnabled`, returns in
+   its publication): `domains/gui_input.luau` "Fingers" assigns the finger to the
    input actions whose bindings use it (`UIButton`: landed on it;
    `TouchPosition / TouchDelta / TouchPinch`, gated by `UIModifier` when
    set, else only an unsunk finger; contexts by Priority, `Sink` stops)
@@ -488,6 +498,21 @@ Settings > rustudio, and the MicroProfiler). What a phone gets from it:
   `RUSTUDIO_LOWEND=0` turns the mode off for a run, `=1` forces it on a
   computer; `RUSTUDIO_AUTO_QUALITY_LEVEL=N` pins Automatic's level (1–21)
   and `RUSTUDIO_QUALITY_TRACE=1` logs each step.
+- **The start, and the black window before the first frame**: the
+  renderer is built in `App::new` (`Game::new` → `Renderer::with_caps`:
+  the shader module, the post, bloom and depth-of-field passes, the sun
+  and light shadow atlases) and the viewport's own pass set — some
+  thirty pipelines through the driver's compiler for one sample count —
+  when a frame first needs it (`render.rs` `ensure_pipelines`). Upstream
+  built the 4x MSAA set at start; on a phone the quality level draws one
+  sample a pixel (`quality.rs` `samples`, levels 1–16), so the 1x set
+  followed at the first frame and the 4x set was paid for nothing until
+  the scene probe or a ViewportFrame asks for it. logcat
+  (`RustStdoutStderr`) times the pieces: `[startup] renderer built in N
+  ms`, `[startup] viewport pipelines for 1 sample(s) a pixel built in N
+  ms`, `[startup] first frame built in N ms, M ms after the engine's
+  start` (`RUSTUDIO_STARTUP_TRACE=1` prints them on a desktop); the
+  activity's own start to `android_main` is the system's share.
 - **3D resolution 75 % by default on Android** (the same
   `choice_default`): the first phone measurements fell well under the
   display's rate at full resolution, and at a phone's pixel density three
@@ -1380,6 +1405,27 @@ also echoed to logcat at the next start.
   see an undefined C symbol. Fixed in `vendor/luau0-src` and locked out
   by `-Wl,--no-undefined` — "Luau native code" above, with the two
   further things native code needed in this library.
+- **The first build that started (11-21): no thumbstick or camera in
+  Play, TopbarPlus's icons over the Roblox button a fifth of the view
+  down, a slower start, and a "crash" on a baseplate with nothing in
+  the log.** Four findings. (1) 0.3.3's gameplay worker (`play_worker.rs`)
+  took `step_play` off the main thread, and its `Input` hand-off didn't
+  know the port's fingers: none reached `__rs_touch_event`, and the
+  presentation, which nothing drained any more, fed every finger it had
+  ever seen to the gesture recognizer again each frame — a list and a
+  frame time growing with every touch event, the likely "crash" (a
+  freeze the system ends leaves no rustudio log; the exit-info says
+  `LOW_MEMORY` or an ANR). "Fingers in Play" step 4 has the fix and its
+  test. (2) `ScreenInsets.TopbarSafeInsets` was laid out as
+  CoreUISafeInsets; it is the top bar's free area now (`mech::
+  gui_topbar_left`, the row in the table above), and `TopbarInset` read
+  before the GUI module's first step answered for a chat button that was
+  on (`G.core_gui_on`). (3) Two viewport pipeline sets before the first
+  frame — "Frame time on a phone", with the `[startup]` lines that now
+  time a start. (4) The player-scripts policy was checked against the
+  DevForum (`crates/rustudio-core/src/default_scripts.rs`): a fork of
+  the old character `Sound` script now keeps Roblox's
+  `RbxCharacterSounds` out, the rest already matched.
 
 ## Later steps (in order)
 

@@ -119,6 +119,10 @@ pub struct GameState {
     /// The chat box takes the keyboard next frame (the top bar's chat
     /// button, SetCore("ChatActive", true)).
     pub chat_focus: bool,
+    /// SetCore("ChatActive") since the last publication, for the
+    /// presentation when the client runs on the gameplay worker
+    /// (play_worker.rs `Presentation::chat_active`).
+    pub chat_active: Option<bool>,
     /// Frames the playtest view had chat available but closed: where the
     /// old "Press / to chat" hint was drawn (the self-test checks none is).
     pub chat_ready_frames: u64,
@@ -152,6 +156,10 @@ pub struct GameState {
     /// gui_input.rs `touch_input`), for UserInputService, the bound
     /// actions and the input action system.
     pub touches: Vec<rustudio_engine::gui::TouchOut>,
+    /// How many of `touches` the recognizer below has seen (`game_viewport`
+    /// runs every frame; the tick that drains them may come later when the
+    /// gameplay worker still holds the last one).
+    pub touches_fed: usize,
     /// Their gestures (src/touch_gestures.rs), for UserInputService.
     pub touch_gestures: Vec<crate::touch_gestures::Gesture>,
     /// The recognizer behind them.
@@ -1152,6 +1160,7 @@ impl Game {
             if let Some(s) = self.play.as_mut() {
                 s.game.chat_open = on;
                 s.game.chat_focus = on;
+                s.game.chat_active = Some(on);
             }
         }
     }
@@ -2310,11 +2319,13 @@ impl Game {
         // phones), and the latest finger is where the game's mouse is
         // (Mouse.Hit / Target, UserInputService:GetMouseLocation()).
         let touch_taps: Vec<(f32, f32)> = match self.play.as_mut() {
-            Some(s) if !s.game.touches.is_empty() || s.game.gestures.count() > 0 => {
+            Some(s) if s.game.touches.len() > s.game.touches_fed || s.game.gestures.count() > 0 => {
                 let now = std::time::Instant::now();
                 let mut taps = Vec::new();
                 let touches = std::mem::take(&mut s.game.touches);
-                for t in &touches {
+                // (only the fingers since the last frame: the tick drains
+                // them, play.rs / play_worker.rs, and resets `touches_fed`)
+                for t in &touches[s.game.touches_fed.min(touches.len())..] {
                     for g in s.game.gestures.feed(t, now) {
                         if let crate::touch_gestures::Gesture::TapInWorld { pos, processed_by_ui: false } = &g {
                             taps.push(*pos);
@@ -2324,9 +2335,10 @@ impl Game {
                 }
                 let ticked = s.game.gestures.tick(now);
                 s.game.touch_gestures.extend(ticked);
-                if !touches.is_empty() {
+                if touches.len() > s.game.touches_fed {
                     s.game.last_activity = s.time;
                 }
+                s.game.touches_fed = touches.len();
                 s.game.touches = touches;
                 taps
             }
@@ -2397,13 +2409,9 @@ impl Game {
         }
         // StarterGui:SetCoreGuiEnabled(Chat, false) hides Roblox's chat (Place A's
         // menu does; Studio shows no chat there).
-        let core_gui_on = |name: &str| self.play.as_ref()
-            .and_then(|s| s.client.as_ref())
-            .and_then(|c| c.world.as_ref())
-            .is_none_or(|w| !w.core_gui_off.contains(name));
         let presentation = self.play.as_ref().and_then(|s| s.presentation.as_ref());
-        let chat_on = presentation.map_or_else(|| core_gui_on("Chat"), |view| view.chat_on);
-        let backpack_on = presentation.map_or_else(|| core_gui_on("Backpack"), |view| view.backpack_on);
+        let chat_on = self.chat_core_gui_on();
+        let backpack_on = presentation.map_or_else(|| self.core_gui_on("Backpack"), |view| view.backpack_on);
         open_chat &= chat_on;
         if !backpack_on {
             slots.clear();
@@ -2520,12 +2528,11 @@ impl Game {
         }
         // Roblox's top bar over the game (the CoreScripts' TopBar, drawn
         // after the menu: its button closes an open menu too).
-        let topbar_on = self
-            .play
-            .as_ref()
-            .and_then(|s| s.client.as_ref())
-            .and_then(|c| c.world.as_ref())
-            .is_none_or(|w| !w.topbar_off);
+        let topbar_on = self.play.as_ref().is_none_or(|s| match s.presentation.as_ref() {
+            // (the client runs on the gameplay worker: its last publication)
+            Some(view) => view.topbar_on,
+            None => s.client.as_ref().and_then(|c| c.world.as_ref()).is_none_or(|w| !w.topbar_off),
+        });
         let mut close_chat = false;
         if topbar_on {
             let (menu_tap, chat_tap) = self.top_bar(ui, rect, chat_on && !menu, chat_open_now, menu);
@@ -2679,6 +2686,27 @@ impl Game {
             _ => &self.doc,
         };
         click_see_through(d, part)
+    }
+
+    /// Whether a CoreGui element is on (StarterGui:SetCoreGuiEnabled, the
+    /// client's `core_gui_off`); on while no client runs here.
+    fn core_gui_on(&self, name: &str) -> bool {
+        self.play
+            .as_ref()
+            .and_then(|s| s.client.as_ref())
+            .and_then(|c| c.world.as_ref())
+            .is_none_or(|w| !w.core_gui_off.contains(name))
+    }
+
+    /// Whether Roblox's chat button is on the top bar (the Chat CoreGui;
+    /// Place A's menu turns it off): the presentation's reading while the
+    /// client runs on the worker. The bar's free area — GuiService.TopbarInset
+    /// and a TopbarSafeInsets ScreenGui — starts after it (`Gui::topbar_chat`).
+    pub(crate) fn chat_core_gui_on(&self) -> bool {
+        self.play
+            .as_ref()
+            .and_then(|s| s.presentation.as_ref())
+            .map_or_else(|| self.core_gui_on("Chat"), |view| view.chat_on)
     }
 
     /// Roblox's top bar over the game, as the CoreScripts' TopBar draws it

@@ -55,7 +55,7 @@ pub(super) fn local_player_gui(d: &Document) -> Option<Ref> {
 /// vtable Studio) that is refilled only when marked (the frame stats
 /// time UILayout, FillGuiVertices and Render2d apart, Studio).
 pub(super) struct RootCache {
-    key: [u32; 12],
+    key: [u32; 13],
     shapes: Vec<Shape>,
     hits: Vec<Hit>,
     /// Stats.UI2D: draw calls, triangles.
@@ -491,7 +491,7 @@ impl Gui {
         }
     }
 
-    fn reuse_billboard_canvas(&mut self, g: Ref, key: [u32; 12]) {
+    fn reuse_billboard_canvas(&mut self, g: Ref, key: [u32; 13]) {
         const BILLBOARD_ROOTS: usize = 128;
         const CANVASES_PER_ROOT: usize = 8;
         const VERTICES_PER_CANVAS: usize = 4096;
@@ -674,17 +674,36 @@ impl Gui {
                     "ScreenGui" => {
                         // ScreenInsets None / DeviceSafeInsets (IgnoreGuiInset, which
                         // doc.rs derives from it both ways): the whole view.
-                        let ignore = matches!(enum_u32(d.prop(g, "ScreenInsets")), Some(0) | Some(1));
+                        // TopbarSafeInsets: the top bar's free area, GuiService.TopbarInset
+                        // (right of Roblox's buttons, the bar's height) — TopbarPlus's
+                        // ScreenGui, whose icons sit at Y scale 0.5 of it, next to the
+                        // chat button.
+                        let si = enum_u32(d.prop(g, "ScreenInsets"));
+                        let ignore = matches!(si, Some(0) | Some(1));
                         let inset = if ignore { 0.0 } else { mech::GUI_TOP_INSET };
+                        let (target, canvas, abs_offset) = if si == Some(3) {
+                            let left = mech::gui_topbar_left(self.topbar_chat.unwrap_or(true)).min(rect.width());
+                            (
+                                Target::Screen(Pos2::new(rect.left() + left, rect.top())),
+                                [rect.width() - left, mech::GUI_TOP_INSET],
+                                [left, -mech::GUI_TOP_INSET],
+                            )
+                        } else {
+                            (
+                                Target::Screen(Pos2::new(rect.left(), rect.top() + inset)),
+                                [rect.width(), rect.height() - inset],
+                                [0.0, inset - mech::GUI_TOP_INSET],
+                            )
+                        };
                         roots.push(Root {
                             on_top: true,
                             light: 1.0,
                             order: 1_000_000 + num(d, g, "DisplayOrder", 0.0) as i64,
                             dist: 0.0,
                             gui: g,
-                            target: Target::Screen(Pos2::new(rect.left(), rect.top() + inset)),
-                            canvas: [rect.width(), rect.height() - inset],
-                            abs_offset: [0.0, inset - mech::GUI_TOP_INSET],
+                            target,
+                            canvas,
+                            abs_offset,
                         });
                         // BillboardGuis / SurfaceGuis kept in a ScreenGui (the
                         // proximity prompts' ProximityPrompts gui) draw at
@@ -846,12 +865,20 @@ impl Gui {
             let global_z = enum_u32(d.prop(g, "ZIndexBehavior")).unwrap_or(0) == 0;
             let canvas_rect =
                 Rect::from_min_size(Pos2::ZERO, egui::vec2(root.canvas[0], root.canvas[1]));
-            let clip =
-                if class == "ScreenGui" || doc::is_a(&class, "PluginGui") || boolp(d, g, "ClipsDescendants", class == "SurfaceGui") {
-                    canvas_rect
-                } else {
-                    Rect::EVERYTHING
-                };
+            let clip = if class == "ScreenGui" {
+                // The view, in the canvas's coordinates: a ScreenGui's content
+                // is not held to its inset box (Roblox: a Frame at Y offset
+                // −58 in a CoreUISafeInsets gui shows under the top bar;
+                // TopbarPlus's dropdowns hang below its TopbarSafeInsets gui).
+                match root.target {
+                    Target::Screen(o) => Rect::from_min_max(rect.min - o.to_vec2(), rect.max - o.to_vec2()),
+                    _ => canvas_rect,
+                }
+            } else if doc::is_a(&class, "PluginGui") || boolp(d, g, "ClipsDescendants", class == "SurfaceGui") {
+                canvas_rect
+            } else {
+                Rect::EVERYTHING
+            };
             let root_box = GuiBox {
                 pos: root.abs_offset,
                 size: root.canvas,
@@ -897,7 +924,7 @@ impl Gui {
                     Target::Billboard(..) => (0.0, 0.0, 2.0),
                 };
                 [
-                    ox, oy, root.canvas[0], root.canvas[1], root.abs_offset[1],
+                    ox, oy, root.canvas[0], root.canvas[1], root.abs_offset[0], root.abs_offset[1],
                     clip.min.x, clip.min.y, clip.max.x, clip.max.y, ctx.pixels_per_point(),
                     global_z as u32 as f32, kind,
                 ]
@@ -2449,7 +2476,7 @@ mod billboard_canvas_tests {
             ..Gui::default()
         };
         let output = || RootCache {
-            key: [24; 12],
+            key: [24; 13],
             shapes: Vec::new(),
             hits: Vec::new(),
             ui2d: (0, 0),
@@ -2460,11 +2487,11 @@ mod billboard_canvas_tests {
         gui.cache.insert(root, output());
         gui.root_boxes.insert(root, Vec::new());
         gui.cache_owned.insert(root, (vec![(label, label)], vec![root]));
-        gui.reuse_billboard_canvas(root, [36; 12]);
+        gui.reuse_billboard_canvas(root, [36; 13]);
         gui.cache.insert(other_root, output());
         gui.root_boxes.insert(other_root, Vec::new());
         gui.cache_owned.insert(other_root, (vec![(other_root, other_root)], vec![other_root]));
-        gui.reuse_billboard_canvas(other_root, [36; 12]);
+        gui.reuse_billboard_canvas(other_root, [36; 13]);
 
         gui.cache_marks(&d, &doc::Marks::Some(vec![
             doc::Mark::Prop(Ref::new(), rbx_dom_weak::ustr("CFrame")),
@@ -2488,8 +2515,8 @@ mod billboard_canvas_tests {
             vfs: Vec::new(), citems: Vec::new(), lhits: Vec::new(),
         };
         let mut gui = Gui::default();
-        let small_key = [24; 12];
-        let large_key = [36; 12];
+        let small_key = [24; 13];
+        let large_key = [36; 13];
         let small = GuiBox { size: [24.0, 24.0], ..GuiBox::default() };
         let large = GuiBox { size: [36.0, 36.0], ..GuiBox::default() };
         gui.cache.insert(root, make_output(small_key));

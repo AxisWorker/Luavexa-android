@@ -299,6 +299,20 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
   or the chat button changes (test
   `topbar_inset_is_the_bar_and_follows_the_viewport`). The left edge is
   this build's bar, not a measurement of Roblox's unibar.
+- **`ScreenGui.ScreenInsets = TopbarSafeInsets` was laid out as
+  CoreUISafeInsets** (below the bar, the whole view). TopbarPlus puts its
+  icons in such a ScreenGui (v3's `TopbarStandard`: holders `Size (1, 0,
+  1, …)`; v2's `TopbarPlusGui`: the container at Y scale 250.2 of it,
+  icons at −0.5 of that) — both arithmetic on a gui that *is* the
+  TopbarInset rect — so the icons landed at the left edge, over the menu
+  button, a fifth of the view down. Now a TopbarSafeInsets ScreenGui is
+  the TopbarInset: it starts after Roblox's buttons (72 / 128 px:
+  `mech::gui_topbar_left`, the chat button from `Gui::topbar_chat`), is 58
+  px tall and sits at AbsolutePosition (left, −58) (`gui_input.rs` roots,
+  `runtime_ext.rs gui_rect`, `GetInsetArea(TopbarSafeInsets)`), and no
+  ScreenGui's content is clipped to its inset box any more (Roblox draws
+  a Frame at Y −58 under the bar; TopbarPlus's dropdowns hang below the
+  bar). Test `topbar_safe_insets_gui_is_the_bars_free_area`.
 - **UIListLayout's flex settings were ignored**: `Wraps`, `HorizontalFlex`
   / `VerticalFlex` (UIFlexAlignment Fill / SpaceAround / SpaceBetween /
   SpaceEvenly) and `ItemLineAlignment`. A wrapping list (90 of LBG's 250

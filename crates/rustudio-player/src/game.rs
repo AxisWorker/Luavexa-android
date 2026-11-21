@@ -25,6 +25,15 @@ pub struct Game {
     /// The running Play / Run session, if any.
     pub play: Option<crate::play::PlaySession>,
     pub(crate) play_thread: Option<crate::play_worker::ThreadedPlay>,
+    /// A play-testing teleport's destination, loading (play_teleport.rs).
+    pub(crate) teleport_job: Option<crate::play_teleport::TeleportJob>,
+    /// The place the next `start_play` plays instead of the edit document,
+    /// and how its player arrives (a teleport).
+    pub teleport_to: Option<crate::play_teleport::Teleport>,
+    /// The live Team Create (universe, place) the Play session began on.
+    pub(crate) play_origin: Option<(u64, u64)>,
+    /// Stop without the "■ Stopped" line (a teleport's session change).
+    pub(crate) quiet_stop: bool,
     pub(crate) play_input_pose_due: bool,
     /// Fixed frame time for deterministic self-tests.
     pub fixed_dt: Option<f32>,
@@ -131,7 +140,14 @@ impl Game {
             // before automatic_quality below takes its first level.
             let caps = rustudio_render::gpu_caps::GpuCaps::of_adapter(&rs.adapter, &rs.device);
             rustudio_core::rustudio_settings::set_weak_gpu(rustudio_render::gpu_caps::decide_lowend(&caps));
-            Renderer::with_caps(&rs.device, &rs.queue, &caps)
+            let t0 = std::time::Instant::now();
+            let r = Renderer::with_caps(&rs.device, &rs.queue, &caps);
+            // (a phone shows black until the first frame: logcat
+            // `RustStdoutStderr` tells how long the renderer took of it)
+            if cfg!(target_os = "android") || std::env::var_os("RUSTUDIO_STARTUP_TRACE").is_some() {
+                eprintln!("[startup] renderer built in {} ms", t0.elapsed().as_millis());
+            }
+            r
         });
         Self {
             phys: Default::default(),
@@ -148,6 +164,10 @@ impl Game {
             account: crate::account::Account::new(),
             play: None,
             play_thread: None,
+            teleport_job: None,
+            teleport_to: None,
+            quiet_stop: false,
+            play_origin: None,
             play_input_pose_due: false,
             fixed_dt: None,
             play_rig: None,

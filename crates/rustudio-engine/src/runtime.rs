@@ -8414,6 +8414,54 @@ mod legacy_tests {
         assert!(has("nochat 72 1000 2"), "{out:?}");
     }
 
+    /// A ScreenGui with ScreenInsets TopbarSafeInsets (TopbarPlus's) is the
+    /// top bar's free area: it starts after Roblox's buttons, is 58 px tall
+    /// and sits at (left, −58) in GUI coordinates — before it is drawn
+    /// (gui_rect) as well as in GetInsetArea — and follows the chat button.
+    #[test]
+    fn topbar_safe_insets_gui_is_the_bars_free_area() {
+        let mut d = Document::new_place();
+        let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
+        let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
+        let src = r#"
+            local GuiService = game:GetService("GuiService")
+            local gui = Instance.new("ScreenGui")
+            gui.IgnoreGuiInset = true
+            gui.ScreenInsets = Enum.ScreenInsets.TopbarSafeInsets
+            gui.Parent = game:GetService("StarterGui")
+            local frame = Instance.new("Frame")
+            frame.Size = UDim2.new(1, 0, 1, 0)
+            frame.Parent = gui
+            print("gui", gui.AbsolutePosition.X, gui.AbsolutePosition.Y, gui.AbsoluteSize.X, gui.AbsoluteSize.Y)
+            print("frame", frame.AbsolutePosition.X, frame.AbsolutePosition.Y, frame.AbsoluteSize.X, frame.AbsoluteSize.Y)
+            local a = GuiService:GetInsetArea(Enum.ScreenInsets.TopbarSafeInsets)
+            print("area", a.Min.X, a.Min.Y, a.Max.X, a.Max.Y)
+            game:GetService("StarterGui"):SetCoreGuiEnabled(Enum.CoreGuiType.Chat, false)
+            print("nochat", gui.AbsolutePosition.X, gui.AbsoluteSize.X, GuiService:GetInsetArea(Enum.ScreenInsets.TopbarSafeInsets).Min.X, GuiService.TopbarInset.Min.X)
+            gui.ScreenInsets = Enum.ScreenInsets.CoreUISafeInsets
+            print("core", gui.AbsolutePosition.X, gui.AbsolutePosition.Y, gui.AbsoluteSize.X, gui.AbsoluteSize.Y)
+        "#;
+        let s = d.dom.insert(
+            sps,
+            InstanceBuilder::new("LocalScript").with_name("T").with_property("Source", src.to_string()),
+        );
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(d, RunMode::Run);
+        w.side = Side::Client;
+        w.input.view_size = [800.0, 600.0];
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        rt.step(1.0 / 60.0);
+        let out = rt.leave().output;
+        let has = |p: &str| out.iter().any(|(_, t)| t.starts_with(p));
+        assert!(has("gui 128 -58 672 58"), "{out:?}");
+        assert!(has("frame 128 -58 672 58"), "{out:?}");
+        assert!(has("area 128 -58 800 0"), "{out:?}");
+        assert!(has("nochat 72 728 72 72"), "{out:?}");
+        assert!(has("core 0 0 800 542"), "{out:?}");
+    }
+
     /// A game's TextBox under the soft keyboard (Android, viewport.rs
     /// `keyboard_pan`): the keyboard's place reaches
     /// UserInputService.OnScreenKeyboardVisible / Position / Size in the

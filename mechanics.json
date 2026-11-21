@@ -1257,6 +1257,20 @@
    "source": "Roblox Studio (offline Studio, Play, 863x675 view): GuiService:GetGuiInset() = (0, 58); ScreenGui without IgnoreGuiInset 863x617 at (0,0), with it 863x675 at (0,-58)"
   },
   {
+   "name": "gui top bar free area left",
+   "group": "gui",
+   "value": 72,
+   "unit": "px",
+   "source": "the CoreScripts' TopBar constants (Studio's ExtraContent/scripts/CoreScripts/Modules/TopBar/Constants.lua): ScreenSideOffset 16 + TopBarButtonHeight 44 + TopBarPadding 12 past the Roblox button; GuiService.TopbarInset.Min.X and where a ScreenInsets TopbarSafeInsets ScreenGui starts, with Roblox's chat off (this build's bar, not a measurement of Roblox's unibar)"
+  },
+  {
+   "name": "gui top bar free area left with chat",
+   "group": "gui",
+   "value": 128,
+   "unit": "px",
+   "source": "the same with the chat button (TopBarPadding 12 + TopBarButtonHeight 44) after the Roblox button"
+  },
+  {
    "name": "gui font em per text size",
    "group": "gui",
    "value": 1.04,
