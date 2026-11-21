@@ -174,8 +174,15 @@ pub enum GuiEvent {
     SetText(Ref, String),
     /// GuiService.SelectedObject moved by keyboard navigation.
     Select(Option<Ref>),
-    /// ScrollingFrame.CanvasPosition moved by the wheel (pixels).
+    /// ScrollingFrame.CanvasPosition moved by the wheel (pixels): the
+    /// canvas glides there.
     Scroll(Ref, [f32; 2]),
+    /// ScrollingFrame.CanvasPosition dragged by a finger (pixels): the
+    /// canvas follows at once.
+    ScrollDrag(Ref, [f32; 2]),
+    /// A finger left a ScrollingFrame moving (pixels a second): the canvas
+    /// keeps going and slows down.
+    Fling(Ref, [f32; 2]),
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +276,15 @@ struct TouchFinger {
     under: HashSet<Ref>,
     /// The GuiButtons under it when it landed.
     began_on: Vec<Ref>,
+    /// The ScrollingFrame it landed on (the top one that scrolls): it
+    /// drags the canvas, and flings it when it leaves moving.
+    scroll: Option<Ref>,
+    /// It has dragged the canvas past the tap slop: no click on the lift.
+    scrolled: bool,
+    /// Its speed over the last moves (GUI pixels a second), and when the
+    /// last move was.
+    speed: (f32, f32),
+    moved_at: std::time::Instant,
 }
 
 /// An interactive object, in screen space, in draw order.

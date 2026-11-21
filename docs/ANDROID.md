@@ -272,7 +272,20 @@ fingers that land on the view go to the game raw:
    returns a `TouchOut` per finger: GUI coordinates, the delta, `sunk`
    (an Active object or a TextBox under it when it landed) and
    `began_on` (the GuiButtons under its landing point). With the game
-   menu open every finger is `sunk`.
+   menu open every finger is `sunk`. A finger that lands on a
+   ScrollingFrame (the top one under it with `ScrollingEnabled`) drags
+   its canvas (`GuiEvent::ScrollDrag`: `CanvasPosition` follows the
+   finger at once, against it, limited by `ScrollingDirection`), and
+   when it lifts moving the canvas keeps its speed and slows down
+   (`GuiEvent::Fling`; `play_game.rs scroll_fling` + the glide step,
+   `mech::GUI_TOUCH_FLING_*`, rustudio's own curve); a finger that
+   scrolled past the tap slop doesn't click the button it landed on.
+   Whether the camera turns too is `Active`'s, as in Roblox: a
+   ScrollingFrame with `Active = false` scrolls and lets the finger
+   through to the camera (the DevForum's "camera moves while I scroll"
+   threads, fixed by setting Active); most of LBG's lists are
+   `Active = false`. The unit test is gui_input.rs
+   `a_finger_drags_a_scrolling_frame_and_does_not_click_through_it`.
 3. `play_game.rs game_viewport` runs the gestures over them
    (`crates/rustudio-player/src/touch_gestures.rs`: tap, tap in world, long press, pan, pinch,
    rotate, swipe; `mech::TOUCH_*`), makes an unprocessed tap in the world
@@ -513,6 +526,31 @@ Settings > rustudio, and the MicroProfiler). What a phone gets from it:
   ms`, `[startup] first frame built in N ms, M ms after the engine's
   start` (`RUSTUDIO_STARTUP_TRACE=1` prints them on a desktop); the
   activity's own start to `android_main` is the system's share.
+- **Play's start** (the "game loads slowly" of the second phone report)
+  is timed the same way: `[startup] Play started in N ms: runtimes made
+  A, server DataModel copied B, client DataModel replicated C, physics
+  built D, globals bound E, server queries warmed F, server scripts
+  started G, player added H, …; K scripts compiled (X KB, C from the
+  bytecode cache, M --!native) in T ms` — the "play: …" marks of
+  `start_play` (`crates/rustudio-core/src/load_trace.rs` `play_step`)
+  and the compiler's share (`runtime.rs compile_script` →
+  `load_trace::note_compile`) — and once more eight seconds in
+  (`[startup] 8 s into Play; K scripts compiled …`: modules compile as
+  they are required, so most of a big game's compiling comes after the
+  start line). `RUSTUDIO_LOAD_TRACE=1` (through `debug.rustudio.env`)
+  prints the full `LOADTRACE` trail instead: the place read and parsed,
+  every frame over 100 ms with its biggest bench sections, the asset
+  queues as they change. What is known of the cost without a trace:
+  LBG is 7.3 MB of Luau in 685 scripts, 67 of them `--!native` (1.4
+  MB, compiled to machine code as they load — `RUSTUDIO_NO_NATIVE=1`
+  interprets them instead); the bytecode cache
+  (`crates/rustudio-engine/src/bytecode_cache.rs`) kept bytecode on
+  disk only for sources over 256 KB, so a phone compiled the 80 scripts
+  between 16 KB and 256 KB (5 MB) again at every launch — on Android
+  everything over 16 KB goes to disk now (`MIN_DISK`), and the memory
+  cap is 128 MB instead of 768. The place's 154,682 instances are read,
+  copied for the server and replicated to the client at every Play; the
+  trace tells which of these a phone spends its time in.
 - **3D resolution 75 % by default on Android** (the same
   `choice_default`): the first phone measurements fell well under the
   display's rate at full resolution, and at a phone's pixel density three
@@ -1426,6 +1464,36 @@ also echoed to logcat at the next start.
   DevForum (`crates/rustudio-core/src/default_scripts.rs`): a fork of
   the old character `Sound` script now keeps Roblox's
   `RbxCharacterSounds` out, the rest already matched.
+- **The second report on that build (11-21): the baseplate "crash" gone,
+  LBG plays, its moves run, shift lock and VFX work, TopbarPlus sits
+  right; left were a slow load, a finger over a list that turned the
+  camera instead of scrolling, and three script errors Roblox doesn't
+  give.** (1) `Run Service is not a valid member of DataModel "Game"`:
+  Roblox's RunService instance is *named* "Run Service", and LBG's
+  character modules (`CharacterStorage.*.M1` / `FrontDash`, 15 of them)
+  read `game["Run Service"]`; the module failed to load, so
+  `Controls:880` indexed nil with `FrontDash`. rustudio names services
+  by class (`doc.rs default_instance_name`, the table rustudio-net
+  shares), so the DataModel's child lookup takes the Roblox name as an
+  alias (`mech::service_class_for_name`, `runtime.rs find_named_child`:
+  `game["Run Service"]`, `FindFirstChild`, `WaitForChild`). (2) `Unable
+  to assign property CustomPhysicalProperties. PhysicalProperties
+  expected, got nil`: `part.CustomPhysicalProperties = nil` is how a
+  script goes back to the material's physics on Roblox; `lua_to_variant`
+  takes nil as `PhysicalProperties::Default` now (the property reads nil
+  again). Both are in the runtime test
+  `run_service_by_its_roblox_name_and_physical_properties_reset`. (3)
+  `Savage Fangs:419: attempt to index nil with 'GetAttribute'` is in a
+  script newer than the place on file (the lines don't match); the
+  candidate is `Player:GetAttribute('SelectedCharacter')` in the hit's
+  `task.spawn`, where `Player` is nil after the move's own "dummy
+  check" (`Player:IsA('Model')`) — open until the script or the place
+  is at hand. (4) ScrollingFrames had no touch scrolling at all (only
+  the wheel): "Fingers in Play" step 2 has it now, with Roblox's
+  `Active` rule for the camera. (5) The load: no log was sent; the
+  `[startup] Play started …` line and the compile summary ("Frame time
+  on a phone", "Play's start") exist for the next one, and the bytecode
+  disk cache covers every script over 16 KB on Android.
 
 ## Later steps (in order)
 

@@ -205,7 +205,8 @@ pub use history::{studio_step_name, FinishOp, HistoryEvent};
 /// "Union", a character's "Body Colors" and "Shirt Graphic". Services
 /// stay as their class: RunService's real Name is "Run Service", but
 /// `game.RunService` resolves by child name (runtime.rs `index_routed`
-/// has no class fallback). Not here, unverified: IntersectOperation
+/// has no class fallback); `game["Run Service"]` finds it through
+/// mech::service_class_for_name. Not here, unverified: IntersectOperation
 /// (Studio's Intersect names the result "Intersection"; the constructor
 /// may not), ManualWeld / ManualGlue. The same table is in
 /// rustudio_net::model (that crate can't depend on this one;

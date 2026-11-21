@@ -1563,9 +1563,32 @@ impl Gui {
                     }
                     let began_on: Vec<Ref> = under.iter().filter(|h| h.button).map(|h| h.r).collect();
                     let sunk = top.is_some();
+                    // The top ScrollingFrame under it scrolls with it (as on
+                    // a phone; whether the camera turns too stays with
+                    // Active, like Roblox: a frame with Active off lets the
+                    // finger through to the camera while it scrolls).
+                    let scroll = under.iter().rev().find(|h| h.scrolling).map(|h| h.r);
+                    if let Some(sf) = scroll {
+                        // (a finger landing stops the canvas gliding)
+                        self.events.push(GuiEvent::ScrollDrag(sf, [0.0, 0.0]));
+                    }
+                    let now_t = std::time::Instant::now();
                     self.touch_fingers.insert(
                         t.id,
-                        TouchFinger { x, y, start: (x, y), since: std::time::Instant::now(), sunk, pressed, under: now, began_on: began_on.clone() },
+                        TouchFinger {
+                            x,
+                            y,
+                            start: (x, y),
+                            since: now_t,
+                            sunk,
+                            pressed,
+                            under: now,
+                            began_on: began_on.clone(),
+                            scroll,
+                            scrolled: false,
+                            speed: (0.0, 0.0),
+                            moved_at: now_t,
+                        },
                     );
                     out.push(TouchOut { id: t.id, state: t.state, x, y, dx: 0.0, dy: 0.0, sunk, began_on });
                 }
@@ -1574,6 +1597,28 @@ impl Gui {
                     let (dx, dy) = (x - f.x, y - f.y);
                     f.x = x;
                     f.y = y;
+                    if let Some(sf) = f.scroll {
+                        // The canvas moves against the finger, by the
+                        // finger's own pixels (direction-limited where it
+                        // is applied: ScrollingDirection).
+                        if dx != 0.0 || dy != 0.0 {
+                            self.events.push(GuiEvent::ScrollDrag(sf, [-dx, -dy]));
+                        }
+                        let far = ((x - f.start.0).powi(2) + (y - f.start.1).powi(2)).sqrt();
+                        if far > mech::TOUCH_TAP_SLOP_PX {
+                            f.scrolled = true;
+                        }
+                        // Its speed: the last move over its time, blended
+                        // with what came before (a flick is the last few
+                        // moves; a finger that stopped before lifting
+                        // flings nothing).
+                        let now_t = std::time::Instant::now();
+                        let dt = now_t.duration_since(f.moved_at).as_secs_f32().max(1.0 / 240.0);
+                        let (vx, vy) = (dx / dt, dy / dt);
+                        let k = mech::GUI_TOUCH_FLING_BLEND;
+                        f.speed = (f.speed.0 + (vx - f.speed.0) * k, f.speed.1 + (vy - f.speed.1) * k);
+                        f.moved_at = now_t;
+                    }
                     for h in &under {
                         if f.under.contains(&h.r) {
                             self.events.push(GuiEvent::Fire(h.r, "MouseMoved", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
@@ -1595,6 +1640,16 @@ impl Gui {
                     for h in &under {
                         self.events.push(GuiEvent::Fire(h.r, "InputEnded", vec![input(t.state, dx, dy)]));
                     }
+                    // Lifted from a ScrollingFrame it dragged: the canvas
+                    // keeps its speed and slows down, unless the finger had
+                    // stopped (its last move is older than a frame or two).
+                    if let (Some(sf), true) = (f.scroll, f.scrolled) {
+                        let fresh = f.moved_at.elapsed() <= std::time::Duration::from_millis(mech::GUI_TOUCH_FLING_HOLD_MS);
+                        let (vx, vy) = if fresh { f.speed } else { (0.0, 0.0) };
+                        if vx.abs() + vy.abs() > mech::GUI_TOUCH_FLING_MIN_PX_S {
+                            self.events.push(GuiEvent::Fling(sf, [-vx, -vy]));
+                        }
+                    }
                     if let Some(pr) = f.pressed {
                         if super::share().pressed == Some(pr) {
                             super::share().pressed = None;
@@ -1603,7 +1658,9 @@ impl Gui {
                             if let Some(h) = self.hits.iter().find(|h| h.r == pr && h.button).cloned() {
                                 self.events.push(GuiEvent::Fire(pr, "MouseButton1Up", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
                                 let top = under.iter().rev().find(|h| h.textbox || h.active);
-                                if top.is_some_and(|t| t.r == pr) {
+                                // (a finger that scrolled the list the button
+                                // is in was scrolling, not clicking)
+                                if top.is_some_and(|t| t.r == pr) && !f.scrolled {
                                     self.events.push(GuiEvent::Fire(pr, "MouseButton1Click", vec![]));
                                     if h.active {
                                         self.events.push(GuiEvent::Fire(pr, "Activated", vec![input(TouchState::End, dx, dy), GuiArg::Num(1.0)]));
@@ -2533,5 +2590,81 @@ mod billboard_canvas_tests {
         assert_eq!(gui.cache[&root].key, small_key);
         assert_eq!(gui.layout[&child], small);
         assert_eq!(gui.cache_owner[&child].0, root);
+    }
+}
+
+#[cfg(test)]
+mod touch_scroll_tests {
+    use super::*;
+
+    fn hit(r: Ref, x0: f32, y0: f32, x1: f32, y1: f32, button: bool, scrolling: bool) -> Hit {
+        Hit {
+            r,
+            quad: [Pos2::new(x0, y0), Pos2::new(x1, y0), Pos2::new(x1, y1), Pos2::new(x0, y1)],
+            clip: None,
+            button,
+            textbox: false,
+            sink: button,
+            active: button,
+            scrolling,
+            drag: false,
+            painted: true,
+        }
+    }
+
+    /// A finger dragged over a ScrollingFrame scrolls it (the canvas
+    /// follows the finger, then keeps going when the finger leaves moving),
+    /// and the button it landed on in the list is not clicked by the lift.
+    /// The frame has Active off: the finger is still the camera's (`sunk`
+    /// comes from the button it landed on, as in Roblox).
+    #[test]
+    fn a_finger_drags_a_scrolling_frame_and_does_not_click_through_it() {
+        let (sf, button) = (Ref::new(), Ref::new());
+        let mut gui = Gui { input_inset: Some(0.0), ..Gui::default() };
+        gui.hits.push(hit(sf, 0.0, 0.0, 200.0, 400.0, false, true));
+        gui.hits.push(hit(button, 0.0, 0.0, 200.0, 50.0, true, false));
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let touch = |state, x: f32, y: f32| GuiTouch { id: 3, state, pos: Pos2::new(x, y) };
+        let out = gui.touch_input(&[touch(TouchState::Begin, 100.0, 40.0)], rect);
+        assert!(out[0].sunk && out[0].began_on == vec![button], "{:?} {:?}", out[0].sunk, out[0].began_on);
+        assert!(gui.events.iter().any(|e| matches!(e, GuiEvent::ScrollDrag(r, [0.0, 0.0]) if *r == sf)), "{:?}", gui.events);
+        gui.events.clear();
+        gui.touch_input(&[touch(TouchState::Change, 100.0, 20.0)], rect);
+        gui.touch_input(&[touch(TouchState::Change, 100.0, 10.0)], rect);
+        let drags: Vec<[f32; 2]> = gui.events.iter().filter_map(|e| match e {
+            GuiEvent::ScrollDrag(r, d) if *r == sf => Some(*d),
+            _ => None,
+        }).collect();
+        assert_eq!(drags, vec![[0.0, 20.0], [0.0, 10.0]], "{:?}", gui.events);
+        gui.events.clear();
+        gui.touch_input(&[touch(TouchState::End, 100.0, 10.0)], rect);
+        let names: Vec<&str> = gui.events.iter().filter_map(|e| match e {
+            GuiEvent::Fire(r, n, _) if *r == button => Some(*n),
+            _ => None,
+        }).collect();
+        assert!(names.contains(&"MouseButton1Up") && !names.contains(&"MouseButton1Click") && !names.contains(&"Activated"), "{names:?}");
+        assert!(gui.events.iter().any(|e| matches!(e, GuiEvent::Fling(r, [_, vy]) if *r == sf && *vy > 0.0)), "{:?}", gui.events);
+        assert!(gui.touch_fingers.is_empty());
+
+        // A tap on the button, with the frame under it: a click, no scroll.
+        gui.events.clear();
+        gui.touch_input(&[touch(TouchState::Begin, 100.0, 40.0)], rect);
+        gui.touch_input(&[touch(TouchState::Change, 102.0, 41.0)], rect);
+        gui.touch_input(&[touch(TouchState::End, 102.0, 41.0)], rect);
+        let names: Vec<&str> = gui.events.iter().filter_map(|e| match e {
+            GuiEvent::Fire(r, n, _) if *r == button => Some(*n),
+            _ => None,
+        }).collect();
+        assert!(names.contains(&"MouseButton1Click") && names.contains(&"Activated"), "{names:?}");
+        assert!(!gui.events.iter().any(|e| matches!(e, GuiEvent::Fling(..))), "{:?}", gui.events);
+
+        // A frame that doesn't scroll (ScrollingEnabled off: `scrolling`
+        // false) is dragged over like any frame.
+        gui.hits[0].scrolling = false;
+        gui.events.clear();
+        gui.touch_input(&[touch(TouchState::Begin, 100.0, 300.0)], rect);
+        gui.touch_input(&[touch(TouchState::Change, 100.0, 200.0)], rect);
+        gui.touch_input(&[touch(TouchState::End, 100.0, 200.0)], rect);
+        assert!(!gui.events.iter().any(|e| matches!(e, GuiEvent::ScrollDrag(..) | GuiEvent::Fling(..))), "{:?}", gui.events);
     }
 }

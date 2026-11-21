@@ -1415,7 +1415,8 @@ impl Walk<'_, '_> {
             textbox,
             sink: is_button || textbox || boolp(d, r, "Active", false),
             active: boolp(d, r, "Active", is_button),
-            scrolling,
+            // (the wheel and a finger scroll it only while ScrollingEnabled)
+            scrolling: scrolling && boolp(d, r, "ScrollingEnabled", true),
             drag: boolp(d, r, "Draggable", false)
                 || child_of_class(d, r, "UIDragDetector").is_some_and(|dd| boolp(d, dd, "Enabled", true)),
             painted: self.items.len() > items_before,

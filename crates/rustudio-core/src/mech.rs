@@ -527,6 +527,19 @@ pub const GUI_TOPBAR_LEFT: f32 = 72.0; // GuiService.TopbarInset.Min.X with Robl
 pub const GUI_TOPBAR_LEFT_CHAT: f32 = 128.0; // ... with the chat button (TopBarPadding 12 + 44) before it; a ScreenGui with ScreenInsets TopbarSafeInsets (TopbarPlus) is the TopbarInset rect: it starts here and is GUI_TOP_INSET tall
 /// GuiService.TopbarInset's left edge: where the top bar's free area starts
 /// past Roblox's buttons, with or without the chat button.
+/// A service's class from the Name its instance has in Roblox where the
+/// two differ: `game["Run Service"]` is RunService (the one service whose
+/// Name isn't its class; old scripts index it that way). rustudio's
+/// services are named by class (doc.rs `default_instance_name`), so the
+/// DataModel's child lookup maps the Name to the class (runtime.rs
+/// `find_named_child`: `game["Run Service"]`, FindFirstChild, WaitForChild).
+pub fn service_class_for_name(name: &str) -> Option<&'static str> {
+    match name {
+        "Run Service" => Some("RunService"),
+        _ => None,
+    }
+}
+
 pub fn gui_topbar_left(chat: bool) -> f32 {
     if chat { GUI_TOPBAR_LEFT_CHAT } else { GUI_TOPBAR_LEFT }
 }
@@ -541,6 +554,10 @@ pub const GUI_SURFACE_AFFINE_ERR_PX: f32 = 0.5; // SurfaceGui triangles whose co
 pub const GUI_SCROLL_PX_PER_POINT: f32 = 1.0; // ScrollingFrame: CanvasPosition pixels per pixel of the scroll event
 pub const GUI_SCROLL_EASE_PULL: f32 = 0.21; // ScrollingFrame wheel glide, per 60 Hz frame: the speed wanted is this share of the distance left …
 pub const GUI_SCROLL_EASE_BLEND: f32 = 0.5; // … and the speed moves this far toward it (fitted to Studio 0.747's CanvasPosition per frame for two notches, checks/plugins/widgets/captures/studio-widgets.txt: 0,8,24,42,56,68,77,84,89,92 | 103,120,139,154 … 200; within 3 px)
+pub const GUI_TOUCH_FLING_BLEND: f32 = 0.6; // ScrollingFrame under a finger: each move's speed moves the finger's remembered speed this far toward it (rustudio's own; no capture of Roblox's touch scrolling)
+pub const GUI_TOUCH_FLING_HOLD_MS: u64 = 80; // … a finger whose last move is older than this when it lifts had stopped: no fling (rustudio's own)
+pub const GUI_TOUCH_FLING_MIN_PX_S: f32 = 60.0; // … slower than this (GUI pixels a second) flings nothing (rustudio's own)
+pub const GUI_TOUCH_FLING_DECAY: f32 = 0.95; // … the flung canvas keeps this share of its speed each 60 Hz frame, and stops under half a pixel a frame (rustudio's own; Roblox's curve isn't captured)
 pub const GUI_SCROLL_PX_PER_NOTCH: f32 = 100.0; // FInt ScrollWheelDeltaAmount default (.data Studio, registered by Studio, used at Studio)
 pub const QUERY_GRID_CELL: f32 = 16.0; // studs: spatial grid cell for Raycast / GetPartBoundsInBox / GetPartsInPart
 pub const QUERY_GRID_MAX_CELLS: usize = 512; // parts spanning more cells than this are always tested

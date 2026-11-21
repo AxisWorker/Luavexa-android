@@ -1282,6 +1282,12 @@ fn lua_to_variant(
                 ))
             })?),
         },
+        // `part.CustomPhysicalProperties = nil` is how a script goes back to
+        // the material's physics in Roblox (the property reads nil then);
+        // the stored value is PhysicalProperties::Default.
+        VariantType::PhysicalProperties if matches!(v, Value::Nil) => {
+            Variant::PhysicalProperties(rbx_types::PhysicalProperties::Default)
+        }
         other => match crate::ltypes::datatype_to_variant(v) {
             Some(var) => var,
             None if matches!(v, Value::Nil) => {
@@ -1918,8 +1924,15 @@ pub(crate) fn native_call(lua: &Lua, r: Ref, name: &str, atom: i32, args: &[NArg
             let child = instance.children().iter().copied().find(|r| {
                 w.d().dom.get_by_ref(*r).is_some_and(|i| i.name == child_name)
             });
-            rustudio_core::telemetry::touch(class, name);
-            return Some(Ok((Fv::Inst(child.unwrap_or_else(Ref::none)), true)));
+            // (`game:FindFirstChild("Run Service")`, a service by its
+            // Roblox name: find_named_child's alias, the slow way)
+            let aliased = child.is_none()
+                && mech::service_class_for_name(child_name).is_some()
+                && w.d().dom.root_ref() == r;
+            if !aliased {
+                rustudio_core::telemetry::touch(class, name);
+                return Some(Ok((Fv::Inst(child.unwrap_or_else(Ref::none)), true)));
+            }
         }
     }
     if m == "GetAttribute" && rt.method.core {
@@ -3844,7 +3857,29 @@ struct ChildIndex {
 const CHILD_INDEX_MIN: usize = 64;
 
 /// `parent:FindFirstChild(name)`: the first child with that name.
+/// A child of `r` by name (`inst.Name`, FindFirstChild, WaitForChild).
+/// The DataModel's services answer to the Name Roblox's instance has
+/// where that differs from the class, too: RunService is "Run Service"
+/// there, and a game's modules read `game["Run Service"]` (rustudio names
+/// its services by class: crates/rustudio-core/src/doc.rs
+/// default_instance_name; mech::service_class_for_name lists the aliases).
 fn find_named_child(lua: &Lua, r: Ref, name: &str) -> mlua::Result<Option<Ref>> {
+    if let Some(c) = find_named_child_plain(lua, r, name)? {
+        return Ok(Some(c));
+    }
+    let Some(service) = mech::service_class_for_name(name) else {
+        return Ok(None);
+    };
+    let is_game = world(lua)?.d().dom.root_ref() == r;
+    if !is_game {
+        return Ok(None);
+    }
+    // (made if no script asked for it yet, as `game:GetService` does: the
+    // service is always there on Roblox)
+    get_service(lua, service, true)
+}
+
+fn find_named_child_plain(lua: &Lua, r: Ref, name: &str) -> mlua::Result<Option<Ref>> {
     let w = world(lua)?;
     let d = w.d();
     let Some(i) = d.dom.get_by_ref(r) else {
@@ -6855,6 +6890,18 @@ pub(crate) fn place_chunk_name(full_name: &str) -> String {
     format!("@{}", &full_name[..end])
 }
 
+/// Whether a source asks for native code (`--!native` among the hot
+/// comments at its top; a rough look at the first lines, for the
+/// `[startup]` summary only).
+fn native_marked(source: &str) -> bool {
+    let mut end = source.len().min(512);
+    while !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    source[..end]
+        .lines().take_while(|l| l.trim_start().is_empty() || l.trim_start().starts_with("--")).any(|l| l.contains("--!native"))
+}
+
 /// Compiles a script's Source with `script` bound in its own environment.
 fn compile_script(lua: &Lua, r: Ref, shared: &Table) -> mlua::Result<Function> {
     let (source, name) = {
@@ -6879,7 +6926,10 @@ fn compile_script(lua: &Lua, r: Ref, shared: &Table) -> mlua::Result<Function> {
     domains::script_env(lua, r, &env)?;
     // Big sources compile once (the other side of Play, the next run):
     // bytecode_cache.rs.
-    match crate::bytecode_cache::get(&source) {
+    let t0 = std::time::Instant::now();
+    let cached = crate::bytecode_cache::get(&source);
+    let (bytes, was_cached, native) = (source.len(), cached.is_some(), native_marked(&source));
+    let f = match cached {
         Some(b) => lua.load(&b[..]).set_mode(mlua::chunk::ChunkMode::Binary)
             .set_name(place_chunk_name(&name))
             .set_environment(env)
@@ -6888,7 +6938,10 @@ fn compile_script(lua: &Lua, r: Ref, shared: &Table) -> mlua::Result<Function> {
             .set_name(place_chunk_name(&name))
             .set_environment(env)
             .into_function(),
-    }
+    };
+    // (the `[startup]` summary of a Play's compiling: load_trace.rs)
+    rustudio_core::load_trace::note_compile(bytes, was_cached, native, t0.elapsed());
+    f
     })();
     domains::assets_cloud::scene::restore(lua,memory_category)?;
     result
@@ -8460,6 +8513,50 @@ mod legacy_tests {
         assert!(has("area 128 -58 800 0"), "{out:?}");
         assert!(has("nochat 72 728 72 72"), "{out:?}");
         assert!(has("core 0 0 800 542"), "{out:?}");
+    }
+
+    /// Two things a fighting game's modules do that Roblox takes: index
+    /// the DataModel by RunService's real Name, `game["Run Service"]`
+    /// (rustudio names the service by class; FindFirstChild / WaitForChild
+    /// go by the stored Name and stay nil, as `game:FindFirstChild("Run
+    /// Service")` is on Roblox when a place was saved with the class name),
+    /// and `part.CustomPhysicalProperties = nil` to go back to the
+    /// material's physics (the property reads nil again afterwards).
+    #[test]
+    fn run_service_by_its_roblox_name_and_physical_properties_reset() {
+        let mut d = Document::new_place();
+        let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
+        let src = r#"
+            local rs = game["Run Service"]
+            print("name", rs.ClassName, rs == game:GetService("RunService"), rs == game.RunService)
+            print("found", game:FindFirstChild("Run Service") == rs, game:WaitForChild("Run Service") == rs, workspace:FindFirstChild("Run Service"))
+            print("missing", pcall(function() return game["Run Servic"] end))
+            local part = Instance.new("Part")
+            part.CustomPhysicalProperties = PhysicalProperties.new(2, 0.5, 0.25)
+            print("custom", part.CustomPhysicalProperties.Density, part.CustomPhysicalProperties.Friction)
+            part.CustomPhysicalProperties = nil
+            print("reset", part.CustomPhysicalProperties == nil)
+            print("bad", pcall(function() part.Size = nil end))
+        "#;
+        let s = d.dom.insert(
+            sss,
+            InstanceBuilder::new("Script").with_name("T").with_property("Source", src.to_string()),
+        );
+        let rt = Runtime::new().unwrap();
+        let w = World::new(d, RunMode::Run);
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        rt.step(1.0 / 60.0);
+        let out = rt.leave().output;
+        let has = |p: &str| out.iter().any(|(_, t)| t.starts_with(p));
+        let says = |p: &str, m: &str| out.iter().any(|(_, t)| t.starts_with(p) && t.contains(m));
+        assert!(has("name RunService true true"), "{out:?}");
+        assert!(has("found true true nil"), "{out:?}");
+        assert!(says("missing false", "Run Servic is not a valid member of DataModel \"Game\""), "{out:?}");
+        assert!(has("custom 2 0.5"), "{out:?}");
+        assert!(has("reset true"), "{out:?}");
+        assert!(says("bad false", "Unable to assign property Size. Vector3 expected, got nil"), "{out:?}");
     }
 
     /// A game's TextBox under the soft keyboard (Android, viewport.rs

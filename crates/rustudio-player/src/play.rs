@@ -2541,6 +2541,7 @@ impl Game {
 
     /// One frame of the play session.
     pub fn play_tick(&mut self, ctx: &egui::Context, dt: f32, host: &mut dyn GameHost, no_ui: bool, shift: bool) {
+        rustudio_core::load_trace::play_frame();
         let keyboard = PlayKeyboard::read(ctx, self.gui.focus.is_some(), no_ui, shift);
         if self.play_thread.is_some() {
             self.threaded_step(keyboard, dt, host);

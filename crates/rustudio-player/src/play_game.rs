@@ -362,6 +362,8 @@ pub fn fire_gui_events(rt: &Runtime, events: Vec<rustudio_engine::gui::GuiEvent>
                 }
             }
             GuiEvent::Scroll(r, d) => scroll_by(rt, r, d),
+            GuiEvent::ScrollDrag(r, d) => scroll_drag(rt, r, d),
+            GuiEvent::Fling(r, v) => scroll_fling(rt, r, v),
         }
     }
     rt.dispatch();
@@ -378,6 +380,9 @@ struct SmoothScroll {
     /// moved the canvas, which ends the glide.
     written: glam::Vec2,
     acc: f32,
+    /// A flung canvas (a finger left it moving): it keeps `vel` and slows
+    /// down (mech GUI_TOUCH_FLING_DECAY) instead of easing to `target`.
+    fling: bool,
 }
 
 /// The glides of one VM (the game's, or the plugins' edit VM), kept in that
@@ -433,14 +438,64 @@ fn scroll_by(rt: &rustudio_engine::runtime::Runtime, r: Ref, d: [f32; 2]) {
     let Some((cur, max)) = scroll_range(rt, r) else {
         return;
     };
-    let delta = glam::Vec2::new(d[0], d[1]) * mech::GUI_SCROLL_PX_PER_POINT;
+    let delta = scroll_axes(rt, r, glam::Vec2::new(d[0], d[1]) * mech::GUI_SCROLL_PX_PER_POINT);
     let mut m = scrolls_mut(&rt.lua);
-    let fresh = SmoothScroll { pos: cur, vel: glam::Vec2::ZERO, target: cur, written: cur, acc: 0.0 };
+    let fresh = SmoothScroll { pos: cur, vel: glam::Vec2::ZERO, target: cur, written: cur, acc: 0.0, fling: false };
     let s = m.0.entry(r).or_insert(fresh);
-    if s.written != cur {
-        *s = SmoothScroll { pos: cur, vel: glam::Vec2::ZERO, target: cur, written: cur, acc: 0.0 };
+    if s.written != cur || s.fling {
+        *s = SmoothScroll { pos: cur, vel: glam::Vec2::ZERO, target: cur, written: cur, acc: 0.0, fling: false };
     }
     s.target = (s.target + delta).clamp(glam::Vec2::ZERO, max);
+}
+
+/// A ScrollingFrame's ScrollingDirection (X 1, Y 2, XY 4; XY when unset)
+/// applied to a scroll: the other axis's part is dropped.
+fn scroll_axes(rt: &rustudio_engine::runtime::Runtime, r: Ref, d: glam::Vec2) -> glam::Vec2 {
+    let dir = rt
+        .world_mut()
+        .and_then(|w| match w.d().prop(r, "ScrollingDirection") {
+            Some(Variant::Enum(e)) => Some(e.to_u32()),
+            _ => None,
+        })
+        .unwrap_or(4);
+    match dir {
+        1 => glam::Vec2::new(d.x, 0.0),
+        2 => glam::Vec2::new(0.0, d.y),
+        _ => d,
+    }
+}
+
+/// A finger dragging a ScrollingFrame (gui_input.rs `touch_input`): the
+/// canvas follows it at once, within its range, and any glide or fling
+/// under way ends (a landing finger sends a zero drag for that).
+fn scroll_drag(rt: &rustudio_engine::runtime::Runtime, r: Ref, d: [f32; 2]) {
+    let Some((cur, max)) = scroll_range(rt, r) else {
+        return;
+    };
+    let delta = scroll_axes(rt, r, glam::Vec2::new(d[0], d[1]) * mech::GUI_SCROLL_PX_PER_POINT);
+    let next = (cur + delta).clamp(glam::Vec2::ZERO, max).round();
+    scrolls_mut(&rt.lua).0.remove(&r);
+    if next != cur {
+        if let Ok(u) = rt.lua.create_userdata(rustudio_engine::ltypes::LVector2(next)) {
+            rt.set(r, "CanvasPosition", Value::UserData(u));
+        }
+    }
+}
+
+/// A finger that left a ScrollingFrame moving: the canvas goes on at the
+/// finger's speed (pixels a second) and slows down each frame
+/// (`step_smooth_scrolls`).
+fn scroll_fling(rt: &rustudio_engine::runtime::Runtime, r: Ref, v: [f32; 2]) {
+    let Some((cur, _)) = scroll_range(rt, r) else {
+        return;
+    };
+    let per_frame = scroll_axes(rt, r, glam::Vec2::new(v[0], v[1]) * mech::GUI_SCROLL_PX_PER_POINT / 60.0);
+    if per_frame.abs().max_element() < 0.5 {
+        return;
+    }
+    scrolls_mut(&rt.lua)
+        .0
+        .insert(r, SmoothScroll { pos: cur, vel: per_frame, target: cur, written: cur, acc: 0.0, fling: true });
 }
 
 /// One frame of the gliding ScrollingFrames (`scroll_by`), in steps of
@@ -472,13 +527,24 @@ pub fn step_smooth_scrolls(rt: &rustudio_engine::runtime::Runtime, dt: f32) {
             let frame = 1.0 / 60.0;
             while s.acc >= frame * 0.999 {
                 s.acc -= frame;
-                let want = (s.target - s.pos) * mech::GUI_SCROLL_EASE_PULL;
-                s.vel += (want - s.vel) * mech::GUI_SCROLL_EASE_BLEND;
-                s.pos += s.vel;
-                // Past an end (the canvas shrank): stop there on that axis.
+                if s.fling {
+                    // A flung canvas: on at its speed, slowing down.
+                    s.pos += s.vel;
+                    s.vel *= mech::GUI_TOUCH_FLING_DECAY;
+                } else {
+                    let want = (s.target - s.pos) * mech::GUI_SCROLL_EASE_PULL;
+                    s.vel += (want - s.vel) * mech::GUI_SCROLL_EASE_BLEND;
+                    s.pos += s.vel;
+                }
+                // Past an end (the canvas shrank, or the fling reached it):
+                // stop there on that axis.
                 let held = s.pos.clamp(glam::Vec2::ZERO, max);
                 s.vel = glam::Vec2::select(held.cmpne(s.pos), glam::Vec2::ZERO, s.vel);
                 s.pos = held;
+            }
+            if s.fling {
+                // (it stops where it is: the target is wherever it got to)
+                s.target = s.pos.round();
             }
             let done = (s.target - s.pos).abs().max_element() < 0.5 && s.vel.abs().max_element() < 0.5;
             let out = if done { s.target } else { s.pos.round() };
@@ -3241,5 +3307,88 @@ mod click_tests {
         assert_eq!(click_detector_in(&d, p), Some(det));
         let loose = part(&mut d, ws, 0.0);
         assert_eq!(click_detector_in(&d, loose), None);
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    fn canvas_y(rt: &Runtime, r: Ref) -> f32 {
+        match rt.world_mut().unwrap().d().prop(r, "CanvasPosition") {
+            Some(Variant::Vector2(v)) => v.y,
+            _ => 0.0,
+        }
+    }
+
+    /// A finger's drag moves the canvas at once, within the canvas
+    /// (ScrollingDirection decides the axes); a fling keeps it moving and
+    /// slows it down to a stop short of the end, or to the end.
+    #[test]
+    fn a_dragged_canvas_follows_and_a_flung_one_slows_down() {
+        use rbx_dom_weak::types::{UDim, UDim2};
+        let mut d = Document::new_place();
+        let sg = d.find_child(d.dom.root_ref(), "StarterGui").unwrap();
+        let gui = d.dom.insert(sg, InstanceBuilder::new("ScreenGui"));
+        let sf = d.dom.insert(
+            gui,
+            InstanceBuilder::new("ScrollingFrame")
+                .with_property("CanvasSize", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 1000))),
+        );
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(d, RunMode::Run));
+        rt.bind_globals().unwrap();
+        scroll_drag(&rt, sf, [40.0, 30.0]);
+        let pos = match rt.world_mut().unwrap().d().prop(sf, "CanvasPosition") {
+            Some(Variant::Vector2(v)) => (v.x, v.y),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(pos, (0.0, 30.0), "the canvas has no width to scroll");
+        scroll_drag(&rt, sf, [0.0, -100.0]);
+        assert_eq!(canvas_y(&rt, sf), 0.0, "clamped at the top");
+        scroll_drag(&rt, sf, [0.0, 2000.0]);
+        assert_eq!(canvas_y(&rt, sf), 1000.0, "clamped at the bottom");
+        scroll_drag(&rt, sf, [0.0, -500.0]);
+        assert_eq!(canvas_y(&rt, sf), 500.0);
+
+        // Flung upward at 600 px/s (10 px a frame): it moves, slows and stops.
+        scroll_fling(&rt, sf, [0.0, -600.0]);
+        step_smooth_scrolls(&rt, 1.0 / 60.0);
+        let after_one = canvas_y(&rt, sf);
+        assert!(after_one < 500.0 && after_one >= 489.0, "{after_one}");
+        for _ in 0..600 {
+            step_smooth_scrolls(&rt, 1.0 / 60.0);
+        }
+        let rest = canvas_y(&rt, sf);
+        // 10 px a frame at 0.95 a frame: 190 px by the frame it drops
+        // under half a pixel (59 frames; the whole series would be 200).
+        assert!(rest > 300.0 && rest < 320.0, "{rest}");
+        for _ in 0..10 {
+            step_smooth_scrolls(&rt, 1.0 / 60.0);
+        }
+        assert_eq!(canvas_y(&rt, sf), rest, "stopped");
+
+        // A fling into the end stops there.
+        scroll_fling(&rt, sf, [0.0, -6000.0]);
+        for _ in 0..120 {
+            step_smooth_scrolls(&rt, 1.0 / 60.0);
+        }
+        assert_eq!(canvas_y(&rt, sf), 0.0);
+
+        // A finger landing (a zero drag) ends a fling where it is.
+        scroll_fling(&rt, sf, [0.0, 600.0]);
+        step_smooth_scrolls(&rt, 1.0 / 60.0);
+        let mid = canvas_y(&rt, sf);
+        assert!(mid > 0.0, "{mid}");
+        scroll_drag(&rt, sf, [0.0, 0.0]);
+        for _ in 0..10 {
+            step_smooth_scrolls(&rt, 1.0 / 60.0);
+        }
+        assert_eq!(canvas_y(&rt, sf), mid);
+
+        // ScrollingDirection.X: a vertical drag does nothing.
+        rt.set(sf, "ScrollingDirection", Value::UserData(rt.lua.create_userdata(LEnumItem::from_name("ScrollingDirection", "X").unwrap()).unwrap()));
+        scroll_drag(&rt, sf, [0.0, 100.0]);
+        assert_eq!(canvas_y(&rt, sf), mid);
     }
 }
