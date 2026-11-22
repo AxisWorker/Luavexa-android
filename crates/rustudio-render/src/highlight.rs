@@ -228,7 +228,7 @@ impl HighlightPass {
                     targets: &[Some(wgpu::ColorTargetState { format: MASK_FORMAT, blend: None, write_mask: writes })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::current(),
             })
         };
         let all = mask_pipe("highlight mask", wgpu::ColorWrites::RED, false);
@@ -256,7 +256,7 @@ impl HighlightPass {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("highlight params"),

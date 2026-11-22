@@ -1023,7 +1023,7 @@ impl WorldGuiPass {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("world gui"),
@@ -1095,7 +1095,7 @@ impl WorldGuiPass {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         // Into the effects' buffer (`effects`): world GUIs, strips and
         // particles, premultiplied, alpha kept (round 27).
@@ -1134,7 +1134,7 @@ impl WorldGuiPass {
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::current(),
             })
         };
         let fx_pipeline = fx_into("world gui effects", "vs", std::mem::size_of::<GuiVertex>(), wgpu::VertexStepMode::Vertex, &attrs);
@@ -1182,7 +1182,7 @@ impl WorldGuiPass {
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::current(),
             })
         };
         let fx_in = full("world gui effects in", "fs_in");

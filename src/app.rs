@@ -2033,6 +2033,7 @@ impl eframe::App for RustudioApp {
     fn on_exit(&mut self) {
         crate::studio_settings::flush();
         rustudio_core::rustudio_settings::flush();
+        rustudio_render::pipeline_cache::save(true);
         crate::plugin_host::widgets_ui::on_exit();
         if let Some(s) = self.layout.as_mut() {
             s.save(&self.dock, &self.panels, &self.ed);
@@ -2047,6 +2048,7 @@ impl eframe::App for RustudioApp {
         if let Some(s) = self.layout.as_mut() {
             s.save(&self.dock, &self.panels, &self.ed);
         }
+        rustudio_render::pipeline_cache::save(true);
         // Going to the background: the free heap pages go back now, so the
         // process is judged (and kept) by what it really holds.
         rustudio_core::heap::trim();
@@ -2120,6 +2122,9 @@ impl eframe::App for RustudioApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         rustudio_render::gpu_health::check();
+        // The driver's pipeline cache goes to disk once a burst of pipeline
+        // builds is over (pipeline_cache.rs): the next start skips them.
+        rustudio_render::pipeline_cache::save(false);
         // (a phone shows black until this frame is presented: logcat
         // `RustStdoutStderr` has the renderer's and the first frame's share
         // of its start, render.rs `ensure_pipelines` the viewport's)

@@ -191,6 +191,7 @@ impl PlayerApp {
 impl eframe::App for PlayerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         rustudio_render::gpu_health::check();
+        rustudio_render::pipeline_cache::save(false);
         self.frame(ui);
     }
 
@@ -201,6 +202,7 @@ impl eframe::App for PlayerApp {
     }
 
     fn on_exit(&mut self) {
+        rustudio_render::pipeline_cache::save(true);
         rustudio_core::telemetry::flush();
     }
 }

@@ -310,6 +310,10 @@ pub fn wgpu_options_with(
                 d.required_features |= adapter.features() & egui_wgpu::wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
                 // RUSTUDIO_GPU_TIMING: timestamp queries (gpu_timing.rs).
                 d.required_features |= rustudio_render::gpu_timing::features(adapter.features());
+                // The driver's pipeline cache, kept between runs (Vulkan;
+                // pipeline_cache.rs): a phone's second start skips the
+                // shader compiles of its first.
+                d.required_features |= adapter.features() & egui_wgpu::wgpu::Features::PIPELINE_CACHE;
                 // GPU memory in blocks sized for memory use (8-64 MB), not
                 // wgpu's default 128-256 MB device blocks: the allocator keeps
                 // its last empty block, so a 1440 island settled 2.18-2.19 GB

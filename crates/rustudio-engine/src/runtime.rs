@@ -5314,9 +5314,17 @@ impl Runtime {
         // Scripts marked --!native (and @native functions) run as native
         // code, as in Roblox (vendor mlua state/raw.rs: other chunks are
         // interpreted). RUSTUDIO_NO_NATIVE=1: everything interpreted.
-        if std::env::var_os("RUSTUDIO_NO_NATIVE").is_some_and(|v| v != "0") {
+        let native_on = !std::env::var_os("RUSTUDIO_NO_NATIVE").is_some_and(|v| v != "0");
+        if !native_on {
             lua.enable_jit(false);
         }
+        // Their native code is built in the frames after they load
+        // (native_drain), not while Play starts. RUSTUDIO_NATIVE_NOW=1: at
+        // the load, as before.
+        lua.set_app_data(NativeQueue {
+            on: native_on && !std::env::var_os("RUSTUDIO_NATIVE_NOW").is_some_and(|v| v != "0"),
+            ..Default::default()
+        });
         rustudio_core::load_trace::mark("runtime: Lua made");
         // RUSTUDIO_DETERMINISTIC (test runs): Luau seeds math.random from the time and the
         // state's address; the default Animate script rolls its weighted variants with it,
@@ -6311,6 +6319,7 @@ impl Runtime {
         if let Ok(mut s) = sched(lua) {
             s.step += 1;
         }
+        native_drain(lua);
         crate::script_profiler::vm_frame(lua);
         {
             let _s = rustudio_core::bench::scope("rt_domains_step");
@@ -6902,6 +6911,50 @@ fn native_marked(source: &str) -> bool {
         .lines().take_while(|l| l.trim_start().is_empty() || l.trim_start().starts_with("--")).any(|l| l.contains("--!native"))
 }
 
+/// The --!native scripts loaded without their native code yet: a big
+/// game's 67 native modules (1.4 MB of Luau) went through the code
+/// generator inside Play's start; they run interpreted for their first
+/// frames instead and native_drain builds them a few milliseconds a
+/// frame (Luau attaches the code to the protos, so the closures made at
+/// the load take it up at their next call).
+#[derive(Default)]
+struct NativeQueue {
+    on: bool,
+    items: Vec<(Function, usize)>,
+    built: usize,
+    bytes: usize,
+    took: std::time::Duration,
+    frames: u32,
+}
+
+/// Native code for queued scripts, within a frame's budget (at least one
+/// a frame): called at the start of every Runtime::step.
+fn native_drain(lua: &Lua) {
+    const BUDGET: std::time::Duration = std::time::Duration::from_millis(3);
+    let Some(mut q) = lua.app_data_mut::<NativeQueue>() else { return };
+    if q.items.is_empty() {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    q.frames += 1;
+    while let Some((f, bytes)) = q.items.pop() {
+        lua.compile_native(&f);
+        q.built += 1;
+        q.bytes += bytes;
+        if t0.elapsed() >= BUDGET {
+            break;
+        }
+    }
+    q.took += t0.elapsed();
+    if q.items.is_empty() {
+        rustudio_core::load_trace::native_built(q.built, q.bytes, q.took, q.frames);
+        q.built = 0;
+        q.bytes = 0;
+        q.took = std::time::Duration::ZERO;
+        q.frames = 0;
+    }
+}
+
 /// Compiles a script's Source with `script` bound in its own environment.
 fn compile_script(lua: &Lua, r: Ref, shared: &Table) -> mlua::Result<Function> {
     let (source, name) = {
@@ -6929,6 +6982,12 @@ fn compile_script(lua: &Lua, r: Ref, shared: &Table) -> mlua::Result<Function> {
     let t0 = std::time::Instant::now();
     let cached = crate::bytecode_cache::get(&source);
     let (bytes, was_cached, native) = (source.len(), cached.is_some(), native_marked(&source));
+    // (NativeQueue: a --!native script loads interpreted and is built in
+    // the frames after)
+    let defer = native && lua.app_data_ref::<NativeQueue>().is_some_and(|q| q.on);
+    if defer {
+        lua.enable_jit(false);
+    }
     let f = match cached {
         Some(b) => lua.load(&b[..]).set_mode(mlua::chunk::ChunkMode::Binary)
             .set_name(place_chunk_name(&name))
@@ -6939,6 +6998,12 @@ fn compile_script(lua: &Lua, r: Ref, shared: &Table) -> mlua::Result<Function> {
             .set_environment(env)
             .into_function(),
     };
+    if defer {
+        lua.enable_jit(true);
+        if let (Ok(f), Some(mut q)) = (&f, lua.app_data_mut::<NativeQueue>()) {
+            q.items.push((f.clone(), bytes));
+        }
+    }
     // (the `[startup]` summary of a Play's compiling: load_trace.rs)
     rustudio_core::load_trace::note_compile(bytes, was_cached, native, t0.elapsed());
     f

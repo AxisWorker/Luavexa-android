@@ -178,12 +178,17 @@ impl ClientJoints {
             by_part.entry(p0).or_default().push(i);
             by_part.entry(p1).or_default().push(i);
         }
-        // Outward from each anchored part; parts with no anchored part in
+        // Outward from each anchored part, and from each part the server
+        // has (its place comes from the server's simulation and
+        // replication; a client-only part welded to it rides along, as a
+        // massless part welded into a server assembly does in Studio: a
+        // game's aura clones and FakeHead accessories welded to the
+        // character's limbs from a client script). Parts with neither in
         // their assembly would fall in Studio and are left where they are.
         let mut placed: HashMap<Ref, Xform> = HashMap::new();
         let mut queue: VecDeque<Ref> = VecDeque::new();
         for &p in by_part.keys() {
-            if anchored(cd, p) {
+            if anchored(cd, p) || c2s.contains_key(&p) {
                 if let Some(xf) = cframe(cd, p, "CFrame") {
                     placed.insert(p, xf);
                     queue.push_back(p);
@@ -200,14 +205,12 @@ impl ClientJoints {
                 } else {
                     (p0, compose(&compose(&at, &c1), &c0t.inverse()))
                 };
-                if placed.contains_key(&other) || anchored(cd, other) {
+                if placed.contains_key(&other) || anchored(cd, other) || c2s.contains_key(&other) {
                     continue;
                 }
                 placed.insert(other, xf);
                 queue.push_back(other);
-                if !c2s.contains_key(&other) {
-                    moved.insert(other);
-                }
+                moved.insert(other);
             }
         }
         for p in moved {
@@ -520,6 +523,40 @@ mod tests {
         d.mark_prop(joint, ustr("Transform"));
         joints.solve(&mut d, &replicated);
         assert_eq!(cframe(&d, limb, "CFrame").unwrap().pos, Vec3::new(2.0, 5.0, 0.0));
+    }
+
+    /// A client script's aura part, welded to the character's (server-owned,
+    /// unanchored) limb from a folder outside the character: it rides with
+    /// the limb as the server moves it, like a massless part welded into a
+    /// server assembly in Studio. The limb itself is never moved.
+    #[test]
+    fn client_parts_welded_to_a_server_part_ride_with_it() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let character = d.dom.insert(ws, InstanceBuilder::new("Model"));
+        let limb = d.dom.insert(character, InstanceBuilder::new("Part").with_property("CFrame", at(5.0, 3.0, 0.0)));
+        let vfx = d.dom.insert(ws, InstanceBuilder::new("Folder"));
+        let aura = d.dom.insert(vfx, InstanceBuilder::new("Part").with_property("CFrame", at(0.0, 0.0, 0.0)));
+        d.dom.insert(
+            aura,
+            InstanceBuilder::new("Weld")
+                .with_property("Part0", limb)
+                .with_property("Part1", aura)
+                .with_property("C0", at(0.0, 2.0, 0.0))
+                .with_property("C1", at(0.0, 0.0, 0.0)),
+        );
+        let replicated: HashMap<Ref, Ref> = [(character, character), (limb, limb)].into_iter().collect();
+        d.mark_all();
+        let mut cj = ClientJoints::default();
+        cj.solve(&mut d, &replicated);
+        let pos = |d: &Document, p| cframe(d, p, "CFrame").unwrap().pos;
+        assert!((pos(&d, aura) - Vec3::new(5.0, 5.0, 0.0)).length() < 1e-4, "{:?}", pos(&d, aura));
+        assert_eq!(pos(&d, limb), Vec3::new(5.0, 3.0, 0.0));
+        // The server moved the limb (replication wrote its CFrame).
+        d.dom.get_by_ref_mut(limb).unwrap().properties.insert(ustr("CFrame"), Variant::CFrame(at(25.0, 3.0, -4.0)));
+        d.mark_prop(limb, ustr("CFrame"));
+        cj.solve(&mut d, &replicated);
+        assert!((pos(&d, aura) - Vec3::new(25.0, 5.0, -4.0)).length() < 1e-4, "{:?}", pos(&d, aura));
     }
 
     /// An anchored root moved by script carries a client-made limb with it.

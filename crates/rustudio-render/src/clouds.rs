@@ -371,7 +371,7 @@ impl CloudsGpu {
                     targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::current(),
             })
         };
         let f16 = wgpu::TextureFormat::Rgba16Float;

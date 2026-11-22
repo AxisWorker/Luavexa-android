@@ -1496,7 +1496,7 @@ impl SeeThrough {
                     targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::current(),
             })
         };
         SeeThrough {
@@ -1690,7 +1690,7 @@ impl ViewportPipelines {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::current(),
             })
         };
         use wgpu::CompareFunction as C;
@@ -1852,7 +1852,7 @@ impl ViewportPipelines {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         let ssao_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ssao"),
@@ -1911,7 +1911,7 @@ impl ViewportPipelines {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         let near_fullscreen = |label: &str, fs: &str, targets: usize| {
             let t = Some(wgpu::ColorTargetState {
@@ -1938,7 +1938,7 @@ impl ViewportPipelines {
                     targets: &vec![t; targets],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::current(),
             })
         };
         let near_pipelines = ["fs_near_h", "fs_near_v", "fs_near_mask0", "fs_near_mask1", "fs_near_mask2", "fs_near_mask3", "fs_near_mask4", "fs_near_mask5", "fs_near_edge", "fs_near_bokeh", "fs_near_tent"].iter().map(|fs| near_fullscreen("dof near", fs, 1)).collect();
@@ -1965,7 +1965,7 @@ impl ViewportPipelines {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         let ssao_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ssao"),
@@ -1996,7 +1996,7 @@ impl ViewportPipelines {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::current(),
             })
         };
         let (depth_format, ao_format) = post_float_formats(device);
@@ -2724,7 +2724,7 @@ impl Renderer {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         // A cascade of the sun's shadow: depth only, both sides (thin
         // parts). No depth bias: the EVSM test's minimum variance is the bias.
@@ -2757,7 +2757,7 @@ impl Renderer {
             multisample: Default::default(),
             fragment: None,
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         let sun_cache = SunCache::new(device);
         // Smooth terrain (round 21): its own vertices (terrain.rs
@@ -2818,7 +2818,7 @@ impl Renderer {
             multisample: Default::default(),
             fragment: None,
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         let terrain_shadow_back = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("terrain shadow"),
@@ -2844,7 +2844,7 @@ impl Renderer {
             multisample: Default::default(),
             fragment: None,
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("viewport post effects"),
@@ -2877,7 +2877,7 @@ impl Renderer {
                     targets: &vec![t; targets],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::current(),
             })
         };
 
@@ -2888,7 +2888,7 @@ impl Renderer {
             label: Some("bloom pyramid up"), layout: Some(&layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_post"), compilation_options: Default::default(), buffers: &[] },
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_bloom_up"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: Some(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent::REPLACE }), write_mask: wgpu::ColorWrites::ALL })] }),
-            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
+            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: crate::pipeline_cache::current(),
         };
         let bloom_up = device.create_render_pipeline(&bloom_up_desc);
         let sky_globals = reduced.then(|| {
@@ -5668,7 +5668,7 @@ fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 {
             multisample: Default::default(),
             fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[] }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         SunCache { bgl, pipe, slots: std::array::from_fn(|_| None) }
     }

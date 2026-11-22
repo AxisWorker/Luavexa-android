@@ -238,6 +238,9 @@ pub(super) struct PlayView {
     pub(crate) topbar_on: bool,
     pub(crate) hotbar: Vec<(String, String, bool)>,
     status: String,
+    /// The client's UserGameSettings (the in-game menu's Settings page
+    /// shows them; the main thread has no client to ask).
+    pub(crate) settings: Option<crate::play::game::game_menu::MenuSettings>,
 }
 
 struct Presentation {
@@ -543,13 +546,14 @@ impl Publication {
         } else if !updated {
             PublishedFrame::Reuse
         } else {
-            let (chat, chat_on, backpack_on, topbar_on) = game.with_play_side(Side::Client, |rt, _, _| {
+            let (chat, chat_on, backpack_on, topbar_on, settings) = game.with_play_side(Side::Client, |rt, _, _| {
                 let (chat_on, backpack_on, topbar_on) = rt.world_mut().map_or((true, true, true), |w| {
                     (!w.core_gui_off.contains("Chat"), !w.core_gui_off.contains("Backpack"), !w.topbar_off)
                 });
                 let view = rustudio_engine::runtime::domains::players_chat::chat_view(&rt.lua);
-                (view, chat_on, backpack_on, topbar_on)
-            }).unwrap_or((None, true, true, true));
+                let settings = crate::play::game::game_menu::user_game_settings(&rt.lua);
+                (view, chat_on, backpack_on, topbar_on, settings)
+            }).unwrap_or((None, true, true, true, None));
             let status = game.play_status().unwrap_or_default();
             let chat_active = game.play.as_mut().and_then(|s| s.game.chat_active.take());
             let s = game.play.as_ref().expect("live Play publication");
@@ -567,6 +571,7 @@ impl Publication {
                 topbar_on,
                 hotbar: game.play_hotbar(),
                 status,
+                settings,
             };
             let server_id = (s.showing == Side::Client).then(|| s.other_doc_id()).flatten();
             let map = |r| s.map.s2c.get(&r).copied();

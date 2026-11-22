@@ -267,7 +267,7 @@ impl Renderer {
                 depth_stencil: None,
                 multisample: Default::default(),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::current(),
             });
             self.vf.blit = Some(Blit { pipeline, layout });
         }

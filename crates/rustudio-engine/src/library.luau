@@ -550,6 +550,13 @@ local function load_sequence(id)
     -- The clip's authoring rig, for retargeting (anim_retarget.rs).
     if seq then seq.rig = kfs:FindFirstChildOfClass("AnimationRigData") end
     sequences[id] = seq
+    -- Roblox's Output line for a clip that didn't come (not public, not
+    -- the signed-in account's, or no such asset): the track then never
+    -- plays and never fires Stopped, and the game waits on it — LBG's
+    -- cutscenes end at the camera rig clip's Stopped.
+    if not seq and not string.find(id, "rbxtemp", 1, true) then
+        warn("Failed to load animation - sanitized ID: " .. tostring(id))
+    end
     return seq or nil
 end
 

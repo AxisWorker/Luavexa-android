@@ -526,6 +526,24 @@ Settings > rustudio, and the MicroProfiler). What a phone gets from it:
   ms`, `[startup] first frame built in N ms, M ms after the engine's
   start` (`RUSTUDIO_STARTUP_TRACE=1` prints them on a desktop); the
   activity's own start to `android_main` is the system's share.
+  The driver's share of those pipelines is paid once per driver now:
+  the device is made with wgpu's `PIPELINE_CACHE` feature where the
+  adapter has it (Vulkan), every pipeline descriptor names the
+  process's cache (`crates/rustudio-render/src/pipeline_cache.rs`:
+  `init` in `Game::new`, `current()` in the descriptors), and its blob
+  — the `VkPipelineCache` data, the compiled shaders inside it — is
+  written to `<asset cache>/pipelines/wgpu_pipeline_cache_vulkan_<vendor>_<device>.bin`
+  two seconds after a burst of pipeline builds (`save` each frame; at
+  once on exit and when the activity goes to the background) and
+  handed back at the next start, which then skips the compiles the
+  driver recognises. logcat: `[startup] pipeline cache primed with N
+  KB` / `empty (first run on this driver)`, and `pipeline cache: N KB
+  written after M pipeline(s)`. wgpu checks the blob's header (adapter,
+  driver version) and the driver its own; a mismatch (a driver update,
+  a Turnip swap) starts empty. Turnip and PanVK keep their disk shader
+  cache besides (`MESA_SHADER_CACHE_DIR`, the Turnip section), so they
+  gained less from this than the vendor drivers, which keep nothing
+  between processes. `RUSTUDIO_NO_PIPELINE_CACHE=1` turns it off.
 - **Play's start** (the "game loads slowly" of the second phone report)
   is timed the same way: `[startup] Play started in N ms: runtimes made
   A, server DataModel copied B, client DataModel replicated C, physics
@@ -542,7 +560,14 @@ Settings > rustudio, and the MicroProfiler). What a phone gets from it:
   every frame over 100 ms with its biggest bench sections, the asset
   queues as they change. What is known of the cost without a trace:
   LBG is 7.3 MB of Luau in 685 scripts, 67 of them `--!native` (1.4
-  MB, compiled to machine code as they load — `RUSTUDIO_NO_NATIVE=1`
+  MB — their machine code is no longer built as they load: they run
+  interpreted for their first frames and `runtime.rs native_drain`
+  builds them 3 ms a frame once Play runs, logged as `[startup] native
+  code for N --!native script(s) (X KB) built in T ms over F frame(s)`;
+  `RUSTUDIO_NATIVE_NOW=1` builds at the load as before, and the
+  bytecode disk cache keeps the compiled form of every script over 4 KB
+  across launches, so a second launch compiles next to nothing —
+  `RUSTUDIO_NO_NATIVE=1`
   interprets them instead); the bytecode cache
   (`crates/rustudio-engine/src/bytecode_cache.rs`) kept bytecode on
   disk only for sources over 256 KB, so a phone compiled the 80 scripts

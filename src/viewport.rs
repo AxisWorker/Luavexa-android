@@ -707,11 +707,15 @@ impl Editor {
             // play_game.rs "Fingers in Play"); the in-game menu is egui's.
             let menu_open = self.game.play.as_ref().is_some_and(|s| s.game.menu_open);
             let game = driving && !menu_open && rustudio_engine::touch_input::game_touch();
-            let (stick, jump) = if driving && !game { rustudio_engine::touch_input::play_zones(rect) } else { (None, None) };
+            // The open menu covers the view: no stick or jump button under
+            // it, and its fingers are the chrome's (a finger that moves
+            // scrolls its page, as a ScrollingFrame; a tap clicks), not the
+            // view's right-button look.
+            let (stick, jump) = if driving && !game && !menu_open { rustudio_engine::touch_input::play_zones(rect) } else { (None, None) };
             // (game_viewport adds the editor's widgets over the view)
             let ui = if game { std::mem::take(&mut self.game.touch.zones.ui) } else { Vec::new() };
             self.game.touch.zones = rustudio_engine::touch_input::Zones {
-                viewport: visible,
+                viewport: if menu_open { egui::Rect::NOTHING } else { visible },
                 playing: driving,
                 game,
                 ui,

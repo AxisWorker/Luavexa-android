@@ -140,6 +140,9 @@ impl Game {
             // before automatic_quality below takes its first level.
             let caps = rustudio_render::gpu_caps::GpuCaps::of_adapter(&rs.adapter, &rs.device);
             rustudio_core::rustudio_settings::set_weak_gpu(rustudio_render::gpu_caps::decide_lowend(&caps));
+            // The driver's pipeline cache from the last run, before the
+            // first pipelines are made (pipeline_cache.rs).
+            rustudio_render::pipeline_cache::init(&rs.device, &rs.adapter.get_info(), rustudio_core::assets::cache_dir());
             let t0 = std::time::Instant::now();
             let r = Renderer::with_caps(&rs.device, &rs.queue, &caps);
             // (a phone shows black until the first frame: logcat

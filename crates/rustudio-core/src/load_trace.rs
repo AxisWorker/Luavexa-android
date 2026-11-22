@@ -77,6 +77,18 @@ pub fn note_compile(bytes: usize, cached: bool, native: bool, took: std::time::D
     COMPILED[4].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
 }
 
+/// The deferred native builds of a VM's --!native scripts finished
+/// (runtime.rs native_drain): one `[startup]` line.
+pub fn native_built(n: usize, bytes: usize, took: std::time::Duration, frames: u32) {
+    if startup_trace() {
+        eprintln!(
+            "[startup] native code for {n} --!native script(s) ({} KB) built in {} ms over {frames} frame(s) after their load",
+            bytes / 1024,
+            took.as_millis()
+        );
+    }
+}
+
 /// `; N scripts compiled (X KB, K from the bytecode cache, M --!native)
 /// in T ms` since the last call, which resets the counts.
 fn compile_summary() -> String {
