@@ -28,11 +28,11 @@ use rbx_dom_weak::types::{Ref, Variant};
 use crate::runtime::*;
 
 #[path = "services_encoding.rs"]
-mod encoding;
+pub(crate) mod encoding;
 #[path = "services_http.rs"]
 mod http;
 #[path = "services_reflect.rs"]
-mod reflect;
+pub(crate) mod reflect;
 #[path = "services_stream.rs"]
 pub mod stream;
 

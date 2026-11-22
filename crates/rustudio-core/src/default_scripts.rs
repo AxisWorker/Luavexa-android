@@ -41,9 +41,9 @@
 //!   `ExtraContent/scripts/PlayerScripts/StarterPlayerScripts` and
 //!   `StarterPlayerScriptsCommon`; the client copies them into
 //!   `Player.PlayerScripts` at join (play.rs). The same layout serves an
-//!   install without the project file and a place with its own PlayerModule
-//!   / PlayerScriptsLoader in StarterPlayerScripts (its own win, the loader
-//!   is added). `mech::PLAYER_SCRIPTS_DEFAULT_IAS` is where Default flips
+//!   install without the project file. A place's own PlayerModule /
+//!   PlayerScriptsLoader in StarterPlayerScripts wins there (the loader is
+//!   added beside a fork). `mech::PLAYER_SCRIPTS_DEFAULT_IAS` is where Default flips
 //!   when Roblox's phase 2 comes (the 0.747 Studio capture above is of the
 //!   Enabled layout; what a published place's players get is the rollout's
 //!   reading of Default).
@@ -53,10 +53,12 @@
 //!   `content/avatar/scripts/humanoidAnimateR15_DEPRECATED_20260813.rbxm`,
 //!   R6 `content/avatar/scripts/humanoidAnimatePlayEmote.rbxm`).
 //!
-//! A place's own script of the same name (in StarterPlayerScripts or
-//! StarterCharacterScripts) wins, as in Studio; a place that forked the old
-//! character `Sound` script (StarterCharacterScripts) keeps its sounds and
-//! gets no RbxCharacterSounds (`own_character_sounds`).
+//! A place's own script of the same name in the destination wins, as in
+//! Studio. In the Input Action System layout a custom module in
+//! StarterPlayerScripts can coexist with the default module under
+//! StarterPlayer. A place that forked the old character `Sound` script
+//! (StarterCharacterScripts) keeps its sounds and gets no RbxCharacterSounds
+//! (`own_character_sounds`).
 
 use std::path::{Path, PathBuf};
 
@@ -389,8 +391,7 @@ fn input_action_system_on(doc: &Document) -> bool {
     }
 }
 
-/// Puts the default player scripts into StarterPlayer.StarterPlayerScripts
-/// (made if missing) unless the place has its own of the same name. Returns
+/// Installs the default player scripts into the StarterPlayer tree. Returns
 /// the names inserted.
 pub fn insert_player_scripts(doc: &mut Document) -> Result<Vec<&'static str>, String> {
     let Some(root_dir) = studio_dir() else {
@@ -452,10 +453,10 @@ fn insert_player_scripts_from(doc: &mut Document, root_dir: &Path) -> Result<Vec
     let base = root_dir.join(PLAYER_SCRIPTS);
     let mut added = Vec::new();
     // The Input Action System layout: StarterPlayer.PlayerModule (see the
-    // module docs). CreateDefaultPlayerModule false: the place forked it.
-    let own_old = ["PlayerModule", "PlayerScriptsLoader"].iter().any(|n| child_named(doc, sps, n).is_some());
+    // module docs). CreateDefaultPlayerModule false: the place forked it. A
+    // place's own modules in StarterPlayerScripts coexist with it.
     let create_default = doc.prop(sp, "CreateDefaultPlayerModule") != Some(Variant::Bool(false));
-    if !own_old && input_action_system_on(doc) {
+    if input_action_system_on(doc) {
         let project = base.join("PlayerScripts.rbxp");
         let present = project.try_exists().map_err(|e| format!("{}: {e}", project.display()))?;
         if present {
@@ -704,19 +705,26 @@ mod tests {
                 .with_property("CreateDefaultPlayerModule", false),
         );
         check(d, &["RbxCharacterSounds"], false);
-        // Enabled with a fork in StarterPlayerScripts: the classic layout
-        // around the fork (the loader added, the fork kept).
-        let mut d = place_with_flag(2);
-        let root_ref = d.dom.root_ref();
-        d.dom.insert(
-            root_ref,
-            InstanceBuilder::new("StarterPlayer").with_name("StarterPlayer").with_child(
-                InstanceBuilder::new("StarterPlayerScripts")
-                    .with_name("StarterPlayerScripts")
-                    .with_child(script("ModuleScript", "PlayerModule", "return 'fork'".into())),
-            ),
-        );
-        check(d, &["PlayerScriptsLoader", "RbxCharacterSounds"], true);
+        // A fork in StarterPlayerScripts: Enabled keeps Studio's layout
+        // beside it (custom_player_module_coexists_with_the_input_action_system);
+        // Default and Disabled build the classic layout around the fork (the
+        // loader added, the fork kept).
+        let forked = |flag: u32| {
+            let mut d = place_with_flag(flag);
+            let root_ref = d.dom.root_ref();
+            d.dom.insert(
+                root_ref,
+                InstanceBuilder::new("StarterPlayer").with_name("StarterPlayer").with_child(
+                    InstanceBuilder::new("StarterPlayerScripts")
+                        .with_name("StarterPlayerScripts")
+                        .with_child(script("ModuleScript", "PlayerModule", "return 'fork'".into())),
+                ),
+            );
+            d
+        };
+        check(forked(2), &["PlayerModule", "RbxCharacterSounds"], false);
+        check(forked(0), &["PlayerScriptsLoader", "RbxCharacterSounds"], true);
+        check(forked(1), &["PlayerScriptsLoader", "RbxCharacterSounds"], true);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -779,6 +787,64 @@ mod tests {
             assert!(roblox_sounds(&d).is_some(), "{flag}");
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn custom_player_module_coexists_with_the_input_action_system() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rustudio-custom-player-{unique}"));
+        let base = root.join(PLAYER_SCRIPTS);
+        let module = base.join("StarterPlayer/PlayerModule");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("init.lua"), "return 'default'").unwrap();
+        std::fs::write(module.join("PlayerScriptsLoader.client.lua"), "return").unwrap();
+        std::fs::write(
+            base.join("PlayerScripts.rbxp"),
+            r#"{"instanceHierarchy":{"tree":{"StarterPlayer":{"$path":"StarterPlayer"}}}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(base.join("StarterPlayerScripts")).unwrap();
+        std::fs::write(
+            base.join("StarterPlayerScripts/PlayerScriptsLoader.lua"),
+            "return",
+        )
+        .unwrap();
+
+        let mut doc = Document::new_place();
+        let starter = doc.find_child(doc.dom.root_ref(), "StarterPlayer").unwrap();
+        let scripts = doc.find_child(starter, "StarterPlayerScripts").unwrap();
+        let custom = doc.dom.insert(
+            scripts,
+            script("ModuleScript", "PlayerModule", "return 'custom'".into()),
+        );
+        // Workspace.PlayerScriptsUseInputActionSystem: Disabled (1) for the
+        // legacy place, Enabled (2) for the modern one (Default is the classic
+        // layout while Roblox's rollout is in phase 1, see the module docs).
+        let set_flag = |d: &mut Document, state: u32| {
+            let workspace = d.workspace().unwrap();
+            d.dom.get_by_ref_mut(workspace).unwrap().properties.insert(
+                "PlayerScriptsUseInputActionSystem".into(),
+                Variant::Enum(rbx_dom_weak::types::Enum::from_u32(state)),
+            );
+        };
+        let mut legacy = doc.clone_for_play("legacy".into());
+        set_flag(&mut legacy, 1);
+        set_flag(&mut doc, 2);
+        let legacy_added = insert_player_scripts_from(&mut legacy, &root);
+        let modern_added = insert_player_scripts_from(&mut doc, &root);
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(legacy_added.unwrap(), ["PlayerScriptsLoader"]);
+        let legacy_starter = legacy.find_child(legacy.dom.root_ref(), "StarterPlayer").unwrap();
+        assert!(child_named(&legacy, legacy_starter, "PlayerModule").is_none());
+        assert_eq!(modern_added.unwrap(), ["PlayerModule"]);
+        assert_eq!(child_named(&doc, scripts, "PlayerModule"), Some(custom));
+        assert!(child_named(&doc, scripts, "PlayerScriptsLoader").is_none());
+        let default_module = child_named(&doc, starter, "PlayerModule").unwrap();
+        assert!(child_named(&doc, default_module, "PlayerScriptsLoader").is_some());
     }
 
     #[test]

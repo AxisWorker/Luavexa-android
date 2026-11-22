@@ -127,6 +127,10 @@ pub struct Game {
     /// (camera aspect from it; drawn scaled into the panel): self-test
     /// steps that compare with a Studio capture at Studio's view size.
     pub view_render_size: Option<[u32; 2]>,
+    /// Extra 3D adornments for this frame (Team Create collaborator camera gizmos).
+    pub extra_adorn: Vec<rustudio_render::adorn::AdornDraw>,
+    /// Extra Highlight draws for this frame (Team Create collaborator selections).
+    pub extra_highlights: Vec<rustudio_render::highlight::HighlightDraw>,
     /// Fingers (touch screens): what the viewport laid out for them and the
     /// movement stick's state (crates/rustudio-engine/src/touch_input.rs).
     pub touch: rustudio_engine::touch_input::Touch,
@@ -225,6 +229,8 @@ impl Game {
             terrain_brushed: None,
             lighting: Default::default(),
             view_render_size: None,
+            extra_adorn: Vec::new(),
+            extra_highlights: Vec::new(),
             touch: Default::default(),
         }
     }

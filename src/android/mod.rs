@@ -301,6 +301,10 @@ pub fn run(app: AndroidApp) {
 /// loss and out-of-memory are reported the same way; the frames after
 /// them show what they show (the renderer's own buffer and texture
 /// bounds are checked before the calls, render.rs `MaterialArrays`).
+/// Replaces the handlers `rustudio_render::gpu_health::watch` set for the
+/// device (an Output warning for the first error; a panic at the next
+/// frame once the device is lost): here the run saves and restarts instead
+/// (`gpu_watch`).
 pub fn install_gpu_error_handler(device: &egui_wgpu::wgpu::Device) {
     device.on_uncaptured_error(std::sync::Arc::new(|e: egui_wgpu::wgpu::Error| {
         let n = GPU_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;

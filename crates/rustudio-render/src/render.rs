@@ -264,6 +264,24 @@ struct InstanceRaw {
     tint: [f32; 4],
 }
 
+/// The mesh detail policy stored on a MeshPart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MeshFidelity {
+    Automatic,
+    Precise,
+    Performance,
+}
+
+impl MeshFidelity {
+    pub fn from_enum(value: u32) -> Self {
+        match value {
+            1 => Self::Precise,
+            2 => Self::Performance,
+            _ => Self::Automatic,
+        }
+    }
+}
+
 /// How a texture combines with the part (shader `extra.w`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TexMode {
@@ -477,8 +495,46 @@ pub mod gpu_check {
             };
             r.render(&rs, [320, 180], &frame);
         }
+        // The env probe's faces and a ViewportFrame: drawn with the startup
+        // pipelines into their own targets, so their sample counts must
+        // agree (one sample on OpenGL).
+        let mut tasks = vec![env_probe_gpu::Task::Face(0), env_probe_gpu::Task::Pyramid];
+        tasks.push(env_probe_gpu::Task::Convolve { mip: 1, first: 0, count: 1 });
+        let probe = env_probe_gpu::ProbeFrame { centre: Vec3::ZERO, tasks, blend: 0.5, swap: false };
+        let frame = Frame {
+            globals,
+            quality: None,
+            cull_view_proj: proj * view,
+            fov_y: 1.0,
+            lights: &[],
+            shadows: true,
+            sun_cascades: cascades,
+            overlay: &[],
+            lines: &[],
+            sky: true,
+            water: Default::default(),
+            clouds: None,
+            probe: Some(probe),
+        };
+        r.render(&rs, [320, 180], &frame);
+        let (layer, part) = (Ref::new(), Ref::new());
+        r.set_layer(part, Some(layer));
+        r.set_item(part, vec![PartDraw { custom_mesh: None, ..scene.parts[0].draw }]);
+        let req = vf::Request {
+            size: [64, 64],
+            cam: Xform { pos: Vec3::new(0.0, 0.0, 10.0), rot: glam::Mat3::IDENTITY },
+            fov_y: 1.0,
+            ambient: [0.5; 3],
+            light: [1.0; 3],
+            light_dir: -Vec3::Y,
+            background: [0.0, 0.0, 0.0, 1.0],
+        };
+        r.render_viewport_frames(&rs, &std::collections::HashMap::from([(layer, req)]));
+        assert!(r.vf_texture(layer).is_some(), "the ViewportFrame was not drawn");
         // The passes made on first use by a scene that has them.
-        for samples in [1, SAMPLES] {
+        // (a device that cannot sample multisampled textures never builds 4x)
+        let sample_counts: &[u32] = if caps.sampled_msaa() { &[1, SAMPLES] } else { &[1] };
+        for &samples in sample_counts {
             drop(crate::world_gui::WorldGuiPass::new(&device, &queue, DISPLAY_FORMAT, samples));
             drop(crate::highlight::HighlightPass::new(&device, DISPLAY_FORMAT, DEPTH_FORMAT, samples, std::mem::size_of::<Vertex>() as u64));
         }
@@ -500,6 +556,9 @@ mod gpu_tests {
     #[test]
     fn primitive_parity_geometry() {
         let meshes = build_meshes();
+        assert_eq!(meshes[MeshKind::Block as usize].len() / 3, 12);
+        assert_eq!(meshes[MeshKind::Ball as usize].len() / 3, 432);
+        assert_eq!(meshes[MeshKind::Cylinder as usize].len() / 3, 96);
         let points: Vec<_> = ball_outline_points().collect();
         for vertex in &meshes[MeshKind::Ball as usize] {
             assert!(points.iter().any(|p| p.distance(Vec3::from_array(vertex.pos)) < 1e-6));
@@ -510,6 +569,25 @@ mod gpu_tests {
         for index in [0usize, MeshKind::Ball as usize, MeshKind::Cylinder as usize] {
             assert!(meshes[index].iter().all(|v| v.projection[0] == 0.0));
         }
+    }
+
+    #[test]
+    fn frustum_box_inside_distinguishes_interior_straddling_and_outside() {
+        let proj = Mat4::perspective_rh(70.0_f32.to_radians(), 16.0 / 9.0, 0.1, 1000.0);
+        let view = Mat4::look_to_rh(Vec3::ZERO, -Vec3::Z, Vec3::Y);
+        let planes = frustum(proj * view);
+
+        // Strictly inside frustum
+        assert!(box_visible(&planes, Vec3::new(-1.0, -1.0, -25.0), Vec3::new(1.0, 1.0, -20.0)));
+        assert!(box_inside(&planes, Vec3::new(-1.0, -1.0, -25.0), Vec3::new(1.0, 1.0, -20.0)));
+
+        // Straddling left frustum plane
+        assert!(box_visible(&planes, Vec3::new(-100.0, -1.0, -25.0), Vec3::new(0.0, 1.0, -20.0)));
+        assert!(!box_inside(&planes, Vec3::new(-100.0, -1.0, -25.0), Vec3::new(0.0, 1.0, -20.0)));
+
+        // Completely behind camera
+        assert!(!box_visible(&planes, Vec3::new(-1.0, -1.0, 10.0), Vec3::new(1.0, 1.0, 20.0)));
+        assert!(!box_inside(&planes, Vec3::new(-1.0, -1.0, 10.0), Vec3::new(1.0, 1.0, 20.0)));
     }
 
     #[test]
@@ -856,6 +934,7 @@ struct Batch {
     hi: Vec3,
     start: u32,
     count: u32,
+    has_hidden: bool,
 }
 
 /// Anchored, opaque parts: uploaded once, sorted by (pass, mesh/texture,
@@ -864,9 +943,15 @@ struct Batch {
 #[derive(Default)]
 struct StaticLayout {
     raw: Vec<InstanceRaw>,
+    /// Pass and (mesh, texture) per slot, for the next rebuild's merge.
+    keys: Vec<(Pass, (usize, usize))>,
     /// Bounding radius per instance (descending within a batch).
     radii: Vec<f32>,
     batches: Vec<Batch>,
+    /// Conservative solid occluder boxes extracted from opaque static parts,
+    /// grouped into 128-stud cells sorted by surface area descending.
+    occluders: Vec<crate::occlusion::OccluderBox>,
+    occluder_cells: Vec<crate::occlusion::OccluderCell>,
     hidden: usize,
     /// Slots changed in place, uploaded next frame.
     writes: Vec<u32>,
@@ -906,6 +991,57 @@ fn sort_stable_by<T: Copy>(v: &mut Vec<T>, cmp: impl Fn(&T, &T) -> std::cmp::Ord
 /// An instance's bounding sphere (centre from its transform).
 fn raw_sphere(raw: &InstanceRaw, radius: f32) -> (Vec3, f32) {
     (Vec3::new(raw.r0[3], raw.r1[3], raw.r2[3]), radius.max(Vec3::from_slice(&raw.size[..3]).length() * 0.5))
+}
+
+/// A hasher for Refs (random 128-bit ids, so a multiply-xor mix spreads
+/// them): the renderer looks parts up by Ref every frame, and SipHash was
+/// a measurable share of that.
+#[derive(Default, Clone, Copy)]
+pub struct RefHasher(u64);
+
+impl std::hash::Hasher for RefHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for c in bytes.chunks(8) {
+            let mut b = [0u8; 8];
+            b[..c.len()].copy_from_slice(c);
+            self.write_u64(u64::from_le_bytes(b));
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(26) ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    fn write_u128(&mut self, v: u128) {
+        self.write_u64(v as u64);
+        self.write_u64((v >> 64) as u64);
+    }
+    fn write_isize(&mut self, v: isize) {
+        self.write_u64(v as u64);
+    }
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64);
+    }
+}
+
+pub type RefMap<V> = HashMap<Ref, V, std::hash::BuildHasherDefault<RefHasher>>;
+pub type RefSet = HashSet<Ref, std::hash::BuildHasherDefault<RefHasher>>;
+
+/// `f32::total_cmp`'s order as unsigned integers.
+fn total_order_bits(r: f32) -> u32 {
+    let b = r.to_bits() as i32;
+    (b ^ ((((b >> 31) as u32) >> 1) as i32)) as u32 ^ 0x8000_0000
+}
+
+#[test]
+fn total_order_bits_sort_as_total_cmp() {
+    let v = [f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.0, 1.5, -1.5, 1e-40, -1e-40, 3.0e38, 0.25, 7.0];
+    for a in v {
+        for b in v {
+            assert_eq!(a.total_cmp(&b), total_order_bits(a).cmp(&total_order_bits(b)), "{a} {b}");
+        }
+    }
 }
 
 /// Counters for the last frame (shown in the bench report).
@@ -976,6 +1112,45 @@ fn box_visible(planes: &[glam::Vec4; 5], lo: Vec3, hi: Vec3) -> bool {
         );
         p.truncate().dot(v) + p.w >= 0.0
     })
+}
+
+/// True when the entire box `[lo, hi]` lies strictly inside all five frustum planes.
+fn box_inside(planes: &[glam::Vec4; 5], lo: Vec3, hi: Vec3) -> bool {
+    planes.iter().all(|p| {
+        let v = Vec3::new(
+            if p.x > 0.0 { lo.x } else { hi.x },
+            if p.y > 0.0 { lo.y } else { hi.y },
+            if p.z > 0.0 { lo.z } else { hi.z },
+        );
+        p.truncate().dot(v) + p.w >= 0.0
+    })
+}
+
+/// World-space AABB of an uploaded `InstanceRaw`.
+fn raw_aabb(raw: &InstanceRaw) -> (Vec3, Vec3) {
+    let h = Vec3::new(raw.size[0], raw.size[1], raw.size[2]) * 0.5;
+    let ext = Vec3::new(raw.r0[0], raw.r0[1], raw.r0[2]).abs() * h.x
+        + Vec3::new(raw.r1[0], raw.r1[1], raw.r1[2]).abs() * h.y
+        + Vec3::new(raw.r2[0], raw.r2[1], raw.r2[2]).abs() * h.z;
+    let pos = Vec3::new(raw.r0[3], raw.r1[3], raw.r2[3]);
+    (pos - ext, pos + ext)
+}
+
+/// True when an `InstanceRaw` is strictly opaque solid geometry eligible to act
+/// as a software occlusion culler occluder (excludes hidden, transparent, Glass,
+/// Water, ForceField, Decal, and Cutout draws).
+fn raw_is_solid_occluder(raw: &InstanceRaw) -> bool {
+    let kind = raw.extra[0] as u32 & 7;
+    let tm = raw.extra[3];
+    raw.color[3] >= 0.999
+        && raw.size[0] > 0.0
+        && raw.size[1] > 0.0
+        && raw.size[2] > 0.0
+        && kind != 3
+        && kind != 5
+        && kind != 6
+        && tm != 2.0
+        && tm != 5.0
 }
 
 pub fn sphere_visible(planes: &[glam::Vec4; 5], c: Vec3, r: f32) -> bool {
@@ -1291,10 +1466,176 @@ impl MaterialArrays {
     }
 }
 
+/// Big shared vertex and index buffers that loaded meshes are placed in
+/// (`MeshPool`): one buffer pair for thousands of meshes, so draws of
+/// different meshes keep the same bindings and the GPU tracks a few
+/// buffers instead of one or two per mesh. Same vertices and indices: a
+/// mesh draws with its first index and base vertex.
+pub(crate) struct Slab {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    id: u64,
+    /// Free byte ranges (start, length) of the vertex and index buffers.
+    free: std::sync::Mutex<[Vec<(u64, u64)>; 2]>,
+}
+
+const SLAB_VERTEX_BYTES: u64 = 32 << 20;
+const SLAB_INDEX_BYTES: u64 = 16 << 20;
+
+impl Slab {
+    fn take(&self, which: usize, len: u64) -> Option<u64> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        let list = &mut free[which];
+        let i = list.iter().position(|r| r.1 >= len)?;
+        let (start, have) = list[i];
+        if have == len {
+            list.remove(i);
+        } else {
+            list[i] = (start + len, have - len);
+        }
+        Some(start)
+    }
+    fn give(&self, which: usize, start: u64, len: u64) {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        let list = &mut free[which];
+        let at = list.partition_point(|r| r.0 < start);
+        list.insert(at, (start, len));
+        // (join neighbours)
+        if at + 1 < list.len() && list[at].0 + list[at].1 == list[at + 1].0 {
+            list[at].1 += list[at + 1].1;
+            list.remove(at + 1);
+        }
+        if at > 0 && list[at - 1].0 + list[at - 1].1 == list[at].0 {
+            list[at - 1].1 += list[at].1;
+            list.remove(at);
+        }
+    }
+}
+
+/// A mesh's place in a slab, given back when the last copy of the mesh
+/// (a culling alias shares it) goes.
+pub(crate) struct SlabRange {
+    slab: std::sync::Arc<Slab>,
+    v: (u64, u64),
+    i: Option<(u64, u64)>,
+}
+
+impl Drop for SlabRange {
+    fn drop(&mut self) {
+        self.slab.give(0, self.v.0, self.v.1);
+        if let Some((s, l)) = self.i {
+            self.slab.give(1, s, l);
+        }
+    }
+}
+
+pub(crate) struct MeshPool {
+    queue: wgpu::Queue,
+    slabs: Vec<std::sync::Arc<Slab>>,
+    /// Uploads not yet written: (slab, 0 vertices / 1 indices, offset,
+    /// bytes). Each queue write takes its own staging buffer (one buffer
+    /// object each on ANV: thousands of meshes took seconds on the first
+    /// frame), so `flush` writes adjacent ones as one.
+    pending: Vec<(std::sync::Arc<Slab>, u8, u64, Vec<u8>)>,
+}
+
+impl MeshPool {
+    fn new(queue: &wgpu::Queue) -> Self {
+        MeshPool { queue: queue.clone(), slabs: Vec::new(), pending: Vec::new() }
+    }
+
+    /// Writes the pending uploads, adjacent ones merged into one write.
+    /// Before anything draws or writes pooled meshes.
+    pub(crate) fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let mut pending = std::mem::take(&mut self.pending);
+        pending.sort_by_key(|p| (p.0.id, p.1, p.2));
+        let mut i = 0;
+        while i < pending.len() {
+            let (slab, which, start) = (pending[i].0.clone(), pending[i].1, pending[i].2);
+            let mut bytes = std::mem::take(&mut pending[i].3);
+            let mut end = start + bytes.len() as u64;
+            i += 1;
+            while i < pending.len() && pending[i].0.id == slab.id && pending[i].1 == which && pending[i].2 == end {
+                end += pending[i].3.len() as u64;
+                bytes.extend_from_slice(&pending[i].3);
+                i += 1;
+            }
+            let buf = if which == 0 { &slab.vbuf } else { &slab.ibuf };
+            self.queue.write_buffer(buf, start, &bytes);
+        }
+    }
+
+    /// Room for `vlen` vertex bytes and `ilen` index bytes in one slab (a
+    /// new slab when none has it); None when they exceed a slab.
+    fn place(&mut self, device: &wgpu::Device, vlen: u64, ilen: u64) -> Option<SlabRange> {
+        if vlen == 0 || vlen > SLAB_VERTEX_BYTES || ilen > SLAB_INDEX_BYTES {
+            return None;
+        }
+        for slab in &self.slabs {
+            if let Some(v) = slab.take(0, vlen) {
+                if ilen == 0 {
+                    return Some(SlabRange { slab: slab.clone(), v: (v, vlen), i: None });
+                }
+                if let Some(i) = slab.take(1, ilen) {
+                    return Some(SlabRange { slab: slab.clone(), v: (v, vlen), i: Some((i, ilen)) });
+                }
+                slab.give(0, v, vlen);
+            }
+        }
+        let id = self.slabs.len() as u64 + 1;
+        // (mapped at creation: wgpu then counts the whole buffer as zeroed,
+        // instead of tracking which ranges were written and clearing the
+        // rest when a draw first reads the slab)
+        let buf = |label: &str, size: u64, usage: wgpu::BufferUsages| {
+            let b = device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: true });
+            b.unmap();
+            b
+        };
+        let slab = std::sync::Arc::new(Slab {
+            vbuf: buf("mesh slab vertices", SLAB_VERTEX_BYTES, wgpu::BufferUsages::VERTEX),
+            ibuf: buf("mesh slab indices", SLAB_INDEX_BYTES, wgpu::BufferUsages::INDEX),
+            id,
+            free: std::sync::Mutex::new([vec![(0, SLAB_VERTEX_BYTES)], vec![(0, SLAB_INDEX_BYTES)]]),
+        });
+        self.slabs.push(slab.clone());
+        let v = slab.take(0, vlen)?;
+        let i = if ilen > 0 { Some((slab.take(1, ilen)?, ilen)) } else { None };
+        Some(SlabRange { slab, v: (v, vlen), i })
+    }
+}
+
+/// A binding key for a mesh with its own buffers (pooled meshes use their
+/// slab's id): what `draw_bound` compares to skip re-binding.
+fn fresh_bind_key() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 40);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What a pass has bound in vertex slot 0 and the index buffer
+/// (`Mesh::draw_bound`); `UNBOUND` after anything else binds them.
+pub(crate) type Bound = std::cell::Cell<[u64; 2]>;
+pub(crate) const UNBOUND: [u64; 2] = [u64::MAX; 2];
+
+#[derive(Clone)]
 pub(crate) struct Mesh {
     vbuf: wgpu::Buffer,
+    /// The first vertex (pooled: its place in the slab) and first index.
+    base_vertex: u32,
+    first_index: u32,
+    /// Binding identity of (vbuf, ibuf): the slab's id when pooled.
+    bind_key: u64,
+    /// The slab range, kept while any copy of the mesh lives.
+    _pool_range: Option<std::sync::Arc<SlabRange>>,
     /// Corners drawn: the index count when indexed, else the vertex count.
     count: u32,
+    /// Relative corner offsets for the asset's resident LOD ranges.
+    lod_offsets: Option<std::sync::Arc<[u32]>>,
+    /// The resident prefix available to Automatic, from the mesh header.
+    high_quality_lods: u8,
+    fidelity: MeshFidelity,
     /// Indexed meshes (`indexed`): identical corners share one vertex, so
     /// the vertex shader runs once per distinct corner instead of three
     /// times a triangle. Same triangles, same vertex values.
@@ -1311,22 +1652,167 @@ pub(crate) struct Mesh {
     cull: Option<bool>,
     /// Made for the skinning pass (STORAGE usage).
     storage: bool,
+    /// Conservative local-space inscribed solid box for software occlusion culling.
+    occluder: Option<(Vec3, Vec3)>,
+}
+
+// Studio 0.748 loads this distance table from the served
+// settings and compares it with the squared distance to the box.
+// The versioned render pipeline has a separate rollout gate.
+const MESH_LOD_DISTANCES: [f32; 4] = [250.0, 500.0, 2000.0, 3000.0];
+
+#[derive(Clone, Copy)]
+struct MeshLodView {
+    camera: Vec3,
+    thresholds: [f32; 4],
+}
+
+impl MeshLodView {
+    fn new(camera: Vec3, tan_half_fov: f32) -> Self {
+        let scale = 35.0_f32.to_radians().tan() / tan_half_fov;
+        Self {
+            camera,
+            thresholds: MESH_LOD_DISTANCES.map(|distance| (distance * scale).powi(2)),
+        }
+    }
+
+    fn distance_squared(self, raw: &InstanceRaw) -> f32 {
+        let centre = Vec3::new(raw.r0[3], raw.r1[3], raw.r2[3]);
+        let half = Vec3::from_slice(&raw.size) * 0.5;
+        let extent = Vec3::from_slice(&raw.r0).abs() * half.x
+            + Vec3::from_slice(&raw.r1).abs() * half.y
+            + Vec3::from_slice(&raw.r2).abs() * half.z;
+        ((self.camera - centre).abs() - extent).max(Vec3::ZERO).length_squared()
+    }
+
+    fn level(self, distance_squared: f32, coarsest: usize) -> usize {
+        self.thresholds[..coarsest].partition_point(|&threshold| threshold <= distance_squared)
+    }
+}
+
+#[cfg(test)]
+mod mesh_lod_tests {
+    use super::*;
+
+    #[test]
+    fn studio_legacy_boundaries() {
+        let view = MeshLodView::new(Vec3::ZERO, 35.0_f32.to_radians().tan());
+        for (level, threshold) in MESH_LOD_DISTANCES.into_iter().enumerate() {
+            assert_eq!(view.level((threshold - 0.01).powi(2), 4), level);
+            assert_eq!(view.level(threshold.powi(2), 4), level + 1);
+        }
+        assert_eq!(view.level(750.0_f32.powi(2), 1), 1);
+        let narrow = MeshLodView::new(Vec3::ZERO, 17.5_f32.to_radians().tan());
+        assert_eq!(narrow.level(500.0_f32.powi(2), 4), 0);
+        assert_eq!(narrow.level(560.0_f32.powi(2), 4), 1);
+    }
+
+    #[test]
+    fn distance_uses_world_aabb_of_rotated_part() {
+        let view = MeshLodView::new(Vec3::new(11.0, 7.0, 0.0), 35.0_f32.to_radians().tan());
+        let raw = InstanceRaw {
+            size: [2.0, 8.0, 4.0, 0.0],
+            r0: [0.0, 1.0, 0.0, 2.0],
+            r1: [-1.0, 0.0, 0.0, 3.0],
+            r2: [0.0, 0.0, 1.0, 0.0],
+            ..HIDDEN
+        };
+        // Half extents in world space: (4, 1, 2).
+        assert_eq!(view.distance_squared(&raw), 34.0);
+    }
 }
 
 impl Mesh {
+    fn scene_lod(&self, view: MeshLodView, instances: &[InstanceRaw]) -> usize {
+        let Some(offsets) = &self.lod_offsets else { return 0 };
+        let limit = match self.fidelity {
+            MeshFidelity::Precise => return 0,
+            MeshFidelity::Automatic => usize::from(self.high_quality_lods),
+            MeshFidelity::Performance => offsets.len() - 1,
+        };
+        let mut coarsest = (limit - 1).min(offsets.len() - 2).min(MESH_LOD_DISTANCES.len());
+        for instance in instances {
+            if coarsest == 0 {
+                break;
+            }
+            if instance.color[3] > 0.0 {
+                coarsest = view.level(view.distance_squared(instance), coarsest);
+            }
+        }
+        coarsest
+    }
+
+    fn lod_corners(&self, lod: usize) -> std::ops::Range<u32> {
+        if lod == 0 {
+            return 0..self.count;
+        }
+        let offsets = self.lod_offsets.as_ref().expect("selected LOD has offsets");
+        offsets[lod]..offsets[lod + 1]
+    }
+
     /// Binds the mesh (slot 0, and its indices) and draws `instances`.
     pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass, instances: std::ops::Range<u32>) {
-        if self.count == 0 {
+        // (an empty mesh draws nothing; wgpu refuses a slice of its empty
+        // buffer)
+        if self.count == 0 || self.vbuf.size() == 0 {
             return;
         }
         pass.set_vertex_buffer(0, self.vbuf.slice(..));
         match &self.ibuf {
             Some(ib) => {
                 pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.count, 0, instances);
+                pass.draw_indexed(self.first_index..self.first_index + self.count, self.base_vertex as i32, instances);
             }
-            None => pass.draw(0..self.count, instances),
+            None => pass.draw(self.base_vertex..self.base_vertex + self.count, instances),
         }
+    }
+
+    /// [`Mesh::draw`], skipping the vertex and index buffer binds when the
+    /// pass already has this mesh (`slot`) bound: `bound` holds the slot last
+    /// bound in the pass (usize::MAX = unknown; reset it after binding any
+    /// other vertex buffer 0 or index buffer). The draws are the same.
+    pub(crate) fn draw_bound(&self, pass: &mut wgpu::RenderPass, instances: std::ops::Range<u32>, bound: &Bound) {
+        self.draw_bound_range(pass, instances, 0..self.count, bound);
+    }
+
+    fn draw_bound_range(
+        &self,
+        pass: &mut wgpu::RenderPass,
+        instances: std::ops::Range<u32>,
+        corners: std::ops::Range<u32>,
+        bound: &Bound,
+    ) {
+        if corners.is_empty() || self.vbuf.size() == 0 {
+            return;
+        }
+        let mut b = bound.get();
+        if b[0] != self.bind_key {
+            pass.set_vertex_buffer(0, self.vbuf.slice(..));
+            b[0] = self.bind_key;
+        }
+        match &self.ibuf {
+            Some(ib) => {
+                if b[1] != self.bind_key {
+                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    b[1] = self.bind_key;
+                }
+                bound.set(b);
+                pass.draw_indexed(self.first_index + corners.start..self.first_index + corners.end, self.base_vertex as i32, instances);
+            }
+            None => {
+                bound.set(b);
+                pass.draw(self.base_vertex + corners.start..self.base_vertex + corners.end, instances);
+            }
+        }
+    }
+
+    /// The box (unit space) its vertices stay inside, for screen bounds:
+    /// None when it isn't known to hold them (skinned meshes move theirs).
+    pub(crate) fn screen_bounds(&self) -> Option<(Vec3, Vec3)> {
+        if self.storage {
+            return None;
+        }
+        self.bounds
     }
 
     /// Shares identical corners, stopping as soon as the vertex budget is exceeded.
@@ -1365,6 +1851,15 @@ impl Mesh {
     }
 
     fn try_upload(device: &wgpu::Device, label: &str, verts: &[Vertex], usage: wgpu::BufferUsages, cull: Option<bool>) -> Option<Mesh> {
+        Self::try_upload_in(None, device, label, verts, usage, cull)
+    }
+
+    /// `upload` into the pool's slabs (own buffers when it doesn't fit one).
+    fn upload_pooled(pool: &mut MeshPool, device: &wgpu::Device, label: &str, verts: &[Vertex], usage: wgpu::BufferUsages, cull: Option<bool>) -> Mesh {
+        Self::try_upload_in(Some(pool), device, label, verts, usage, cull).unwrap_or_else(|| Self::upload(device, label, verts, usage, cull))
+    }
+
+    fn try_upload_in(pool: Option<&mut MeshPool>, device: &wgpu::Device, label: &str, verts: &[Vertex], usage: wgpu::BufferUsages, cull: Option<bool>) -> Option<Mesh> {
         let max = device.limits().max_buffer_size;
         let indexed = if std::mem::size_of_val(verts) as u64 > max {
             let index_bytes = verts.len() as u64 * std::mem::size_of::<u32>() as u64;
@@ -1378,6 +1873,45 @@ impl Mesh {
         } else {
             None
         };
+        let bounds = verts.iter().fold(None, |b: Option<(Vec3, Vec3)>, v| {
+            let p = Vec3::from(v.pos);
+            Some(b.map_or((p, p), |(lo, hi)| (lo.min(p), hi.max(p))))
+        });
+        let vsize = std::mem::size_of::<Vertex>() as u64;
+        // (into a slab: storage meshes, the skinning pass's, keep their own)
+        if let Some(pool) = pool.filter(|_| !usage.contains(wgpu::BufferUsages::STORAGE)) {
+            let (vdata, index): (&[Vertex], Option<&[u32]>) = match &indexed {
+                Some((unique, index)) => (unique, Some(index)),
+                None => (verts, None),
+            };
+            let vlen = vdata.len() as u64 * vsize;
+            let ilen = index.map_or(0, |i| i.len() as u64 * 4);
+            if let Some(range) = pool.place(device, vlen, ilen) {
+                let slab = range.slab.clone();
+                pool.pending.push((slab.clone(), 0, range.v.0, bytemuck::cast_slice(vdata).to_vec()));
+                if let (Some(i), Some((at, _))) = (index, range.i) {
+                    pool.pending.push((slab.clone(), 1, at, bytemuck::cast_slice(i).to_vec()));
+                }
+                let count = index.map_or(vdata.len(), |i| i.len()) as u32;
+                return Some(Mesh {
+                    vbuf: slab.vbuf.clone(),
+                    base_vertex: (range.v.0 / vsize) as u32,
+                    first_index: range.i.map_or(0, |i| (i.0 / 4) as u32),
+                    bind_key: slab.id,
+                    count,
+                    lod_offsets: None,
+                    high_quality_lods: 1,
+                    fidelity: MeshFidelity::Precise,
+                    ibuf: index.map(|_| slab.ibuf.clone()),
+                    remap: indexed.map(|(_, index)| std::sync::Arc::from(index)),
+                    bounds,
+                    cull,
+                    storage: false,
+                    occluder: None,
+                    _pool_range: Some(std::sync::Arc::new(range)),
+                });
+            }
+        }
         let (vdata, ibuf, remap, count) = match indexed {
             Some((unique, index)) => {
                 let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1395,11 +1929,7 @@ impl Mesh {
             contents: bytemuck::cast_slice(&vdata),
             usage,
         });
-        let bounds = verts.iter().fold(None, |b: Option<(Vec3, Vec3)>, v| {
-            let p = Vec3::from(v.pos);
-            Some(b.map_or((p, p), |(lo, hi)| (lo.min(p), hi.max(p))))
-        });
-        Some(Mesh { vbuf, count, ibuf, remap, bounds, cull, storage: false })
+        Some(Mesh { vbuf, base_vertex: 0, first_index: 0, bind_key: fresh_bind_key(), _pool_range: None, count, lod_offsets: None, high_quality_lods: 1, fidelity: MeshFidelity::Precise, ibuf, remap, bounds, cull, storage: false, occluder: None })
     }
 
     /// `corners` (one vertex per corner, as uploaded) as this mesh's
@@ -1550,6 +2080,10 @@ struct Target {
     bloom_levels: Vec<wgpu::TextureView>,
     bloom_down_bgs: Vec<wgpu::BindGroup>,
     bloom_up_bgs: Vec<wgpu::BindGroup>,
+    /// Native BlurEffect: 1/4-res ping-pong targets + bind groups
+    /// (downsample -> H -> V; final blurred HDR scene in `blur_views[1]`).
+    blur_views: [wgpu::TextureView; 2],
+    blur_bgs: [wgpu::BindGroup; 3],
     /// SSAO at half resolution: the AO depth, then (occlusion, depth) ping-
     /// ponged through the blurs; a bind group per pass (depth + its input).
     ssao_depth_view: wgpu::TextureView,
@@ -1561,12 +2095,23 @@ struct Target {
 }
 
 struct ViewportPipelines {
+    /// The sample count these pipelines were built for (1 on OpenGL).
+    samples: u32,
     water: crate::water::WaterPass,
     glass_resolve: wgpu::RenderPipeline,
     sky: wgpu::RenderPipeline,
     opaque: wgpu::RenderPipeline,
     opaque_two_sided: wgpu::RenderPipeline,
     opaque_low: Option<[[wgpu::RenderPipeline; 2]; 2]>,
+    /// fs_part specialised (shader.wgsl SPEC_*) for runs of untextured,
+    /// non-glass/water/ForceField parts in a frame without a debug view:
+    /// [cull back, two-sided].
+    opaque_plain: Option<[wgpu::RenderPipeline; 2]>,
+    /// opaque_plain further specialised to a frame's globals (shader.wgsl
+    /// SPEC_GLOBALS, render.rs spec_mask), made on a worker the first time a
+    /// mask is seen (None while it compiles: opaque_plain draws meanwhile).
+    plain_spec: std::sync::Arc<std::sync::Mutex<HashMap<u32, Option<[wgpu::RenderPipeline; 2]>>>>,
+    plain_src: (std::sync::Arc<String>, wgpu::PipelineLayout, wgpu::MultisampleState),
     transparent_culled: wgpu::RenderPipeline,
     glass: wgpu::RenderPipeline,
     glass_culled: wgpu::RenderPipeline,
@@ -1612,9 +2157,10 @@ impl ViewportPipelines {
         reduced: bool,
     ) -> Self {
         let source = shader_source(reduced).replace("const VIEWPORT_SAMPLES: i32 = 4;", &format!("const VIEWPORT_SAMPLES: i32 = {samples};"));
+        let spec_base = std::sync::Arc::new(crate::gpu_caps::shader_for(device, &if samples == 1 { single_sample_shader(source) } else { source }));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("viewport color and depth"),
-            source: wgpu::ShaderSource::Wgsl(crate::gpu_caps::shader_for(device, &if samples == 1 { single_sample_shader(source) } else { source }).into()),
+            source: wgpu::ShaderSource::Wgsl(spec_base.as_str().into()),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("viewport"),
@@ -1648,7 +2194,7 @@ impl ViewportPipelines {
             mask: !0,
             alpha_to_coverage_enabled: false,
         };
-        let make = |label: &str,
+        let make_c = |label: &str,
                     vs: &str,
                     fs: &str,
                     buffers: &[Option<wgpu::VertexBufferLayout>],
@@ -1656,14 +2202,15 @@ impl ViewportPipelines {
                     cull: Option<wgpu::Face>,
                     depth_write: bool,
                     depth_compare: wgpu::CompareFunction,
-                    blend: Option<wgpu::BlendState>| {
+                    blend: Option<wgpu::BlendState>,
+                    constants: &[(&str, f64)]| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(if fs.starts_with("fs_part") || fs == "fs_decal_depth" { &part_layout } else { &layout }),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some(vs),
-                    compilation_options: Default::default(),
+                    compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
                     buffers,
                 },
                 primitive: wgpu::PrimitiveState {
@@ -1682,7 +2229,7 @@ impl ViewportPipelines {
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
                     entry_point: Some(fs),
-                    compilation_options: Default::default(),
+                    compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
                     targets: &[Some(wgpu::ColorTargetState {
                         format: HDR_FORMAT,
                         blend,
@@ -1692,6 +2239,17 @@ impl ViewportPipelines {
                 multiview_mask: None,
                 cache: crate::pipeline_cache::current(),
             })
+        };
+        let make = |label: &str,
+                    vs: &str,
+                    fs: &str,
+                    buffers: &[Option<wgpu::VertexBufferLayout>],
+                    topology: wgpu::PrimitiveTopology,
+                    cull: Option<wgpu::Face>,
+                    depth_write: bool,
+                    depth_compare: wgpu::CompareFunction,
+                    blend: Option<wgpu::BlendState>| {
+            make_c(label, vs, fs, buffers, topology, cull, depth_write, depth_compare, blend, &[])
         };
         use wgpu::CompareFunction as C;
         use wgpu::PrimitiveTopology as T;
@@ -1728,6 +2286,21 @@ impl ViewportPipelines {
             C::Greater,
             None,
         );
+        // The debug views stay compiled in: without them ANV fuses some of
+        // the lighting's shared products differently (one test-place pixel's
+        // green rounded a step lower, deterministically); with them every
+        // pixel is the generic program's. (RUSTUDIO_SPEC_KEEP=t,k keeps
+        // those paths too: a diagnostic.)
+        let keep = std::env::var("RUSTUDIO_SPEC_KEEP").unwrap_or_default();
+        let flag = |c: char| if keep.contains(c) { 1.0 } else { 0.0 };
+        let plain = [("SPEC_TEXTURED", flag('t')), ("SPEC_SPECIAL_KINDS", flag('k')), ("SPEC_DEBUG_VIEWS", 1.0)];
+        // Off unless RUSTUDIO_SPEC_PIPELINE is set: on Intel (Mesa ANV) the
+        // specialised program rounds one test-place pixel's green differently
+        // (27,75,20 vs 27,74,20), so it is not yet the same image.
+        let opaque_plain = spec_pipelines_on().then(|| {
+            let src = (std::sync::Arc::new(spec_source(&spec_base, plain[0].1 > 0.5, plain[1].1 > 0.5, None)), part_layout.clone(), ms);
+            [Some(wgpu::Face::Back), None].map(|cull| opaque_part_pipeline(device, &src, cull))
+        });
         let opaque_low = (samples == 1).then(|| {
             ["fs_part_opaque_low", "fs_part_opaque_shadowed"].map(|entry| {
                 [Some(wgpu::Face::Back), None].map(|cull| make(
@@ -2033,12 +2606,16 @@ impl ViewportPipelines {
 
 
         Self {
+            samples,
             water,
             glass_resolve,
             sky,
             opaque,
             opaque_two_sided,
             opaque_low,
+            opaque_plain,
+            plain_spec: Default::default(),
+            plain_src: (spec_base.clone(), part_layout.clone(), ms),
             transparent_culled,
             glass,
             glass_culled,
@@ -2060,6 +2637,128 @@ impl ViewportPipelines {
             see,
         }
     }
+}
+
+/// RUSTUDIO_SPEC_PIPELINE: draw plain opaque runs with specialised fs_part
+/// pipelines (shader.wgsl SPEC_*).
+fn spec_pipelines_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUSTUDIO_SPEC_PIPELINE").is_some())
+}
+
+/// The frame-wide conditions fs_part branches on (shader.wgsl SPEC_MASK).
+fn spec_mask(g: &Globals) -> u32 {
+    u32::from(g.perf[0] < 0.5)
+        | u32::from(g.perf[0] < 1.5) << 1
+        | u32::from(g.perf[3] > 0.5) << 2
+        | u32::from(g.lamp1[3] > 1.5) << 3
+        | u32::from(g.sun_color[3] > 0.5) << 4
+        | u32::from(g.env_spec[2] > 0.5) << 5
+}
+
+/// An opaque part pipeline over fs_part with `constants` (the opaque
+/// pipelines' state: depth write, Greater, no blend).
+/// The viewport shader with part_shade's specialisation constants set
+/// (shader.wgsl SPEC_*; the debug views always kept, see ViewportPipelines).
+fn spec_source(base: &str, textured: bool, special_kinds: bool, mask: Option<u32>) -> String {
+    let mut s = base
+        .replace("const SPEC_TEXTURED: bool = true;", &format!("const SPEC_TEXTURED: bool = {textured};"))
+        .replace("const SPEC_SPECIAL_KINDS: bool = true;", &format!("const SPEC_SPECIAL_KINDS: bool = {special_kinds};"));
+    if let Some(m) = mask {
+        s = s
+            .replace("const SPEC_GLOBALS: bool = false;", "const SPEC_GLOBALS: bool = true;")
+            .replace("const SPEC_MASK: u32 = 0u;", &format!("const SPEC_MASK: u32 = {m}u;"));
+    }
+    s
+}
+
+/// An opaque part pipeline (vs_part / fs_part, the opaque pipelines' state:
+/// depth write, Greater, no blend) over a module made from `source`.
+fn opaque_part_pipeline(
+    device: &wgpu::Device,
+    (source, layout, ms): &(std::sync::Arc<String>, wgpu::PipelineLayout, wgpu::MultisampleState),
+    cull: Option<wgpu::Face>,
+) -> wgpu::RenderPipeline {
+    let constants: &[(&str, f64)] = &[];
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("parts specialised"),
+        source: wgpu::ShaderSource::Wgsl(source.as_str().into()),
+    });
+    let shader = &module;
+    let vertex_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<Vertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 8 => Float32x2, 12 => Float32x4, 11 => Float32x4],
+    };
+    let instance_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<InstanceRaw>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 9 => Float32x4, 10 => Float32x4, 13 => Float32x4],
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("parts-plain-spec"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_part"),
+            compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
+            buffers: &[Some(vertex_layout), Some(instance_layout)],
+        },
+        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: cull, ..Default::default() },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Greater),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: *ms,
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_part"),
+            compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
+            targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+impl ViewportPipelines {
+    /// The plain pipelines specialised to `mask`, once made; asks a worker
+    /// to make them the first time (opaque_plain draws until then).
+    fn plain_for(&self, device: &wgpu::Device, mask: u32) -> Option<[wgpu::RenderPipeline; 2]> {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var_os("RUSTUDIO_NO_SPEC_PIPELINE").is_some()) {
+            return None;
+        }
+        let mut map = self.plain_spec.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(&mask) {
+            Some(p) => p.clone(),
+            None => {
+                map.insert(mask, None);
+                let (device, src, cache) = (device.clone(), self.plain_src.clone(), self.plain_spec.clone());
+                std::thread::Builder::new()
+                    .name("rustudio-pipeline".into())
+                    .spawn(move || {
+                        let src = (std::sync::Arc::new(spec_source(&src.0, false, false, Some(mask))), src.1, src.2);
+                        let pipes = [Some(wgpu::Face::Back), None].map(|cull| opaque_part_pipeline(&device, &src, cull));
+                        cache.lock().unwrap_or_else(|e| e.into_inner()).insert(mask, Some(pipes));
+                    })
+                    .ok();
+                None
+            }
+        }
+    }
+}
+
+/// The sample count the startup viewport pipelines (and the env probe and
+/// ViewportFrame targets drawn with them) are built for. The 4x shader
+/// variant reads the MSAA scene with textureSamples (GL 4.5, or
+/// ARB_shader_texture_image_samples, which pre-Skylake Intel drivers lack),
+/// and an OpenGL device draws one sample anyway (gpu_caps::sampled_msaa).
+fn startup_samples(caps: &crate::gpu_caps::GpuCaps) -> u32 {
+    if caps.sampled_msaa() { SAMPLES } else { 1 }
 }
 
 fn sample_slot(samples: u32) -> usize {
@@ -2094,15 +2793,26 @@ pub struct Renderer {
     /// The viewport's passes per sample count (`sample_slot`), each built
     /// on first use (`ensure_pipelines`): a frame needs the set for its
     /// quality level's samples (quality.rs `samples`: one a pixel up to
-    /// level 16, as a weak GPU's levels are) and the probe's faces the 4x
-    /// set; a set is some thirty pipelines through the driver's compiler,
-    /// a second or more of a phone's start before the first frame.
+    /// level 16, as a weak GPU's levels are) and the probe's faces the
+    /// `probe_samples` set; a set is some thirty pipelines through the
+    /// driver's compiler, a second or more of a phone's start before the
+    /// first frame.
     pipelines: [Option<ViewportPipelines>; 3],
+    /// The sample count the env probe's faces and ViewportFrame targets are
+    /// drawn with (`startup_samples`: 4x, or 1 where the 4x shader can't run).
+    probe_samples: u32,
+    /// The one-sample pipelines being made on a worker since startup, for
+    /// a session that will draw with them (Automatic on a weak GPU, Low):
+    /// the first frame takes them instead of compiling them itself (seconds
+    /// on Mesa ANV the first time a build's shaders are seen).
+    lower_pending: Option<std::sync::mpsc::Receiver<ViewportPipelines>>,
     terrain_layout: wgpu::BindGroupLayout,
     /// Skinned parts deformed on the GPU (skin_gpu.rs).
     skin: crate::skin_gpu::SkinGpu,
     /// Highlight instances over the finished image (highlight.rs).
     highlight: [Option<crate::highlight::HighlightPass>; 3],
+    /// 3D viewport adornments (collaborator camera gizmos, adorn.rs).
+    adorn: [Option<crate::adorn::AdornPass>; 3],
     /// The last frame's view-projection (Highlights draw with it).
     last_view_proj: Mat4,
     /// SurfaceGuis / BillboardGuis tested against the scene's depth (round 23).
@@ -2128,6 +2838,10 @@ pub struct Renderer {
     bloom_down: wgpu::RenderPipeline,
     bloom_up: wgpu::RenderPipeline,
     post_bloom_size: f32,
+    blur_down: wgpu::RenderPipeline,
+    blur_h: wgpu::RenderPipeline,
+    blur_v: wgpu::RenderPipeline,
+    post_blur_size: f32,
     shadow: wgpu::RenderPipeline,
     /// Each sun cascade's static casters, kept between redraws (SunCache).
     sun_cache: SunCache,
@@ -2204,8 +2918,10 @@ pub struct Renderer {
     /// 1×1 black: the emissive mask of textures without one.
     black_view: wgpu::TextureView,
     meshes: Vec<Mesh>,
+    /// The slabs loaded meshes are placed in.
+    pool: MeshPool,
     /// (mesh, cull back) -> the second slot drawing it the other way.
-    cull_alias: HashMap<(u32, bool), u32>,
+    cull_alias: HashMap<(u32, bool, MeshFidelity), u32>,
     tex_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     /// Texture bind groups; index 0 is plain white.
@@ -2216,13 +2932,19 @@ pub struct Renderer {
     instance_cap: usize,
     static_buf: wgpu::Buffer,
     static_cap: usize,
-    items: HashMap<Ref, Item>,
+    items: RefMap<Item>,
+    /// Bumped by every change to `items` (set / move / remove / clear):
+    /// whether any part's draws may differ from when it was last read.
+    items_generation: u64,
     /// Items drawn from the per-frame list (pending and dynamic).
-    per_frame: HashSet<Ref>,
+    per_frame: RefSet,
+    /// Subset of `per_frame` items containing an opaque solid occluder candidate.
+    dyn_occluders: RefSet,
     /// ViewportFrames' parts (vf_render.rs): never in the world's lists;
     /// each frame's items, and a generation bumped whenever one changes.
     vf: vf::Layers,
     st: StaticLayout,
+    occlusion: crate::occlusion::OcclusionBuffer,
     pending: usize,
     pending_at: Option<Instant>,
     /// Last static rebuild / quiet-part scan (both rate-limited).
@@ -2543,7 +3265,7 @@ impl Renderer {
         let sun = crate::sun_shadow::SunShadows::new(device, &shadow_view);
         // Studio's scene environment probe (env_probe.rs): binding 13 is its
         // current slot, 21 the slot it blends to.
-        let probe = env_probe_gpu::ProbeGpu::new(device, queue, SAMPLES, DEPTH_FORMAT, std::mem::size_of::<Globals>() as u64);
+        let probe = env_probe_gpu::ProbeGpu::new(device, queue, startup_samples(&caps), DEPTH_FORMAT, std::mem::size_of::<Globals>() as u64);
         let probe_globals_bg = Self::globals_group(
             device,
             &bgl,
@@ -2891,20 +3613,30 @@ impl Renderer {
             primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: crate::pipeline_cache::current(),
         };
         let bloom_up = device.create_render_pipeline(&bloom_up_desc);
+        let blur_down = fullscreen("blur down", "fs_blur_down", 1);
+        let blur_h = fullscreen("blur across", "fs_blur_h", 1);
+        let blur_v = fullscreen("blur down", "fs_blur_v", 1);
         let sky_globals = reduced.then(|| {
             let layout = Self::sky_globals_layout(device);
             let bg = Self::sky_globals_group(device, &layout, &globals_buf, &sky_view, &sky_sampler);
             (layout, bg)
         });
-        let meshes = build_meshes()
+        let mut meshes: Vec<Mesh> = build_meshes()
             .into_iter()
             .map(|verts| Mesh::upload(device, "mesh", &verts, wgpu::BufferUsages::VERTEX, Some(true)))
             .collect();
+        // Built-in conservative inscribed solid boxes for software occlusion culling.
+        meshes[MeshKind::Block as usize].occluder = Some((Vec3::splat(-0.5), Vec3::splat(0.5)));
+        meshes[MeshKind::Ball as usize].occluder = Some((Vec3::splat(-0.265), Vec3::splat(0.265)));
+        meshes[MeshKind::Cylinder as usize].occluder =
+            Some((Vec3::new(-0.5, -0.34, -0.34), Vec3::new(0.5, 0.34, 0.34)));
 
         let instance_cap = 1024;
         let line_cap = 4096;
         let mut r = Renderer {
             pipelines: [None, None, None],
+            probe_samples: startup_samples(&caps),
+            lower_pending: None,
             terrain_layout: terrain_bgl,
             skin: crate::skin_gpu::SkinGpu::new(device, caps.compute()),
             gui_fog: ([0.0, 1e9, 0.0, 0.0], [0.0; 3]),
@@ -2914,6 +3646,7 @@ impl Renderer {
             gui_n_lights: 0,
             world_gui: [None, None, None],
             highlight: [None, None, None],
+            adorn: [None, None, None],
             last_view_proj: Mat4::IDENTITY,
             glass_layout,
             material_epoch: Instant::now(),
@@ -2924,6 +3657,10 @@ impl Renderer {
             bloom_down,
             bloom_up,
             post_bloom_size: 24.0,
+            blur_down,
+            blur_h,
+            blur_v,
+            post_blur_size: 0.0,
             shadow,
             sun_cache,
             terrain_shadow,
@@ -2967,6 +3704,7 @@ impl Renderer {
             materials,
             sky_size: 0,
             meshes,
+            pool: MeshPool::new(queue),
             cull_alias: HashMap::new(),
             tex_layout,
             sampler,
@@ -2984,10 +3722,13 @@ impl Renderer {
                 instance_cap * std::mem::size_of::<InstanceRaw>(),
             ),
             static_cap: instance_cap,
-            items: HashMap::new(),
-            per_frame: HashSet::new(),
+            items: RefMap::default(),
+            items_generation: 0,
+            per_frame: RefSet::default(),
+            dyn_occluders: RefSet::default(),
             vf: Default::default(),
             st: StaticLayout::default(),
+            occlusion: crate::occlusion::OcclusionBuffer::new(),
             pending: 0,
             pending_at: None,
             last_rebuild: Instant::now(),
@@ -3003,6 +3744,20 @@ impl Renderer {
             texture_id: None,
         };
         r.add_texture(device, queue, 1, 1, &[255, 255, 255, 255]);
+        let one_sample_likely = rustudio_core::rustudio_settings::weak_gpu()
+            || rustudio_core::rustudio_settings::performance_value("quality") == "automatic"
+            || rustudio_core::rustudio_settings::performance_value("detail") == "low";
+        if r.probe_samples != 1 && one_sample_likely && std::env::var_os("RUSTUDIO_NO_PIPELINE_PREBUILD").is_none() {
+            let (device, queue) = (device.clone(), queue.clone());
+            let (g, t, gl, tr, reduced) = (r.globals_layout.clone(), r.tex_layout.clone(), r.glass_layout.clone(), r.terrain_layout.clone(), r.reduced);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let spawned = std::thread::Builder::new().name("rustudio-pipelines".into()).spawn(move || {
+                let _ = tx.send(ViewportPipelines::new(&device, &queue, &g, &t, &gl, &tr, 1, reduced));
+            });
+            if spawned.is_ok() {
+                r.lower_pending = Some(rx);
+            }
+        }
         r
     }
 
@@ -3834,6 +4589,29 @@ impl Renderer {
         );
     }
 
+    /// Uploads the voxels `lo..=hi` of the light grid from the whole grid's
+    /// bytes `data` (as `set_lightgrid` takes them).
+    pub fn set_lightgrid_region(&mut self, queue: &wgpu::Queue, data: &[u8], lo: [usize; 3], hi: [usize; 3]) {
+        let [nx, ny, nz] = crate::lightgrid::dims().map(|n| n as u32);
+        if data.len() != (2 * nx * ny * nz) as usize || (0..3).any(|k| lo[k] > hi[k]) {
+            return;
+        }
+        let size = [0, 1, 2].map(|k| (hi[k] - lo[k] + 1) as u32);
+        // (the texture is X, Z, Y: rows of X along Z, layers along Y)
+        let offset = 2 * ((lo[1] as u64 * nz as u64 + lo[2] as u64) * nx as u64 + lo[0] as u64);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.lightgrid_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: lo[0] as u32, y: lo[2] as u32, z: lo[1] as u32 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(2 * nx), rows_per_image: Some(nz) },
+            wgpu::Extent3d { width: size[0], height: size[2], depth_or_array_layers: size[1] },
+        );
+    }
+
     pub fn set_localgrid(&mut self, queue: &wgpu::Queue, data: &[u8]) {
         let [nx, ny, nz] = crate::lightgrid::dims().map(|n| n as u32);
         if data.len() != (nx * ny * nz * 4) as usize { return; }
@@ -3896,15 +4674,25 @@ impl Renderer {
         self.pipelines[sample_slot(samples)].as_ref().expect("viewport pipelines made by ensure_pipelines")
     }
 
-    /// The viewport's passes for `samples` a pixel, built on first use.
+    /// The viewport's passes for `samples` a pixel, built on first use (the
+    /// one-sample set: the startup worker's, when one was started).
     fn ensure_pipelines(&mut self, rs: &egui_wgpu::RenderState, samples: u32) -> &ViewportPipelines {
         let slot = sample_slot(samples);
         if self.pipelines[slot].is_none() {
             let t0 = Instant::now();
-            let made = ViewportPipelines::new(
-                &rs.device, &rs.queue, &self.globals_layout, &self.tex_layout, &self.glass_layout,
-                &self.terrain_layout, samples, self.reduced,
-            );
+            let pending = if samples == 1 { self.lower_pending.take() } else { None };
+            let made = pending
+                .and_then(|rx| {
+                    // (the worker's, when it was started: the same pipelines)
+                    let _p = rustudio_core::bench::scope("r_pipelines_wait");
+                    rx.recv().ok()
+                })
+                .unwrap_or_else(|| {
+                    ViewportPipelines::new(
+                        &rs.device, &rs.queue, &self.globals_layout, &self.tex_layout, &self.glass_layout,
+                        &self.terrain_layout, samples, self.reduced,
+                    )
+                });
             if cfg!(target_os = "android") || std::env::var_os("RUSTUDIO_STARTUP_TRACE").is_some() {
                 eprintln!("[startup] viewport pipelines for {samples} sample(s) a pixel built in {} ms", t0.elapsed().as_millis());
             }
@@ -4050,6 +4838,19 @@ impl Renderer {
         };
         let bloom_down_bgs = (0..5).map(|i| pair("bloom pyramid down", if i == 0 { &hdr_view } else { &bloom_levels[i-1] }, &hdr_view)).collect();
         let bloom_up_bgs = (1..5).map(|i| pair("bloom pyramid up", &bloom_levels[i], &hdr_view)).collect();
+        let blur_tex = |label: &str| device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: (size[0] >> 2).max(1), height: (size[1] >> 2).max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        }).create_view(&Default::default());
+        let blur_views = [blur_tex("blur a"), blur_tex("blur b")];
+        let blur_bgs = [
+            pair("blur down", &hdr_view, &self.black_view),
+            pair("blur across", &blur_views[1], &self.black_view),
+            pair("blur down", &blur_views[0], &self.black_view),
+        ];
         let near_views: Vec<_> = (0..11).map(|i| device.create_texture(&wgpu::TextureDescriptor {
             label: Some("dof near quarter"), size: wgpu::Extent3d { width: (size[0]/4).max(1), height: if i == 0 {size[1]} else {(size[1]/4).max(1)}, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR_FORMAT,
@@ -4096,7 +4897,15 @@ impl Renderer {
                 ],
             })
         };
-        let post_depth_bg = ssao_bg("post depth and near", &near_views[10]);
+        let post_depth_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("post depth, near and blur"),
+            layout: &viewport.ssao_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&depth_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&near_views[10]) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&blur_views[1]) },
+            ],
+        });
         // down (input unused) → a … occlusion reads the depth → a, blur
         // across a → b, blur down b → a, apply reads a.
         let ssao_bgs = [
@@ -4158,6 +4967,8 @@ impl Renderer {
             bloom_levels,
             bloom_down_bgs,
             bloom_up_bgs,
+            blur_views,
+            blur_bgs,
             ssao_depth_view,
             ssao_views,
             ssao_bgs,
@@ -4200,6 +5011,7 @@ impl Renderer {
         if list.is_empty() {
             return;
         }
+        self.pool.flush();
         let Some(t) = self.target.as_ref() else { return };
         let pass = self.highlight[sample_slot(t.samples)].get_or_insert_with(|| {
             crate::highlight::HighlightPass::new(&rs.device, DISPLAY_FORMAT, DEPTH_FORMAT, t.samples, std::mem::size_of::<Vertex>() as u64)
@@ -4225,6 +5037,18 @@ impl Renderer {
             }
         }
         pass.draw(&rs.device, &rs.queue, t.size, t.samples, &t.depth, &t.display_view, self.last_view_proj, &work);
+    }
+
+    /// 3D viewport adornments (collaborator camera gizmos, adorn.rs) drawn
+    /// onto the finished image, depth-tested against the scene's depth buffer.
+    pub fn draw_adorn(&mut self, rs: &egui_wgpu::RenderState, list: &[crate::adorn::AdornDraw]) {
+        if list.is_empty() {
+            return;
+        }
+        let Some(t) = self.target.as_ref() else { return };
+        let pass = self.adorn[sample_slot(t.samples)]
+            .get_or_insert_with(|| crate::adorn::AdornPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, t.samples));
+        pass.draw(&rs.device, &rs.queue, &t.depth, &t.display_view, self.last_view_proj, list);
     }
 
     /// The bloom and the final image again, from the HDR image as it is now
@@ -4255,12 +5079,41 @@ impl Renderer {
         }
     }
 
+    fn encode_blur(&self, encoder: &mut wgpu::CommandEncoder, target: &Target, size: f32) {
+        if size <= 0.0 { return; }
+        let passes: [(&str, &wgpu::RenderPipeline, &wgpu::BindGroup, &wgpu::TextureView); 3] = [
+            ("blur down", &self.blur_down, &target.blur_bgs[0], &target.blur_views[1]),
+            ("blur across", &self.blur_h, &target.blur_bgs[1], &target.blur_views[0]),
+            ("blur vertical", &self.blur_v, &target.blur_bgs[2], &target.blur_views[1]),
+        ];
+        for (label, pipeline, bg, view) in passes {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.globals_bg, &[]);
+            pass.set_bind_group(1, bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
     fn finish_again(&self, rs: &egui_wgpu::RenderState) {
         let _b = rustudio_core::bench::scope("fx_post_again");
         let Some(target) = self.target.as_ref() else { return };
         let viewport = self.pipelines(target.samples);
         let mut encoder = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("effects post") });
         self.encode_bloom(&mut encoder, target, self.post_bloom_size);
+        self.encode_blur(&mut encoder, target, self.post_blur_size);
         let steps: [(&str, &wgpu::RenderPipeline, &wgpu::BindGroup, Vec<&wgpu::TextureView>); 14] = [
             ("dof across", &viewport.dof_h, &target.dof_bgs[0], vec![&target.dof_views[0]]),
             ("dof down", &self.dof_v, &target.dof_bgs[1], vec![&target.dof_views[1]]),
@@ -4333,8 +5186,15 @@ impl Renderer {
         frame: &Frame,
     ) -> Option<egui::TextureId> {
         let svc_t0 = Instant::now();
+        self.pool.flush();
         let size = [size[0].clamp(1, 8192), size[1].clamp(1, 8192)];
         crate::gpu_timing::set_automatic(frame.quality.is_some());
+        // (bench: the Automatic level averaged over the run, and the share of
+        // frames per shading tier, as "ms per frame")
+        if let Some(q) = frame.quality {
+            rustudio_core::bench::add("count: quality level", f64::from(q.level()), 1);
+            rustudio_core::bench::add(match q.detail() as u32 { 0 => "count: tier low", 1 => "count: tier medium", _ => "count: tier high" }, 1.0, 1);
+        }
         if rustudio_core::profiler::active() {
             rustudio_core::profiler::counter("lights", rustudio_core::profiler::Cat::Render, frame.lights.len() as f64);
         }
@@ -4354,7 +5214,8 @@ impl Renderer {
         }
         self.ensure_target(rs, size, samples);
         if frame.probe.as_ref().is_some_and(|pf| pf.tasks.iter().any(|t| matches!(t, env_probe_gpu::Task::Face(_)))) {
-            self.ensure_pipelines(rs, SAMPLES);
+            let probe_samples = self.probe_samples;
+            self.ensure_pipelines(rs, probe_samples);
         }
         let device = &rs.device;
         let queue = &rs.queue;
@@ -4382,6 +5243,7 @@ impl Renderer {
             globals.env_spec[3] = pf.blend;
         }
         self.post_bloom_size = globals.bloom[1];
+        self.post_blur_size = globals.sky_rot[1];
         // NearIntensity below 0.22 takes the cheap full-resolution pass
         // (fs_dof_v), not the near chain (shader.wgsl DOF_CHEAP_BELOW).
         self.post_dof_near = globals.dof[2] >= DOF_CHEAP_BELOW;
@@ -4436,18 +5298,75 @@ impl Renderer {
             frame.globals.cam_pos[2],
         );
         let planes = frustum(frame.cull_view_proj);
+        let tan_half_fov = (frame.fov_y * 0.5).tan();
+        let mesh_lod_view = MeshLodView::new(cam, tan_half_fov);
+        let scene_lod = |key: (usize, usize), instances: &[InstanceRaw]| {
+            self.meshes.get(key.0).map_or(0, |mesh| mesh.scene_lod(mesh_lod_view, instances))
+        };
         // A part whose bounding radius covers less than LOD_MIN_PX pixels is skipped.
-        let focal = size[1] as f32 * 0.5 / (frame.fov_y * 0.5).tan().max(1e-3);
+        let focal = size[1] as f32 * 0.5 / tan_half_fov.max(1e-3);
         let lod_px = frame.quality.map_or(rustudio_core::mech::LOD_MIN_PX, |p| p.lod_radius_pixels(size[1]));
         let lod_k = lod_px / focal;
         let draw_distance = frame.quality.map_or(f32::INFINITY, |p| p.distance());
 
+        static NO_OCCLUSION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let occlusion_enabled = !*NO_OCCLUSION.get_or_init(|| std::env::var_os("RUSTUDIO_NO_OCCLUSION").is_some());
+        if occlusion_enabled {
+            let _occ_scope = rustudio_core::bench::scope("r_occlusion");
+            let mut dyn_occluders: Vec<crate::occlusion::OccluderBox> = Vec::new();
+            for r in &self.dyn_occluders {
+                let Some(item) = self.items.get(r) else { continue };
+                for d in &item.draws {
+                    if !shows(d) || pass_of(d) != Some(Pass::Opaque) || d.alpha < 0.999 {
+                        continue;
+                    }
+                    let mslot = mesh_slot(d);
+                    let Some(m) = self.meshes.get(mslot) else { continue };
+                    if m.storage || m.cull == Some(false) {
+                        continue;
+                    }
+                    let Some((olo, ohi)) = m.occluder else { continue };
+                    let raw = to_raw(d, item.bias);
+                    if !raw_is_solid_occluder(&raw) {
+                        continue;
+                    }
+                    if let Some(ob) = crate::occlusion::OccluderBox::from_part(
+                        u32::MAX,
+                        raw.r0,
+                        raw.r1,
+                        raw.r2,
+                        [raw.size[0], raw.size[1], raw.size[2]],
+                        olo,
+                        ohi,
+                    ) {
+                        dyn_occluders.push(ob);
+                    }
+                }
+            }
+            let st_raw = &self.st.raw;
+            self.occlusion.build(
+                frame.cull_view_proj,
+                cam,
+                &planes,
+                draw_distance,
+                &self.st.occluders,
+                &self.st.occluder_cells,
+                |slot| st_raw.get(slot as usize).is_some_and(raw_is_solid_occluder),
+                &dyn_occluders,
+            );
+        } else {
+            self.occlusion.build(frame.cull_view_proj, cam, &planes, draw_distance, &[], &[], |_| false, &[]);
+        }
+
         let r_scope = rustudio_core::bench::scope("r_static_cull");
-        // Static batches: frustum test per cell, then trim the smallest parts.
-        let mut static_ranges: Vec<(Pass, (usize, usize), u32, u32)> = Vec::new();
-        let mut push_range = |pass, key, start, end| match static_ranges.last_mut() {
-            Some(last) if last.0 == pass && last.1 == key && last.3 == start => last.3 = end,
-            _ => static_ranges.push((pass, key, start, end)),
+        // Static batches: frustum + occlusion test per cell, then trim the smallest parts.
+        let mut static_ranges: Vec<(Pass, (usize, usize), u32, u32, usize)> = Vec::new();
+        let mut push_range = |pass, key, start, end| {
+            let lod = scene_lod(key, &self.st.raw[start as usize..end as usize]);
+            match static_ranges.last_mut() {
+                Some(last) if last.0 == pass && last.1 == key && last.3 == start && last.4 == lod => last.3 = end,
+                _ => static_ranges.push((pass, key, start, end, lod)),
+            }
         };
         let mut see_bounds = SeeBounds::new(Mat4::from_cols_array_2d(&frame.globals.view_proj), size);
         for b in &self.st.batches {
@@ -4457,6 +5376,11 @@ impl Renderer {
             }
             let distance = box_distance(cam, b.lo, b.hi);
             if distance > draw_distance {
+                stats.culled_batches += 1;
+                continue;
+            }
+            let occ_vis = self.occlusion.test_aabb(b.lo, b.hi);
+            if occ_vis == crate::occlusion::Visibility::Occluded {
                 stats.culled_batches += 1;
                 continue;
             }
@@ -4470,23 +5394,50 @@ impl Renderer {
             if b.pass == Pass::Decal {
                 see_bounds.add_box(b.lo, b.hi);
             }
-            if frame.quality.is_some() {
+            let straddles_frustum = !box_inside(&planes, b.lo, b.hi);
+            let straddles_dist = frame.quality.is_some() && {
                 let far = (cam - b.lo).abs().max((cam - b.hi).abs());
-                if far.length_squared() > draw_distance * draw_distance {
-                    // A static cell can straddle the Automatic view distance.
-                    // Use the same sphere-range test as the moving draws.
-                    for slot in b.start..b.start + n {
-                        let raw = &self.st.raw[slot as usize];
+                far.length_squared() > draw_distance * draw_distance
+            };
+            let tris_per_inst = self.meshes.get(b.key.0).map_or(0, |m| m.count / 3);
+            let per_inst_occ = occ_vis == crate::occlusion::Visibility::Partial && tris_per_inst >= 2000;
+            if straddles_frustum || straddles_dist || per_inst_occ || b.has_hidden {
+                let mut run_start = u32::MAX;
+                for slot in b.start..b.start + n {
+                    let raw = &self.st.raw[slot as usize];
+                    let mut keep = raw.size[0] > 0.0;
+                    if keep && (straddles_frustum || straddles_dist) {
                         let centre = Vec3::new(raw.r0[3], raw.r1[3], raw.r2[3]);
-                        let limit = draw_distance + self.st.radii[slot as usize];
-                        if (centre - cam).length_squared() <= limit * limit {
-                            push_range(b.pass, b.key, slot, slot + 1);
-                        } else {
-                            stats.lod_skipped += 1;
+                        let rad = self.st.radii[slot as usize];
+                        if straddles_frustum && !sphere_visible(&planes, centre, rad) {
+                            keep = false;
+                        } else if straddles_dist {
+                            let limit = draw_distance + rad;
+                            if (centre - cam).length_squared() > limit * limit {
+                                keep = false;
+                                stats.lod_skipped += 1;
+                            }
                         }
                     }
-                    continue;
+                    if keep && per_inst_occ {
+                        let (ilo, ihi) = raw_aabb(raw);
+                        if self.occlusion.is_occluded(ilo, ihi) {
+                            keep = false;
+                        }
+                    }
+                    if keep {
+                        if run_start == u32::MAX {
+                            run_start = slot;
+                        }
+                    } else if run_start != u32::MAX {
+                        push_range(b.pass, b.key, run_start, slot);
+                        run_start = u32::MAX;
+                    }
                 }
+                if run_start != u32::MAX {
+                    push_range(b.pass, b.key, run_start, b.start + n);
+                }
+                continue;
             }
             push_range(b.pass, b.key, b.start, b.start + n);
         }
@@ -4520,13 +5471,23 @@ impl Renderer {
                 if !shows(d) || !sphere_visible(&planes, d.xf.pos, rad) {
                     continue;
                 }
-                // A piece of terrain water: frustum-culled by its own box
+                // A piece of terrain water: frustum-culled and occlusion-culled by its own box
                 // (every piece has the whole water's box; game_view.rs).
                 let piece_hidden = d.material == 5.0
                     && d.custom_mesh.is_some()
                     && self.meshes.get(mesh_slot(d)).and_then(|m| m.bounds).is_some_and(|(lo, hi)| {
                         let c = d.xf.pos + d.xf.rot * ((lo + hi) * 0.5 * d.size);
-                        !sphere_visible(&planes, c, ((hi - lo) * d.size).length() * 0.5)
+                        let half = (hi - lo) * 0.5 * d.size;
+                        let rad_p = half.length();
+                        if !sphere_visible(&planes, c, rad_p) {
+                            return true;
+                        }
+                        if self.occlusion.is_active() {
+                            let r = d.xf.rot;
+                            let ext = r.x_axis.abs() * half.x + r.y_axis.abs() * half.y + r.z_axis.abs() * half.z;
+                            return self.occlusion.is_occluded(c - ext, c + ext);
+                        }
+                        false
                     });
                 let dist = (d.xf.pos - cam).length();
                 if dist - rad > draw_distance || rad < lod_k * (dist - rad).max(0.0) {
@@ -4695,8 +5656,8 @@ impl Renderer {
 
         let target = self.target.as_ref()?;
         let viewport = self.pipelines[sample_slot(samples)].as_ref()?;
-        // (the probe's faces draw with the 4x set: below)
-        let probe_viewport = self.pipelines[sample_slot(SAMPLES)].as_ref();
+        // (the probe's faces draw with the `probe_samples` set: below)
+        let probe_viewport = self.pipelines[sample_slot(self.probe_samples)].as_ref();
         let cloud_slot = sample_slot(samples);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("viewport"),
@@ -4773,11 +5734,14 @@ impl Renderer {
                 pass.set_scissor_rect(0, 0, side, side);
                 pass
             };
+            // (the mesh bound in the current pass: `cast_bound.set(MAX)` at
+            // each pass and after the terrain binds its own vertices)
+            let cast_bound: Bound = std::cell::Cell::new(UNBOUND);
             let cast = |pass: &mut wgpu::RenderPass, key: (usize, usize), range: std::ops::Range<u32>| {
                 if let Some(mesh) = self.meshes.get(key.0) {
                     rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SHADOW, 1, (mesh.count / 3) as u64 * (range.end - range.start) as u64);
                     draw_top::add(1 + ci as u8, key.0, (mesh.count / 3) as u64, (range.end - range.start) as u64);
-                    mesh.draw(pass, range);
+                    mesh.draw_bound(pass, range, &cast_bound);
                 }
             };
             let terrain = |pass: &mut wgpu::RenderPass, solid: bool| {
@@ -4823,6 +5787,7 @@ impl Renderer {
             // they cast with the moving parts)
             let skinned = |key: (usize, usize)| self.meshes.get(key.0).is_some_and(|m| m.storage);
             let draw_static = |pass: &mut wgpu::RenderPass, all: bool| {
+                cast_bound.set(UNBOUND);
                 pass.set_pipeline(&self.shadow);
                 pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
                 self.sun.bind(pass, ci);
@@ -4835,6 +5800,7 @@ impl Renderer {
             // This frame's moving parts and the grass (its blades depend on
             // the camera's distance).
             let draw_moving = |pass: &mut wgpu::RenderPass| {
+                cast_bound.set(UNBOUND);
                 pass.set_pipeline(&self.shadow);
                 pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
                 self.sun.bind(pass, ci);
@@ -4871,6 +5837,8 @@ impl Renderer {
                     rustudio_core::bench::add("sun_cache_redraw", 0.0, 1);
                     let mut pass = depth_pass(&mut encoder, &slot.view, "sun cascade static casters");
                     draw_static(&mut pass, false);
+                    drop(pass);
+                    crate::gpu_timing::mark(&mut encoder, "gpu: sun cache redraw");
                 }
                 let slot = self.sun_cache.slots[ci].as_ref().expect("sun cache slot");
                 let mut pass = depth_pass(&mut encoder, &self.shadow_view, "sun shadow cascade");
@@ -4883,7 +5851,9 @@ impl Renderer {
                 draw_static(&mut pass, true);
                 draw_moving(&mut pass);
             }
+            crate::gpu_timing::mark(&mut encoder, if ci == 0 { "gpu: sun cascade 0 draw" } else { "gpu: sun cascade 1-3 draw" });
             self.sun.blur(&mut encoder, cascade, ci);
+            crate::gpu_timing::mark(&mut encoder, "gpu: sun blur");
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: sun shadows");
         drop(r_scope);
@@ -4958,6 +5928,8 @@ impl Renderer {
                 pass.set_pipeline(&self.lshadow_pipe);
                 pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
                 pass.set_vertex_buffer(1, self.static_buf.slice(..));
+                // (one pass, only part meshes bind slot 0 in it)
+                let lbound: Bound = std::cell::Cell::new(UNBOUND);
                 let cols = rustudio_core::mech::LSHADOW_ATLAS / rustudio_core::mech::LSHADOW_FACE;
                 let face_px = rustudio_core::mech::LSHADOW_FACE;
                 for (slot, pos, range) in &slots {
@@ -4978,7 +5950,7 @@ impl Renderer {
                         for b in &near {
                             if let Some(mesh) = self.meshes.get(b.key.0) {
                                 rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SHADOW, 1, (mesh.count / 3) as u64 * b.count as u64);
-                                mesh.draw(&mut pass, b.start..b.start + b.count);
+                                mesh.draw_bound(&mut pass, b.start..b.start + b.count, &lbound);
                             }
                         }
                     }
@@ -4995,19 +5967,62 @@ impl Renderer {
         let has_neon = blended.iter().any(|e| (e.2.extra[0] as u32 & 7) == 1);
         let split = water_seen || !water_runs.is_empty() || has_glass || has_neon;
         let mut calls = 0usize;
+        // The mesh (slot 0 vertices and indices) and texture (group 1) the
+        // current pass has bound, so runs of one mesh across cells bind it
+        // once. `unbind` whenever a pass begins or anything else binds those.
+        let bound_mesh: Bound = std::cell::Cell::new(UNBOUND);
+        let bound_tex = std::cell::Cell::new(usize::MAX);
+        let unbind = || {
+            bound_mesh.set(UNBOUND);
+            bound_tex.set(usize::MAX);
+        };
         // One instanced draw per run of (mesh, texture).
         let draw = |pass: &mut wgpu::RenderPass,
                     key: (usize, usize),
                     range: std::ops::Range<u32>,
+                    lod: usize,
                     calls: &mut usize| {
             let Some(mesh) = self.meshes.get(key.0) else {
                 return;
             };
-            pass.set_bind_group(1, self.textures.get(key.1).unwrap_or(&self.textures[0]), &[]);
-            rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SCENE, 1, (mesh.count / 3) as u64 * (range.end - range.start) as u64);
-            draw_top::add(0, key.0, (mesh.count / 3) as u64, (range.end - range.start) as u64);
-            mesh.draw(pass, range);
+            let tex = if key.1 < self.textures.len() { key.1 } else { 0 };
+            if bound_tex.get() != tex {
+                pass.set_bind_group(1, &self.textures[tex], &[]);
+                bound_tex.set(tex);
+            }
+            let corners = mesh.lod_corners(lod);
+            let triangles = u64::from((corners.end - corners.start) / 3);
+            let instances = u64::from(range.end - range.start);
+            rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SCENE, 1, triangles * instances);
+            draw_top::add(0, key.0, triangles, instances);
+            mesh.draw_bound_range(pass, range, corners, &bound_mesh);
             *calls += 1;
+        };
+        // Uncounted draw helper for auxiliary passes (env probe cube faces and
+        // decal depth prepass) that do not contribute to Studio's main-view
+        // SceneTriangleCount / SceneDrawcallCount.
+        let draw_uncounted = |pass: &mut wgpu::RenderPass,
+                              key: (usize, usize),
+                              range: std::ops::Range<u32>,
+                              lod: usize| {
+            let Some(mesh) = self.meshes.get(key.0) else {
+                return;
+            };
+            let tex = if key.1 < self.textures.len() { key.1 } else { 0 };
+            if bound_tex.get() != tex {
+                pass.set_bind_group(1, &self.textures[tex], &[]);
+                bound_tex.set(tex);
+            }
+            let corners = mesh.lod_corners(lod);
+            mesh.draw_bound_range(pass, range, corners, &bound_mesh);
+        };
+        let draw_scene_dynamic = |pass: &mut wgpu::RenderPass, key, range: std::ops::Range<u32>, calls: &mut usize| {
+            let lod = scene_lod(key, &raw[range.start as usize..range.end as usize]);
+            draw(pass, key, range, lod, calls);
+        };
+        let draw_dynamic_uncounted = |pass: &mut wgpu::RenderPass, key, range: std::ops::Range<u32>| {
+            let lod = scene_lod(key, &raw[range.start as usize..range.end as usize]);
+            draw_uncounted(pass, key, range, lod);
         };
         // Scene environment probe work (env_probe.rs): Studio draws one cube
         // face a frame at the probe box's centre (Studio; 90 degrees,
@@ -5016,7 +6031,7 @@ impl Renderer {
         if let Some(pf) = frame.probe.as_ref() {
             for task in &pf.tasks {
                 if let env_probe_gpu::Task::Face(f) = *task {
-                    // (a face draws with the 4x set, made above for this frame)
+                    // (a face draws with the `probe_samples` set, made above for this frame)
                     let Some(pv) = probe_viewport else {
                         self.probe.store_face(device, &mut encoder, f);
                         continue;
@@ -5038,12 +6053,7 @@ impl Renderer {
                     {
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("env probe face"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &self.probe.face_msaa,
-                                depth_slice: None,
-                                resolve_target: Some(self.probe.face_resolve()),
-                                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Discard },
-                            })],
+                            color_attachments: &[Some(self.probe.face_color())],
                             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                                 view: &self.probe.face_depth,
                                 depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
@@ -5055,18 +6065,19 @@ impl Renderer {
                         });
                         pass.set_bind_group(0, &self.probe_globals_bg, &[]);
                         pass.set_bind_group(2, &target.glass_bg, &[]);
+                        unbind();
                         pass.set_vertex_buffer(1, self.static_buf.slice(..));
                         for b in self.st.batches.iter().filter(|b| b.pass == Pass::Opaque) {
                             if !box_visible(&face_planes, b.lo, b.hi) {
                                 continue;
                             }
                             pass.set_pipeline(if self.culls_back(b.key.0) { &pv.opaque } else { &pv.opaque_two_sided });
-                            draw(&mut pass, b.key, b.start..b.start + b.count, &mut calls);
+                            draw_uncounted(&mut pass, b.key, b.start..b.start + b.count, 0);
                         }
                         pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                         for r in &opaque_runs {
                             pass.set_pipeline(if self.culls_back(r.0.0) { &pv.opaque } else { &pv.opaque_two_sided });
-                            draw(&mut pass, r.0, r.1..r.2, &mut calls);
+                            draw_uncounted(&mut pass, r.0, r.1..r.2, 0);
                         }
                         if !self.terrain_chunks.is_empty() {
                             pass.set_pipeline(&pv.terrain);
@@ -5104,24 +6115,27 @@ impl Renderer {
         let pipes = if encoded { &viewport.see_pipes } else { &linear_pipes };
         let surface_decals = |pass: &mut wgpu::RenderPass, calls: &mut usize| {
             if !surface_decal_runs.is_empty() {
+                unbind();
                 pass.set_pipeline(&pipes.transparent);
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                 for r in &surface_decal_runs {
-                    draw(pass, r.0, r.1..r.2, calls);
+                    draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
                 }
                 pass.set_bind_group(1, &self.textures[0], &[]);
+                unbind();
             }
         };
         let see_through = |pass: &mut wgpu::RenderPass, calls: &mut usize| {
+            unbind();
             pass.set_bind_group(2, &target.glass_bg, &[]);
             pass.set_pipeline(&pipes.transparent);
             pass.set_vertex_buffer(1, self.static_buf.slice(..));
             for r in static_ranges.iter().filter(|r| r.0 == Pass::Decal) {
-                draw(pass, r.1, r.2..r.3, calls);
+                draw(pass, r.1, r.2..r.3, r.4, calls);
             }
             pass.set_vertex_buffer(1, self.instance_buf.slice(..));
             for r in &decal_runs {
-                draw(pass, r.0, r.1..r.2, calls);
+                draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
             }
             for r in &blend_runs {
                 pass.set_pipeline(if r.1 < glass_end {
@@ -5131,12 +6145,12 @@ impl Renderer {
                 } else {
                     &pipes.transparent
                 });
-                draw(pass, r.0, r.1..r.2, calls);
+                draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
             }
             if !overlay_runs.is_empty() {
                 pass.set_pipeline(&pipes.overlay);
                 for r in &overlay_runs {
-                    draw(pass, r.0, r.1..r.2, calls);
+                    draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
                 }
             }
         };
@@ -5240,6 +6254,7 @@ impl Renderer {
                 pass.set_pipeline(&viewport.lines);
                 pass.set_vertex_buffer(0, self.line_buf.slice(..));
                 pass.draw(0..frame.lines.len() as u32, 0..1);
+                unbind();
             }
         };
         {
@@ -5256,6 +6271,9 @@ impl Renderer {
             // (file meshes, unless a MeshPart is DoubleSided: as Studio).
             let low_opaque = frame.quality.filter(|profile| profile.detail() < 2.0)
                 .zip(viewport.opaque_low.as_ref());
+            static NO_PLAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let no_debug_view = viewport.opaque_plain.is_some() && frame.globals.sky_rot[2] <= 0.5 && !*NO_PLAIN.get_or_init(|| std::env::var_os("RUSTUDIO_NO_PLAIN_PIPELINE").is_some());
+            let plain_spec = if no_debug_view { viewport.plain_for(device, spec_mask(&globals)) } else { None };
             let opaque_pipe = |key: (usize, usize), instances: &[InstanceRaw]| {
                 let culls_back = self.culls_back(key.0);
                 if let Some((profile, pipes)) = low_opaque.filter(|_| {
@@ -5264,6 +6282,19 @@ impl Renderer {
                     let shadowed = usize::from(profile.shadow_tile_divisor() != 0);
                     return &pipes[shadowed][usize::from(!culls_back)];
                 }
+                // (texture mode 0 and no glass, water or ForceField kind:
+                // the paths opaque_plain leaves out)
+                if no_debug_view && instances.iter().all(|part| {
+                    let kind = part.extra[0] as u32 & 7;
+                    part.extra[3] == 0.0 && kind != 3 && kind != 5 && kind != 6
+                }) {
+                    if let Some(p) = &plain_spec {
+                        return &p[usize::from(!culls_back)];
+                    }
+                    if let Some(p) = &viewport.opaque_plain {
+                        return &p[usize::from(!culls_back)];
+                    }
+                }
                 if culls_back {
                     &viewport.opaque
                 } else {
@@ -5271,15 +6302,16 @@ impl Renderer {
                 }
             };
 
+            unbind();
             pass.set_vertex_buffer(1, self.static_buf.slice(..));
             for r in static_ranges.iter().filter(|r| r.0 == Pass::Opaque) {
                 pass.set_pipeline(opaque_pipe(r.1, &self.st.raw[r.2 as usize..r.3 as usize]));
-                draw(&mut pass, r.1, r.2..r.3, &mut calls);
+                draw(&mut pass, r.1, r.2..r.3, r.4, &mut calls);
             }
             pass.set_vertex_buffer(1, self.instance_buf.slice(..));
             for r in &opaque_runs {
                 pass.set_pipeline(opaque_pipe(r.0, &raw[r.1 as usize..r.2 as usize]));
-                draw(&mut pass, r.0, r.1..r.2, &mut calls);
+                draw_scene_dynamic(&mut pass, r.0, r.1..r.2, &mut calls);
             }
             // Only opaque authored decal texels contribute scene depth. The
             // shader rejects other blended materials and fractional coverage;
@@ -5287,7 +6319,7 @@ impl Renderer {
             // sorted color pass for layer order and semitransparent edges.
             pass.set_pipeline(&viewport.decal_depth);
             for r in &surface_decal_runs {
-                draw(&mut pass, r.0, r.1..r.2, &mut calls);
+                draw_dynamic_uncounted(&mut pass, r.0, r.1..r.2);
             }
             for r in &blend_runs {
                 // fs_decal_depth discards every mode except Decal.
@@ -5295,7 +6327,7 @@ impl Renderer {
                     .iter()
                     .any(|part| part.extra[3] == DECAL_TEX_MODE)
                 {
-                    draw(&mut pass, r.0, r.1..r.2, &mut calls);
+                    draw_dynamic_uncounted(&mut pass, r.0, r.1..r.2);
                 }
             }
             // Terrain chunks in view.
@@ -5305,6 +6337,7 @@ impl Renderer {
                 for c in self.terrain_chunks.values().chain(self.terrain_grass.values()) {
                     if box_visible(&planes, c.lo, c.hi)
                         && (frame.quality.is_none() || box_distance(cam, c.lo, c.hi) <= draw_distance)
+                        && !self.occlusion.is_occluded(c.lo, c.hi)
                     {
                         rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SCENE, 1, (c.count / 3) as u64);
                         draw_top::add(0, usize::MAX, (c.count / 3) as u64, 1);
@@ -5317,6 +6350,7 @@ impl Renderer {
                     }
                 }
                 pass.set_bind_group(1, &self.textures[0], &[]);
+                unbind();
             }
             if !encoded {
                 surface_decals(&mut pass, &mut calls);
@@ -5350,6 +6384,7 @@ impl Renderer {
                     depth_or_array_layers: 1,
                 },
             );
+            crate::gpu_timing::mark(&mut encoder, "gpu: split scene copy");
             if water_seen || !water_runs.is_empty() {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("water"),
@@ -5377,10 +6412,14 @@ impl Renderer {
                 pass.set_pipeline(&viewport.water.pipeline);
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 pass.set_bind_group(2, &target.water_bg, &[]);
+                unbind();
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                 for r in &water_runs {
-                    draw(&mut pass, r.0, r.1..r.2, &mut calls);
+                    draw_scene_dynamic(&mut pass, r.0, r.1..r.2, &mut calls);
                 }
+            }
+            if water_seen || !water_runs.is_empty() {
+                crate::gpu_timing::mark(&mut encoder, "gpu: terrain water");
             }
             // A separate immutable snapshot prevents sampling an active depth attachment.
             if has_glass {
@@ -5474,6 +6513,7 @@ impl Renderer {
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: clouds composite");
         self.encode_bloom(&mut encoder, target, globals.bloom[1]);
+        self.encode_blur(&mut encoder, target, globals.sky_rot[1]);
         crate::gpu_timing::mark(&mut encoder, "gpu: bloom");
         let mut fullscreen = |label: &str,
                               pipeline: &wgpu::RenderPipeline,
@@ -5538,7 +6578,12 @@ impl Renderer {
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: post");
         self.probe.flush(queue);
-        queue.submit([encoder.finish()]);
+        let r_scope = rustudio_core::bench::scope("r_finish");
+        let commands = encoder.finish();
+        drop(r_scope);
+        let r_scope = rustudio_core::bench::scope("r_submit");
+        queue.submit([commands]);
+        drop(r_scope);
         if let Some(c) = self.clouds[cloud_slot].as_mut() {
             c.after_submit();
         }
@@ -5552,24 +6597,30 @@ impl Renderer {
 const BUILTIN_MESHES: usize = 5;
 
 impl Renderer {
-    /// The mesh index to draw loaded mesh `index` single-sided (back faces
-    /// culled) or two-sided with: `index` itself, or, when another part
-    /// already draws that shared mesh the other way (a DoubleSided MeshPart
-    /// beside single-sided ones), a second slot over the same vertices.
-    /// Skinned slots are a part's own and are set in place.
-    pub fn mesh_cull_slot(&mut self, index: u32, cull_back: bool) -> u32 {
+    /// Get a mesh slot for this combination of culling and fidelity.
+    /// Aliases share the original GPU allocation. Skinned slots belong to
+    /// one part and can change culling in place.
+    pub fn mesh_cull_slot(&mut self, index: u32, cull_back: bool, fidelity: MeshFidelity) -> u32 {
         let Some(m) = self.meshes.get_mut(index as usize + BUILTIN_MESHES) else { return index };
-        if m.storage || m.cull.is_none_or(|c| c == cull_back) {
+        let fidelity = if m.lod_offsets.is_none()
+            || (fidelity == MeshFidelity::Automatic && m.high_quality_lods <= 1)
+        {
+            MeshFidelity::Precise
+        } else {
+            fidelity
+        };
+        if m.storage || (fidelity == m.fidelity && m.cull.is_none_or(|c| c == cull_back)) {
             m.cull = Some(cull_back);
             return index;
         }
-        if let Some(&a) = self.cull_alias.get(&(index, cull_back)) {
+        let key = (index, cull_back, fidelity);
+        if let Some(&a) = self.cull_alias.get(&key) {
             return a;
         }
-        let alias = Mesh { vbuf: m.vbuf.clone(), count: m.count, ibuf: m.ibuf.clone(), remap: m.remap.clone(), bounds: m.bounds, cull: Some(cull_back), storage: false };
+        let alias = Mesh { cull: Some(cull_back), fidelity, ..m.clone() };
         self.meshes.push(alias);
         let a = (self.meshes.len() - 1 - BUILTIN_MESHES) as u32;
-        self.cull_alias.insert((index, cull_back), a);
+        self.cull_alias.insert(key, a);
         a
     }
 
@@ -5797,6 +6848,47 @@ impl Renderer {
         self.add_mesh_with(device, positions, normals, uvs, colors, planes, false)
     }
 
+    /// Upload all levels together. The ordinary draw and collision-independent
+    /// tools use the first range. Scene batches may choose another range.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_mesh_lods(
+        &mut self,
+        device: &wgpu::Device,
+        positions: &[Vec3],
+        normals: &[Vec3],
+        uvs: &[glam::Vec2],
+        colors: &[glam::Vec4],
+        planes: &[glam::Vec4],
+        lods: &rustudio_core::mesh::MeshLods,
+    ) -> u32 {
+        let index = self.add_mesh_projected(device, positions, normals, uvs, colors, planes);
+        let mesh = &mut self.meshes[index as usize + BUILTIN_MESHES];
+        if let [0, first_end, _, ..] = lods.face_offsets.as_slice() {
+            if mesh.count as usize == positions.len() {
+                mesh.count = first_end * 3;
+                mesh.high_quality_lods = lods.high_quality_count.max(1);
+                mesh.lod_offsets = Some(lods.face_offsets.iter().map(|offset| offset * 3).collect());
+                let lod0 = &positions[..(*first_end as usize * 3)];
+                mesh.bounds = Some(lod0.iter().fold(
+                    (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
+                    |(lo, hi), point| (lo.min(*point), hi.max(*point)),
+                ));
+            } else {
+                // The combined geometry may exceed the device buffer limit
+                // even when LOD0 fits. Keep the full-detail draw available.
+                let end = *first_end as usize * 3;
+                let retry = self.add_mesh_projected(
+                    device, &positions[..end], &normals[..end], &uvs[..end],
+                    colors.get(..end).unwrap_or(&[]), &planes[..end],
+                );
+                let full = self.meshes.pop().expect("LOD0 upload creates a mesh slot");
+                debug_assert_eq!(retry, index + 1);
+                self.meshes[index as usize + BUILTIN_MESHES] = full;
+            }
+        }
+        index
+    }
+
     /// `add_mesh_projected`; `storage` also lets the skinning pass write it.
     #[allow(clippy::too_many_arguments)]
     fn add_mesh_with(
@@ -5822,9 +6914,9 @@ impl Renderer {
                 contents: bytemuck::cast_slice(&verts),
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             });
-            Mesh { vbuf, count: verts.len() as u32, ibuf: None, remap: None, bounds: None, cull: None, storage }
+            Mesh { vbuf, base_vertex: 0, first_index: 0, bind_key: fresh_bind_key(), _pool_range: None, count: verts.len() as u32, lod_offsets: None, high_quality_lods: 1, fidelity: MeshFidelity::Precise, ibuf: None, remap: None, bounds: None, cull: None, storage, occluder: None }
         } else {
-            Mesh::upload(device, "loaded mesh", &verts, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, None)
+            Mesh::upload_pooled(&mut self.pool, device, "loaded mesh", &verts, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, None)
         };
         self.meshes.push(mesh);
         (self.meshes.len() - 1 - BUILTIN_MESHES) as u32
@@ -5838,13 +6930,14 @@ impl Renderer {
             contents: bytemuck::cast_slice(verts),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
-        self.meshes.push(Mesh { vbuf, count: verts.len() as u32, ibuf: None, remap: None, bounds: None, cull: None, storage: false });
+        self.meshes.push(Mesh { vbuf, base_vertex: 0, first_index: 0, bind_key: fresh_bind_key(), _pool_range: None, count: verts.len() as u32, lod_offsets: None, high_quality_lods: 1, fidelity: MeshFidelity::Precise, ibuf: None, remap: None, bounds: None, cull: None, storage: false, occluder: None });
         (self.meshes.len() - 1 - BUILTIN_MESHES) as u32
     }
 
     /// Overwrites vertices `first..` of loaded mesh `index` in place (no new
     /// buffer, only these bytes go up). False when they don't fit.
     pub fn write_mesh_vertices(&mut self, queue: &wgpu::Queue, index: u32, first: u32, verts: &[Vertex]) -> bool {
+        self.pool.flush();
         self.mesh_gen += 1;
         let Some(m) = self.meshes.get(index as usize + BUILTIN_MESHES) else { return false };
         // (an indexed mesh has no corner layout to patch: the caller reloads
@@ -5853,8 +6946,16 @@ impl Renderer {
             return false;
         }
         if !verts.is_empty() {
-            queue.write_buffer(&m.vbuf, first as u64 * std::mem::size_of::<Vertex>() as u64, bytemuck::cast_slice(verts));
+            queue.write_buffer(&m.vbuf, (m.base_vertex as u64 + first as u64) * std::mem::size_of::<Vertex>() as u64, bytemuck::cast_slice(verts));
             rustudio_core::bench::add("live_mesh_bytes", 0.0, (verts.len() * std::mem::size_of::<Vertex>()) as u64);
+            // (the box grows to hold the new vertices: it stays a box the
+            // mesh is inside, for culling and screen bounds)
+            if let Some(m) = self.meshes.get_mut(index as usize + BUILTIN_MESHES) {
+                m.bounds = verts.iter().fold(m.bounds, |b, v| {
+                    let p = Vec3::from(v.pos);
+                    Some(b.map_or((p, p), |(lo, hi)| (lo.min(p), hi.max(p))))
+                });
+            }
         }
         true
     }
@@ -5868,6 +6969,7 @@ impl Renderer {
         &mut self, queue: &wgpu::Queue, index: u32, positions: &[Vec3], normals: &[Vec3],
         uvs: &[glam::Vec2], colors: &[glam::Vec4], projection: [f32; 4],
     ) -> bool {
+        self.pool.flush();
         self.mesh_gen += 1;
         let Some(m) = self.meshes.get(index as usize + BUILTIN_MESHES) else { return false };
         if m.corners() as usize != positions.len() || normals.len() != positions.len() {
@@ -5887,9 +6989,18 @@ impl Renderer {
             })
             .collect();
         let Some(verts) = m.contents(&verts) else { return false };
-        queue.write_buffer(&m.vbuf, 0, bytemuck::cast_slice(&verts));
+        queue.write_buffer(&m.vbuf, m.base_vertex as u64 * std::mem::size_of::<Vertex>() as u64, bytemuck::cast_slice(&verts));
         rustudio_core::bench::add("live_mesh_bytes", 0.0, (verts.len() * std::mem::size_of::<Vertex>()) as u64);
-        if m.storage {
+        let storage = m.storage;
+        // (every vertex is new: the box is theirs)
+        let bounds = verts.iter().fold(None, |b: Option<(Vec3, Vec3)>, v| {
+            let p = Vec3::from(v.pos);
+            Some(b.map_or((p, p), |(lo, hi)| (lo.min(p), hi.max(p))))
+        });
+        if let Some(m) = self.meshes.get_mut(index as usize + BUILTIN_MESHES) {
+            m.bounds = bounds;
+        }
+        if storage {
             self.skin.again(index);
         }
         true
@@ -5938,6 +7049,7 @@ impl Renderer {
         &mut self, device: &wgpu::Device, queue: &wgpu::Queue, index: Option<u32>,
         positions: &[Vec3], normals: &[Vec3], uvs: &[glam::Vec2], colors: &[glam::Vec4],
     ) -> u32 {
+        self.pool.flush();
         self.mesh_gen += 1;
         let slot = index.map(|i| i as usize + BUILTIN_MESHES);
         match (index, slot.and_then(|s| self.meshes.get_mut(s))) {
@@ -5967,7 +7079,7 @@ impl Renderer {
                 }
                 match m.contents(&verts) {
                     Some(verts) => {
-                        queue.write_buffer(&m.vbuf, 0, bytemuck::cast_slice(&verts));
+                        queue.write_buffer(&m.vbuf, m.base_vertex as u64 * std::mem::size_of::<Vertex>() as u64, bytemuck::cast_slice(&verts));
                         i
                     }
                     None => self.add_mesh_colored(device, positions, normals, uvs, colors),
@@ -6008,6 +7120,7 @@ impl Renderer {
     /// Adds or updates one part's draws. Parts that keep changing place move
     /// to the per-frame list; colour-only changes update the static slot.
     pub fn set_item(&mut self, r: Ref, mut draws: Vec<PartDraw>) {
+        self.items_generation = self.items_generation.wrapping_add(1);
         // Studio seeds material offsets from an allocation address. A DOM
         // referent supplies the equivalent stable per-instance identity here.
         let identity = u64::from_str_radix(&r.to_string()[16..], 16).unwrap_or(0);
@@ -6033,10 +7146,18 @@ impl Renderer {
             items,
             st,
             per_frame,
+            dyn_occluders,
             pending,
             pending_at,
             ..
         } = self;
+        let has_dyn_occ = draws.iter().any(|d| {
+            shows(d)
+                && pass_of(d) == Some(Pass::Opaque)
+                && d.alpha >= 0.999
+                && d.size.max_element() >= 5.0
+                && d.size.min_element() >= 0.4
+        });
         let static_ok = draws.iter().all(|d| !shows(d) || pass_of(d).is_some());
         let Some(item) = items.get_mut(&r) else {
             let bias = bias_of(&draws);
@@ -6050,6 +7171,9 @@ impl Renderer {
                 },
             );
             per_frame.insert(r);
+            if has_dyn_occ {
+                dyn_occluders.insert(r);
+            }
             *pending += 1;
             // Settle time counts from the first waiting part: a game that
             // spawns something every few frames would otherwise never settle.
@@ -6066,11 +7190,17 @@ impl Renderer {
             });
         item.draws = draws;
         update_item_slots(r, item, st, per_frame, pending, same_place, static_ok);
+        if matches!(item.state, ItemState::Static(_)) || !has_dyn_occ {
+            dyn_occluders.remove(&r);
+        } else {
+            dyn_occluders.insert(r);
+        }
     }
 
     /// Apply the host transform to draws whose geometry and materials are
     /// already resolved.
     pub fn move_item(&mut self, r: Ref, old: Xform, new: Xform) -> bool {
+        self.items_generation = self.items_generation.wrapping_add(1);
         let inv = old.rot.transpose();
         let transform = |xf: Xform| Xform {
             pos: new.pos + new.rot * (inv * (xf.pos - old.pos)),
@@ -6100,6 +7230,17 @@ impl Renderer {
         update_item_slots(
             r, item, &mut self.st, &mut self.per_frame, &mut self.pending, same_place, true,
         );
+        if !matches!(item.state, ItemState::Static(_))
+            && item.draws.iter().any(|d| {
+                shows(d)
+                    && pass_of(d) == Some(Pass::Opaque)
+                    && d.alpha >= 0.999
+                    && d.size.max_element() >= 5.0
+                    && d.size.min_element() >= 0.4
+            })
+        {
+            self.dyn_occluders.insert(r);
+        }
         true
     }
 
@@ -6148,6 +7289,7 @@ impl Renderer {
     }
 
     pub fn remove_item(&mut self, r: Ref) {
+        self.items_generation = self.items_generation.wrapping_add(1);
         if self.vf.layer_of.contains_key(&r) {
             self.set_layer(r, None);
             return;
@@ -6162,6 +7304,10 @@ impl Renderer {
                         let old = raw_sphere(&self.st.raw[s as usize], self.st.radii[s as usize]);
                         self.st.caster_dirty.push(old);
                         self.st.raw[s as usize] = HIDDEN;
+                        let bi = self.st.batches.partition_point(|b| b.start + b.count <= s);
+                        if let Some(b) = self.st.batches.get_mut(bi) {
+                            b.has_hidden = true;
+                        }
                         self.st.writes.push(s);
                         self.st.caster_writes = true;
                         self.st.hidden += 1;
@@ -6172,17 +7318,25 @@ impl Renderer {
             ItemState::Dynamic => {}
         }
         self.per_frame.remove(&r);
+        self.dyn_occluders.remove(&r);
     }
 
     pub fn clear_items(&mut self) {
+        self.items_generation = self.items_generation.wrapping_add(1);
         let layered = &self.vf.layer_of;
         self.items.retain(|r, _| layered.contains_key(r));
         self.per_frame.clear();
+        self.dyn_occluders.clear();
         self.st = StaticLayout::default();
         self.static_gen += 1;
         self.caster_gen += 1;
         self.pending = 0;
         self.pending_at = None;
+    }
+
+    /// See `items_generation`.
+    pub fn items_generation(&self) -> u64 {
+        self.items_generation
     }
 
     pub fn item_draws(&self, r: Ref) -> Option<&[PartDraw]> {
@@ -6191,85 +7345,307 @@ impl Renderer {
 
     /// Re-sorts every settled part into the static buffer.
     fn rebuild_static(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        struct Row {
-            pass: Pass,
-            key: (usize, usize),
-            cell: u64,
+        static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if std::env::var_os("RUSTUDIO_STATIC_CHECK").is_some() {
+            // (a check: the merge's layout against the full rebuild's)
+            let merged = self.static_merge();
+            self.rebuild_static_full(device, queue);
+            if let Some(m) = merged {
+                let st = &self.st;
+                let same = bytemuck::cast_slice::<_, u8>(&m.raw) == bytemuck::cast_slice::<_, u8>(&st.raw)
+                    && m.keys == st.keys
+                    && m.radii.iter().map(|r| r.to_bits()).eq(st.radii.iter().map(|r| r.to_bits()))
+                    && m.batches.len() == st.batches.len()
+                    && m.batches.iter().zip(&st.batches).all(|(a, b)| {
+                        a.pass == b.pass && a.key == b.key && a.start == b.start && a.count == b.count
+                            && a.lo.to_array().map(f32::to_bits) == b.lo.to_array().map(f32::to_bits)
+                            && a.hi.to_array().map(f32::to_bits) == b.hi.to_array().map(f32::to_bits)
+                    });
+                eprintln!("STATIC_CHECK merged={} instances={} batches={} {}", st.raw.len(), m.raw.len(), st.batches.len(), if same { "SAME" } else { "DIFFERENT" });
+            } else {
+                eprintln!("STATIC_CHECK merge declined, instances={}", self.st.raw.len());
+            }
+            return;
+        }
+        if !*FULL.get_or_init(|| std::env::var_os("RUSTUDIO_STATIC_FULL").is_some()) {
+            let scope = rustudio_core::bench::scope("rs_merge");
+            let merged = self.static_merge();
+            drop(scope);
+            if let Some(st) = merged {
+                rustudio_core::bench::add("rs_merged", 0.0, 1);
+                self.finish_static(device, queue, st);
+                return;
+            }
+        }
+        self.rebuild_static_full(device, queue);
+    }
+
+    /// The static layout a full rebuild would make, from the last one and
+    /// the parts that joined since: the full order is (pass, mesh/texture,
+    /// cell, radius descending) with ties in the item map's order, then draw
+    /// order. The map keeps its entries' order until it grows, so the last
+    /// layout is already in that order (checked; None to sort all instead),
+    /// and only the newcomers are sorted and merged in.
+    fn static_merge(&mut self) -> Option<StaticLayout> {
+        let n_old = self.st.raw.len();
+        if n_old == 0 || self.st.keys.len() != n_old || self.st.radii.len() != n_old {
+            return None;
+        }
+        struct New {
+            key: (Pass, (usize, usize), u64, u32, u32, u32),
             radius: f32,
             raw: InstanceRaw,
-            lo: Vec3,
-            hi: Vec3,
-            owner: Ref,
-            index: u32,
         }
-        let mut rows: Vec<Row> = Vec::with_capacity(self.items.len());
+        // Per old slot: (rank, draw index) of its item, rank = the order the
+        // map gives the static items in.
+        let mut slot_owner: Vec<(u32, u32)> = vec![(u32::MAX, 0); n_old];
+        let mut owners: Vec<&mut Item> = Vec::with_capacity(self.items.len());
+        let mut fresh: Vec<New> = Vec::new();
+        let vf = &self.vf;
+        let mut bail = false;
         for (r, item) in self.items.iter_mut() {
-            if item.state == ItemState::Dynamic || self.vf.layer_of.contains_key(r) {
+            if item.state == ItemState::Dynamic || (!vf.layer_of.is_empty() && vf.layer_of.contains_key(r)) {
                 continue;
             }
             if !item.draws.iter().all(|d| !shows(d) || pass_of(d).is_some()) {
                 item.state = ItemState::Dynamic;
                 continue;
             }
-            item.state = ItemState::Static(vec![u32::MAX; item.draws.len()]);
+            let rank = owners.len() as u32;
+            match &item.state {
+                ItemState::Static(slots) => {
+                    for (i, &sl) in slots.iter().enumerate() {
+                        if sl == u32::MAX {
+                            continue;
+                        }
+                        if sl as usize >= n_old || slot_owner[sl as usize].0 != u32::MAX {
+                            bail = true;
+                        } else {
+                            slot_owner[sl as usize] = (rank, i as u32);
+                        }
+                    }
+                }
+                _ => {
+                    item.state = ItemState::Static(vec![u32::MAX; item.draws.len()]);
+                    for (i, d) in item.draws.iter().enumerate() {
+                        let Some(pass) = pass_of(d).filter(|_| shows(d)) else { continue };
+                        let c = (d.xf.pos / CELL).floor();
+                        let radius = radius_of(d);
+                        fresh.push(New {
+                            key: (pass, draw_key(d), morton([c.x as i32, c.y as i32, c.z as i32]), !total_order_bits(radius), rank, i as u32),
+                            radius,
+                            raw: to_raw(d, item.bias),
+                        });
+                    }
+                }
+            }
+            owners.push(item);
+        }
+        if bail {
+            return None;
+        }
+        // The old instances still static, in slot order, with their keys
+        // from the instance itself (as a full rebuild computes them).
+        let key_of = |slot: usize, raw: &InstanceRaw| {
+            let c = (Vec3::new(raw.r0[3], raw.r1[3], raw.r2[3]) / CELL).floor();
+            let (pass, key) = self.st.keys[slot];
+            let (rank, draw) = slot_owner[slot];
+            (pass, key, morton([c.x as i32, c.y as i32, c.z as i32]), !total_order_bits(self.st.radii[slot]), rank, draw)
+        };
+        let mut old: Vec<(u32, (Pass, (usize, usize), u64, u32, u32, u32))> = Vec::with_capacity(n_old);
+        for slot in 0..n_old {
+            if slot_owner[slot].0 == u32::MAX {
+                continue;
+            }
+            let k = key_of(slot, &self.st.raw[slot]);
+            if old.last().is_some_and(|l| l.1 >= k) {
+                return None;
+            }
+            old.push((slot as u32, k));
+        }
+        fresh.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+        rustudio_core::bench::add("rs_merge_new", 0.0, fresh.len() as u64);
+        let mut st = StaticLayout {
+            raw: Vec::with_capacity(old.len() + fresh.len()),
+            keys: Vec::with_capacity(old.len() + fresh.len()),
+            radii: Vec::with_capacity(old.len() + fresh.len()),
+            ..Default::default()
+        };
+        let (mut i, mut j) = (0, 0);
+        let mut cell_of_batch = u64::MAX;
+        while i < old.len() || j < fresh.len() {
+            let take_old = j >= fresh.len() || (i < old.len() && old[i].1 < fresh[j].key);
+            let (key, raw, radius) = if take_old {
+                let (s, k) = (old[i].0 as usize, old[i].1);
+                i += 1;
+                (k, self.st.raw[s], self.st.radii[s])
+            } else {
+                j += 1;
+                (fresh[j - 1].key, fresh[j - 1].raw, fresh[j - 1].radius)
+            };
+            let slot = st.raw.len() as u32;
+            // (the box aabb_of gives, from the same axes and size)
+            let axis = |r: [f32; 4]| Vec3::new(r[0], r[1], r[2]);
+            let h = Vec3::new(raw.size[0], raw.size[1], raw.size[2]) * 0.5;
+            let ext = axis(raw.r0).abs() * h.x + axis(raw.r1).abs() * h.y + axis(raw.r2).abs() * h.z;
+            let pos = Vec3::new(raw.r0[3], raw.r1[3], raw.r2[3]);
+            let (lo, hi) = (pos - ext, pos + ext);
+            st.raw.push(raw);
+            st.keys.push((key.0, key.1));
+            st.radii.push(radius);
+            if let ItemState::Static(slots) = &mut owners[key.4 as usize].state {
+                slots[key.5 as usize] = slot;
+            }
+            match st.batches.last_mut() {
+                Some(b) if b.pass == key.0 && b.key == key.1 && cell_of_batch == key.2 => {
+                    b.count += 1;
+                    b.lo = b.lo.min(lo);
+                    b.hi = b.hi.max(hi);
+                }
+                _ => {
+                    cell_of_batch = key.2;
+                    st.batches.push(Batch { pass: key.0, key: key.1, lo, hi, start: slot, count: 1, has_hidden: false });
+                }
+            }
+        }
+        Some(st)
+    }
+
+    fn rebuild_static_full(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        // What a draw sorts by (small, so the sort moves little) and, by the
+        // same index, what it carries. A stable sort of the keys gives the
+        // order a stable sort of whole rows gave.
+        struct Key {
+            pass: Pass,
+            key: (usize, usize),
+            cell: u64,
+            radius: f32,
+            row: u32,
+        }
+        struct Row {
+            raw: InstanceRaw,
+            lo: Vec3,
+            hi: Vec3,
+            /// (index into `owners`, draw index)
+            owner: (u32, u32),
+        }
+        let scope = rustudio_core::bench::scope("rs_collect");
+        let mut keys: Vec<Key> = Vec::with_capacity(self.items.len());
+        let mut rows: Vec<Row> = Vec::with_capacity(self.items.len());
+        let mut owners: Vec<&mut Item> = Vec::with_capacity(self.items.len());
+        let vf = &self.vf;
+        for (r, item) in self.items.iter_mut() {
+            if item.state == ItemState::Dynamic || (!vf.layer_of.is_empty() && vf.layer_of.contains_key(r)) {
+                continue;
+            }
+            if !item.draws.iter().all(|d| !shows(d) || pass_of(d).is_some()) {
+                item.state = ItemState::Dynamic;
+                continue;
+            }
+            match &mut item.state {
+                ItemState::Static(slots) => {
+                    slots.clear();
+                    slots.resize(item.draws.len(), u32::MAX);
+                }
+                state => *state = ItemState::Static(vec![u32::MAX; item.draws.len()]),
+            }
+            let at = owners.len() as u32;
             for (i, d) in item.draws.iter().enumerate() {
                 let Some(pass) = pass_of(d).filter(|_| shows(d)) else {
                     continue;
                 };
                 let c = (d.xf.pos / CELL).floor();
                 let (lo, hi) = aabb_of(d);
-                rows.push(Row {
+                keys.push(Key {
                     pass,
                     key: draw_key(d),
                     cell: morton([c.x as i32, c.y as i32, c.z as i32]),
                     radius: radius_of(d),
-                    raw: to_raw(d, item.bias),
-                    lo,
-                    hi,
-                    owner: *r,
-                    index: i as u32,
+                    row: rows.len() as u32,
                 });
+                rows.push(Row { raw: to_raw(d, item.bias), lo, hi, owner: (at, i as u32) });
             }
+            owners.push(item);
         }
-        rows.sort_by(|a, b| {
-            (a.pass, a.key, a.cell)
-                .cmp(&(b.pass, b.key, b.cell))
-                .then(b.radius.total_cmp(&a.radius))
-        });
+        drop(scope);
+        let scope = rustudio_core::bench::scope("rs_sort");
+        // (pass, mesh, texture, cell, radius descending) as integers in the
+        // same order: f32::total_cmp is the order of these bits.
+        // The row (the order the draws came in) last makes every key
+        // distinct, so an unstable sort of these gives the stable order.
+        let packable = keys.iter().all(|k| k.key.0 < 1 << 31 && k.key.1 < 1 << 32) && rows.len() < 1 << 32;
+        if packable {
+            let mut packed: Vec<(u64, u64, u64)> = keys
+                .iter()
+                .map(|k| {
+                    (
+                        (k.pass as u64) << 63 | (k.key.0 as u64) << 32 | k.key.1 as u64,
+                        k.cell,
+                        (!total_order_bits(k.radius) as u64) << 32 | k.row as u64,
+                    )
+                })
+                .collect();
+            packed.sort_unstable();
+            let mut sorted: Vec<Key> = Vec::with_capacity(keys.len());
+            for p in &packed {
+                let row = p.2 as u32;
+                // (keys[i].row == i: pushed in step with rows)
+                let k = &keys[row as usize];
+                sorted.push(Key { pass: k.pass, key: k.key, cell: k.cell, radius: k.radius, row });
+            }
+            keys = sorted;
+        } else {
+            keys.sort_by(|a, b| {
+                (a.pass, a.key, a.cell)
+                    .cmp(&(b.pass, b.key, b.cell))
+                    .then(b.radius.total_cmp(&a.radius))
+            });
+        }
+        drop(scope);
+        let scope = rustudio_core::bench::scope("rs_layout");
         let mut st = StaticLayout {
-            raw: Vec::with_capacity(rows.len()),
-            radii: Vec::with_capacity(rows.len()),
+            raw: Vec::with_capacity(keys.len()),
+            radii: Vec::with_capacity(keys.len()),
             ..Default::default()
         };
         let mut cell_of_batch = u64::MAX;
-        for (slot, row) in rows.iter().enumerate() {
+        for (slot, k) in keys.iter().enumerate() {
             let slot = slot as u32;
+            let row = &rows[k.row as usize];
             st.raw.push(row.raw);
-            st.radii.push(row.radius);
-            if let Some(ItemState::Static(slots)) =
-                self.items.get_mut(&row.owner).map(|i| &mut i.state)
-            {
-                slots[row.index as usize] = slot;
+            st.keys.push((k.pass, k.key));
+            st.radii.push(k.radius);
+            if let ItemState::Static(slots) = &mut owners[row.owner.0 as usize].state {
+                slots[row.owner.1 as usize] = slot;
             }
             match st.batches.last_mut() {
-                Some(b) if b.pass == row.pass && b.key == row.key && cell_of_batch == row.cell => {
+                Some(b) if b.pass == k.pass && b.key == k.key && cell_of_batch == k.cell => {
                     b.count += 1;
                     b.lo = b.lo.min(row.lo);
                     b.hi = b.hi.max(row.hi);
                 }
                 _ => {
-                    cell_of_batch = row.cell;
+                    cell_of_batch = k.cell;
                     st.batches.push(Batch {
-                        pass: row.pass,
-                        key: row.key,
+                        pass: k.pass,
+                        key: k.key,
                         lo: row.lo,
                         hi: row.hi,
                         start: slot,
                         count: 1,
+                        has_hidden: false,
                     });
                 }
             }
         }
+        drop(owners);
+        drop(scope);
+        self.finish_static(device, queue, st);
+    }
+
+    /// Uploads a new static layout and makes it current.
+    fn finish_static(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mut st: StaticLayout) {
+        let scope = rustudio_core::bench::scope("rs_upload");
         if st.raw.len() > self.static_cap {
             self.static_cap = st.raw.len().next_power_of_two();
             self.static_buf = Self::make_buf(
@@ -6281,14 +7657,42 @@ impl Renderer {
         if !st.raw.is_empty() {
             queue.write_buffer(&self.static_buf, 0, bytemuck::cast_slice(&st.raw));
         }
+        drop(scope);
+        let scope = rustudio_core::bench::scope("rs_swap");
+        st.occluders.clear();
+        for (slot, (raw, &(pass, key))) in st.raw.iter().zip(&st.keys).enumerate() {
+            if pass != Pass::Opaque || !raw_is_solid_occluder(raw) {
+                continue;
+            }
+            let Some(m) = self.meshes.get(key.0) else { continue };
+            if m.storage || m.cull == Some(false) {
+                continue;
+            }
+            let Some((olo, ohi)) = m.occluder else { continue };
+            if let Some(ob) = crate::occlusion::OccluderBox::from_part(
+                slot as u32,
+                raw.r0,
+                raw.r1,
+                raw.r2,
+                [raw.size[0], raw.size[1], raw.size[2]],
+                olo,
+                ohi,
+            ) {
+                st.occluders.push(ob);
+            }
+        }
+        st.occluder_cells = crate::occlusion::build_occluder_cells(&mut st.occluders, CELL);
         self.st = st;
         self.static_gen += 1;
         self.caster_gen += 1;
         let items = &self.items;
         self.per_frame
             .retain(|r| items.get(r).is_some_and(|i| i.state == ItemState::Dynamic));
+        self.dyn_occluders
+            .retain(|r| items.get(r).is_some_and(|i| i.state == ItemState::Dynamic));
         self.pending = 0;
         self.pending_at = None;
+        drop(scope);
     }
 
     /// Uploads static slots changed in place (merged into contiguous runs).
@@ -6330,7 +7734,7 @@ fn update_item_slots(
     r: Ref,
     item: &mut Item,
     st: &mut StaticLayout,
-    per_frame: &mut HashSet<Ref>,
+    per_frame: &mut RefSet,
     pending: &mut usize,
     same_place: bool,
     static_ok: bool,
@@ -6355,6 +7759,10 @@ fn update_item_slots(
                 if s != u32::MAX {
                     st.caster_dirty.push(raw_sphere(&st.raw[s as usize], st.radii[s as usize]));
                     st.raw[s as usize] = HIDDEN;
+                    let bi = st.batches.partition_point(|b| b.start + b.count <= s);
+                    if let Some(b) = st.batches.get_mut(bi) {
+                        b.has_hidden = true;
+                    }
                     st.writes.push(s);
                     st.caster_writes = true;
                     st.hidden += 1;
@@ -6772,9 +8180,9 @@ impl MeshBuilder {
 
 /// Selection uses the same tessellation and size transform as the visible ball.
 pub(crate) fn ball_outline_points() -> impl Iterator<Item = Vec3> {
-    (0..=18).flat_map(|i| (0..32).map(move |j| {
-        let th = std::f32::consts::PI * i as f32 / 18.0;
-        let ph = std::f32::consts::TAU * j as f32 / 32.0;
+    (0..=10).flat_map(|i| (0..24).map(move |j| {
+        let th = std::f32::consts::PI * i as f32 / 10.0;
+        let ph = std::f32::consts::TAU * j as f32 / 24.0;
         Vec3::new(th.sin() * ph.cos(), th.cos(), th.sin() * ph.sin()) * 0.5
     }))
 }
@@ -6805,9 +8213,9 @@ fn build_meshes() -> Vec<Vec<Vertex>> {
         }
     }
 
-    // Ball
+    // Ball: Studio's built-in sphere primitive has 432 triangles (10 rings x 24 segs).
     let mut ball = MeshBuilder::default();
-    let (rings, segs) = (18, 32);
+    let (rings, segs) = (10, 24);
     let sp = |i: usize, j: usize| {
         let th = std::f32::consts::PI * i as f32 / rings as f32;
         let ph = std::f32::consts::TAU * j as f32 / segs as f32;
@@ -6826,9 +8234,9 @@ fn build_meshes() -> Vec<Vec<Vertex>> {
         }
     }
 
-    // Cylinder (axis along X, like Roblox cylinders)
+    // Cylinder (axis along X, like Roblox cylinders): Studio's built-in cylinder has 96 triangles (24 segs).
     let mut cyl = MeshBuilder::default();
-    let segs = 32;
+    let segs = 24;
     let ring = |j: usize| {
         let a = std::f32::consts::TAU * j as f32 / segs as f32;
         Vec3::new(0.0, a.cos(), a.sin())

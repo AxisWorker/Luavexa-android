@@ -77,6 +77,12 @@ impl Side {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RepOp {
     Prop(Ref, String),
+    /// One attribute changed or cleared on the server: replicated by name so
+    /// client-local attributes survive server attribute changes.
+    Attr(Ref, String),
+    /// One CollectionService tag added or removed on the server: replicated by
+    /// tag so client-local tags survive server tag changes.
+    Tag(Ref, String),
     Name(Ref),
     Parent(Ref),
     /// Physics moved a part: its CFrame is copied without Changed events
@@ -164,7 +170,7 @@ pub struct World {
     pub destroyed: HashSet<Ref>,
     pub output: Vec<(Level, String)>,
     /// Velocities read from physics (AssemblyLinearVelocity).
-    pub velocities: HashMap<Ref, Vec3>,
+    pub velocities: rustc_hash::FxHashMap<Ref, Vec3>,
     /// Velocities scripts asked for.
     pub velocity_requests: Vec<(Ref, Vec3)>,
     /// Humanoids that died this frame.
@@ -222,6 +228,11 @@ pub struct World {
     pub freed: u64,
     /// Scripts parented (or enabled) where Roblox runs them, started at the next dispatch.
     pub to_start: Vec<Ref>,
+    /// While Play replicates a new character (client): its LocalScripts go to
+    /// `held` instead of `to_start`, for Play to start after CharacterAdded and
+    /// the new GUI's scripts, in Studio's order.
+    pub hold_character_scripts: bool,
+    pub held: Vec<Ref>,
     /// Terrain edited by scripts this frame (Terrain:Fill…): its voxels,
     /// written back to SmoothGrid once per step (runtime_ext::flush_terrain).
     pub terrain_edit: Option<(Ref, rustudio_core::terrain::Voxels)>,
@@ -342,6 +353,22 @@ impl World {
         }
     }
 
+    /// Whether `r` is in the LocalPlayer's Character (client).
+    fn in_local_character(&self, r: Ref) -> bool {
+        let d = self.d();
+        let root = d.dom.root_ref();
+        d.find_child(root, "Players")
+            .and_then(|p| match d.prop(p, "LocalPlayer") {
+                Some(Variant::Ref(lp)) if d.exists(lp) => Some(lp),
+                _ => None,
+            })
+            .and_then(|lp| match d.prop(lp, "Character") {
+                Some(Variant::Ref(c)) if d.exists(c) => Some(c),
+                _ => None,
+            })
+            .is_some_and(|c| d.is_ancestor(c, r))
+    }
+
     /// Queues scripts at and under `r` that now run here.
     fn queue_scripts(&mut self, r: Ref) {
         let refs: Vec<Ref> = std::iter::once(r)
@@ -355,7 +382,11 @@ impl World {
                     .is_some_and(|c| c == "Script" || c == "LocalScript")
                 && self.runs_here(s)
             {
-                self.to_start.push(s);
+                if self.hold_character_scripts && self.in_local_character(s) {
+                    self.held.push(s);
+                } else {
+                    self.to_start.push(s);
+                }
             }
         }
     }
@@ -625,7 +656,7 @@ impl World {
             structure_changed: false,
             destroyed: HashSet::new(),
             output: Vec::new(),
-            velocities: HashMap::new(),
+            velocities: Default::default(),
             velocity_requests: Vec::new(),
             died: Vec::new(),
             load_character: Vec::new(),
@@ -660,6 +691,8 @@ impl World {
             orphans: HashSet::new(),
             freed: 0,
             to_start: Vec::new(),
+            hold_character_scripts: false,
+            held: Vec::new(),
             terrain_edit: None,
         }
     }
@@ -1074,6 +1107,20 @@ const LUA_METHODS: &[(&str, &str)] = &[
 
 /// Property lookup through the class chain; aliases resolve to their
 /// canonical property. Returns (canonical name, type, read-only).
+/// The reflected property `name` of `class` is no member for scripts
+/// (Scriptability::None, or tagged NotScriptable: Instance.Attributes and
+/// Tags are Custom + NotScriptable): Studio's `inst.name` finds a child.
+pub(super) fn prop_hidden_from_scripts(class: &str, name: &str) -> bool {
+    let db = doc::db();
+    let Some(c) = db.classes.get(class) else { return false };
+    db.superclasses_iter(c)
+        .find_map(|cls| cls.properties.get(name))
+        .is_some_and(|p| {
+            !matches!(p.kind, PropertyKind::Alias { .. })
+                && (matches!(p.scriptability, Scriptability::None) || p.tags.contains(&PropertyTag::NotScriptable))
+        })
+}
+
 fn prop_desc(class: &str, name: &str) -> Option<(&'static str, DataType<'static>, bool)> {
     // Sound.Pitch is a deprecated alias of PlaybackSpeed in Roblox, but the
     // reflection database lists it as its own property (RbxCharacterSounds sets it).
@@ -1719,7 +1766,7 @@ pub(crate) enum Fv {
 
 fn index_entry_fast(lua: &Lua, r: Ref, key: &str, atom: i32) -> (mlua::Result<Fv>, bool) {
     enum Got {
-        Name,
+        Name(String),
         Class,
         Parent(Ref),
         Position(Vec3),
@@ -1763,7 +1810,7 @@ fn index_entry_fast(lua: &Lua, r: Ref, key: &str, atom: i32) -> (mlua::Result<Fv
             Got::Full(i.parent())
         } else {
             match rt.special {
-                routes::Special::Name => Got::Name,
+                routes::Special::Name => Got::Name(i.name.clone()),
                 routes::Special::ClassName => Got::Class,
                 routes::Special::Parent => Got::Parent(i.parent()),
                 _ => match rt.prop {
@@ -1803,10 +1850,9 @@ fn index_entry_fast(lua: &Lua, r: Ref, key: &str, atom: i32) -> (mlua::Result<Fv
             }
             return (index_routed(lua, r, key, class_u, parent, rt).map(Fv::V), quiet);
         }
-        Got::Name => {
+        Got::Name(name) => {
             rustudio_core::telemetry::touch(class_u.as_str(), key);
-            let name = world(lua).map(|w| w.d().dom.get_by_ref(r).map(|i| i.name.clone()).unwrap_or_default());
-            return (name.map(Fv::Str), quiet);
+            return (Ok(Fv::Str(name)), quiet);
         }
         Got::Class => {
             rustudio_core::telemetry::touch(class_u.as_str(), key);
@@ -1893,6 +1939,14 @@ pub(crate) fn native_call(lua: &Lua, r: Ref, name: &str, atom: i32, args: &[NArg
         let value = child_result(instance.children());
         rustudio_core::telemetry::touch(class, name);
         return Some(Ok((value, true)));
+    }
+    // The same list as the general GetDescendants (call_method), pushed
+    // as an Instance array through the weak cache instead of an mlua table
+    // built one inst_value at a time.
+    if m == "GetDescendants" && rt.method.core && (args.is_empty() || matches!(args, [NArg::Nil])) {
+        let refs: Vec<Ref> = w.d().dom.descendants_of(r).map(|i| i.referent()).filter(|x| *x != r).collect();
+        rustudio_core::telemetry::touch(class, name);
+        return Some(Ok((child_result(&refs), true)));
     }
     if rt.method.core && class_u == "Players" {
         let d = w.d();
@@ -2100,6 +2154,14 @@ pub(crate) enum FastVal {
     UDim2(LUDim2),
 }
 
+fn joint_pose_property(class: &str, name: &str) -> bool {
+    match name {
+        "Anchored" => doc::is_a(class, "BasePart"),
+        "C0" | "C1" | "Enabled" | "Part0" | "Part1" => domains::world::part::poses_immediately(class),
+        _ => false,
+    }
+}
+
 /// `inst.key = value` for a reflected property stored as given: no domain,
 /// runtime_ext or capability rule takes the member, it isn't one of
 /// newindex_routed's own (Name, Parent, Attachment / BasePart frames, a
@@ -2195,15 +2257,34 @@ pub(crate) fn typed_write(lua: &Lua, r: Ref, key: &str, atom: i32, val: FastVal)
     if instance.properties.get(&info.canon) == Some(&value) {
         return Some(Ok(no_dispatch));
     }
+    // A part's CFrame carries its assembly (carry_assembly, after the store).
+    let carry = if canon == "CFrame" && w.mode != RunMode::Edit && doc::is_a(class, "BasePart") {
+        match instance.properties.get(&info.canon) {
+            Some(Variant::CFrame(cf)) => Some(Xform::from_cframe(cf)),
+            _ => return None,
+        }
+    } else {
+        None
+    };
     let quiet = no_dispatch && !w.listening.contains(&r) && !w.item_changed && !rustudio_core::telemetry::on();
     // Nothing to fire or record for the change history: the value goes
     // into its slot in place (store_prop_in_world's changed path with no
     // listener, outside Edit; ScreenGui's twinned inset properties excepted).
     let mut w = w;
-    if quiet && w.mode != RunMode::Edit && class_u != "ScreenGui" && store_in_place(&mut w, r, info.canon, &value) {
+    if quiet && w.mode != RunMode::Edit && class_u != "ScreenGui"
+        && !joint_pose_property(class, canon) && store_in_place(&mut w, r, info.canon, &value)
+    {
+        if carry.is_some() {
+            drop(w);
+            return Some(carry_assembly(lua, r, carry).map(|_| true));
+        }
         return Some(Ok(true));
     }
-    Some(store_prop_in_world(lua, w, r, info.canon, value).map(|_| quiet))
+    let done = store_prop_in_world(lua, w, r, info.canon, value).map(|_| quiet);
+    if done.is_ok() && carry.is_some() {
+        return Some(carry_assembly(lua, r, carry).map(|_| quiet));
+    }
+    Some(done)
 }
 
 /// Replaces a property's stored (or class-shared) value with `value`,
@@ -2495,6 +2576,13 @@ fn prop_get_plain(
             return Ok(Some(Value::Function(f.clone())));
         }
     }
+    // A property scripts can't see (reflection NotScriptable, e.g.
+    // Instance.Attributes): a child of that name answers, as in Studio.
+    // A game's `require(Packages.Attributes)` got nil here and its
+    // whole player setup failed (2026-11-21).
+    if prop.is_some() && prop_hidden_from_scripts(class, key) && find_named_child(lua, r, key)?.is_some() {
+        return Ok(None);
+    }
     let (enum_name, value, defaulted) = match prop {
         Some(p) => {
             let (stored, v) = {
@@ -2520,8 +2608,17 @@ fn prop_get_plain(
                 // intern every child name a script indexes.)
                 .and_then(|i| i.properties.get(&rbx_dom_weak::Ustr::from_existing(key)?).cloned());
             match v {
+                // A stored non-reflected value (the file's own data) never
+                // hides a child of that name (see `prop_hidden_from_scripts`).
+                Some(_) if find_named_child(lua, r, key)?.is_some() => return Ok(None),
                 Some(v) => (None, Some(v), None),
-                None => return Ok(None),
+                // A class newer than the reflection database: Studio's
+                // measured constructor value where there is one
+                // (doc::constructor_default), else the stub's.
+                None => match doc::class_default(class, key) {
+                    Some(v) => (None, Some(v), None),
+                    None => return Ok(None),
+                },
             }
         }
     };
@@ -2570,7 +2667,7 @@ pub fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
 }
 
 fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scripts: bool) -> mlua::Result<()> {
-    let (old, descendants, lost, snaps, stopped) = {
+    let (old, descendants, lost, snaps, enters_ws, stopped, gripped) = {
         let mut w = world(lua)?;
         let old = w
             .d()
@@ -2661,7 +2758,8 @@ fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scr
         } else {
             HashSet::new()
         };
-        (old, descendants, lost, snaps, stopped)
+        let gripped = if w.mode != RunMode::Edit { crate::tool_grip::gripped_handles(w.d(), r, enters_ws) } else { Vec::new() };
+        (old, descendants, lost, snaps, enters_ws, stopped, gripped)
     };
     for (model, pivot) in lost {
         store_prop(lua, model, "PrimaryPart", Variant::Ref(Ref::none()))?;
@@ -2670,13 +2768,28 @@ fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scr
     for (part, xf) in snaps {
         store_prop(lua, part, "CFrame", Variant::CFrame(xf.to_cframe()))?;
     }
+    if enters_ws {
+        let mut w = world(lua)?;
+        let moves = domains::world::part::entering_joint_moves(w.d(), &descendants);
+        apply_assembly_pose(&mut w, moves);
+    }
     fire_parent_signals(lua, r, old, new_parent, descendants)?;
+    // After the hierarchy signals (Studio: an AncestryChanged handler on the Tool still
+    // reads CanCollide true; EquipTool has returned with it false): the queued
+    // Immediate fires run first.
+    if !gripped.is_empty() {
+        signal_timing::flush_immediate(lua);
+    }
+    for handle in gripped {
+        store_prop(lua, handle, "CanCollide", Variant::Bool(false))?;
+    }
     if !stopped.is_empty() {
         signal_timing::flush_immediate(lua);
         stop_code_of(lua, &stopped);
     }
     Ok(())
 }
+
 
 /// Parts of `r`'s tree that its saved WeldConstraints place as it enters the
 /// Workspace, and the welds of the tree that take their offset now. A
@@ -3126,6 +3239,11 @@ fn store_prop_in_world(
     let before = (w.mode == RunMode::Edit && name != "Source" && w.d().records_change(r))
         .then(|| w.d().dom.get_by_ref(r).map(|i| i.properties.clone()))
         .flatten();
+    let old_frame = if w.mode != RunMode::Edit && matches!(name, "C0" | "C1") {
+        w.d().prop_key(r, key)
+    } else {
+        None
+    };
     let changed = {
         let Some(inst) = w.dm().dom.get_by_ref_mut(r) else {
             return Err(rt_err("the Instance no longer exists"));
@@ -3183,6 +3301,12 @@ fn store_prop_in_world(
         if matches!(name, "Part0" | "Part1" | "Enabled") && w.d().class_of(r).is_some_and(|c| c == "WeldConstraint") {
             weld_rejoined(&mut w, r);
         }
+        if w.mode != RunMode::Edit && matches!(name, "Anchored" | "C0" | "C1" | "Enabled" | "Part0" | "Part1")
+            && w.d().class_of(r).is_some_and(|class| joint_pose_property(class.as_str(), name))
+        {
+            let moves = domains::world::part::joint_property_moves(w.d(), r, name, old_frame.as_ref());
+            apply_assembly_pose(&mut w, moves);
+        }
         // (Physics sees the change through the document's marks.)
         // A part's Size changes its mass: Studio fires Changed for Size,
         // then AssemblyMass, then Mass (checks/plugins/services/captures/
@@ -3232,6 +3356,67 @@ fn fire_changed(lua: &Lua, r: Ref, key: &str) -> mlua::Result<()> {
     Ok(())
 }
 
+/// After a script moved part `r` from `before` (CFrame, PivotTo): the rest
+/// of its assembly moves with it at once, keeping its offsets, as in
+/// Studio, where a read of a welded part right after the write already
+/// sees it moved (an FPS view model sets its AnimBase from the camera,
+/// then reads the Grip and AimPart it carries to aim down the sights; a
+/// read a frame stale left the sights half way). The offsets are the
+/// parts' current ones: a Motor6D.Transform set since the last step
+/// isn't in them yet (Studio's neither). Play / Run only; parts outside
+/// Workspace aren't joined (Studio leaves them where they are).
+fn carry_assembly(lua: &Lua, r: Ref, before: Option<Xform>) -> mlua::Result<()> {
+    let Some(before) = before else { return Ok(()) };
+    let mut w = world(lua)?;
+    if w.mode == RunMode::Edit {
+        return Ok(());
+    }
+    let moves = {
+        let d = w.d();
+        let after = match d.prop(r, "CFrame") {
+            Some(Variant::CFrame(cf)) => Xform::from_cframe(&cf),
+            _ => return Ok(()),
+        };
+        if after == before {
+            return Ok(());
+        }
+        let carried = domains::world::part::with_graph(d, |g| g.carried_by_move(d, r));
+        if carried.is_empty() {
+            return Ok(());
+        }
+        let delta = cf_mul(&after, &cf_inv(&before));
+        let moves: Vec<(Ref, Xform)> = carried
+            .into_iter()
+            .filter_map(|q| match d.prop(q, "CFrame") {
+                Some(Variant::CFrame(cf)) => Some((
+                    q,
+                    cf_mul(&delta, &Xform::from_cframe(&cf)).orthonormalized(),
+                )),
+                _ => None,
+            })
+            .collect();
+        moves
+    };
+    apply_assembly_pose(&mut w, moves);
+    Ok(())
+}
+
+fn apply_assembly_pose(w: &mut World, moves: Vec<(Ref, Xform)>) {
+    static CFRAME: std::sync::LazyLock<rbx_dom_weak::Ustr> = std::sync::LazyLock::new(|| ustr("CFrame"));
+    for (q, pose) in moves {
+        let v = Variant::CFrame(pose.to_cframe());
+        if !store_in_place(w, q, *CFRAME, &v) {
+            if let Some(i) = w.dm().dom.get_by_ref_mut(q) {
+                i.properties.insert(*CFRAME, v);
+            }
+            w.dm().mark_prop(q, *CFRAME);
+            if w.side == Side::Server && w.has_peer {
+                w.record(RepOp::Prop(q, "CFrame".to_string()));
+            }
+        }
+    }
+}
+
 /// The change history's record of a script's property write: every
 /// property of `r` that differs from `before` (the written one and its
 /// twins).
@@ -3263,6 +3448,52 @@ pub(crate) fn note_script_prop(w: &mut World, r: Ref, key: rbx_dom_weak::Ustr, o
     if new != old {
         w.dm().note_script_change(doc::Change::Prop { r, name: key, old, new });
     }
+}
+
+/// Sets or clears one attribute on `r`, preserving all other attributes,
+/// firing `AttributeChanged` / `AttributeChanged:{name}`, and recording a
+/// per-attribute replication op on the server.
+fn set_attr(lua: &Lua, r: Ref, name: &str, var: Option<Variant>) -> mlua::Result<()> {
+    let mut w = world(lua)?;
+    let key = ustr("Attributes");
+    let old_prop = {
+        let Some(inst) = w.dm().dom.get_by_ref_mut(r) else {
+            return Err(rt_err("the Instance no longer exists"));
+        };
+        let empty = Attributes::new();
+        let old = match inst.properties.get(&key) {
+            Some(Variant::Attributes(a)) => a,
+            _ => &empty,
+        };
+        // The value it already has: nothing changes and nothing fires
+        // (Roblox fires AttributeChanged only on a change).
+        if old.get(name) == var.as_ref() {
+            return Ok(());
+        }
+        // Rebuild without the key, then add the new value (nil clears it).
+        let mut attrs = Attributes::new();
+        for (k, v) in old.iter() {
+            if k.as_str() != name {
+                attrs.insert(k.clone(), v.clone());
+            }
+        }
+        if let Some(var) = var {
+            attrs.insert(name.to_string(), var);
+        }
+        inst.properties.insert(key, Variant::Attributes(attrs))
+    };
+    note_script_prop(&mut w, r, key, old_prop);
+    w.dm().mark_prop(r, key);
+    w.record(RepOp::Attr(r, name.to_string()));
+    if !w.listening.contains(&r) && !rustudio_core::telemetry::on() {
+        return Ok(());
+    }
+    drop(w);
+    let an = Value::String(lua.create_string(name)?);
+    let mut w = world(lua)?;
+    w.fire(r, "AttributeChanged", vec![an]);
+    w.fire(r, &format!("AttributeChanged:{name}"), vec![]);
+    Ok(())
 }
 
 fn set_callback(lua: &Lua, r: Ref, key: &str, value: Value) -> mlua::Result<()> {
@@ -3568,7 +3799,12 @@ fn newindex_routed(
     let disabling = canon == "Disabled"
         && matches!(v, Variant::Bool(true))
         && matches!(class, "Script" | "LocalScript");
+    let carry = canon == "CFrame" && doc::is_a(class, "BasePart");
+    let before = if carry { part_xform(lua, r).ok() } else { None };
     store_prop_key(lua, r, info.canon, v)?;
+    if carry {
+        carry_assembly(lua, r, before)?;
+    }
     if enabling {
         start_if_enabled(lua, r)?;
     }
@@ -4112,7 +4348,9 @@ fn model_pivot(w: &World, r: Ref) -> Xform {
 fn pivot_to(lua: &Lua, r: Ref, target: Xform) -> mlua::Result<()> {
     let (class, _, _) = inst_meta(lua, r)?;
     if doc::is_a(&class, "BasePart") {
-        return store_prop(lua, r, "CFrame", Variant::CFrame(target.to_cframe()));
+        let before = part_xform(lua, r).ok();
+        store_prop(lua, r, "CFrame", Variant::CFrame(target.to_cframe()))?;
+        return carry_assembly(lua, r, before);
     }
     let (pivot, parts) = {
         let w = world(lua)?;
@@ -4733,31 +4971,7 @@ fn call_method_routed(
             let n = arg_str(&args, 1, "string")?;
             check_attribute_name(&n)?;
             let var = attribute_value(&arg(&args, 2))?;
-            let old = match world(lua)?.d().prop(this, "Attributes") {
-                Some(Variant::Attributes(a)) => a,
-                _ => Attributes::new(),
-            };
-            // The value it already has: nothing changes and nothing fires
-            // (Roblox fires AttributeChanged only on a change).
-            let current = old.iter().find(|(k, _)| k.as_str() == n).map(|(_, v)| v);
-            if current == var.as_ref() {
-                return none();
-            }
-            // Rebuild without the key, then add the new value (nil clears it).
-            let mut attrs = Attributes::new();
-            for (k, v) in old.iter() {
-                if k.as_str() != n {
-                    attrs.insert(k.clone(), v.clone());
-                }
-            }
-            if let Some(var) = var {
-                attrs.insert(n.clone(), var);
-            }
-            store_prop(lua, this, "Attributes", Variant::Attributes(attrs))?;
-            let an = Value::String(lua.create_string(&n)?);
-            let mut w = world(lua)?;
-            w.fire(this, "AttributeChanged", vec![an]);
-            w.fire(this, &format!("AttributeChanged:{n}"), vec![]);
+            set_attr(lua, this, &n, var)?;
             none()
         }
         "GetPropertyChangedSignal" => {
@@ -6629,7 +6843,14 @@ impl Runtime {
                 .app_data_mut::<World>()
                 .map(|mut w| std::mem::take(&mut w.events))
                 .unwrap_or_default();
-            if deferred.is_empty() && events.is_empty() {
+            // Threads the immediate fires just deferred (a handler's
+            // task.defer) run in this cycle too, as Roblox drains its
+            // deferred queue before the invocation point ends.
+            let more = || {
+                sched(lua).is_ok_and(|s| !s.deferred.is_empty())
+                    || lua.app_data_ref::<World>().is_some_and(|w| !w.to_start.is_empty())
+            };
+            if deferred.is_empty() && events.is_empty() && !more() {
                 if let Ok(mut s) = signals(lua) {
                     s.destroyed_ancestry.clear();
                 }
@@ -7383,35 +7604,6 @@ impl Runtime {
 
     /// Replication: sets a property as the server did (fires Changed here).
     pub fn apply_prop(&self, r: Ref, name: &str, v: Variant) {
-        // Attributes: each one that changed fires AttributeChanged (and its
-        // GetAttributeChangedSignal), as when a script sets it.
-        let changed_attrs: Vec<String> = if name == "Attributes" {
-            let old = world(&self.lua)
-                .ok()
-                .and_then(|w| match w.d().prop(r, "Attributes") {
-                    Some(Variant::Attributes(a)) => Some(a),
-                    _ => None,
-                });
-            match (&v, old) {
-                (Variant::Attributes(new), old) => {
-                    let old = old.unwrap_or_default();
-                    let mut keys: Vec<String> = new
-                        .iter()
-                        .filter(|(k, val)| old.get(k.as_str()) != Some(*val))
-                        .map(|(k, _)| k.to_string())
-                        .collect();
-                    keys.extend(
-                        old.iter()
-                            .filter(|(k, _)| new.get(k.as_str()).is_none())
-                            .map(|(k, _)| k.to_string()),
-                    );
-                    keys
-                }
-                _ => Vec::new(),
-            }
-        } else {
-            Vec::new()
-        };
         // A Humanoid's Health from the server fires HealthChanged here, and
         // Died when it reaches 0 (Roblox fires both on the clients too).
         let health = (name == "Health")
@@ -7455,15 +7647,32 @@ impl Runtime {
                 }
             }
         }
-        if !changed_attrs.is_empty() {
-            if let Ok(mut w) = world(&self.lua) {
-                for k in changed_attrs {
-                    if let Ok(s) = self.lua.create_string(&k) {
-                        w.fire(r, "AttributeChanged", vec![Value::String(s)]);
-                    }
-                    w.fire(r, &format!("AttributeChanged:{k}"), vec![]);
-                }
-            }
+    }
+
+    /// Replication: sets or clears one attribute as the server did, preserving
+    /// every other attribute (including client-local ones).
+    pub fn apply_attr(&self, r: Ref, name: &str, v: Option<Variant>) {
+        if world(&self.lua).ok().is_none_or(|w| !w.d().exists(r)) {
+            return;
+        }
+        if let Err(e) = set_attr(&self.lua, r, name, v) {
+            report(&self.lua, &e);
+        }
+    }
+
+    /// Replication: adds or removes one CollectionService tag as the server
+    /// did, preserving every other tag (including client-local ones).
+    pub fn apply_tag(&self, r: Ref, tag: &str, present: bool) {
+        if world(&self.lua).ok().is_none_or(|w| !w.d().exists(r)) {
+            return;
+        }
+        let res = if present {
+            ext::add_tag(&self.lua, r, tag)
+        } else {
+            ext::remove_tag(&self.lua, r, tag)
+        };
+        if let Err(e) = res {
+            report(&self.lua, &e);
         }
     }
 

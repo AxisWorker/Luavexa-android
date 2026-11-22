@@ -536,10 +536,16 @@ Settings > rustudio, and the MicroProfiler). What a phone gets from it:
   and light shadow atlases) and the viewport's own pass set — some
   thirty pipelines through the driver's compiler for one sample count —
   when a frame first needs it (`render.rs` `ensure_pipelines`). Upstream
-  built the 4x MSAA set at start; on a phone the quality level draws one
-  sample a pixel (`quality.rs` `samples`, levels 1–16), so the 1x set
-  followed at the first frame and the 4x set was paid for nothing until
-  the scene probe or a ViewportFrame asks for it. logcat
+  builds a set at start (`startup_samples`: 4x MSAA, or 1 sample where
+  the 4x shader can't run, as on OpenGL 4.3) and, since 0.4.0, a worker
+  thread makes the 1x set meanwhile for a session likely to draw with it
+  (weak-GPU mode, Automatic quality, Low detail;
+  `RUSTUDIO_NO_PIPELINE_PREBUILD=1` turns the worker off); on a phone the
+  quality level draws one sample a pixel (`quality.rs` `samples`, levels
+  1–16), so the port builds nothing at start, takes the worker's 1x set
+  at the first frame (or builds it there), and pays for the
+  `probe_samples` set only when the scene probe or a ViewportFrame asks
+  for it. logcat
   (`RustStdoutStderr`) times the pieces: `[startup] renderer built in N
   ms`, `[startup] viewport pipelines for 1 sample(s) a pixel built in N
   ms`, `[startup] first frame built in N ms, M ms after the engine's

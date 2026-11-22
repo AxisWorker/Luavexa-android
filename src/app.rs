@@ -61,6 +61,8 @@ pub enum Tab {
     TerrainEditor,
     /// Studio's Toolbox (Home / View > Toolbox): src/toolbox.
     Toolbox,
+    /// Studio's Asset Manager (Home > Assets, Window > Asset Manager): src/asset_manager.
+    AssetManager,
     /// File Sync (src/file_sync): the project attached to the place.
     FileSync,
     /// View > MicroProfiler (Ctrl+F6): the profiler window
@@ -83,6 +85,7 @@ impl Tab {
             Tab::AvatarSettings => "Avatar Settings",
             Tab::TerrainEditor => "Terrain Editor",
             Tab::Toolbox => "Toolbox",
+            Tab::AssetManager => "Asset Manager",
             Tab::FileSync => "File Sync",
             Tab::Profiler => "MicroProfiler",
             Tab::Script(_) => "Script",
@@ -259,6 +262,8 @@ pub struct Editor {
     pub terrain_ed: crate::terrain_editor::TerrainEditor,
     /// The Toolbox panel's state (src/toolbox), kept while it is hidden.
     pub toolbox: crate::toolbox::Toolbox,
+    /// The Asset Manager panel's state (src/asset_manager), kept while hidden.
+    pub asset_manager: crate::asset_manager::AssetManager,
     /// The MicroProfiler window while its tab is open (recording runs while
     /// it exists; dropping it stops recording).
     pub profiler: Option<rustudio_profiler_ui::ProfilerWindow>,
@@ -279,6 +284,9 @@ pub struct Editor {
     /// The hovered instance's outline parts, for (hover, journal end).
     /// The selection's outline parts, for (journal end, selection).
     pub selection_outline_refs: std::cell::RefCell<(u64, Vec<rbx_dom_weak::types::Ref>, Vec<rbx_dom_weak::types::Ref>)>,
+    /// The selected parts and what the ribbon asks of them, for one
+    /// document state and selection (SelectionInfo).
+    pub selection_info: std::cell::RefCell<SelectionInfo>,
     /// The view selector's meshes for the current view.
     pub selector_cache: crate::viewport::SelectorCache,
     pub hover_outline_refs: (Option<(rbx_dom_weak::types::Ref, u64, u64)>, Vec<rbx_dom_weak::types::Ref>),
@@ -400,6 +408,7 @@ impl RustudioApp {
         let wayland = cc.window_handle().ok().map(|h| matches!(h.as_raw(), RawWindowHandle::Wayland(_)));
         let mut app = Self::new_in(&cc.egui_ctx, cc.wgpu_render_state.clone(), wayland, open, harness, demo);
         app.ed.plugins.set_repaint_context(cc.egui_ctx.clone());
+        rustudio_core::load_trace::mark("app created");
         app
     }
 
@@ -458,6 +467,7 @@ impl RustudioApp {
             file_sync: Default::default(),
             terrain_ed: Default::default(),
             toolbox: Default::default(),
+            asset_manager: Default::default(),
             profiler: None,
             toolbox_vf: Default::default(),
             fly_held: 0.0,
@@ -470,6 +480,7 @@ impl RustudioApp {
             hover_outline_refs: (None, Vec::new()),
             selector_cache: Default::default(),
             selection_outline_refs: std::cell::RefCell::new((u64::MAX, Vec::new(), Vec::new())),
+            selection_info: Default::default(),
             keyboard_cover: 0.0,
             view_pan: 0.0,
             harness,
@@ -602,7 +613,9 @@ impl RustudioApp {
             crate::plugin_host::widgets_ui::set_persist_dir(Some(rustudio_core::paths::config().join("rustudio")));
         }
         // (a GPU validation error is a logcat line, not the end of the
-        // process: src/android/mod.rs install_gpu_error_handler)
+        // process: src/android/mod.rs install_gpu_error_handler. Set after
+        // Game::new, so it replaces gpu_health::watch's handlers — the
+        // Output warning and the lost-device panic a desktop gets.)
         #[cfg(target_os = "android")]
         if let Some(rs) = ed.game.render_state.as_ref() {
             crate::android::install_gpu_error_handler(&rs.device);
@@ -976,6 +989,11 @@ impl Editor {
     /// A file dialog closed: act on its answer.
     pub fn poll_file_dialogs(&mut self) {
         use crate::file_dialog::Purpose;
+        if let Some((purpose, paths)) = self.dialogs.poll_multi() {
+            if !paths.is_empty() && purpose == Purpose::AssetManagerImport {
+                self.asset_manager_import_files(paths);
+            }
+        }
         let Some((purpose, path)) = self.dialogs.poll() else {
             return;
         };
@@ -1002,6 +1020,8 @@ impl Editor {
                     d.parent = path.display().to_string();
                 }
             }
+            Purpose::AssetManagerImport => self.asset_manager_import_files(vec![path]),
+            Purpose::TemplateAdd | Purpose::TemplateThumb(_) | Purpose::TemplateReplace(_) => self.start_template_file(&purpose, path),
         }
     }
 
@@ -1067,7 +1087,7 @@ impl Editor {
         self.dialogs.start(Purpose::InsertModel, d, Kind::PickFile);
     }
 
-    fn insert_model_file(&mut self, path: PathBuf) {
+    pub(crate) fn insert_model_file(&mut self, path: PathBuf) {
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let parent = self.paste_target(false);
@@ -1326,13 +1346,71 @@ impl Editor {
     }
 
     pub(crate) fn has_selected_parts(&self) -> bool {
-        self.game.doc.selection.iter().any(|&r| {
-            self.game.scene.get(r).is_some()
-                || self.game.doc.dom.descendants_of(r).any(|d| self.game.scene.get(d.referent()).is_some())
-        })
+        !self.selected_parts_shared().is_empty()
+    }
+
+    /// The selection info, brought up to date with the document, the scene
+    /// and the selection first.
+    fn selection_info_mut(&self) -> std::cell::RefMut<'_, SelectionInfo> {
+        let key = (self.game.doc.id, self.game.doc.journal_end(), self.game.scene.doc_id, self.game.scene.parts.len());
+        let mut info = self.selection_info.borrow_mut();
+        if info.key != Some(key) || info.selection != self.game.doc.selection {
+            *info = SelectionInfo {
+                key: Some(key),
+                selection: self.game.doc.selection.clone(),
+                parts: std::rc::Rc::new(self.walk_selected_parts()),
+                ..Default::default()
+            };
+        }
+        info
+    }
+
+    /// The selected parts (selected_parts) without copying them: the menu,
+    /// ribbon and outline ask several times a frame, and walking a big
+    /// selection's descendants each time cost ~60M instructions a frame on
+    /// a select-all of 5 000 parts.
+    pub(crate) fn selected_parts_shared(&self) -> std::rc::Rc<Vec<Ref>> {
+        self.selection_info_mut().parts.clone()
+    }
+
+    /// Whether every selected part has `prop` true (Lock / Anchor's checks).
+    pub(crate) fn selected_parts_all(&self, prop: &'static str) -> bool {
+        let mut info = self.selection_info_mut();
+        if let Some(&(_, v)) = info.all_true.iter().find(|(p, _)| *p == prop) {
+            return v;
+        }
+        let v = info.parts.iter().all(|r| matches!(self.game.doc.prop(*r, prop), Some(rbx_dom_weak::types::Variant::Bool(true))));
+        info.all_true.push((prop, v));
+        v
+    }
+
+    /// The selection's material when every selected part shares one.
+    pub(crate) fn selected_parts_material(&self) -> Option<u32> {
+        let mut info = self.selection_info_mut();
+        if let Some(m) = info.material {
+            return m;
+        }
+        let mut out = None;
+        for r in info.parts.iter() {
+            let m = match self.game.doc.prop(*r, "Material") {
+                Some(rbx_dom_weak::types::Variant::Enum(e)) => e.to_u32(),
+                _ => 256,
+            };
+            if out.is_some_and(|o| o != m) {
+                out = None;
+                break;
+            }
+            out = Some(m);
+        }
+        info.material = Some(out);
+        out
     }
 
     pub fn selected_parts(&self) -> Vec<Ref> {
+        (*self.selected_parts_shared()).clone()
+    }
+
+    fn walk_selected_parts(&self) -> Vec<Ref> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         for &r in &self.game.doc.selection {
@@ -1815,6 +1893,7 @@ impl TabViewer for Viewer<'_> {
             Tab::TerrainEditor => self.ed.terrain_editor_ui(ui),
             Tab::Plugin(n) => self.ed.plugin_widget_ui(ui, *n),
             Tab::Toolbox => self.ed.toolbox_ui(ui),
+            Tab::AssetManager => self.ed.asset_manager_ui(ui),
             Tab::FileSync => self.ed.file_sync_panel_ui(ui),
             Tab::Profiler => {
                 let rect = ui.available_rect_before_wrap();
@@ -2122,6 +2201,9 @@ impl eframe::App for RustudioApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         rustudio_render::gpu_health::check();
+        if let Some(message) = rustudio_render::gpu_health::take_uncaptured() {
+            self.ed.warn(message);
+        }
         // The driver's pipeline cache goes to disk once a burst of pipeline
         // builds is over (pipeline_cache.rs): the next start skips them.
         rustudio_render::pipeline_cache::save(false);
@@ -2133,6 +2215,7 @@ impl eframe::App for RustudioApp {
         let t0 = Instant::now();
         self.last_ui_frame = Some(t0);
         if self.egui_ctx.is_none() {
+            rustudio_core::load_trace::mark("first ui pass");
             self.egui_ctx = Some(ui.ctx().clone());
         }
         self.cpu_usage = frame.info().cpu_usage;
@@ -2370,8 +2453,10 @@ impl RustudioApp {
         self.watchdog.stage("plugins", "project and scene synchronization");
         ed.project_tick();
         ed.file_sync_tick();
+        ed.template_preview_tick();
         ed.plugins_tick();
         ed.toolbox_tick(&ctx);
+        ed.asset_manager_tick(&ctx);
         ed.toolbox_harness_tick();
         if self.ed.harness.run.no_ui {
             self.no_ui_frame(ui, &ctx, frame_start, dt);
@@ -2432,7 +2517,7 @@ impl RustudioApp {
             self.panels = crate::panels::Panels::default();
             self.dock = default_dock();
             for t in popped {
-                if self.dock.find_tab(&t).is_none() && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::Toolbox | Tab::FileSync) {
+                if self.dock.find_tab(&t).is_none() && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::Toolbox | Tab::AssetManager | Tab::FileSync) {
                     crate::panels::place(&mut self.dock, t, &self.panels.homes);
                 }
             }
@@ -2623,6 +2708,7 @@ impl RustudioApp {
             (Tab::AvatarSettings, "Avatar Settings"),
             (Tab::TerrainEditor, "Terrain Editor"),
             (Tab::Toolbox, "Toolbox"),
+            (Tab::AssetManager, "Asset Manager"),
             (Tab::FileSync, "File Sync"),
             (Tab::Profiler, "MicroProfiler"),
         ]
@@ -2966,4 +3052,17 @@ pub fn view_pixels(r: egui::Rect, ppp: f32, size: [usize; 2]) -> (usize, usize, 
     let (x0, y0) = (start(r.min.x, size[0]), start(r.min.y, size[1]));
     let (x1, y1) = (end(r.max.x, size[0]), end(r.max.y, size[1]));
     (x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
+}
+
+/// The selected parts for one (document, journal end, scene) state and
+/// selection, and the ribbon's questions about them, answered once.
+#[derive(Default)]
+pub struct SelectionInfo {
+    key: Option<(u64, u64, u64, usize)>,
+    selection: Vec<Ref>,
+    parts: std::rc::Rc<Vec<Ref>>,
+    /// (property, every selected part has it true)
+    all_true: Vec<(&'static str, bool)>,
+    /// Some(shared material, if any) once asked.
+    material: Option<Option<u32>>,
 }

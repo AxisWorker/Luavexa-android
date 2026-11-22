@@ -40,6 +40,14 @@ pub enum Purpose {
     TerrainImage { height: bool },
     /// File Sync: the project to attach.
     FileSyncProject,
+    /// Asset Manager > Import: one or more local files to import/upload.
+    AssetManagerImport,
+    /// Start Page > Open a Template > Edit: a place file to add as a template.
+    TemplateAdd,
+    /// … an image for one of the person's templates (by key).
+    TemplateThumb(String),
+    /// … another place file for one of the person's templates.
+    TemplateReplace(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,27 +127,37 @@ impl Request {
 pub struct Dialogs {
     #[cfg(not(target_os = "android"))]
     pending: Option<(Purpose, Receiver<Option<PathBuf>>)>,
+    #[cfg(not(target_os = "android"))]
+    pending_multi: Option<(Purpose, Receiver<Vec<PathBuf>>)>,
+    /// (the picker, and whether it was asked for several files: `poll_multi`)
     #[cfg(target_os = "android")]
-    pending: Option<(Purpose, crate::android::storage::Picker)>,
+    pending: Option<(Purpose, crate::android::storage::Picker, bool)>,
     /// Repainted when a dialog closes (the UI may be idle meanwhile).
     pub ctx: Option<egui::Context>,
 }
 
 impl Dialogs {
     pub fn new(ctx: egui::Context) -> Self {
-        Self { pending: None, ctx: Some(ctx) }
+        Self { ctx: Some(ctx), ..Default::default() }
     }
 
     /// A dialog is open.
     #[allow(dead_code)]
     pub fn busy(&self) -> bool {
-        self.pending.is_some()
+        #[cfg(not(target_os = "android"))]
+        {
+            self.pending.is_some() || self.pending_multi.is_some()
+        }
+        #[cfg(target_os = "android")]
+        {
+            self.pending.is_some()
+        }
     }
 
     /// Opens the dialog; false (and nothing happens) while another is open.
     #[cfg(not(target_os = "android"))]
     pub fn start(&mut self, purpose: Purpose, request: Request, kind: Kind) -> bool {
-        if self.pending.is_some() {
+        if self.busy() {
             return false;
         }
         let dialog = request.into_rfd();
@@ -165,6 +183,31 @@ impl Dialogs {
         true
     }
 
+    /// Opens a multi-file picker dialog.
+    #[cfg(not(target_os = "android"))]
+    pub fn start_multi(&mut self, purpose: Purpose, request: Request) -> bool {
+        if self.busy() {
+            return false;
+        }
+        let dialog = request.into_rfd();
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        let spawned = std::thread::Builder::new().name("file-dialog-multi".into()).spawn(move || {
+            let paths = pollster::block_on(dialog.pick_files())
+                .map(|hs| hs.into_iter().map(|h| h.path().to_path_buf()).collect())
+                .unwrap_or_default();
+            let _ = tx.send(paths);
+            if let Some(c) = ctx {
+                c.request_repaint();
+            }
+        });
+        if spawned.is_err() {
+            return false;
+        }
+        self.pending_multi = Some((purpose, rx));
+        true
+    }
+
     /// The finished dialog's purpose and path (None: cancelled).
     #[cfg(not(target_os = "android"))]
     pub fn poll(&mut self) -> Option<(Purpose, Option<PathBuf>)> {
@@ -177,13 +220,37 @@ impl Dialogs {
         self.pending.take().map(|(purpose, _)| (purpose, path))
     }
 
+    /// The finished multi-file dialog's purpose and chosen paths (empty: cancelled).
+    #[cfg(not(target_os = "android"))]
+    pub fn poll_multi(&mut self) -> Option<(Purpose, Vec<PathBuf>)> {
+        let (_, rx) = self.pending_multi.as_ref()?;
+        let paths = match rx.try_recv() {
+            Ok(p) => p,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => Vec::new(),
+        };
+        self.pending_multi.take().map(|(purpose, _)| (purpose, paths))
+    }
+
     /// Opens rustudio's own picker; false while another is open.
     #[cfg(target_os = "android")]
     pub fn start(&mut self, purpose: Purpose, request: Request, kind: Kind) -> bool {
+        self.start_picker(purpose, request, kind, false)
+    }
+
+    /// Opens rustudio's own picker for `poll_multi` (it picks one file at
+    /// a time); false while another is open.
+    #[cfg(target_os = "android")]
+    pub fn start_multi(&mut self, purpose: Purpose, request: Request) -> bool {
+        self.start_picker(purpose, request, Kind::PickFile, true)
+    }
+
+    #[cfg(target_os = "android")]
+    fn start_picker(&mut self, purpose: Purpose, request: Request, kind: Kind, multi: bool) -> bool {
         if self.pending.is_some() {
             return false;
         }
-        self.pending = Some((purpose, crate::android::storage::Picker::new(request, kind)));
+        self.pending = Some((purpose, crate::android::storage::Picker::new(request, kind), multi));
         if let Some(c) = &self.ctx {
             c.request_repaint();
         }
@@ -195,9 +262,25 @@ impl Dialogs {
     #[cfg(target_os = "android")]
     pub fn poll(&mut self) -> Option<(Purpose, Option<PathBuf>)> {
         let ctx = self.ctx.clone()?;
-        let (_, picker) = self.pending.as_mut()?;
+        let (_, picker, multi) = self.pending.as_mut()?;
+        if *multi {
+            return None;
+        }
         let done = picker.show(&ctx)?;
-        self.pending.take().map(|(purpose, _)| (purpose, done))
+        self.pending.take().map(|(purpose, _, _)| (purpose, done))
+    }
+
+    /// The picker opened by `start_multi`: its one chosen file (empty:
+    /// cancelled).
+    #[cfg(target_os = "android")]
+    pub fn poll_multi(&mut self) -> Option<(Purpose, Vec<PathBuf>)> {
+        let ctx = self.ctx.clone()?;
+        let (_, picker, multi) = self.pending.as_mut()?;
+        if !*multi {
+            return None;
+        }
+        let done = picker.show(&ctx)?;
+        self.pending.take().map(|(purpose, _, _)| (purpose, done.into_iter().collect()))
     }
 }
 
