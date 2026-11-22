@@ -296,10 +296,12 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                     LEnumItem::from_name("AssetFetchStatus", "Loading").unwrap(),
                 )?);
                 world(lua)?.fire(r, &format!("AssetFetchStatus:{id}"), vec![v]);
-                std::thread::spawn(move || {
-                    let ok = rustudio_core::assets::script_content_blocking(&id).is_ok();
-                    *result.lock().unwrap() = Some(ok);
-                });
+                // Queued behind what the scene and the scripts need now, a
+                // few at a time (core assets.rs `Priority::Preload`): a
+                // thread per id put a place's 2000-asset preload lists on
+                // 2000 threads, all contending for the download slots with
+                // the map's own meshes and textures.
+                rustudio_core::assets::preload_content(&id, result);
             }
             Ok(())
         })?,
@@ -333,15 +335,32 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         }
         lua.create_sequence_from(out)
     })?)?;
+    lua.globals().set(
+        "__rs_preload_deadline",
+        lua.create_function(|_, ()| Ok(rustudio_core::assets::preload_deadline()))?,
+    )?;
     lua.load(r#"
 local M = __rs_lua_methods
+-- Roblox's PreloadAsync yields until each asset was fetched or timed out
+-- (Enum.AssetFetchStatus.TimedOut; the callback gets that status). Here a
+-- call waits assets::preload_deadline seconds at most (20;
+-- RUSTUDIO_PRELOAD_DEADLINE): a place that preloads its 2000 animations
+-- and sounds from one server script, and starts its game after, would
+-- otherwise sit for minutes on a phone's link. The downloads go on in the
+-- background (GetAssetFetchStatus moves to Success as each arrives, the
+-- AssetFetchStatus signals fire), and the next use of an asset finds its
+-- bytes cached.
 function M.PreloadAsync(self, assets, callback)
     if type(assets) ~= 'table' then error('Unable to cast to Array', 2) end
     local ids = __ac_content_ids(assets)
     __rs_asset_begin(self,ids)
+    local deadline = os.clock() + __rs_preload_deadline()
     for _,id in ipairs(ids) do
         local s = self:GetAssetFetchStatus(id)
-        while s == Enum.AssetFetchStatus.Loading do task.wait(); s = self:GetAssetFetchStatus(id) end
+        while s == Enum.AssetFetchStatus.Loading and os.clock() < deadline do
+            task.wait(); s = self:GetAssetFetchStatus(id)
+        end
+        if s == Enum.AssetFetchStatus.Loading then s = Enum.AssetFetchStatus.TimedOut end
         if callback then callback(id,s) end
     end
 end
@@ -400,6 +419,9 @@ mod tests {
     use super::*;
     use rustudio_core::doc::Document;
     use rbx_dom_weak::InstanceBuilder;
+    /// The preload tests one at a time: RequestQueueSize counts every
+    /// content loading in the process, a held download included.
+    static PRELOADS: Mutex<()> = Mutex::new(());
     #[test]
     fn realtime_class_access_matches_studio(){
         let mut d=Document::new_place();
@@ -419,8 +441,62 @@ print('assets-cloud-realtime-ok')
         let output=rt.leave().output;
         assert!(output.iter().any(|(_,s)|s.contains("assets-cloud-realtime-ok")),"{output:?}");
     }
+    /// PreloadAsync on a link that can't keep up: the call returns after
+    /// its deadline with TimedOut for what is still downloading, the
+    /// download goes on and the status reaches Success later.
+    #[test]
+    fn preload_async_times_out_instead_of_holding_the_script() {
+        use rustudio_core::assets::{hold_download, AssetRef};
+        let _one_at_a_time = PRELOADS.lock().unwrap_or_else(|e| e.into_inner());
+        // (the deadline is read when the call starts; other tests' preloads
+        // of generated content finish before any deadline)
+        std::env::set_var("RUSTUDIO_PRELOAD_DEADLINE", "0.2");
+        let asset = AssetRef { id: 7_000_000_042, version: None };
+        let hold = hold_download(asset);
+        let mut d = Document::new_place();
+        let parent = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
+        let script = d.dom.insert(parent, InstanceBuilder::new("Script").with_property("Source", r#"
+local c = game:GetService('ContentProvider')
+local id = 'rbxassetid://7000000042'
+local got, t0 = nil, os.clock()
+c:PreloadAsync({id}, function(content, status) assert(content == id); got = status end)
+assert(got == Enum.AssetFetchStatus.TimedOut, tostring(got))
+assert(os.clock() - t0 >= 0.2 and os.clock() - t0 < 5, tostring(os.clock() - t0))
+assert(c:GetAssetFetchStatus(id) == Enum.AssetFetchStatus.Loading)
+assert(c.RequestQueueSize >= 1)
+c:GetAssetFetchStatusChangedSignal(id):Connect(function(status)
+    if status == Enum.AssetFetchStatus.Success then print('preload-arrived-later') end
+end)
+print('preload-timed-out')
+"#.to_string()));
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(d, RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.run_script(script);
+        let t0 = std::time::Instant::now();
+        let seen = |rt: &Runtime, what: &str| {
+            crate::runtime::world(&rt.lua).map(|w| w.output.iter().any(|(_, s)| s.contains(what))).unwrap_or(false)
+        };
+        while !seen(&rt, "preload-timed-out") && !seen(&rt, "Script:") && t0.elapsed() < std::time::Duration::from_secs(10) {
+            rt.step(1. / 60.);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::env::remove_var("RUSTUDIO_PRELOAD_DEADLINE");
+        // The link delivers: the status moves on.
+        hold.release(Ok(vec![0; 16]));
+        while !seen(&rt, "preload-arrived-later") && t0.elapsed() < std::time::Duration::from_secs(20) {
+            rt.step(1. / 60.);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let output = rt.leave().output;
+        assert!(output.iter().any(|(_, s)| s.contains("preload-timed-out")), "{output:?}");
+        assert!(output.iter().any(|(_, s)| s.contains("preload-arrived-later")), "{output:?}");
+        assert!(!output.iter().any(|(l, _)| matches!(l, rustudio_core::log::Level::Error)), "{output:?}");
+    }
+
     #[test]
     fn assets_cloud_material_and_preload() {
+        let _one_at_a_time = PRELOADS.lock().unwrap_or_else(|e| e.into_inner());
         let mut d = Document::new_place();
         let parent = d
             .find_child(d.dom.root_ref(), "ServerScriptService")

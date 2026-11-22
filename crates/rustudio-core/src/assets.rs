@@ -428,10 +428,259 @@ pub fn session_checking(on: bool) {
 
 /// The session check ended (from its worker thread): signed in or not.
 pub fn session_ready(client: Option<SharedClient>) {
+    let signed_in = client.is_some();
     if let Ok(mut g) = SESSION.lock() {
         *g = client;
     }
+    if signed_in {
+        forget_refusals();
+    }
     session_checking(false);
+}
+
+// ------------------------------------------------------------ refusals
+
+/// Assets delivery refused this process (private to their owner, deleted,
+/// moderated): asking again costs a request and gets the same answer. A
+/// place's preload lists name its owner's private animations by the
+/// hundred; without this every PreloadAsync (the server's, then each
+/// client's) and every play of them asked again. A login session can
+/// change the answer, so it empties the list.
+static REFUSED: Mutex<Option<HashMap<u64, String>>> = Mutex::new(None);
+
+fn refused(id: u64) -> Option<String> {
+    REFUSED.lock().ok()?.as_ref()?.get(&id).cloned()
+}
+
+fn note_refused(id: u64, why: &str) {
+    if let Ok(mut g) = REFUSED.lock() {
+        g.get_or_insert_with(HashMap::new).insert(id, why.to_string());
+    }
+}
+
+/// A session arrived (or changed): what was private may be served now.
+pub fn forget_refusals() {
+    if let Ok(mut g) = REFUSED.lock() {
+        *g = None;
+    }
+}
+
+/// Notes a refusal and gives the error back as text.
+fn download_error(id: u64, error: AssetDownloadError) -> String {
+    if let AssetDownloadError::Refused(_) = &error {
+        note_refused(id, &error.to_string());
+    }
+    error.to_string()
+}
+
+// ------------------------------------------------------- shared downloads
+
+/// One download per asset at a time: a second asker for the same asset
+/// (a preload and the first play of an animation; the server's and the
+/// client's preloads of one list; a part's texture asked by the scene while
+/// a script preloads it) waits for the first's bytes instead of asking
+/// delivery again.
+static INFLIGHT: LazyLock<Mutex<HashMap<AssetRef, Arc<Inflight>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Default)]
+struct Inflight {
+    done: Mutex<Option<Result<Arc<Vec<u8>>, String>>>,
+    changed: Condvar,
+}
+
+/// Runs `download` (which also writes the cache file) unless another
+/// thread is already downloading `a`, in which case its result is shared.
+fn download_shared(a: AssetRef, download: impl FnOnce() -> Result<Vec<u8>, String>) -> Result<Arc<Vec<u8>>, String> {
+    let (slot, first) = {
+        let mut m = INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        match m.get(&a) {
+            Some(slot) => (slot.clone(), false),
+            None => {
+                let slot = Arc::new(Inflight::default());
+                m.insert(a, slot.clone());
+                (slot, true)
+            }
+        }
+    };
+    if !first {
+        let mut done = slot.done.lock().unwrap_or_else(|e| e.into_inner());
+        while done.is_none() {
+            done = slot.changed.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+        return done.clone().unwrap();
+    }
+    // Publishes on every exit, a panic in `download` included: nobody
+    // waits forever on a download that never finished.
+    struct Publish(AssetRef, Arc<Inflight>);
+    impl Drop for Publish {
+        fn drop(&mut self) {
+            let mut done = self.1.done.lock().unwrap_or_else(|e| e.into_inner());
+            if done.is_none() {
+                *done = Some(Err("download did not finish".into()));
+            }
+            drop(done);
+            self.1.changed.notify_all();
+            if let Ok(mut m) = INFLIGHT.lock() {
+                m.remove(&self.0);
+            }
+        }
+    }
+    let publish = Publish(a, slot.clone());
+    let result = download().map(Arc::new);
+    *slot.done.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.clone());
+    drop(publish);
+    result
+}
+
+/// How soon a download is wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    /// Something waits for it: a part on screen, a sound told to play, an
+    /// animation a track was made for.
+    Needed,
+    /// ContentProvider:PreloadAsync, warming the cache: after everything
+    /// needed, and never on more than a few of the download slots.
+    Preload,
+}
+
+/// Preloads downloading at once, out of [`MAX_ASSET_DOWNLOADS`]: the rest
+/// of the slots stay free for what is needed now.
+pub const MAX_PRELOAD_DOWNLOADS: usize = 4;
+
+struct Scheduler {
+    state: Mutex<Queues>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct Queues {
+    needed: std::collections::VecDeque<DownloadJob>,
+    preload: std::collections::VecDeque<DownloadJob>,
+    preload_active: usize,
+}
+
+impl Scheduler {
+    fn push(&self, priority: Priority, job: DownloadJob) {
+        let mut q = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match priority {
+            Priority::Needed => q.needed.push_back(job),
+            Priority::Preload => q.preload.push_back(job),
+        }
+        drop(q);
+        self.changed.notify_one();
+    }
+
+    /// The next job: a needed one, else a preload while fewer than
+    /// [`MAX_PRELOAD_DOWNLOADS`] run.
+    fn next(&self) -> (DownloadJob, Priority) {
+        let mut q = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(job) = q.needed.pop_front() {
+                return (job, Priority::Needed);
+            }
+            if q.preload_active < MAX_PRELOAD_DOWNLOADS {
+                if let Some(job) = q.preload.pop_front() {
+                    q.preload_active += 1;
+                    return (job, Priority::Preload);
+                }
+            }
+            q = self.changed.wait(q).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn finished(&self, priority: Priority) {
+        if priority == Priority::Preload {
+            let mut q = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            q.preload_active -= 1;
+            drop(q);
+            self.changed.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    fn queued(&self) -> (usize, usize) {
+        let q = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (q.needed.len(), q.preload.len())
+    }
+}
+
+/// Queues a download job for the asset workers.
+pub fn schedule(priority: Priority, job: impl FnOnce() + Send + 'static) {
+    LazyLock::force(&ASSET_WORKERS);
+    SCHEDULER.push(priority, Box::new(job));
+}
+
+static SCHEDULER: LazyLock<Scheduler> = LazyLock::new(|| Scheduler {
+    state: Mutex::new(Queues::default()),
+    changed: Condvar::new(),
+});
+
+/// How long ContentProvider:PreloadAsync waits for its list, in seconds
+/// (RUSTUDIO_PRELOAD_DEADLINE overrides; domains/assets_cloud.rs). Roblox
+/// waits for each asset to arrive or time out; a place that preloads 2000
+/// assets from the server script that then starts its game would wait
+/// minutes on a phone's link. What is still queued at the deadline is
+/// reported TimedOut and goes on downloading.
+pub fn preload_deadline() -> f64 {
+    std::env::var("RUSTUDIO_PRELOAD_DEADLINE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(20.0)
+}
+
+/// A download held open (tests): every asker of `a` waits on it until
+/// [`DownloadHold::release`] hands them the bytes, as a slow link would.
+#[doc(hidden)]
+pub struct DownloadHold(AssetRef, Arc<Inflight>);
+
+#[doc(hidden)]
+pub fn hold_download(a: AssetRef) -> DownloadHold {
+    let slot = Arc::new(Inflight::default());
+    INFLIGHT.lock().unwrap_or_else(|e| e.into_inner()).insert(a, slot.clone());
+    DownloadHold(a, slot)
+}
+
+impl DownloadHold {
+    pub fn release(self, result: Result<Vec<u8>, String>) {
+        *self.1.done.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.map(Arc::new));
+        self.1.changed.notify_all();
+        if let Ok(mut m) = INFLIGHT.lock() {
+            m.remove(&self.0);
+        }
+    }
+}
+
+/// ContentProvider:PreloadAsync's fetch of one content id, after what the
+/// scene and the scripts need now; `done` gets true once the bytes are
+/// cached (false: can't be had). One queued download serves every asker
+/// of the same id (the server's preload, then the client's).
+pub fn preload_content(id: &str, done: Arc<Mutex<Option<bool>>>) {
+    static WAITERS: Mutex<Option<HashMap<String, Vec<Arc<Mutex<Option<bool>>>>>>> = Mutex::new(None);
+    let key = content_key(id);
+    {
+        let mut g = WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+        let map = g.get_or_insert_with(HashMap::new);
+        if let Some(list) = map.get_mut(&key) {
+            list.push(done);
+            return;
+        }
+        map.insert(key.clone(), vec![done]);
+    }
+    let id = id.to_string();
+    schedule(Priority::Preload, move || {
+        let ok = script_content_blocking(&id).is_ok();
+        let waiters = WAITERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .and_then(|m| m.remove(&key))
+            .unwrap_or_default();
+        for w in waiters {
+            *w.lock().unwrap_or_else(|e| e.into_inner()) = Some(ok);
+        }
+    });
 }
 
 /// Waits (up to `max`) for a session check that is still running, so a
@@ -484,22 +733,35 @@ fn fetch_cached(id: u64, local: bool) -> Result<Arc<Vec<u8>>, String> {
     if let Some(b) = local.then(|| ledger_path(id).and_then(|p| std::fs::read(p).ok())).flatten() {
         return Ok(Arc::new(b));
     }
-    let fetched = download_asset_bytes(id);
-    let b = match fetched {
-        Ok(b) => b,
+    let fetched = match refused(id) {
+        Some(why) => Err(why),
+        None => download_shared(a, || {
+            if let Ok(b) = std::fs::read(cache_path(a)) {
+                return Ok(b);
+            }
+            let b = download_asset_bytes(id)?;
+            write_cache(a, &b);
+            Ok(b)
+        }),
+    };
+    match fetched {
+        Ok(b) => Ok(b),
         Err(e) => {
             if let Some(b) = local.then(|| local_store_path(id).and_then(|p| std::fs::read(p).ok())).flatten() {
                 return Ok(Arc::new(b));
             }
-            return Err(e);
+            Err(e)
         }
-    };
+    }
+}
+
+/// Saves downloaded bytes under the asset's cache path.
+fn write_cache(a: AssetRef, bytes: &[u8]) {
     let path = cache_path(a);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&path, &b);
-    Ok(Arc::new(b))
+    let _ = std::fs::write(&path, bytes);
 }
 
 const MAX_ASSET_DOWNLOADS: usize = 12;
@@ -528,25 +790,20 @@ fn retry_after_delay(value: &str, now: SystemTime) -> Option<Duration> {
 type DownloadResult = Result<Vec<u8>, AssetDownloadError>;
 type DownloadJob = Box<dyn FnOnce() + Send>;
 
-// Only queued jobs use these workers. Blocking callers use the same
-// download permits directly, including when waiting out a shared pause.
-static ASSET_WORKERS: LazyLock<Sender<DownloadJob>> = LazyLock::new(|| {
-    let (send, receive) = channel::<DownloadJob>();
-    let receive = Arc::new(Mutex::new(receive));
+// Only queued jobs (`schedule`) use these workers; they take needed
+// downloads before preloads. Blocking callers use the same download
+// permits directly, including when waiting out a shared pause.
+static ASSET_WORKERS: LazyLock<()> = LazyLock::new(|| {
     for i in 0..MAX_ASSET_DOWNLOADS {
-        let receive = receive.clone();
         let _ = std::thread::Builder::new().name(format!("asset-download-{i}")).spawn(move || loop {
-            let job = receive.lock().unwrap().recv();
-            match job {
-                Ok(job) => {
-                    let _p = crate::profiler::scope("asset_download", crate::profiler::Cat::Assets);
-                    job()
-                }
-                Err(_) => break,
+            let (job, priority) = SCHEDULER.next();
+            {
+                let _p = crate::profiler::scope("asset_download", crate::profiler::Cat::Assets);
+                job();
             }
+            SCHEDULER.finished(priority);
         });
     }
-    send
 });
 
 static ASSET_DOWNLOADS: LazyLock<AssetDownloads> =
@@ -649,16 +906,25 @@ impl AssetDownloads {
         version: Option<u64>,
         account: Option<impl FnMut() -> DownloadResult>,
         public: impl FnMut() -> DownloadResult,
-    ) -> Result<Vec<u8>, String> {
+    ) -> DownloadResult {
         match account.map(|download| self.retry(download)) {
             Some(Ok(bytes)) => Ok(bytes),
-            Some(Err(error @ AssetDownloadError::Transient { .. })) => Err(error.to_string()),
-            Some(Err(error)) if version.is_some() => Err(error.to_string()),
-            Some(Err(error)) => self
-                .retry(public)
-                .map_err(|public| format!("{error}; {public}")),
-            None if version.is_some() => Err("sign in (Account) to download asset versions".into()),
-            None => self.retry(public).map_err(|error| error.to_string()),
+            Some(Err(error @ AssetDownloadError::Transient { .. })) => Err(error),
+            Some(Err(error)) if version.is_some() => Err(error),
+            Some(Err(error)) => self.retry(public).map_err(|public| {
+                let both = rustudio_account::Error::new(format!("{error}; {public}"));
+                match public {
+                    AssetDownloadError::Transient { status, retry_after, .. } => {
+                        AssetDownloadError::Transient { status, retry_after, error: both }
+                    }
+                    AssetDownloadError::Refused(_) => AssetDownloadError::Refused(both),
+                    AssetDownloadError::Other(_) => AssetDownloadError::Other(both),
+                }
+            }),
+            None if version.is_some() => Err(AssetDownloadError::Other(rustudio_account::Error::new(
+                "sign in (Account) to download asset versions",
+            ))),
+            None => self.retry(public),
         }
     }
 }
@@ -680,25 +946,26 @@ fn download_asset_bytes(id: u64) -> Result<Vec<u8>, String> {
         }
     } else {
         match public() {
-            Err(AssetDownloadError::Other(error)) => {
-                let c = wait_for_session(Duration::from_secs(30))
+            Err(error @ (AssetDownloadError::Refused(_) | AssetDownloadError::Other(_))) => {
+                let session = wait_for_session(Duration::from_secs(30))
                     .then(session_client)
-                    .flatten()
-                    .ok_or_else(|| error.to_string())?;
+                    .flatten();
+                let Some(c) = session else {
+                    return Err(download_error(id, error));
+                };
                 let d = {
                     let guard = c.lock().map_err(|_| "account busy".to_string())?;
-                    guard
-                        .as_ref()
-                        .ok_or_else(|| error.to_string())?
-                        .session
-                        .downloader()
+                    match guard.as_ref() {
+                        Some(c) => c.session.downloader(),
+                        None => return Err(download_error(id, error)),
+                    }
                 };
                 ASSET_DOWNLOADS.retry(|| d.download_asset_typed(id, None))
             }
             result => result,
         }
     };
-    result.map_err(|error| error.to_string())
+    result.map_err(|error| download_error(id, error))
 }
 
 /// Any content id's bytes, blocking (background threads): generated
@@ -897,7 +1164,11 @@ fn public_prefetch_inner(id: u64) -> Fetch {
         };
     }
     map.insert(id, None);
-    std::thread::spawn(move || {
+    drop(g);
+    // On the asset workers, ahead of preloads (a track was made for this
+    // clip, a sound was told to play): a thread per id made a client
+    // warming 1400 animations spawn 1400 threads.
+    schedule(Priority::Needed, move || {
         let r = public_cached(id).map(|_| ());
         content_track(&format!("rbxassetid://{id}"),if r.is_ok(){2}else{3});
         if let Ok(mut g) = STATES.lock() {
@@ -979,6 +1250,7 @@ impl AssetStore {
         self.client = client;
         if !had && self.client.is_some() {
             // Retry what failed only because nobody was signed in.
+            forget_refusals();
             self.deferred.extend(self.failed.drain().map(|(a, _)| a));
             self.auth_told = false;
         }
@@ -1019,6 +1291,12 @@ impl AssetStore {
         if let Some(why) = self.failed.get(&a) {
             return Fetch::Unavailable(why.clone());
         }
+        if a.version.is_none() {
+            if let Some(why) = refused(a.id) {
+                self.failed.insert(a, why.clone());
+                return Fetch::Unavailable(why);
+            }
+        }
         // The session check is still running: wait for it rather than
         // fail anonymously (most assets need the session).
         if self.client.is_none() && CHECKING.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1033,34 +1311,40 @@ impl AssetStore {
         let client = self.client.clone().or_else(session_client);
         self.pending.insert(a);
         let tx = self.tx.clone();
-        ASSET_WORKERS
-            .send(Box::new(move || {
-                let result = (|| -> Result<(), String> {
-                    // Copy the session out so downloads run side by side.
-                    let downloader = client
-                        .and_then(|client| Some(client.lock().ok()?.as_ref()?.session.downloader()));
-                    let bytes = ASSET_DOWNLOADS.editor_download(
+        schedule(Priority::Needed, move || {
+            let result = download_shared(a, || {
+                // (a preload may have cached it while this job queued)
+                if let Ok(bytes) = std::fs::read(cache_path(a)) {
+                    return Ok(bytes);
+                }
+                // Copy the session out so downloads run side by side.
+                let downloader =
+                    client.and_then(|client| Some(client.lock().ok()?.as_ref()?.session.downloader()));
+                let bytes = ASSET_DOWNLOADS
+                    .editor_download(
                         a.version,
                         downloader.map(|d| move || d.download_asset_typed(a.id, a.version)),
                         || public_asset_typed(a.id),
-                    )?;
-                    let path = cache_path(a);
-                    if let Some(dir) = path.parent() {
-                        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-                    }
-                    std::fs::write(&path, bytes).map_err(|e| e.to_string())
-                })();
-                content_track(
-                    &format!(
-                        "rbxassetid://{}{}",
-                        a.id,
-                        a.version.map(|v| format!("?version={v}")).unwrap_or_default()
-                    ),
-                    if result.is_ok() { 2 } else { 3 },
-                );
-                let _ = tx.send((a, result));
-            }))
-            .expect("asset workers stopped");
+                    )
+                    .map_err(|error| download_error(a.id, error))?;
+                let path = cache_path(a);
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+                Ok(bytes)
+            })
+            .map(|_| ());
+            content_track(
+                &format!(
+                    "rbxassetid://{}{}",
+                    a.id,
+                    a.version.map(|v| format!("?version={v}")).unwrap_or_default()
+                ),
+                if result.is_ok() { 2 } else { 3 },
+            );
+            let _ = tx.send((a, result));
+        });
         Fetch::Pending
     }
 
@@ -2421,7 +2705,7 @@ mod tests {
                     || panic!("transient failure must not use public delivery"),
                 )
                 .unwrap_err();
-            assert_eq!(error, format!("HTTP {status}"));
+            assert_eq!(error.to_string(), format!("HTTP {status}"));
             assert_eq!(tries, ASSET_BACKOFF.len() + 1);
         }
     }
@@ -2441,9 +2725,196 @@ mod tests {
                 .editor_download(Some(3), Some(auth), || panic!(
                     "versioned asset used public delivery"
                 ))
-                .unwrap_err(),
+                .unwrap_err()
+                .to_string(),
             "Authentication required"
         );
+    }
+
+    #[test]
+    fn needed_downloads_go_before_preloads_which_keep_slots_free() {
+        let scheduler = Scheduler {
+            state: Mutex::new(Queues::default()),
+            changed: Condvar::new(),
+        };
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let note = |what: &'static str| {
+            let order = order.clone();
+            Box::new(move || order.lock().unwrap().push(what)) as DownloadJob
+        };
+        for _ in 0..MAX_PRELOAD_DOWNLOADS + 1 {
+            scheduler.push(Priority::Preload, note("preload"));
+        }
+        scheduler.push(Priority::Needed, note("needed"));
+        assert_eq!(scheduler.queued(), (1, MAX_PRELOAD_DOWNLOADS + 1));
+        let (job, priority) = scheduler.next();
+        assert_eq!(priority, Priority::Needed);
+        job();
+        assert_eq!(*order.lock().unwrap(), ["needed"]);
+        // Preloads take at most MAX_PRELOAD_DOWNLOADS slots while running.
+        for _ in 0..MAX_PRELOAD_DOWNLOADS {
+            let (job, priority) = scheduler.next();
+            assert_eq!(priority, Priority::Preload);
+            job();
+        }
+        std::thread::scope(|scope| {
+            let (send, receive) = channel();
+            let scheduler = &scheduler;
+            scope.spawn(move || {
+                let (job, priority) = scheduler.next();
+                job();
+                send.send(priority).unwrap();
+            });
+            assert!(
+                receive.recv_timeout(Duration::from_millis(200)).is_err(),
+                "a fifth preload started while four were running"
+            );
+            // A needed download still goes through at once.
+            scheduler.push(Priority::Needed, note("needed-late"));
+            let (job, priority) = scheduler.next();
+            assert_eq!(priority, Priority::Needed);
+            job();
+            scheduler.finished(Priority::Preload);
+            assert_eq!(receive.recv_timeout(Duration::from_secs(5)).unwrap(), Priority::Preload);
+        });
+        assert_eq!(order.lock().unwrap().len(), MAX_PRELOAD_DOWNLOADS + 3);
+    }
+
+    /// Until a second asker holds the in-flight slot (the map's, the
+    /// downloader's and its publisher's references, plus one).
+    fn wait_for_waiter(a: AssetRef) {
+        let t0 = Instant::now();
+        loop {
+            let waiting = INFLIGHT.lock().unwrap().get(&a).map(Arc::strong_count).unwrap_or(0) >= 4;
+            if waiting || t0.elapsed() > Duration::from_secs(5) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn one_download_serves_every_asker_of_an_asset() {
+        let a = AssetRef { id: 7_000_000_001, version: Some(1) };
+        let downloads = std::sync::atomic::AtomicUsize::new(0);
+        let gate = (Mutex::new(false), Condvar::new());
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                download_shared(a, || {
+                    downloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _open = gate.1.wait_while(gate.0.lock().unwrap(), |open| !*open).unwrap();
+                    Ok(vec![1, 2, 3])
+                })
+            });
+            // The second asker arrives while the first downloads.
+            while !INFLIGHT.lock().unwrap().contains_key(&a) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let second = scope.spawn(|| download_shared(a, || panic!("downloaded twice")));
+            wait_for_waiter(a);
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            assert_eq!(*first.join().unwrap().unwrap(), vec![1, 2, 3]);
+            assert_eq!(*second.join().unwrap().unwrap(), vec![1, 2, 3]);
+        });
+        assert_eq!(downloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!INFLIGHT.lock().unwrap().contains_key(&a));
+        // A download that panics still answers its waiters.
+        let b = AssetRef { id: 7_000_000_002, version: Some(1) };
+        let gate = (Mutex::new(false), Condvar::new());
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                std::panic::catch_unwind(|| {
+                    download_shared(b, || {
+                        let _open = gate.1.wait_while(gate.0.lock().unwrap(), |open| !*open).unwrap();
+                        panic!("boom")
+                    })
+                })
+                .unwrap_err()
+            });
+            while !INFLIGHT.lock().unwrap().contains_key(&b) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let second = scope.spawn(|| download_shared(b, || Ok(vec![])));
+            wait_for_waiter(b);
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            first.join().unwrap();
+            assert_eq!(second.join().unwrap().unwrap_err(), "download did not finish");
+        });
+    }
+
+    #[test]
+    fn refusals_are_remembered_until_a_session_arrives() {
+        let id = 7_000_000_003;
+        assert_eq!(refused(id), None);
+        let refusal = AssetDownloadError::Refused(rustudio_account::Error::new(
+            "asset 7000000003: public asset delivery: Authentication required to access Asset.",
+        ));
+        assert_eq!(
+            download_error(id, refusal),
+            "asset 7000000003: public asset delivery: Authentication required to access Asset."
+        );
+        assert!(refused(id).is_some());
+        // Other failures (the link was down) are asked again.
+        download_error(7_000_000_004, AssetDownloadError::Other(rustudio_account::Error::new("io")));
+        assert_eq!(refused(7_000_000_004), None);
+        download_error(7_000_000_005, transient(429, None));
+        assert_eq!(refused(7_000_000_005), None);
+        forget_refusals();
+        assert_eq!(refused(id), None);
+    }
+
+    #[test]
+    fn preloads_wait_while_the_preload_slots_are_busy() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        for _ in 0..MAX_PRELOAD_DOWNLOADS {
+            let gate = gate.clone();
+            schedule(Priority::Preload, move || {
+                let _open = gate.1.wait_while(gate.0.lock().unwrap(), |open| !*open).unwrap();
+            });
+        }
+        let id = "rbxtemp://rustudio/preload-slots-test";
+        register_generated(id, vec![1]);
+        let done = Arc::new(Mutex::new(None));
+        preload_content(id, done.clone());
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(*done.lock().unwrap(), None, "a preload ran on a busy slot: {:?}", SCHEDULER.queued());
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let t0 = Instant::now();
+        while done.lock().unwrap().is_none() && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*done.lock().unwrap(), Some(true));
+        unregister_generated(id);
+    }
+
+    #[test]
+    fn preload_content_answers_every_asker_through_the_workers() {
+        let id = "rbxtemp://rustudio/preload-content-test";
+        register_generated(id, vec![9; 16]);
+        let first = Arc::new(Mutex::new(None));
+        let second = Arc::new(Mutex::new(None));
+        preload_content(id, first.clone());
+        preload_content(id, second.clone());
+        let t0 = Instant::now();
+        while (first.lock().unwrap().is_none() || second.lock().unwrap().is_none())
+            && t0.elapsed() < Duration::from_secs(10)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*first.lock().unwrap(), Some(true));
+        assert_eq!(*second.lock().unwrap(), Some(true));
+        assert_eq!(content_fetch_status(id), 2);
+        unregister_generated(id);
+        let missing = Arc::new(Mutex::new(None));
+        preload_content("rbxtemp://rustudio/preload-content-missing", missing.clone());
+        let t0 = Instant::now();
+        while missing.lock().unwrap().is_none() && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*missing.lock().unwrap(), Some(false));
     }
 
     #[test]

@@ -939,7 +939,7 @@ impl Session {
         version: Option<u64>,
     ) -> std::result::Result<Vec<u8>, AssetDownloadError> {
         let first = self.download_asset_at(asset_id, version);
-        if let Err(AssetDownloadError::Other(e)) = &first {
+        if let Err(AssetDownloadError::Refused(e) | AssetDownloadError::Other(e)) = &first {
             if e.0.contains("Authentication required") && self.refresh_cookie().unwrap_or(false) {
                 return self.download_asset_at(asset_id, version);
             }
@@ -988,15 +988,17 @@ impl Session {
             ))
         })?;
         let Some(location) = v.pointer("/locations/0/location").and_then(|l| l.as_str()) else {
-            let why = v
-                .pointer("/errors/0/message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("no download location");
+            let why = v.pointer("/errors/0/message").and_then(|m| m.as_str());
             // v2 answers 200 with the refusal in the body (see `public_asset_typed`).
             let http = if status == 200 { String::new() } else { format!(" (HTTP {status})") };
-            return Err(Error(format!(
-                "asset {asset_id}: asset delivery: {why}{http}"
-            )).into());
+            let error = Error(format!(
+                "asset {asset_id}: asset delivery: {}{http}",
+                why.unwrap_or("no download location")
+            ));
+            return Err(match why {
+                Some(_) => AssetDownloadError::Refused(error),
+                None => AssetDownloadError::Other(error),
+            });
         };
         let response = self.get_bytes_response(location, false)?;
         if let Some(error) = AssetDownloadError::transient_response(asset_id, "download", &response) {
