@@ -123,6 +123,7 @@ xbuild quirks worth knowing (commit e67b501):
 | Activity destroyed | — | `onDestroy` hook: close request, then `process::exit(0)`; `android_main` always leaves the process when the loop ends (`lifecycle.rs`): status 0 for a close, 2 for an eframe error, 101 for a panic (named in logcat with its crash report) |
 | "Open with rustudio" while it runs | Finder's hand-over (`macos::take_opened`) | a second instance of the activity per VIEW intent (`launchMode` `standard`), caught at the library's entry point: its file is copied in and queued for the editor's next frame, the editor's task comes to the front, the new activity finishes unseen (`src/android/intent.rs`). A place the last start died within 20 s of opening by itself isn't opened again by itself (`state/opening`, `storage.rs`) |
 | UI zoom | 1.0 of the display's scale | first run: the zoom that fits ~1100 points across (0.8 … 1.6 of the density), then View > Zoom In / Out as saved |
+| A played game | the dock's 3D view, at the UI zoom (View > Play Fills the Screen off) | View > Play Fills the Screen on: the game alone over the window at zoom 1 (a point is a dp, Roblox's unit on Android) until it ends (`RUSTUDIO_PLAY_FULL`; "The game's canvas" below) |
 | GPU driver | the system's | the device's Vulkan driver, or on Snapdragon phones the Turnip (Mesa) driver shipped in the APK, swapped in before wgpu starts (`src/android/turnip.rs`; "Turnip driver" below) — on an Adreno 6xx with its bandwidth compression (UBWC) off, which restarted a Snapdragon 865 phone outright ("UBWC and the whole-device restarts" below); OpenGL ES as the fallback either way |
 | Graphics quality (File > Studio Settings > rustudio > Performance) | Manual at the full profile, 100% 3D resolution; Automatic from level 5 | weak-GPU mode (`gpu_caps.rs`: every Android device): Automatic from level 1 — no shadows, SSAO, clouds, bloom, DoF, probe or grass until the frame times allow — and 75% 3D resolution (`rustudio_settings::choice_default`); "Frame time on a phone" below. View > GPU Driver names the adapter and holds the Mesa driver switch |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
@@ -334,6 +335,24 @@ Block buttons only with the next spawn's re-send). `RUSTUDIO_TOUCH=0` (the
 `debug.rustudio.env` property) puts the editor's stick and jump back
 (the keyboard-and-mouse reading of fingers) on a device; `=1` turns the
 game's touch on on a desktop with a touch screen.
+
+**The game's canvas: View > Play Fills the Screen** (on by default on
+Android; `RUSTUDIO_PLAY_FULL=1` / `0` sets it, saved with the layout).
+While a game is played it alone covers the window, at the display's own
+scale — egui zoom 1, so a point is a density-independent pixel, Roblox's
+GUI unit on Android — and the menu bar, ribbon, status bar, dock and
+panel windows come back when it ends (`src/app.rs` `play_fills_screen` /
+`play_full_frame`; Shift+F5, the Roblox menu's Leave and the Back button
+end a session as before). Without it a phone's Studio, zoomed out to fit
+the ribbon (the first-run zoom above, 0.8), gave a played game the dock's
+3D view: a canvas about a third of the screen (833 × 316 points on a
+1550 × 720 phone, 258 under the top bar) in units a fifth smaller than
+Roblox's, so the PlayerModule's thumbstick and jump button and LBG's Dash
+/ M1 / Block / Shiftlock buttons, laid out from the bottom up in those
+units, ran up under the top bar and off the view. The same phone now
+gives the game 886 × 411 units, what Roblox's app gives it: the phone
+layout (`min(TouchControlFrame.AbsoluteSize) <= 500`), a 70-unit jump
+button, every button on the screen.
 
 ### Text: the soft keyboard, Cut / Copy / Paste
 

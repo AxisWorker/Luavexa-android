@@ -101,6 +101,10 @@ pub struct UiState {
     pub popped_class: Option<egui::ViewportClass>,
     pub zoom: f32,
     pub show_gui: bool,
+    /// View > Play Fills the Screen: a played game alone over the window
+    /// (RustudioApp::play_fills_screen); on by default on a phone or
+    /// tablet, RUSTUDIO_PLAY_FULL=1 / 0 sets it.
+    pub play_full: bool,
     pub grid_size: f32,
     pub about: bool,
     /// View > GPU Driver (src/graphics_settings.rs).
@@ -125,6 +129,11 @@ impl Default for UiState {
             popped_class: None,
             zoom: 1.0,
             show_gui: true,
+            play_full: match std::env::var("RUSTUDIO_PLAY_FULL").ok().as_deref() {
+                Some("0") => false,
+                Some(_) => true,
+                None => cfg!(target_os = "android"),
+            },
             grid_size: rustudio_core::mech::GRID_SPACING,
             about: false,
             graphics_settings: false,
@@ -260,6 +269,7 @@ pub const VIEW: &[M] = &[
     I("Zoom In", "Ctrl+=", "zoom_in"),
     I("Zoom Out", "Ctrl+-", "zoom_out"),
     I("Full Screen", "F11", "full_screen"),
+    I("Play Fills the Screen", "", "play_full"),
     // Which adapter and driver draw the 3D view; on Android the Mesa
     // driver switch (src/graphics_settings.rs). The quality settings are
     // File > Studio Settings > rustudio > Performance.

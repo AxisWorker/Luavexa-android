@@ -5322,7 +5322,7 @@ impl Runtime {
         // (native_drain), not while Play starts. RUSTUDIO_NATIVE_NOW=1: at
         // the load, as before.
         lua.set_app_data(NativeQueue {
-            on: native_on && !std::env::var_os("RUSTUDIO_NATIVE_NOW").is_some_and(|v| v != "0"),
+            on: native_on && !native_at_load_asked(),
             ..Default::default()
         });
         rustudio_core::load_trace::mark("runtime: Lua made");
@@ -6925,6 +6925,20 @@ struct NativeQueue {
     bytes: usize,
     took: std::time::Duration,
     frames: u32,
+}
+
+static NATIVE_AT_LOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Builds every later-made VM's --!native scripts at their load, as before
+/// the queue (a test that profiles a script's first run natively;
+/// RUSTUDIO_NATIVE_NOW=1 asks the same).
+pub fn native_at_load(on: bool) {
+    NATIVE_AT_LOAD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn native_at_load_asked() -> bool {
+    NATIVE_AT_LOAD.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("RUSTUDIO_NATIVE_NOW").is_some_and(|v| v != "0")
 }
 
 /// Native code for queued scripts, within a frame's budget (at least one

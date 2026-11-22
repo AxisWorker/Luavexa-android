@@ -325,6 +325,17 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
   lines (crates/rustudio-engine/src/gui_walk.rs `list_lines`; AbsoluteContentSize follows the
   drawn boxes; test `list_wraps_and_flexes`). Not done: UIFlexItem Shrink
   and a Fill line narrower than its items (nothing shrinks).
+- **A layout inside a Folder laid out nothing**: `gui_walk.rs` flattened a
+  Folder's GuiObjects into its parent's children and looked for a
+  UIListLayout / UIGridLayout / UIPageLayout among the parent's own
+  children only, so LBG's skill bar — `Skills.Container.Buttons`, a
+  Folder holding the UIListLayout and the skill buttons cloned into it as
+  skills are added — drew every button at the Container's top-left, one on
+  top of the other. Now each group of GuiObjects (the parent's own, each
+  Folder's) is placed by the layout among its owner's children, inside the
+  parent's content, as Roblox does (`layout_group`; test
+  `list_layout_in_a_folder`). Not done: an AutomaticSize parent measuring a
+  Folder-held list's lines.
 - **UIShadow was not drawn** (138 in LBG: glows behind its result frames,
   kill feed, close buttons). Now a Shape-mode shadow is drawn under its
   object's background: the box (with its UICorner) moved by Offset, grown

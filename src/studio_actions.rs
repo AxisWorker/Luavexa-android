@@ -123,6 +123,7 @@ impl Editor {
             "grid_4" => (self.show_grid, Some(self.ui.grid_size == 4.0)),
             "grid_16" => (self.show_grid, Some(self.ui.grid_size == 16.0)),
             "show_ui" => (true, Some(self.ui.show_gui)),
+            "play_full" => (true, Some(self.ui.play_full)),
             "screenshot" => (true, None),
             "mute" => (true, Some(rustudio_engine::audio::muted())),
             "test" | "test_here" | "run" => (!playing, None),
@@ -330,6 +331,7 @@ impl Editor {
             "grid_4" => self.ui.grid_size = 4.0,
             "grid_16" => self.ui.grid_size = 16.0,
             "show_ui" => self.ui.show_gui = !self.ui.show_gui,
+            "play_full" => self.ui.play_full = !self.ui.play_full,
             "screenshot" => {
                 let dir = rustudio_core::paths::pictures();
                 let _ = std::fs::create_dir_all(&dir);

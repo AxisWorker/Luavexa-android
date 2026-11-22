@@ -183,6 +183,8 @@ fn native_directive() {
 
 #[test]
 fn native_functions_are_flagged() {
+    // The script's first run must already be native: no deferred build.
+    crate::runtime::native_at_load(true);
     start_recording(false);
     set_sample_hz(4000);
     let out = run(

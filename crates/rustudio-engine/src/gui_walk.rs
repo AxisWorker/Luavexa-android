@@ -465,30 +465,17 @@ impl Walk<'_, '_> {
         });
     }
 
-    /// Lays out and draws the GuiObject children of `parent` inside `content`.
-    pub(super) fn children(&mut self, parent: Ref, content: Rect, dn: Down) {
+    /// Places the GuiObjects of `group` (the GuiObject children of `owner`:
+    /// the parent, or a Folder under it) by the UIListLayout / UIGridLayout /
+    /// UIPageLayout among `owner`'s children, inside `content`. Without a
+    /// layout nothing is placed: the objects sit at their own Position.
+    fn layout_group(&mut self, owner: Ref, group: &[Ref], content: Rect, dn: Down, placed: &mut HashMap<Ref, Rect>) {
         let d = self.input.doc;
-        // Folders organize GUI descendants without introducing a layout box.
-        // (what was read is kept for the GUI cache: gui_input.rs cache_marks)
-        fn gui_children(d: &Document, parent: Ref, out: &mut Vec<Ref>, gui: &mut Gui, by: Ref) {
-            gui.walk_kids.push(parent);
-            for child in children(d, parent) {
-                gui.walk_reads.push((child, by));
-                match d.class_of(child).as_deref() {
-                    Some("Folder") => gui_children(d, child, out, gui, by),
-                    Some(class) if doc::is_a(class, "GuiObject") => out.push(child),
-                    _ => {}
-                }
-            }
-        }
-        let mut kids = Vec::new();
-        gui_children(d, parent, &mut kids, self.gui, self.cur);
-        let list_layout = child_of_class(d, parent, "UIListLayout");
-        let list = list_layout.or_else(|| child_of_class(d, parent, "UIPageLayout"));
-        let grid = child_of_class(d, parent, "UIGridLayout");
-        let mut placed: HashMap<Ref, Rect> = HashMap::new();
+        let list_layout = child_of_class(d, owner, "UIListLayout");
+        let list = list_layout.or_else(|| child_of_class(d, owner, "UIPageLayout"));
+        let grid = child_of_class(d, owner, "UIGridLayout");
         if let Some(lay) = grid.or(list) {
-            let mut order: Vec<Ref> = kids
+            let mut order: Vec<Ref> = group
                 .iter()
                 .copied()
                 .filter(|k| boolp(d, *k, "Visible", true))
@@ -710,11 +697,49 @@ impl Walk<'_, '_> {
                 let off = |r: Ref| placed.get(&r).map(|p| p.min - content.min);
                 if let (Some(a), Some(b)) = (off(from).or(off(to)), off(to)) {
                     let o = a + (b - a) * alpha;
-                    for p in placed.values_mut() {
-                        *p = p.translate(-o);
+                    for k in group {
+                        if let Some(p) = placed.get_mut(k) {
+                            *p = p.translate(-o);
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// Lays out and draws the GuiObject children of `parent` inside `content`.
+    pub(super) fn children(&mut self, parent: Ref, content: Rect, dn: Down) {
+        let d = self.input.doc;
+        // The parent's own GuiObject children, and each Folder's (a Folder
+        // organizes GUI descendants without a layout box of its own; a
+        // UIListLayout / UIGridLayout inside the Folder lays out the
+        // Folder's GuiObjects within the parent's content, as Roblox does —
+        // a Folder of buttons with its own UIListLayout — while a layout
+        // under the parent arranges the parent's direct children only).
+        // `kids` keeps the drawing order (a Folder's children where it is).
+        // (what was read is kept for the GUI cache: gui_input.rs cache_marks)
+        fn gui_children(d: &Document, parent: Ref, out: &mut Vec<Ref>, groups: &mut Vec<(Ref, Vec<Ref>)>, gui: &mut Gui, by: Ref) {
+            gui.walk_kids.push(parent);
+            let mut own = Vec::new();
+            for child in children(d, parent) {
+                gui.walk_reads.push((child, by));
+                match d.class_of(child).as_deref() {
+                    Some("Folder") => gui_children(d, child, out, groups, gui, by),
+                    Some(class) if doc::is_a(class, "GuiObject") => {
+                        out.push(child);
+                        own.push(child);
+                    }
+                    _ => {}
+                }
+            }
+            groups.push((parent, own));
+        }
+        let mut kids = Vec::new();
+        let mut groups = Vec::new();
+        gui_children(d, parent, &mut kids, &mut groups, self.gui, self.cur);
+        let mut placed: HashMap<Ref, Rect> = HashMap::new();
+        for (owner, group) in &groups {
+            self.layout_group(*owner, group, content, dn, &mut placed);
         }
         // Sibling order: ZIndex, then child order.
         let mut sorted = kids;
@@ -2393,6 +2418,53 @@ mod layout_tests {
             assert!((b_(b).size[1] - 20.0).abs() < 0.01, "stretched {:?}", b_(b).size);
             let h = b_(holder);
             assert!((h.size[0] - 100.0).abs() < 0.01 && (h.size[1] - 70.0).abs() < 0.01, "AutomaticSize Y holds the three lines: {:?}", h.size);
+        });
+        out.textures_delta.clear();
+    }
+
+    /// A UIListLayout inside a Folder lays out the Folder's GuiObjects within
+    /// the parent's content (LBG's skill bar: Skills.Container.Buttons is a
+    /// Folder holding the UIListLayout and the cloned skill buttons); a
+    /// layout under the parent arranges the parent's direct children only,
+    /// a Folder's children keeping their own Position.
+    #[test]
+    fn list_layout_in_a_folder() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let tile = |doc: &mut Document, parent: Ref, n: i32| {
+            doc.dom.insert(parent, InstanceBuilder::new("TextButton").with_property("LayoutOrder", n)
+                .with_property("Size", UDim2::new(UDim::new(0.0, 40), UDim::new(0.0, 20))))
+        };
+        let container = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let buttons = doc.dom.insert(container, InstanceBuilder::new("Folder"));
+        doc.dom.insert(buttons, InstanceBuilder::new("UIListLayout")
+            .with_property("FillDirection", Enum::from_u32(0))
+            .with_property("Padding", UDim::new(0.0, 5)));
+        let skills: Vec<Ref> = (0..3).map(|n| tile(&mut doc, buttons, n)).collect();
+        // The parent's own list leaves a Folder's children alone.
+        let listed = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        doc.dom.insert(listed, InstanceBuilder::new("UIListLayout").with_property("FillDirection", Enum::from_u32(1)));
+        let own: Vec<Ref> = (0..2).map(|n| tile(&mut doc, listed, n)).collect();
+        let folder = doc.dom.insert(listed, InstanceBuilder::new("Folder"));
+        let loose = tile(&mut doc, folder, 9);
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 100.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
+            let dn = Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 };
+            walk.children(container, rect, dn);
+            walk.children(listed, rect, dn);
+            let b_ = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1.clone();
+            let at: Vec<[f32; 2]> = skills.iter().map(|t| b_(*t).pos).collect();
+            assert_eq!(at, vec![[0.0, 0.0], [45.0, 0.0], [90.0, 0.0]], "the Folder's list lays its buttons out in a row");
+            let at: Vec<[f32; 2]> = own.iter().map(|t| b_(*t).pos).collect();
+            assert_eq!(at, vec![[0.0, 0.0], [0.0, 20.0]], "the parent's list arranges its direct children");
+            assert_eq!(b_(loose).pos, [0.0, 0.0], "a Folder's child without a layout of its own keeps its Position");
         });
         out.textures_delta.clear();
     }

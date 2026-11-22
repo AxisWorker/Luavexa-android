@@ -2377,6 +2377,10 @@ impl RustudioApp {
             self.no_ui_frame(ui, &ctx, frame_start, dt);
             return;
         }
+        if self.play_fills_screen() {
+            self.play_full_frame(ui, &ctx, frame_start, dt);
+            return;
+        }
         let ed = &mut self.ed;
         // A folder with several project files: which one to open.
         if let Some((dir, files)) = ed.project_choice.clone() {
@@ -2740,6 +2744,68 @@ impl RustudioApp {
             self.text_menu.end_frame(&ctx);
         }
         self.watchdog.complete();
+    }
+
+    /// View > Play Fills the Screen (on by default on a phone or tablet):
+    /// while a game is played, the game alone over the whole window, at
+    /// the display's own scale, as Roblox's app shows it — the menu bar,
+    /// ribbon, status bar and the other panels come back when it ends.
+    /// A phone's Studio is zoomed out to fit the ribbon (android::touch
+    /// auto_zoom), which left a game in the dock's 3D view a canvas a
+    /// third of the screen's, in units a fifth smaller than Roblox's
+    /// density-independent pixels: LBG's PlayerModule and its own Dash /
+    /// M1 / Block / Shiftlock buttons, laid out from the bottom up in
+    /// those units, ran off the top of the view (the same phone gives
+    /// Roblox a 886 × 411 unit canvas: the phone layout, 70-unit jump
+    /// button, every button on the screen).
+    fn play_fills_screen(&self) -> bool {
+        self.ed.ui.play_full && self.ed.game.play.is_some()
+    }
+
+    fn play_full_frame(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, frame_start: Instant, dt: f32) {
+        let ed = &mut self.ed;
+        {
+            let _p = rustudio_core::bench::scope("scene_sync");
+            ed.game.scene.sync(&mut ed.game.doc);
+        }
+        // The display's scale: a point is a density-independent pixel,
+        // Roblox's GUI unit on Android (the editor's zoom returns with its
+        // chrome: `frame` sets it back every frame).
+        if (ctx.zoom_factor() - 1.0).abs() > 1e-3 {
+            ctx.set_zoom_factor(1.0);
+        }
+        self.watchdog.stage("scene synchronization", "3D view");
+        // (Shift+F5 stops, and the game's keys)
+        ed.shortcuts(ctx);
+        // (the dock's 3D view tab is the one drawn here: the same state)
+        self.ed.ui.viewport_hidden = false;
+        let ed = &mut self.ed;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::BG))
+            .show(ui, |ui| {
+                let _p = rustudio_core::bench::scope("viewport");
+                ed.viewport_ui(ui);
+            });
+        ed.user_screenshot_tick(ctx);
+        rustudio_engine::runtime::domains::assets_cloud::capture::frame_tick(ctx, ed.game.viewport_rect);
+        ed.confirm_ui(ctx);
+        ed.account_window(ctx);
+        ed.cloud_windows(ctx);
+        self.watchdog.stage("3D view", "harness and screenshot readback");
+        self.finish_frame(ctx, frame_start, dt);
+        // The soft keyboard over a game's TextBox (the chat), as in `frame`.
+        #[cfg(target_os = "android")]
+        {
+            let textbox = self.ed.textbox_focused();
+            let want = crate::android::keyboard::wanted(ctx, textbox);
+            self.text_bar.end_frame(ctx, &self.keyboard, want);
+            self.keyboard.end_frame(ctx, textbox);
+            let doing = match &self.ed.game.doc.path {
+                Some(p) => format!("playing {}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+                None => String::new(),
+            };
+            crate::android::memory::tick(&doing);
+        }
     }
 
     /// `--no-ui`: the 3D view alone over the whole window, nothing of the

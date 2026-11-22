@@ -110,6 +110,7 @@ pub struct Layout {
     pub show_grid: Option<bool>,
     pub grid_size: Option<f32>,
     pub show_gui: Option<bool>,
+    pub play_full: Option<bool>,
     pub snap_move: Option<bool>,
     pub move_inc: Option<f32>,
     pub snap_rotate: Option<bool>,
@@ -242,6 +243,7 @@ impl Layout {
         if let Some(v) = self.show_grid { ed.show_grid = v; }
         if let Some(v) = self.grid_size.and_then(finite).filter(|v| *v > 0.0) { ed.ui.grid_size = v; }
         if let Some(v) = self.show_gui { ed.ui.show_gui = v; }
+        if let Some(v) = self.play_full.filter(|_| std::env::var_os("RUSTUDIO_PLAY_FULL").is_none()) { ed.ui.play_full = v; }
         if let Some(v) = self.snap_move { ed.game.snap_move = v; }
         if let Some(v) = self.move_inc.and_then(finite).filter(|v| *v > 0.0) { ed.game.move_inc = v; }
         if let Some(v) = self.snap_rotate { ed.game.snap_rotate = v; }
@@ -404,6 +406,7 @@ impl Saver {
             show_grid: Some(ed.show_grid),
             grid_size: Some(ed.ui.grid_size),
             show_gui: Some(ed.ui.show_gui),
+            play_full: Some(ed.ui.play_full),
             snap_move: Some(ed.game.snap_move),
             move_inc: Some(ed.game.move_inc),
             snap_rotate: Some(ed.game.snap_rotate),
