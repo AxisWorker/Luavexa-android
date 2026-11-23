@@ -29,6 +29,12 @@ pub fn studio_collides(name: &str, rig: RigType) -> bool {
     }
 }
 
+/// Whether `name` is a part of Studio's R15 or R6 rig (a custom rig's other
+/// parts keep the collisions they were saved with).
+pub fn is_standard_part(name: &str) -> bool {
+    R15_PARTS.iter().chain(R6_PARTS).any(|p| p.name == name)
+}
+
 /// Body colours (Roblox BodyColors), as RGB.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BodyColors {

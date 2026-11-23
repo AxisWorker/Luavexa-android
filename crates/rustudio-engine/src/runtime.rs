@@ -177,6 +177,10 @@ pub struct World {
     pub died: Vec<Ref>,
     /// Players that asked for a new character (Player:LoadCharacter).
     pub load_character: Vec<Ref>,
+    /// Player.Character set by a server script this frame (player, model;
+    /// a none model for nil): Play's session makes it the character
+    /// (play.rs `adopt_character`), as Roblox treats the write as a spawn.
+    pub character_set: Vec<(Ref, Ref)>,
     /// KeyCode names held down (UserInputService:IsKeyDown).
     pub keys_down: HashSet<String>,
     /// Enum.CoreGuiType names turned off by StarterGui:SetCoreGuiEnabled.
@@ -660,6 +664,7 @@ impl World {
             velocity_requests: Vec::new(),
             died: Vec::new(),
             load_character: Vec::new(),
+            character_set: Vec::new(),
             keys_down: HashSet::new(),
             core_gui_off: HashSet::new(),
             topbar_off: false,
@@ -3551,6 +3556,47 @@ fn newindex_routed(
             .and_then(|n| n.parse::<f64>().ok())
             .ok_or_else(|| rt_err(&format!("Invalid value \"{name}\" for enum FontSize")))?;
         return newindex(lua, r, "TextSize", Value::Number(px));
+    }
+    // Player.Character = model (a server script, Play): Roblox treats it as
+    // a spawn — the old character's CharacterRemoving, then it goes, Changed,
+    // CharacterAdded for the new one on both sides, the camera and the
+    // controller on it (play.rs `adopt_character` does the rest from
+    // `character_set`; the property replicates with the client's
+    // CharacterAdded there, so the model's LocalScripts start after it as
+    // after a spawn). The write of a model that is already the character
+    // changes nothing, as in Roblox.
+    if key == "Character" && class == "Player" {
+        let m = match &value {
+            Value::Nil => Ref::none(),
+            v => opt_inst(v).ok_or_else(|| bad_assign("Character", "Instance", v))?,
+        };
+        let (play_server, old) = {
+            let w = world(lua)?;
+            let old = match w.d().prop(r, "Character") {
+                Some(Variant::Ref(o)) if o.is_some() && w.d().exists(o) => o,
+                _ => Ref::none(),
+            };
+            (w.mode != RunMode::Edit && w.side == Side::Server, old)
+        };
+        if play_server {
+            if old == m {
+                return Ok(());
+            }
+            let old_v = inst_value(lua, old)?;
+            let pname = Value::String(lua.create_string("Character")?);
+            let mut w = world(lua)?;
+            if let Some(i) = w.dm().dom.get_by_ref_mut(r) {
+                i.properties.insert(ustr("Character"), Variant::Ref(m));
+            }
+            w.dm().mark_prop(r, ustr("Character"));
+            if old.is_some() {
+                w.fire(r, "CharacterRemoving", vec![old_v]);
+            }
+            w.fire(r, "Changed", vec![pname]);
+            w.fire(r, "Changed:Character", vec![]);
+            w.character_set.push((r, m));
+            return Ok(());
+        }
     }
     match key {
         "Name" => {

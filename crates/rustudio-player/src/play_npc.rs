@@ -266,7 +266,7 @@ impl Game {
 
     /// Hands a character back to the general physics (it died, went away,
     /// was anchored).
-    fn npc_remove(&mut self, model: Ref) {
+    pub(super) fn npc_remove(&mut self, model: Ref) {
         let Some(s) = self.play.as_mut() else { return };
         let Some(n) = s.npcs.by_model.remove(&model) else { return };
         if let Some(v) = &n.view {

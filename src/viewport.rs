@@ -712,8 +712,13 @@ impl Editor {
             // scrolls its page, as a ScrollingFrame; a tap clicks), not the
             // view's right-button look.
             let (stick, jump) = if driving && !game && !menu_open { rustudio_engine::touch_input::play_zones(rect) } else { (None, None) };
-            // (game_viewport adds the editor's widgets over the view)
-            let ui = if game { std::mem::take(&mut self.game.touch.zones.ui) } else { Vec::new() };
+            // The editor's widgets over the view are this frame's: game_viewport
+            // (the top bar's buttons, the hotbar, the chat box) and the Stop
+            // button of a filled screen (app.rs play_stop_button) add theirs
+            // after this, and the touch layer reads them with the next frame's
+            // fingers. (Carrying the last frame's list over kept every frame's
+            // rects for the whole session: a few more each frame, never dropped.)
+            let ui = Vec::with_capacity(if game { 8 } else { 0 });
             self.game.touch.zones = rustudio_engine::touch_input::Zones {
                 viewport: if menu_open { egui::Rect::NOTHING } else { visible },
                 playing: driving,

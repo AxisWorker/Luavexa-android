@@ -405,6 +405,36 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
   protocol's own end-of-join signal; a join that stalls under QUIC flow
   control while the phone is busy applying batches can still pass for
   quiet.
+- **A server script's `Player.Character = rig` left the player with no
+  controls.** Roblox treats the write as a spawn (the class page; staff on
+  the DevForum, 2024: the old character is removed "the way things have
+  worked since the beginning"): the old character's `CharacterRemoving`,
+  then it goes, `Changed("Character")`, `CharacterAdded` with the rig on
+  the server and on each client, the camera's `CameraSubject` on its
+  Humanoid, the PlayerModule rebinding its controls to it — the custom-rig
+  pattern games use (`CharacterAutoLoads = false`, a rig cloned from
+  storage into Workspace, `player.Character = rig`). rustudio stored the
+  property like any other: no event, so the camera and controls stayed on
+  the old model (which the game then destroyed) and the rig stood in
+  Workspace as an NPC, dead to input. Now the property's setter
+  (crates/rustudio-engine/src/runtime.rs `newindex_routed`, Play's server)
+  fires the old character's `CharacterRemoving` and `Changed` and hands
+  the pair to the session, which makes the rig the character from where
+  it stands, facing where it faces (crates/rustudio-player/src/play.rs
+  `adopt_character`): out of the NPCs, Studio's limb collisions on its
+  standard parts, the controller on it, the server's `CharacterAdded`,
+  the old model out of Workspace and destroyed after it (a respawn's
+  order), then the client's half once the rig has replicated
+  (`character_client_half`: the property, the camera's `CameraSubject`,
+  `CharacterAdded`, the rig's own LocalScripts started after it, as after
+  a spawn). `Character = nil` leaves the player without one, the old
+  character gone the same way. As on Roblox, nothing is cloned into the
+  rig (no StarterCharacterScripts, Animate or Health — a custom rig brings
+  its own) and the Backpack and PlayerGui stay: that is `LoadCharacter`'s
+  work. Writing the model that is already the character changes nothing.
+  Test `server_set_character_is_the_player_character` (rig from
+  ReplicatedStorage, events on both sides, camera, the rig's LocalScript
+  once, `Player:Move` walks it, then nil).
 
 ## Coverage of Studio's API
 

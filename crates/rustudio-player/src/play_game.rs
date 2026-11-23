@@ -2586,7 +2586,20 @@ impl Game {
             }
         };
         if let Some(s) = self.play.as_ref().and_then(|s| s.game.kicked.clone()) {
-            draw_kicked(&painter, rect, &s);
+            // Its Leave button ends the session, as the menu's Leave does (a
+            // phone has no Stop button or Shift+F5 over a game filling the
+            // screen); a finger landing on it stays egui's (Zones::ui).
+            let leave = draw_kicked(&painter, rect, &s);
+            self.touch.zones.ui.push(leave);
+            let resp = ui.interact(leave, ui.id().with("kicked_leave"), egui::Sense::click());
+            if let Some(c) = state_overlay(&resp) {
+                painter.rect_filled(leave, 4.0, c);
+            }
+            if resp.clicked() {
+                if let Some(s) = self.play.as_mut() {
+                    s.game.leave_request = true;
+                }
+            }
         }
         self.game_menu(ui, rect);
         if !menu {
@@ -3204,7 +3217,10 @@ fn draw_legacy_chat(ed: &Game, painter: &egui::Painter, rect: Rect, chat_on: boo
 }
 
 /// Studio's "Disconnected" dialog after Player:Kick.
-fn draw_kicked(painter: &egui::Painter, rect: Rect, msg: &str) {
+/// Studio's "Disconnected" dialog over a kicked game: the title, the
+/// message and a Leave button at the bottom right (Roblox's ErrorPrompt).
+/// Returns the button's rect (the caller gives it the click).
+fn draw_kicked(painter: &egui::Painter, rect: Rect, msg: &str) -> Rect {
     painter.rect_filled(rect, 0.0, Color32::from_black_alpha(110));
     let body = if msg.is_empty() {
         "You have been kicked by this experience or its moderators.".to_string()
@@ -3212,11 +3228,15 @@ fn draw_kicked(painter: &egui::Painter, rect: Rect, msg: &str) {
         format!("You have been kicked by this experience or its moderators. Moderation message:\n\n{msg}")
     };
     let g = painter.layout(body, egui::FontId::proportional(15.0), Color32::from_gray(220), 310.0);
-    let size = egui::vec2(350.0, g.size().y + 100.0);
+    let size = egui::vec2(350.0, g.size().y + 116.0);
     let r = Rect::from_center_size(rect.center(), size);
     painter.rect_filled(r, 8.0, Color32::from_rgb(35, 37, 39));
     painter.text(r.min + egui::vec2(20.0, 18.0), egui::Align2::LEFT_TOP, "Disconnected", egui::FontId::proportional(18.0), Color32::WHITE);
     painter.galley(r.min + egui::vec2(20.0, 50.0), g, Color32::WHITE);
+    let leave = Rect::from_min_size(r.max - egui::vec2(16.0 + 96.0, 14.0 + 36.0), egui::vec2(96.0, 36.0));
+    painter.rect_filled(leave, 4.0, Color32::from_gray(235));
+    painter.text(leave.center(), egui::Align2::CENTER_CENTER, "Leave", egui::FontId::proportional(15.0), Color32::from_rgb(35, 37, 39));
+    leave
 }
 
 impl GameState {

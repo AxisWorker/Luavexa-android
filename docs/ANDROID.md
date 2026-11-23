@@ -118,7 +118,7 @@ xbuild quirks worth knowing (commit e67b501):
 | Clipboard | egui-winit (arboard) | egui's copies mirrored to `ClipboardManager` after each frame, pastes read from it (`src/android/clipboard.rs`) |
 | Browser links (`platform::open_url`) | `ctx.open_url` (webbrowser) | `ACTION_VIEW` Intent from the activity (`jni::open_url`); eframe's `links` feature isn't built for Android |
 | System bars | — | hidden (immersive mode): the navigation bar — Back / Home / Recents or the gesture pill, the right edge in landscape — and the status bar; a swipe from the edge shows them for a moment, translucent over the editor, and they go again by themselves (`src/android/system_bars.rs`: API 30+ `WindowInsetsController.hide(systemBars)` with transient-by-swipe, before that the sticky immersive view flags; asked at start and again on focus regained / keyboard down, on the Java main thread). `RUSTUDIO_SYSTEM_BARS=1` keeps them. The camera hole's side stays letterboxed in landscape (the cutout mode isn't changed: the chrome doesn't pad by the cutout inset yet) |
-| Back button | — | closes what is open on top (Escape); in Play opens / closes the Roblox menu (Escape's job, as Back does in Roblox's app); otherwise `moveTaskToBack` — the activity isn't destroyed (`src/android/lifecycle.rs`) |
+| Back button | — | closes what is open on top (Escape); in Play opens / closes the Roblox menu (Escape's job, as Back does in Roblox's app; its Leave ends the session, as the Stop button at the game's top right does); otherwise `moveTaskToBack` — the activity isn't destroyed (`src/android/lifecycle.rs`) |
 | Roblox menu and chat in Play | Esc and `/` | the top bar over the game view (the CoreScripts' TopBar layout, drawn on every platform: `play_game.rs` `top_bar`) from Roblox's own TopBar textures (`content/textures/ui/TopBar/`: `iconBase.png` button plate, `coloredlogo.png` Roblox button, `chatOn.png` / `chatOff.png`, `close.png` while the menu is open; `@2x` / `@3x` at a phone's density; hand-drawn shapes only until the content is installed): the Roblox button opens / closes the menu, the unibar's chat button opens the chat with its box focused — the keyboard comes up for it. `SetCore("TopbarEnabled", false)` hides the bar |
 | Activity destroyed | — | `onDestroy` hook: close request, then `process::exit(0)`; `android_main` always leaves the process when the loop ends (`lifecycle.rs`): status 0 for a close, 2 for an eframe error, 101 for a panic (named in logcat with its crash report) |
 | "Open with rustudio" while it runs | Finder's hand-over (`macos::take_opened`) | a second instance of the activity per VIEW intent (`launchMode` `standard`), caught at the library's entry point: its file is copied in and queued for the editor's next frame, the editor's task comes to the front, the new activity finishes unseen (`src/android/intent.rs`). A place the last start died within 20 s of opening by itself isn't opened again by itself (`state/opening`, `storage.rs`) |
@@ -342,8 +342,20 @@ While a game is played it alone covers the window, at the display's own
 scale — egui zoom 1, so a point is a density-independent pixel, Roblox's
 GUI unit on Android — and the menu bar, ribbon, status bar, dock and
 panel windows come back when it ends (`src/app.rs` `play_fills_screen` /
-`play_full_frame`; Shift+F5, the Roblox menu's Leave and the Back button
-end a session as before). Without it a phone's Studio, zoomed out to fit
+`play_full_frame`). The way out is the **Stop button at the top right of
+the game** (`play_stop_button`: one of Roblox's top-bar IconButtons, a
+red stop square, where the bar keeps nothing of its own — its Roblox and
+chat buttons are at the left and a game's TopbarPlus icons follow them;
+a finger landing on it stays egui's, `Zones::ui`; a press let go over it
+counts however long it lasted or the frame between was, egui's own click
+giving up after 0.8 s), since the ribbon's Stop is hidden with the ribbon
+and a phone has no Shift+F5. Checked headless: `--play --window 1280x720
+--ui-click 1242,34@10` on a place ends the session (the result JSON's
+`state` reads `edit`). The Back
+button still opens Roblox's menu, whose Leave (then its confirmation)
+ends the session too, and a game that kicked the player (`Player:Kick`)
+shows Studio's "Disconnected" dialog with a Leave button that ends it as
+well (play_game.rs `draw_kicked`). Without it a phone's Studio, zoomed out to fit
 the ribbon (the first-run zoom above, 0.8), gave a played game the dock's
 3D view: a canvas about a third of the screen (833 × 316 points on a
 1550 × 720 phone, 258 under the top bar) in units a fifth smaller than

@@ -310,6 +310,9 @@ pub struct Editor {
     pub auto_zoom: bool,
     /// CPU time of the last frame's update + draw submission (ms).
     pub last_work_ms: f32,
+    /// Play Fills the Screen's Stop button is pressed (`play_stop_button`:
+    /// the release over it stops the game, however long the press).
+    pub stop_pressed: bool,
     /// The open project folder (files are the truth; src/project_sync.rs).
     pub project: Option<crate::project_sync::ProjectState>,
     /// A folder with several project files: (folder, the files) to choose from.
@@ -490,6 +493,7 @@ impl RustudioApp {
             last_selection: Vec::new(),
             auto_zoom: false,
             last_work_ms: 0.0,
+            stop_pressed: false,
             project: None,
             project_choice: None,
             project_export: None,
@@ -2866,12 +2870,17 @@ impl RustudioApp {
         // (the dock's 3D view tab is the one drawn here: the same state)
         self.ed.ui.viewport_hidden = false;
         let ed = &mut self.ed;
+        let mut stop = false;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG))
             .show(ui, |ui| {
                 let _p = rustudio_core::bench::scope("viewport");
                 ed.viewport_ui(ui);
+                stop = ed.play_stop_button(ui);
             });
+        if stop {
+            ed.stop_play();
+        }
         ed.user_screenshot_tick(ctx);
         rustudio_engine::runtime::domains::assets_cloud::capture::frame_tick(ctx, ed.game.viewport_rect);
         ed.confirm_ui(ctx);
@@ -2951,6 +2960,66 @@ impl RustudioApp {
 }
 
 impl Editor {
+    /// The way out of a game that fills the screen (`play_fills_screen`):
+    /// a Stop button at the top right of the view, where Roblox's own top
+    /// bar keeps nothing (its Roblox and chat buttons are at the left,
+    /// play_game.rs `top_bar`; a game's TopbarPlus icons follow them). The
+    /// ribbon's Stop and Shift+F5 are the editor's, which this mode hides,
+    /// and a phone has no keyboard: Back opens Roblox's menu, whose Leave
+    /// ends the session too, but a Studio tester looks for Stop. Drawn as
+    /// one of the bar's IconButtons (iconBase under a stop square), after
+    /// the view so it is over the game's GUIs and the menu's shield; a
+    /// finger landing on it stays egui's (`Zones::ui`, src/touch_input.rs).
+    /// Returns whether it was tapped.
+    pub fn play_stop_button(&mut self, ui: &mut egui::Ui) -> bool {
+        use egui::{Color32, Pos2, Rect, Stroke};
+        if !self.game.is_playing() {
+            return false;
+        }
+        let rect = self.game.viewport_rect;
+        if !rect.is_positive() || rect.width() < 160.0 {
+            return false;
+        }
+        const BAR_H: f32 = mech::GUI_TOP_INSET; // TopBarHeight
+        const BUTTON: f32 = 44.0; // TopBarButtonHeight
+        const BUTTON_PAD: f32 = 2.0; // TopBarButtonPadding
+        const TOP_MARGIN: f32 = BAR_H - BUTTON - 2.0 * BUTTON_PAD; // TopBarTopMargin
+        const SIDE: f32 = 16.0; // ScreenSideOffset
+        const SQUARE: f32 = 16.0;
+        let y = rect.min.y + TOP_MARGIN + (BAR_H - TOP_MARGIN - BUTTON) * 0.5;
+        let r = Rect::from_min_size(Pos2::new(rect.max.x - SIDE - BUTTON, y), egui::vec2(BUTTON, BUTTON));
+        self.game.touch.zones.ui.push(r);
+        let resp = ui
+            .interact(r, ui.id().with("play_full_stop"), egui::Sense::click())
+            .on_hover_text("Stop (Shift+F5)");
+        let painter = ui.painter_at(rect);
+        // (iconBase.png: black at 0.5, corners 8 of its 32)
+        painter.rect_filled(r, 8.0, Color32::from_black_alpha(128));
+        let square = Rect::from_center_size(r.center(), egui::vec2(SQUARE, SQUARE));
+        painter.rect_filled(square, 2.0, Color32::from_rgb(242, 72, 72));
+        painter.rect_stroke(square, 2.0, Stroke::new(1.0, Color32::from_white_alpha(200)), egui::StrokeKind::Outside);
+        // IconButton's StateOverlay: black at 0.3 while pressed, white at 0.1 while hovered.
+        let down_on = resp.is_pointer_button_down_on();
+        if down_on {
+            painter.rect_filled(r, 8.0, Color32::from_black_alpha(77));
+        } else if resp.hovered() {
+            painter.rect_filled(r, 8.0, Color32::from_white_alpha(26));
+        }
+        // A click, or a press on it let go over it: egui's click needs the
+        // release within 0.8 s and 6 points of the press, and a game's long
+        // frame (a phone loading one) or a finger that rests on the button
+        // breaks that — the one button that leaves the game has to work
+        // regardless (the harness's `--ui-click` lost it that way at 1 fps).
+        let (released, at) = ui.input(|i| (i.pointer.any_released(), i.pointer.interact_pos()));
+        let let_go = released && self.stop_pressed && at.is_some_and(|p| r.contains(p));
+        self.stop_pressed = down_on || (self.stop_pressed && !released && ui.input(|i| i.pointer.any_down()));
+        if resp.clicked() || let_go {
+            self.stop_pressed = false;
+            return true;
+        }
+        false
+    }
+
     pub fn finish_run(&mut self, ctx: &egui::Context, reason: &str) {
         if self.harness.run.finished {
             return;

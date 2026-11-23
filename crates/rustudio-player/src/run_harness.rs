@@ -189,7 +189,9 @@ impl RunHarness {
         serde_json::json!({
             "ended": reason,
             "exit_code": code,
-            "state": if self.play_started.is_some() { "play" } else { "edit" },
+            // (what the run is in as it ends: a Play the Stop button ended
+            // reads "edit")
+            "state": if game.is_playing() { "play" } else { "edit" },
             "no_ui": self.no_ui,
             "end_test_value": value,
             "seconds": self.now(),

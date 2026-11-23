@@ -248,7 +248,9 @@ pub(crate) struct ServerPhase {
     running_speed: Option<f32>,
     humanoid_server: Option<Ref>,
     seat_server: Option<Ref>,
-    server_out: (Vec<Ref>, Vec<Ref>),
+    /// Humanoids that died, Players that asked for a new character
+    /// (LoadCharacter), Player.Character writes (player, model).
+    server_out: (Vec<Ref>, Vec<Ref>, Vec<(Ref, Ref)>),
 }
 
 impl ServerPhase {
@@ -419,6 +421,10 @@ pub struct PlaySession {
     /// The Player instance (server ref).
     pub player: Ref,
     respawn_at: Option<f64>,
+    /// A model a server script made the character (`adopt_character`) whose
+    /// client half (the property, CharacterAdded, the camera) waits for it
+    /// to replicate.
+    character_client_pending: Option<Ref>,
     /// The dead character's parts the server took over (lane DEATH): server part → the
     /// client copy's interpolation buffer (physics::hum_body::Handover).
     handover: HashMap<Ref, rustudio_physics::physics::hum_body::Handover>,
@@ -499,6 +505,7 @@ impl PlaySession {
             character: None,
             player: Ref::none(),
             respawn_at: None,
+            character_client_pending: None,
             handover: HashMap::default(),
             time: 0.0,
             keys_prev: HashSet::new(),
@@ -1089,6 +1096,12 @@ impl Game {
     /// Player.CharacterRemoving (on both sides) just before the old character
     /// goes, as Roblox does on respawn and LoadCharacter.
     fn fire_character_removing(&mut self, model: Ref) {
+        self.fire_character_removing_on(model, true, true);
+    }
+
+    /// `fire_character_removing` on the sides asked for (a script's
+    /// Player.Character write fired the server's itself).
+    fn fire_character_removing_on(&mut self, model: Ref, server: bool, client: bool) {
         let Some((player, cplayer, cmodel)) = self.play.as_ref().map(|s| {
             (
                 s.player,
@@ -1098,7 +1111,8 @@ impl Game {
         }) else {
             return;
         };
-        if player.is_some() {
+        let cplayer = cplayer.filter(|_| client);
+        if player.is_some() && server {
             self.with_side(Side::Server, |rt, _, _| {
                 rt.fire(player, "CharacterRemoving", vec![rt.inst(model)]);
                 rt.dispatch();
@@ -1919,64 +1933,8 @@ impl Game {
                 i.properties.insert(ustr("CanCollide"), Variant::Bool(on));
             }
         }
-        let rig = Rig::read(&self.doc, m);
-        let touch_part = self
-            .doc
-            .find_named(
-                m,
-                if rig_type == RigType::R15 {
-                    "LowerTorso"
-                } else {
-                    "Torso"
-                },
-            )
-            .unwrap_or(rig.root);
         let (start, start_yaw) = self.character_spawn_point();
-        let root_lift =
-            rig::root_height(&self.doc, m)
-                - (mech::CHARACTER_HALF_HEIGHT + mech::CHARACTER_RADIUS + mech::CHARACTER_HOVER);
-        let ch = Character {
-            model: m,
-            accessories_seen: usize::MAX,
-            floor_material: 0,
-            humanoid,
-            rig,
-            rig_type,
-            touch_part,
-            body: CharBody {
-                pos: start,
-                vel_y: 0.0,
-                grounded: false,
-                // Not just off a ledge: no coyote jump mid-air at spawn.
-                air_time: f32::MAX,
-                ..Default::default()
-            },
-            root_lift,
-            yaw: start_yaw,
-            velocity: Vec3::ZERO,
-            dead: false,
-            touching: HashSet::new(),
-            seat_seen: HashSet::new(),
-            state: State::Freefall,
-            landed_for: 0.0,
-            last_speed: -1.0,
-            last_root: None,
-            seat: None,
-            client_sit: false,
-            shape: hum_shape(&self.doc, m, root_lift),
-            hum_mode_left: false,
-            pitch: 0.0,
-            wall: None,
-            seat_cooldown: 0.0,
-            forced: None,
-            forced_for: 0.0,
-            last_move_speed: -1.0,
-            ladder: None,
-            ladder_wait: 0,
-            dynamic: Default::default(),
-            carried: HashSet::new(),
-        };
-        let mut ch = ch;
+        let mut ch = self.character_at(m, rig_type, humanoid, start, start_yaw);
         let pose = character_pose(&ch, &HashMap::new());
         // Where it stands now: a script moving it before the first frame
         // (PivotTo at spawn) is a teleport too.
@@ -1994,6 +1952,7 @@ impl Game {
             p.physics.refresh(parts);
             p.character = Some(ch);
             p.respawn_at = None;
+            p.character_client_pending = None;
         }
 
         // Fresh tools from StarterPack (not for the first character: the
@@ -2178,6 +2137,311 @@ impl Game {
 
     /// StarterPlayer.StarterCharacter (a Model holding a Humanoid) and its
     /// rig type (UpperTorso = R15).
+    /// The controller's view of character model `m` standing at `start`
+    /// (capsule centre) facing `yaw`: a fresh spawn's or an adopted rig's.
+    fn character_at(&self, m: Ref, rig_type: RigType, humanoid: Ref, start: Vec3, yaw: f32) -> Character {
+        let rig = Rig::read(&self.doc, m);
+        let touch_part = self
+            .doc
+            .find_named(
+                m,
+                if rig_type == RigType::R15 {
+                    "LowerTorso"
+                } else {
+                    "Torso"
+                },
+            )
+            .unwrap_or(rig.root);
+        let root_lift =
+            rig::root_height(&self.doc, m)
+                - (mech::CHARACTER_HALF_HEIGHT + mech::CHARACTER_RADIUS + mech::CHARACTER_HOVER);
+        Character {
+            model: m,
+            accessories_seen: usize::MAX,
+            floor_material: 0,
+            humanoid,
+            rig,
+            rig_type,
+            touch_part,
+            body: CharBody {
+                pos: start,
+                vel_y: 0.0,
+                grounded: false,
+                // Not just off a ledge: no coyote jump mid-air at spawn.
+                air_time: f32::MAX,
+                ..Default::default()
+            },
+            root_lift,
+            yaw,
+            velocity: Vec3::ZERO,
+            dead: false,
+            touching: HashSet::new(),
+            seat_seen: HashSet::new(),
+            state: State::Freefall,
+            landed_for: 0.0,
+            last_speed: -1.0,
+            last_root: None,
+            seat: None,
+            client_sit: false,
+            shape: hum_shape(&self.doc, m, root_lift),
+            hum_mode_left: false,
+            pitch: 0.0,
+            wall: None,
+            seat_cooldown: 0.0,
+            forced: None,
+            forced_for: 0.0,
+            last_move_speed: -1.0,
+            ladder: None,
+            ladder_wait: 0,
+            dynamic: Default::default(),
+            carried: HashSet::new(),
+        }
+    }
+
+    /// A server script's `Player.Character = model` (or nil), which Roblox
+    /// treats as a spawn: the setter (runtime.rs) stored it and fired the old
+    /// character's CharacterRemoving; here the old one goes — out of
+    /// Workspace now, destroyed once the new one's CharacterAdded fired, as
+    /// on a respawn — and the new model is the player's character: the
+    /// controller moves it from where it stands, CharacterAdded fires on the
+    /// server, then on the client once the model has replicated, with the
+    /// camera on its Humanoid and its LocalScripts started
+    /// (`character_client_half`). Nothing is cloned into it (no
+    /// StarterCharacterScripts, Animate or Health) and the Backpack and
+    /// PlayerGui stay: that is LoadCharacter's work, not the property's, as
+    /// on Roblox (a custom rig brings its own scripts). A games's rig swap
+    /// (`player.Character = someRig`) was dead to input before: the
+    /// controller still moved the old model the script had destroyed.
+    fn adopt_character(&mut self, player: Ref, m: Ref) {
+        if self.play.as_ref().is_none_or(|s| s.player != player || s.player.is_none()) {
+            return;
+        }
+        let old = self.play.as_ref().and_then(|s| s.character.as_ref()).map(|c| c.model);
+        if m.is_some() && old == Some(m) {
+            return;
+        }
+        if let Some(old) = old {
+            // The client's CharacterRemoving (the server's fired in the
+            // setter); the tool it held goes with it; its body leaves the
+            // controller; it leaves Workspace.
+            self.fire_character_removing_on(old, false, true);
+            self.drop_equipped();
+            self.unequip_client_tool_dropped();
+            let parts: Vec<Ref> = self
+                .doc
+                .dom
+                .descendants_of(old)
+                .filter(|i| doc::is_a(&i.class, "BasePart"))
+                .map(|i| i.referent())
+                .collect();
+            if let Some(s) = self.play.as_mut() {
+                s.character = None;
+                s.physics.remove_humanoid(old);
+                s.physics.skip.retain(|x| !parts.contains(x));
+                s.physics.refresh(parts.iter().copied());
+                s.game.move_target = None;
+            }
+            if self.doc.exists(old) {
+                self.with_side(Side::Server, |rt, _, _| {
+                    rt.apply_parent(old, Ref::none());
+                    rt.dispatch();
+                });
+            }
+        }
+        if let Some(s) = self.play.as_mut() {
+            s.respawn_at = None;
+            s.character_client_pending = None;
+        }
+        let destroy_old = |this: &mut Self| {
+            if let Some(old) = old.filter(|o| this.doc.exists(*o)) {
+                this.with_side(Side::Server, |rt, _, _| {
+                    rt.apply_destroy(old);
+                    rt.dispatch();
+                });
+            }
+        };
+        if m.is_none() || !self.doc.exists(m) {
+            // Character = nil (or a model gone since): no character; the
+            // client learns it the same way.
+            destroy_old(self);
+            self.record(RepOp::Prop(player, "Character".into()));
+            return;
+        }
+        // Out of the NPCs if it stood in Workspace as one.
+        self.npc_remove(m);
+        let humanoid = self
+            .doc
+            .dom
+            .get_by_ref(m)
+            .and_then(|i| {
+                i.children()
+                    .iter()
+                    .copied()
+                    .find(|c| self.doc.class_of(*c).is_some_and(|k| k == "Humanoid"))
+            })
+            .unwrap_or_else(Ref::none);
+        let root = self.doc.find_named(m, "HumanoidRootPart");
+        let root_xf = root.and_then(|r| rustudio_render::scene::xform_of(&self.doc, r));
+        let name = self.doc.dom.get_by_ref(m).map(|i| i.name.clone()).unwrap_or_default();
+        match (humanoid.is_some(), root_xf) {
+            (true, Some(root_xf)) => {
+                // R15 by its Humanoid.RigType, else by its torso.
+                let rig_type = match rustudio_render::scene::enum_u32(self.doc.prop(humanoid, "RigType")) {
+                    Some(0) => RigType::R6,
+                    Some(1) => RigType::R15,
+                    _ if self.doc.find_named(m, "UpperTorso").is_some() => RigType::R15,
+                    _ => RigType::R6,
+                };
+                // Studio's limb collisions for the parts of its rigs; a custom
+                // rig's other parts keep what they were saved with.
+                let body: Vec<(Ref, bool)> = self
+                    .doc
+                    .dom
+                    .get_by_ref(m)
+                    .map(|i| i.children().to_vec())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|c| {
+                        let i = self.doc.dom.get_by_ref(c)?;
+                        (doc::is_a(&i.class, "BasePart") && rig::is_standard_part(&i.name))
+                            .then(|| (c, rig::studio_collides(&i.name, rig_type)))
+                    })
+                    .collect();
+                for (c, on) in body {
+                    if self.doc.prop(c, "CanCollide") != Some(Variant::Bool(on)) {
+                        if let Some(i) = self.doc.dom.get_by_ref_mut(c) {
+                            i.properties.insert(ustr("CanCollide"), Variant::Bool(on));
+                        }
+                        self.doc.mark_prop(c, ustr("CanCollide"));
+                        self.record(RepOp::Prop(c, "CanCollide".into()));
+                    }
+                }
+                let mut ch = self.character_at(m, rig_type, humanoid, Vec3::ZERO, 0.0);
+                // Where it stands, facing where it faces (a script's PivotTo
+                // before the write is where it starts, as on Roblox).
+                ch.body.pos = root_xf.pos - Vec3::Y * ch.root_lift;
+                ch.yaw = rustudio_physics::humanoid::yaw_of_look(-root_xf.rot.z_axis);
+                ch.last_root = Some(root_xf);
+                let parts: Vec<Ref> = self
+                    .doc
+                    .dom
+                    .descendants_of(m)
+                    .filter(|i| doc::is_a(&i.class, "BasePart"))
+                    .map(|i| i.referent())
+                    .collect();
+                self.info(format!(
+                    "Character: {name} ({}, set by a script)",
+                    if rig_type == RigType::R15 { "R15" } else { "R6" }
+                ));
+                if let Some(p) = self.play.as_mut() {
+                    p.physics.skip.extend(parts.iter().copied());
+                    p.physics.refresh(parts);
+                    p.character = Some(ch);
+                }
+            }
+            _ => self.warn(format!(
+                "Character: {name} (set by a script) has no {}: nothing moves it",
+                if humanoid.is_none() { "Humanoid" } else { "HumanoidRootPart" }
+            )),
+        }
+        if let Some(s) = self.play.as_mut() {
+            s.spawns += 1;
+            s.character_client_pending = Some(m);
+        }
+        // Server: CharacterAdded, then the old character's Destroying.
+        self.with_side(Side::Server, |rt, _, _| {
+            rt.fire(player, "CharacterAdded", vec![rt.inst(m)]);
+            rt.dispatch();
+        });
+        destroy_old(self);
+    }
+
+    /// The client's half of a character a script set (`adopt_character`),
+    /// once the model has replicated (one parented later comes later): the
+    /// property, with the model's LocalScripts held until the client's
+    /// CharacterAdded; the camera on its Humanoid; CharacterAdded; the
+    /// scripts — a spawn's order (`spawn_character`).
+    fn character_client_half(&mut self) {
+        let Some((player, m)) = self
+            .play
+            .as_ref()
+            .and_then(|s| s.character_client_pending.map(|m| (s.player, m)))
+        else {
+            return;
+        };
+        if !self.doc.exists(m) {
+            if let Some(s) = self.play.as_mut() {
+                s.character_client_pending = None;
+            }
+            return;
+        }
+        self.replicate_now();
+        let (Some(cp), Some(cm)) = self
+            .play
+            .as_ref()
+            .map(|s| (s.map.s2c.get(&player).copied(), s.map.s2c.get(&m).copied()))
+            .unwrap_or((None, None))
+        else {
+            return;
+        };
+        if let Some(s) = self.play.as_mut() {
+            s.character_client_pending = None;
+        }
+        self.record(RepOp::Prop(player, "Character".into()));
+        self.with_side(Side::Client, |rt, _, _| {
+            if let Some(mut w) = rt.world_mut() {
+                w.hold_character_scripts = true;
+            }
+        });
+        self.replicate_now();
+        let held = self
+            .with_side(Side::Client, |rt, _, _| {
+                rt.world_mut()
+                    .map(|mut w| {
+                        w.hold_character_scripts = false;
+                        std::mem::take(&mut w.held)
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let humanoid = self
+            .doc
+            .dom
+            .get_by_ref(m)
+            .and_then(|i| {
+                i.children()
+                    .iter()
+                    .copied()
+                    .find(|c| self.doc.class_of(*c).is_some_and(|k| k == "Humanoid"))
+            });
+        let (chum, ccam, local) = self
+            .play
+            .as_ref()
+            .map(|s| {
+                let chum = humanoid.and_then(|h| s.map.s2c.get(&h).copied());
+                let cd = s.other_doc.as_ref();
+                let ccam = cd.and_then(|cd| match cd.workspace().and_then(|ws| cd.prop(ws, "CurrentCamera")) {
+                    Some(Variant::Ref(c)) if cd.exists(c) => Some(c),
+                    _ => None,
+                });
+                let local = cd.map(|cd| client_scripts(cd, &[Some(cm)])).unwrap_or_default();
+                (chum, ccam, local)
+            })
+            .unwrap_or((None, None, Vec::new()));
+        let scripts: Vec<Ref> = held.into_iter().chain(local).collect();
+        self.with_side(Side::Client, |rt, _, _| {
+            if let (Some(cam), Some(h)) = (ccam, chum) {
+                rt.set(cam, "CameraSubject", rt.inst(h));
+            }
+            rt.fire(cp, "CharacterAdded", vec![rt.inst(cm)]);
+            rt.dispatch();
+            for r in scripts {
+                rt.start_collected(r);
+            }
+            rt.dispatch();
+        });
+    }
+
     fn starter_character(&self) -> Option<(Ref, RigType)> {
         let root = self.doc.dom.root_ref();
         let sp = self.doc.find_child(root, "StarterPlayer")?;
@@ -3369,6 +3633,7 @@ impl Game {
                         (
                             std::mem::take(&mut w.died),
                             std::mem::take(&mut w.load_character),
+                            std::mem::take(&mut w.character_set),
                         )
                     })
                     .unwrap_or_default()
@@ -3916,8 +4181,8 @@ impl Game {
 
         self.collect_garbage(dt, host);
 
-        // 6. Deaths and respawns.
-        let (died, reload) = std::mem::take(&mut phase.server_out);
+        // 6. Deaths, scripts' Player.Character writes, respawns.
+        let (died, reload, set) = std::mem::take(&mut phase.server_out);
         let my_humanoid = self
             .play
             .as_ref()
@@ -3929,6 +4194,10 @@ impl Game {
             }
             self.kill_character();
         }
+        for (player, model) in set {
+            self.adopt_character(player, model);
+        }
+        self.character_client_half();
         let due = self
             .play
             .as_ref()
@@ -4635,6 +4904,191 @@ mod respawn_gui_tests {
                 assert(pg.Reset:GetAttribute('hp') == 100, 'hp after respawn ' .. tostring(pg.Reset:GetAttribute('hp')))
                 assert(_G.Keep == 1, 'Keep ran ' .. tostring(_G.Keep))
                 assert(pg.Keep == _G.keepGui, 'Keep was replaced')"),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod character_set_tests {
+    use crate::game::Game;
+    use rbx_dom_weak::types::{CFrame, Matrix3, Ref, Variant, Vector3};
+    use rbx_dom_weak::{ustr, InstanceBuilder};
+    use rustudio_engine::runtime::{RunMode, Side};
+
+    fn tick(game: &mut Game, n: usize) {
+        let ctx = egui::Context::default();
+        for _ in 0..n {
+            game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+        }
+    }
+
+    /// A rig as a game keeps one in ReplicatedStorage: HumanoidRootPart,
+    /// Torso and Head on Motor6Ds, an R6 Humanoid, and a LocalScript of its
+    /// own (its controls).
+    fn rig_in_storage(game: &mut Game) -> Ref {
+        let root = game.doc.dom.root_ref();
+        let rs = match game.doc.find_child(root, "ReplicatedStorage") {
+            Some(r) => r,
+            None => game.doc.dom.insert(root, InstanceBuilder::new("ReplicatedStorage").with_name("ReplicatedStorage")),
+        };
+        let rig = game.doc.dom.insert(rs, InstanceBuilder::new("Model").with_name("SwapRig"));
+        let at = |y: f32| CFrame::new(Vector3::new(0.0, y, 0.0), Matrix3::identity());
+        let mut part = |name: &str, size: (f32, f32, f32), y: f32| -> Ref {
+            game.doc.dom.insert(
+                rig,
+                InstanceBuilder::new("Part")
+                    .with_name(name)
+                    .with_property("Size", Vector3::new(size.0, size.1, size.2))
+                    .with_property("CFrame", at(y)),
+            )
+        };
+        let hrp = part("HumanoidRootPart", (2.0, 2.0, 1.0), 3.0);
+        let torso = part("Torso", (2.0, 2.0, 1.0), 3.0);
+        let head = part("Head", (2.0, 1.0, 1.0), 4.5);
+        game.doc.dom.insert(
+            hrp,
+            InstanceBuilder::new("Motor6D").with_name("RootJoint").with_property("Part0", hrp).with_property("Part1", torso),
+        );
+        game.doc.dom.insert(
+            torso,
+            InstanceBuilder::new("Motor6D")
+                .with_name("Neck")
+                .with_property("Part0", torso)
+                .with_property("Part1", head)
+                .with_property("C0", at(1.0))
+                .with_property("C1", at(-0.5)),
+        );
+        game.doc.dom.insert(
+            rig,
+            InstanceBuilder::new("Humanoid").with_property("RigType", rbx_dom_weak::types::Enum::from_u32(0)),
+        );
+        game.doc.dom.insert(
+            rig,
+            InstanceBuilder::new("LocalScript")
+                .with_name("RigControl")
+                .with_property("Source", "_G.rigScript = (_G.rigScript or 0) + 1".to_string()),
+        );
+        if let Some(m) = game.doc.dom.get_by_ref_mut(rig) {
+            m.properties.insert(ustr("PrimaryPart"), Variant::Ref(hrp));
+        }
+        rig
+    }
+
+    const WATCH: &str = r#"
+        _G.added = {}
+        _G.removing = {}
+        PLR.CharacterAdded:Connect(function(c) table.insert(_G.added, c) end)
+        PLR.CharacterRemoving:Connect(function(c) table.insert(_G.removing, c) end)
+    "#;
+
+    /// A server script's `player.Character = rig` (a game's rig swap: the
+    /// rig cloned from storage into Workspace, then the write), as Roblox
+    /// treats it — a spawn: CharacterRemoving for the old character, which
+    /// goes; CharacterAdded for the rig on both sides; the client's
+    /// Player.Character the rig, the camera on its Humanoid, its own
+    /// LocalScript started; and the player's input moves it from where it
+    /// stood. rustudio stored the property and nothing more: the controller
+    /// went on driving the old model (which the game then destroyed) and the
+    /// rig stood in Workspace as an NPC, dead to input.
+    #[test]
+    fn server_set_character_is_the_player_character() {
+        let mut game = Game::new(None);
+        rig_in_storage(&mut game);
+        game.start_play(RunMode::Play, &mut (), false, None);
+        assert!(game.is_playing());
+        tick(&mut game, 90);
+        assert_eq!(
+            game.run_luau(Side::Server, &format!("local PLR = game:GetService('Players'):GetPlayers()[1]; assert(PLR.Character, 'no character'); _G.old = PLR.Character {WATCH}")),
+            None
+        );
+        assert_eq!(
+            game.run_luau(Side::Client, &format!("local PLR = game:GetService('Players').LocalPlayer; _G.old = PLR.Character {WATCH}")),
+            None
+        );
+        // The swap: the rig 12 studs ahead of the character, then the write.
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                local old = plr.Character
+                local rig = game:GetService("ReplicatedStorage").SwapRig:Clone()
+                local base = old.HumanoidRootPart.CFrame * CFrame.new(0, 0, -12)
+                for _, p in rig:GetChildren() do
+                    if p:IsA("BasePart") then
+                        p.CFrame = base * CFrame.new(0, p.Position.Y - 3, 0)
+                    end
+                end
+                rig.Parent = workspace
+                _G.rig = rig
+                _G.rigStart = rig.HumanoidRootPart.Position
+                plr.Character = rig
+                assert(plr.Character == rig, "Character reads back the rig")
+            "#),
+            None
+        );
+        tick(&mut game, 10);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                assert(plr.Character == _G.rig, "server Character: " .. tostring(plr.Character))
+                assert(#_G.removing == 1 and _G.removing[1] == _G.old, "server CharacterRemoving " .. #_G.removing)
+                assert(#_G.added == 1 and _G.added[1] == _G.rig, "server CharacterAdded " .. #_G.added)
+                assert(_G.old.Parent == nil, "the old character is still in " .. tostring(_G.old.Parent))
+                assert(_G.rig.Parent == workspace, "the rig left Workspace")
+            "#),
+            None
+        );
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local plr = game:GetService("Players").LocalPlayer
+                local ch = plr.Character
+                assert(ch and ch.Name == "SwapRig" and ch ~= _G.old, "client Character: " .. tostring(ch))
+                assert(#_G.removing == 1 and _G.removing[1] == _G.old, "client CharacterRemoving " .. #_G.removing)
+                assert(#_G.added == 1 and _G.added[1] == ch, "client CharacterAdded " .. #_G.added)
+                assert(workspace.CurrentCamera.CameraSubject == ch.Humanoid, "camera on " .. tostring(workspace.CurrentCamera.CameraSubject))
+                assert(_G.rigScript == 1, "the rig's LocalScript ran " .. tostring(_G.rigScript) .. " times")
+                assert(_G.old.Parent == nil, "the old character is still in " .. tostring(_G.old.Parent))
+            "#),
+            None
+        );
+        // The player's input moves the rig: Player:Move, as the control
+        // scripts do each frame.
+        for _ in 0..90 {
+            assert_eq!(
+                game.run_luau(Side::Client, "game:GetService('Players').LocalPlayer:Move(Vector3.new(1, 0, 0), false)"),
+                None
+            );
+            tick(&mut game, 1);
+        }
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local p = _G.rig.HumanoidRootPart.Position
+                local d = p - _G.rigStart
+                assert(d.X > 4, "the rig moved " .. tostring(d) .. " on the player's input")
+                assert(p.Y > 0 and p.Y < 6, "the rig stands at " .. tostring(p))
+                assert((_G.rig.Head.Position - p).Magnitude < 3, "the rig's head is " .. tostring(_G.rig.Head.Position))
+            "#),
+            None
+        );
+        // Character = nil: no character, on both sides, the rig gone as a
+        // respawn's old character goes.
+        assert_eq!(game.run_luau(Side::Server, "game:GetService('Players'):GetPlayers()[1].Character = nil"), None);
+        tick(&mut game, 10);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                assert(plr.Character == nil, "server Character: " .. tostring(plr.Character))
+                assert(#_G.removing == 2 and _G.removing[2] == _G.rig, "server CharacterRemoving " .. #_G.removing)
+                assert(_G.rig.Parent == nil, "the rig is still in " .. tostring(_G.rig.Parent))
+            "#),
+            None
+        );
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local plr = game:GetService("Players").LocalPlayer
+                assert(plr.Character == nil, "client Character: " .. tostring(plr.Character))
+                assert(#_G.removing == 2, "client CharacterRemoving " .. #_G.removing)
+            "#),
             None
         );
     }
