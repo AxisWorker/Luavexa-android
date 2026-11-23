@@ -2296,7 +2296,7 @@ impl eframe::App for RustudioApp {
         // process is judged (and kept) by what it really holds.
         rustudio_core::heap::trim();
     }
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         // Fingers: scroll / tap / hold / look, before egui sees them; a
         // paste brings the system clipboard's text.
         #[cfg(target_os = "android")]
@@ -2307,7 +2307,7 @@ impl eframe::App for RustudioApp {
             // is open.
             let start_page = self.ed.start.visible && self.ed.game.doc.id == self.ed.start.doc_id;
             self.ed.game.touch.set_enabled(!start_page, raw);
-            self.ed.game.touch.filter(_ctx, raw, self.ed.game.frame_no);
+            self.ed.game.touch.filter(ctx, raw, self.ed.game.frame_no);
             // (the clipboard first: it swaps egui-winit's pastes, Ctrl+V,
             // for the system clipboard's text; the menu's and the bar's
             // pastes come with their text)
@@ -2316,9 +2316,9 @@ impl eframe::App for RustudioApp {
             self.text_bar.before_frame(raw);
             let textbox = self.ed.textbox_focused();
             let game_box = self.ed.game.play.is_some() && self.ed.game.gui.focus.is_some();
-            self.keyboard.before_frame(_ctx, raw, textbox, game_box);
+            self.keyboard.before_frame(ctx, raw, textbox, game_box);
             let playing = self.ed.game.play_game_input();
-            crate::android::lifecycle::back_pressed(_ctx, raw, playing);
+            crate::android::lifecycle::back_pressed(ctx, raw, playing);
             // The window back in focus: the system bars hidden again.
             crate::android::system_bars::before_frame(raw);
         }
@@ -2351,6 +2351,9 @@ impl eframe::App for RustudioApp {
         }
         if let Some(u) = self.ed.harness.ui_shots.as_mut() {
             u.inject(raw);
+        }
+        if self.ed.game.play_game_input() && ctx.memory(|m| m.focused().is_none()) {
+            rustudio_player::keys::PhysicalKeys::keep_tab_for_game(raw);
         }
         self.ed.game.phys.ingest(raw);
     }
