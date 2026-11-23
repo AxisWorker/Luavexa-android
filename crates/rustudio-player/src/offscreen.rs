@@ -187,6 +187,9 @@ pub fn run<A: eframe::App>(
         if let (Some(rs), Some(t)) = (rs.as_ref(), frame.as_ref()) {
             let jobs = ctx.tessellate(out.shapes, ppp);
             let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: size, pixels_per_point: ppp };
+            // (egui shows the viewport texture the frame drew: its commands
+            // are submitted first)
+            rustudio_render::render_thread::wait();
             let mut renderer = rs.renderer.write();
             for (id, deltas) in &textures_delta.set {
                 for delta in deltas {
@@ -211,7 +214,7 @@ pub fn run<A: eframe::App>(
                 });
                 renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
             }
-            rustudio_render::gpu_timing::submit(&rs.device, &rs.queue, "gpu: egui (offscreen)", extra.into_iter().chain([enc.finish()]));
+            rustudio_render::gpu_timing::submit_finished(&rs.device, &rs.queue, "gpu: egui (offscreen)", extra.into_iter().chain([enc.finish()]));
             for id in &textures_delta.free {
                 renderer.free_texture(id);
             }
@@ -284,6 +287,13 @@ pub fn wgpu_options_with(
     egui_wgpu::WgpuConfiguration {
         wgpu_setup: {
             let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+            // wgpu's build-config flags turn the Khronos validation layer on
+            // in every debug-assertions build (the dev profile): it checked
+            // every GPU call on the render thread and tore the device down
+            // under it at exit (a SIGSEGV in libVkLayer_khronos_validation
+            // while the render thread freed a buffer, a coredump's stack).
+            // WGPU_VALIDATION=1 / WGPU_DEBUG=1 still turn them on.
+            setup.instance_descriptor.flags = egui_wgpu::wgpu::InstanceFlags::empty().with_env();
             #[cfg(target_os = "android")]
             {
                 setup.instance_descriptor.backends =

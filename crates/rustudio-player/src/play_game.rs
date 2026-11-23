@@ -2476,8 +2476,11 @@ impl Game {
         // StarterGui:SetCoreGuiEnabled(Chat, false) hides Roblox's chat (Place A's
         // menu does; Studio shows no chat there).
         let presentation = self.play.as_ref().and_then(|s| s.presentation.as_ref());
-        let chat_on = self.chat_core_gui_on();
-        let backpack_on = presentation.map_or_else(|| self.core_gui_on("Backpack"), |view| view.backpack_on);
+        // Roblox's CoreScripts draw their own chat, hotbar and menu
+        // (core_scripts.rs): rustudio's stand-ins stay hidden then.
+        let core_ui = rustudio_core::rustudio_settings::core_scripts();
+        let chat_on = !core_ui && self.chat_core_gui_on();
+        let backpack_on = !core_ui && presentation.map_or_else(|| self.core_gui_on("Backpack"), |view| view.backpack_on);
         open_chat &= chat_on;
         if !backpack_on {
             slots.clear();
@@ -2579,7 +2582,7 @@ impl Game {
             Some(v) if v.tcs && chat_on => draw_text_chat(&painter, rect, v, chat_open_now, &self.cam),
             _ => {
                 draw_legacy_chat(self, &painter, rect, chat_on);
-                if let Some(v) = view {
+                if let Some(v) = view.filter(|_| !core_ui) {
                     draw_chat_bubbles(&painter, rect, v, &self.cam);
                 }
                 None
@@ -2601,17 +2604,21 @@ impl Game {
                 }
             }
         }
-        self.game_menu(ui, rect);
-        if !menu {
-            self.emote_wheel(ui, rect, &mut slots);
+        if !core_ui {
+            self.game_menu(ui, rect);
+            if !menu {
+                self.emote_wheel(ui, rect, &mut slots);
+            }
         }
         // Roblox's top bar over the game (the CoreScripts' TopBar, drawn
-        // after the menu: its button closes an open menu too).
-        let topbar_on = self.play.as_ref().is_none_or(|s| match s.presentation.as_ref() {
-            // (the client runs on the gameplay worker: its last publication)
-            Some(view) => view.topbar_on,
-            None => s.client.as_ref().and_then(|c| c.world.as_ref()).is_none_or(|w| !w.topbar_off),
-        });
+        // after the menu: its button closes an open menu too). Roblox's own
+        // CoreScripts draw theirs (core_scripts.rs): none of this one then.
+        let topbar_on = !core_ui
+            && self.play.as_ref().is_none_or(|s| match s.presentation.as_ref() {
+                // (the client runs on the gameplay worker: its last publication)
+                Some(view) => view.topbar_on,
+                None => s.client.as_ref().and_then(|c| c.world.as_ref()).is_none_or(|w| !w.topbar_off),
+            });
         let mut close_chat = false;
         if topbar_on {
             let (menu_tap, chat_tap) = self.top_bar(ui, rect, chat_on && !menu, chat_open_now, menu);

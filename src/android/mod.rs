@@ -257,6 +257,9 @@ pub fn run(app: AndroidApp) {
         )
     }));
     perf_hint::stop();
+    // (the render thread's last job finishes before the process leaves:
+    // src/lib.rs run, crates/rustudio-render/src/render_thread.rs)
+    let _ = std::panic::catch_unwind(rustudio_render::render_thread::wait);
     lifecycle::LOOP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
     match result {
         Ok(Ok(())) => {}

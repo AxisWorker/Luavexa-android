@@ -745,11 +745,11 @@ mod tests {
                 .with_property("C0", at(0.0, 2.0, 0.0))
                 .with_property("C1", at(0.0, 0.0, 0.0)),
         );
-        let replicated: HashMap<Ref, Ref> = [(character, character), (limb, limb)].into_iter().collect();
+        let replicated: rustudio_core::RefMap = [(character, character), (limb, limb)].into_iter().collect();
         d.mark_all();
         let mut cj = ClientJoints::default();
         cj.solve(&mut d, &replicated);
-        let pos = |d: &Document, p| cframe(d, p, "CFrame").unwrap().pos;
+        let pos = |d: &Document, p| cframe(d, p, ukey!("CFrame")).unwrap().pos;
         assert!((pos(&d, aura) - Vec3::new(5.0, 5.0, 0.0)).length() < 1e-4, "{:?}", pos(&d, aura));
         assert_eq!(pos(&d, limb), Vec3::new(5.0, 3.0, 0.0));
         // The server moved the limb (replication wrote its CFrame).

@@ -1269,6 +1269,11 @@ pub fn run() -> eframe::Result<()> {
         options,
         Box::new(move |cc| create(cc).map(|a| a as Box<dyn eframe::App>)),
     );
+    // The render thread finishes what it was handed before the process
+    // exits (crates/rustudio-render/src/render_thread.rs; the player's
+    // run does the same): exit handlers tearing the GPU device down under
+    // a job still freeing its buffers crashed at exit.
+    let _ = std::panic::catch_unwind(rustudio_render::render_thread::wait);
     // --fail-on-error (app::Editor::finish_run); a windowed test run's exit
     // status reaches the caller through the headless wrapper's status file.
     let code = app::EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed);

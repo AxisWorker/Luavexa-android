@@ -166,7 +166,7 @@ fn agent() -> ureq::Agent {
     AGENT.clone()
 }
 
-fn get(agent: &ureq::Agent, url: &str, range: Option<(u64, u64)>) -> Result<Vec<u8>, String> {
+pub(crate) fn get(agent: &ureq::Agent, url: &str, range: Option<(u64, u64)>) -> Result<Vec<u8>, String> {
     let mut req = agent.get(url);
     if let Some((a, b)) = range {
         req = req.header("Range", &format!("bytes={a}-{b}"));
