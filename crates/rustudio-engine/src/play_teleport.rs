@@ -70,7 +70,6 @@ impl Arrival {
 }
 
 static REQUEST: Mutex<Option<Request>> = Mutex::new(None);
-static ARRIVAL: Mutex<Option<Arrival>> = Mutex::new(None);
 
 /// Queues a teleport. False when one is already under way (Studio: "All
 /// players in teleport request are already in progress or throttled.").
@@ -91,15 +90,6 @@ pub fn take_request() -> Option<Request> {
 /// Drops a queued teleport (Play stopped, or a new Play begins).
 pub fn clear_request() {
     REQUEST.lock().unwrap_or_else(|e| e.into_inner()).take();
-}
-
-/// Sets (or clears) how the next / running Play session's player arrived.
-pub fn set_arrival(a: Option<Arrival>) {
-    *ARRIVAL.lock().unwrap_or_else(|e| e.into_inner()) = a;
-}
-
-pub fn arrival() -> Option<Arrival> {
-    ARRIVAL.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// A teleport is under way: queued, or taken by the Play loop and loading.

@@ -227,104 +227,6 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
   shapes (Place A's headroom probes rely on it: a turned brush's or a terrain
   chunk's box covers far more than the part). Now exact: box vs box by
   separating axes, box vs mesh triangles (crates/rustudio-physics/src/query_shapes.rs).
-- **Invoke before the callback existed errored** ("OnInvoke is not set" /
-  "OnServerInvoke is not set"). Roblox holds the call: a BindableFunction's
-  `Invoke` yields until `OnInvoke` is set (and never resumes if it never
-  is), a RemoteFunction queues `InvokeServer` / `InvokeClient` until
-  `OnServerInvoke` / `OnClientInvoke` is assigned (both class pages). A
-  character's Controls LocalScript (LBG, Android) invoked a BindableFunction
-  40 ms before the 70k-line renderer LocalScript set its callback and died
-  at that line every spawn. Now every path waits a frame at a time
-  (crates/rustudio-engine/src/runtime.rs PRELUDE `__rs_wait_callback`, INVOKE_PRELUDE
-  `__rs_serve_invoke`; test `invoke_waits_for_the_callback`).
-- **Studio 0.748's PlayerModule lost its InputContexts** (content
-  `version-8d7a1009c17e4ff8`, deployed 2025-11-16). `PlayerScripts.rbxp` now
-  points `PlayerModule.InputContexts` at a second project file
-  (`"$path": "InputContexts.rbxp"`, 4 InputContexts / 30 InputActions / 70
-  InputBindings) where 0.747 spelled the tree out inline; the Rojo-style
-  loader only followed `$path`s to `.lua` / `.luau` files and folders, so
-  the Folder came up empty. InputSetup warned "InputContexts not found" and
-  ControlModule, BaseCamera, CameraInput, MouseLockController, the
-  thumbsticks, ClickToMove and VehicleController all parked on
-  `WaitForChild("InputContexts")`: the character spawned, nothing walked or
-  looked, on every platform once the content updated. Fixed upstream in
-  0.2.6 (`e3f06fd`, "Fixed Play controls and camera on fresh installs"):
-  a `$path` ending in `.rbxp` is loaded as that project's `tree`, relative
-  to its own file, `$properties` over an imported tree apply, and a missing
-  source is an error Play reports ("Could not load Studio PlayerModule for
-  Play: …") instead of a silent empty Folder (crates/rustudio-core/src/default_scripts.rs
-  `project_tree` / `project_node`; test
-  `project_imports_input_contexts_with_properties_and_rejects_missing_sources`).
-  The port's own fix of the same gap was dropped for upstream's.
-- **A new place got the Input Action System PlayerScripts.** Which player
-  scripts a place gets is `Workspace.PlayerScriptsUseInputActionSystem`
-  (Enum.RolloutState): the loader took the new layout
-  (`StarterPlayer.PlayerModule` + its own `PlayerScriptsLoader`, nothing
-  in `Player.PlayerScripts` but `RbxCharacterSounds`) for every place
-  whose flag wasn't Disabled — so for Default, every Baseplate — where
-  Roblox's rollout (phase 1, through 2026) resolves Default to Disabled:
-  the live client gives those places the classic `PlayerScriptsLoader` +
-  `PlayerModule` + `RbxCharacterSounds` in `Player.PlayerScripts`, and
-  games `require(LocalPlayer.PlayerScripts.PlayerModule):GetControls()`.
-  Now Default and Disabled are the classic layout, Enabled the Input
-  Action System one (`StarterPlayer.CreateDefaultPlayerModule` false
-  leaves its PlayerModule out), a fork in StarterPlayerScripts keeps the
-  classic layout around it as before, and
-  `mech::PLAYER_SCRIPTS_DEFAULT_IAS` is the one place to flip when
-  Roblox's phase 2 (early 2027) makes Default mean Enabled
-  (`input_action_system_on`; test
-  `player_scripts_layout_follows_the_rollout_flag`).
-- **A place's own PlayerModule never ran without Studio's content.**
-  The classic loader, PlayerModule and RbxCharacterSounds come from
-  Studio's content folder, and without it (a phone before the download,
-  an offline desktop) `insert_player_scripts` added nothing — not even
-  the loader — so a place with its own `PlayerModule` fork in
-  StarterPlayerScripts (LBG: the shift lock's MouseLockController, its
-  camera and touch controls) never had it required; the engine's
-  keyboard stand-in moved the character instead. `default_scripts.rs`
-  now carries a loader of its own (`PLAYER_SCRIPTS_LOADER`: require the
-  module once, as Roblox's does) and inserts it when a place has a
-  PlayerModule but no loader, content or not (`insert_own_loader`; test
-  `own_player_module_gets_a_loader_without_studio_content`).
-- **`GuiService.TopbarInset` was an empty Rect for ever.** TopbarPlus
-  (`IconNew`, `TopbarPlusGui`) and LBG's ClientRenderer read
-  `TopbarInset.Height`, wait on `GetPropertyChangedSignal("TopbarInset")`
-  while it is 0 and only then build their icons — a wait nothing ended.
-  In Play it is now the top bar's free area as Roblox's reference
-  describes it — from the end of the menu and chat buttons (`play_game.rs
-  top_bar`: 128 px with the chat button, 72 without) to the viewport's
-  right edge, 58 high (the new topbar; the old one's 36 is what
-  TopbarPlus tests for) — an empty Rect in the edit DataModel, and
-  `gui_input.luau` `step_topbar` publishes the change when the viewport
-  or the chat button changes (test
-  `topbar_inset_is_the_bar_and_follows_the_viewport`). The left edge is
-  this build's bar, not a measurement of Roblox's unibar.
-- **`ScreenGui.ScreenInsets = TopbarSafeInsets` was laid out as
-  CoreUISafeInsets** (below the bar, the whole view). TopbarPlus puts its
-  icons in such a ScreenGui (v3's `TopbarStandard`: holders `Size (1, 0,
-  1, …)`; v2's `TopbarPlusGui`: the container at Y scale 250.2 of it,
-  icons at −0.5 of that) — both arithmetic on a gui that *is* the
-  TopbarInset rect — so the icons landed at the left edge, over the menu
-  button, a fifth of the view down. Now a TopbarSafeInsets ScreenGui is
-  the TopbarInset: it starts after Roblox's buttons (72 / 128 px:
-  `mech::gui_topbar_left`, the chat button from `Gui::topbar_chat`), is 58
-  px tall and sits at AbsolutePosition (left, −58) (`gui_input.rs` roots,
-  `runtime_ext.rs gui_rect`, `GetInsetArea(TopbarSafeInsets)`), and no
-  ScreenGui's content is clipped to its inset box any more (Roblox draws
-  a Frame at Y −58 under the bar; TopbarPlus's dropdowns hang below the
-  bar). Test `topbar_safe_insets_gui_is_the_bars_free_area`.
-- **UIListLayout's flex settings were ignored**: `Wraps`, `HorizontalFlex`
-  / `VerticalFlex` (UIFlexAlignment Fill / SpaceAround / SpaceBetween /
-  SpaceEvenly) and `ItemLineAlignment`. A wrapping list (90 of LBG's 250
-  lists: shop rows, the player list, title tiles) was drawn as one long
-  line running off its frame. Now a list breaks into lines at its parent's
-  extent along the fill direction (the lines stacked by the same Padding),
-  the flex alignments grow the items or spread them along a line and
-  spread the lines across, Automatic / Start / Center / End / Stretch set
-  the items within their line, and an AutomaticSize parent holds the
-  lines (crates/rustudio-engine/src/gui_walk.rs `list_lines`; AbsoluteContentSize follows the
-  drawn boxes; test `list_wraps_and_flexes`). Not done: UIFlexItem Shrink
-  and a Fill line narrower than its items (nothing shrinks).
 - **A layout inside a Folder laid out nothing**: `gui_walk.rs` flattened a
   Folder's GuiObjects into its parent's children and looked for a
   UIListLayout / UIGridLayout / UIPageLayout among the parent's own
@@ -332,76 +234,19 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
   Folder holding the UIListLayout and the skill buttons cloned into it as
   skills are added — drew every button at the Container's top-left, one on
   top of the other. Now each group of GuiObjects (the parent's own, each
-  Folder's) is placed by the layout among its owner's children, inside the
-  parent's content, as Roblox does (`layout_group`; test
-  `list_layout_in_a_folder`). Not done: an AutomaticSize parent measuring a
-  Folder-held list's lines.
-- **UIShadow was not drawn** (138 in LBG: glows behind its result frames,
-  kill feed, close buttons). Now a Shape-mode shadow is drawn under its
-  object's background: the box (with its UICorner) moved by Offset, grown
-  by Spread, its edge softened over BlurRadius (scale of the shorter side),
-  in Color at 1 - Transparency; ShowBehindParent false leaves out the part
-  under the box (crates/rustudio-engine/src/gui_fx.rs `shadow`; test `ui_shadow_under_the_box`).
-  Not done: Inset, Text mode, a UIGradient under the shadow.
-- **No top bar over the game**: the Roblox menu (Esc) and the chat (`/`)
-  had keys only, so a phone — no Esc, no `/` — never reached either, and a
-  Studio playtest's view lacked the bar Studio draws in the 58 px inset.
-  Now the CoreScripts' TopBar (Chrome layout, Constants.lua: 44 px
-  buttons, 16 in from the side, 12 apart) is drawn over the game view in
-  Play from Roblox's own TopBar textures (content/textures/ui/TopBar:
-  iconBase.png as each button's plate, coloredlogo.png for the Roblox
-  button, chatOn.png / chatOff.png for the chat button; the @2x / @3x
-  sheets at a phone's density; while the menu is open the bar gives way
-  to the round close button, as TopBarApp hides TopBarFrame for
-  CloseMenuButtonRound; hand-drawn stand-ins until Studio's content is
-  installed): the Roblox button opens and closes the menu, the unibar's
-  chat button opens the chat window with its box focused (hidden with
-  SetCoreGuiEnabled(Chat, false)). `StarterGui:SetCore("TopbarEnabled",
-  false)` hides the bar and `SetCore("ChatActive", open)` opens / closes
-  the chat, as the CoreScripts' registerSetCores does, and
-  `GetCore("TopbarEnabled")` reads it back (TopbarPlus's IconController
-  polls it; the other GetCore keys still return nil) (crates/rustudio-player/src/play_game.rs
-  `top_bar`, crates/rustudio-engine/src/runtime_ext.rs; test `set_core_topbar_and_chat`). Not
-  done: the unibar's other icons (captures, emotes, leaderboard,
-  inventory), the health bar, notifications; a hidden bar keeps the 58 px
-  GuiInset (Roblox drops it to 0 — ScreenGuis then start at the top).
-- **A joined place's meshes and values were named after their class**:
-  the replication stream leaves `Name` out of a NewInstance whose Name is
-  still the constructor's, and `rustudio_net` filled the gap with the
-  class name for every class but five (Event, Function, Wedge,
-  CornerWedge, Union) — so a `SpecialMesh` the file calls `Mesh` arrived
-  as `SpecialMesh`, a `StringValue` called `Value` as `StringValue`, and
-  `part.Mesh` / `folder.Value` raised "Mesh is not a valid member of Part"
-  in a place opened from Roblox while the same .rbxl opened from a file
-  ran clean (LBG's `Wind1` on a cloned `ring`, its `MeshGroup.BeanWind.Mesh`).
-  Now `default_instance_name` — one table, in
-  `rustudio_core::doc` and again in `rustudio_net::model` (the net crate
-  doesn't depend on core; `live_sync.rs` `default_name_tables_agree`
-  keeps the copies equal) — holds Studio's constructor names (meshes
-  "Mesh", the twelve ValueBase classes "Value", Lighting's effects
-  "Bloom" / "Blur" / "ColorCorrection" / "ColorGrading" / "SunRays" /
-  "DepthOfField", "Truss", "NegativePart", "Body Colors", "Shirt
-  Graphic"; services keep their class name — `game.RunService` resolves
-  by child name here); a Team Create join names what arrives by it, and
-  `Instance.new` and Insert Object name new instances by it too
-  (`part.Mesh` after `Instance.new("SpecialMesh", part)`). Not done:
-  names only known from Studio itself for classes not in this list — a
-  class that arrives as its class name but should not is a missing table
-  row (tests `default_instance_names_are_studios`,
-  `default_names_apply_to_direct_and_parked_children`,
-  `instance_new_gives_studios_constructor_names`,
-  `default_name_tables_agree`).
+  Folder's) is placed by the layout beside it, inside the parent's
+  content, as Roblox does (`children`: `place_children` once for the
+  parent and once per Folder; test `list_layout_in_a_folder`). Not done:
+  an AutomaticSize parent measuring a Folder-held list's lines.
 - **A short Team Create join played as if whole**: `rustudio_net`'s
   `Ready` is 1.5 s without an instance batch, not the server's end of
-  transfer, and a child parked for a parent that never arrived, or
-  instances still streaming when the server dropped the session, left no
+  transfer, and a child parked for a parent that never arrived left no
   trace. The Output now counts the parked instances at Ready (a few
-  named) and, at a disconnect, the instances that came after Ready or
-  that the join never finished, each asking to reopen the place or open a
-  saved .rbxl before playing (`model.rs` `parked_count`, `cloud_ui.rs`
-  `ready_count`). (The LBG `BeanWind.Mesh` failure once blamed on this was
-  the default-name gap above: the saved file holds 154,682 instances, not
-  the 160,078 claimed, so the join had been complete.) Not done: the
+  named) and asks to reopen the place, or open a saved .rbxl, before
+  playing (`cloud_ui.rs` on `model.rs`'s `parked_count` /
+  `parked_sample`). (The LBG `BeanWind.Mesh` failure once blamed on this was
+  the constructor-name gap, now closed upstream: the saved file holds
+  154,682 instances, not the 160,078 claimed, so the join had been complete.) Not done: the
   protocol's own end-of-join signal; a join that stalls under QUIC flow
   control while the phone is busy applying batches can still pass for
   quiet.
@@ -513,168 +358,6 @@ rustudio's `os.clock` now counts like Studio's (from the process start) and
 the harness passes Studio's reading at Play (`RUSTUDIO_CLOCK_BASE`): Place A
 camera 75 → 100 with the 2° tolerance unchanged.
 
-## Roblox's CoreScripts from the data model patch (opt-in)
-
-`RUSTUDIO_CORE_SCRIPTS=1` (or Studio Settings > rustudio > Play > Roblox's
-CoreScripts) makes Play put Studio's `DataModelPatch.rbxm` in the client
-(crates/rustudio-core/src/core_scripts.rs) and start its `StarterScript` at
-the CoreScript identity (4). On the control place (Studio
-version-8d7a1009c17e4ff8's patch: 49190 modules, 79 CoreScripts, about
-350 ms to load) StarterScript now runs to its end with no CoreScript error
-in Output: Roblox's top bar draws (Roblox menu, chat and "more" buttons in
-the Builder Icons font) and so does the player list; rustudio's own menu,
-chat, hotbar and emote wheel stay hidden while it's on.
-
-Closed on the way (API dump members; stubs only where a Play session has no
-backend, each noted in the code):
-
-- ScriptContext:AddCoreScriptLocal; DataModel DefineFast*/GetFast*/
-  GetEngineFeature/SetFlagVersion/GetPlaySessionId; settings() flags for
-  CoreScripts.
-- GuiService: SetTopbarInset/TopbarInset, SetMenuIsOpen, SetGlobalGuiInset,
-  GetResolutionScale and the UI-scale/safe-zone/hardware-viewport getters,
-  error getters, Add/RemoveCenterDialog, Add/Remove(Special)Key,
-  GetNotificationTypeList, SendCoreUiNotification (any API-dump callback is
-  now kept).
-- StarterGui:RegisterSetCore / RegisterGetCore behind SetCore / GetCore;
-  ContextActionService core actions (ahead of game actions).
-- MessageBusService, MemStorageService, LocalStorageService /
-  AppStorageService, IXPService (layers loaded, no variables),
-  HttpService:RequestInternal (roblox.com APIs through the login session).
-- RunService / UserInputService / Player / PlayerScripts / UserGameSettings /
-  RenderSettings / VRService / AvatarChatService / ThirdPartyUserService
-  members the CoreScripts read; HumanoidDescription.NumberEmotesLoaded;
-  InsertService:LoadLocalAsset; UDim2:lerp; LocalizationTable:SetEntries
-  without Source; analytics, ads, notifications, achievements and capture
-  gallery as stubs.
-- Rendering: CoreGui ScreenGuis (also inside Folders) draw above PlayerGui;
-  GSUB ligatures for icon fonts; rbxasset:// reaches Studio's ExtraContent.
-
-Client flags (crates/rustudio-core/src/client_flags.rs): Play loads
-Roblox's public PCDesktopClient settings (25 850 flags) and the CoreScripts
-take today's variants. With all of them, on a TextChatService copy of the
-control place, StarterScript and the CoreScripts start with no error in
-Output; about 8 s into Play the "Chrome" top bar draws (Roblox logo, menu
-and chat buttons), with ExpChat's chat window and input bar and the newer
-player list. Clicking the menu button opens Chrome's menu (Switch avatar,
-Music, Report, Leaderboard, Emotes, Inventory, Respawn); clicking the input
-bar, typing and Enter puts the message in the chat window. Closed for this:
-Player.ChatAvailabilityStatus, AudioFocusService, SessionService,
-ExperienceService, TelemetryService (stubs), LinkingService,
-HttpService:GetUserAgent, Translator:RobloxOnlyTranslate,
-GuiService:GetClosestDialogToPosition / GetClosestVisibleDialogToPosition;
-SetCore / GetCore handlers run at their registrant's identity (a game
-LocalScript's SetCore reaching a CoreScript handler that needs LocalUser).
-Engine features (GetEngineFeature) have no public source and read false,
-except AvatarChatServiceEnabled: AvatarChatService answers a client without
-voice or camera chat (ClientFeatures 0, IsEnabled tests a bit of a mask,
-EnableVoice false), VideoCaptureService:GetCameraDevices an empty list, and
-VoiceChatCore's CoreVoiceManager (which needs the service) no longer errors.
-AvatarEditorService:BustAvatarFetchCache (the menu's Respawn) fetches the
-signed-in avatar again for the next character. String properties, names,
-attributes and string arguments take any Lua bytes, as Roblox does; bytes
-that aren't UTF-8 are left out (estimate: rustudio holds UTF-8 text).
-
-Menu and styles (round 2): Foundation (the CoreScripts' UI kit) styles its
-objects through StyleSheets with tags (".size-full", ".row ::UIListLayout").
-Fixed in gui_input.luau: tags and names with "-" in selectors; pseudo-instance
-selectors ("::UIListLayout", "::UIPadding", "::UIFlexItem", "::UICorner"),
-which make and style one modifier per matched element; rule data held
-strongly (a parented StyleRule's Lua object could be collected and its
-properties lost); equal-priority rules applied in sheet order. With those
-the settings menu's Leave / Respawn / Resume row draws as in Roblox and
-Resume closes the menu. AutomaticSize XY frames lay their content out again
-at the width they settle on (ExpChat's translation notice was 300x400; now
-its text height). TextService:GetTextSize / GetTextBoundsAsync measure with
-rustudio's text layout; GetTextSizeOffsetAsync answers 0 (Medium text,
-estimate). rbxthumb:// thumbnails (the People tab's headshot) come from the
-thumbnails API. Lua signals and render-step binds run at their connector's
-identity.
-
-Performance: style matching ran over every descendant of each StyleLink's
-parent every frame, RobloxGui's 45 000 CoreScript modules included. It now
-skips scripts and their children; destroyed-instance sweeps run twice a
-second. Round 3: matching reads each styled tree in one engine call
-(gui_input.rs `style_tree`) and only the elements holding a selector's
-first tag, and reruns per StyleLink only when the DataModel's journal shows
-its tree changed (an element added / moved / removed, a Name / Tags /
-Interactable write), for all links when a sheet, rule, query or the view
-changes (and hover / press / focus when a rule has a :state), with no 2 s
-timer. A rerun with the settings menu open: 150-250 ms -> 8-20 ms (debug).
-
-Look (round 3, compared with the real client's captures):
-- Styles no longer override what an instance sets itself (Roblox's styling
-  guide, "Modified properties"): Foundation's icons keep their Builder Icons
-  FontFace and TextSize over the "text-defaults" / "x-default-text-size"
-  rules, so `microphone`, `arrow-medium-up` and the rest draw as glyphs
-  (they drew as Builder Sans 8 text).
-- RobloxGui is ZIndexBehavior Sibling: the settings menu's Leave / Respawn /
-  Resume row and the Help tab's grid draw over the menu's background, not
-  dimmed under it.
-- The default chat PrefixText is `<font color="#…">DisplayName:</font>` in
-  the team colour, else the CoreScripts' computeNameColor colour;
-  RobloxEmoji's colour glyphs (the verified badge U+E000) draw in their COLR
-  layers' colours (gui_color_glyphs.rs); rich text `color = "…"` with spaces
-  parses.
-- Text outlines: a run's own transparency fades its outline (ExpChat's
-  invisible copy of the name drew a black outline over it), and the eight
-  outline copies share the stroke's alpha (mech GUI_TEXT_STROKE_OVERLAP).
-- A row's flex-grown items that grow on Y are as tall as they are at their
-  new width (the chat input grew to 182 px while typing).
-- An AutomaticSize X object's children measure with the room it can grow
-  into (the Help tab's key column, AutomaticSize XY frames 0 wide around
-  wrapped "Up arrow", wrapped a letter per line).
-- TextFits before the first layout measures TextBounds against the box
-  (SettingsHub's version footer turned TextScaled on and drew over itself).
-- Setting Font sets FontFace to Font.fromEnum of it, and Font.fromEnum maps
-  as Roblox's does (BuilderSansMedium → BuilderSans Medium, Gotham →
-  GothamSSm): the settings rows set Font = BuilderSans and drew in
-  LegacyArial at its 1.5× size. Section headers are text-heading-small
-  (Builder Sans Bold 25, the Foundation token) in content-emphasis white.
-
-Still open: the Respawn confirmation page draws its text tiny.
-TextService:GetTextSizeOffsetAsync is still a stub. The Help tab wraps
-"Drop tool", "Use tool" and "Mouse lock" (Roblox doesn't) and its Camera
-movement / Menu items groups are not on screen; setting FontFace doesn't
-set Font back; `<stroke>` rich text tags are read but not drawn.
-
-A game's top bar beside Roblox's (round 4, Legends Battlegrounds with the
-CoreScripts on, on a phone):
-- The settings menu's Settings page errored at `Utility:1429` ("invalid
-  argument #1 to 'pairs'"): GameSettings' updateAudioDevices pcalls
-  `SoundService:GetOutputDevices()` / `GetInputDevices()`, and when the
-  call fails it hands the error string to UpdateOptions as the option
-  list. rustudio had none of SoundService's device members, so the
-  CoreScripts' call fell to the generic "lacking capability RobloxScript".
-  Now (domains/media.rs) `GetOutputDevices` / `GetInputDevices` answer the
-  default device's name as a one-entry list with the empty GUID the page
-  labels "Default (...)" and index 1; `GetOutputDevice` / `GetInputDevice`
-  the same name and GUID; `SetOutputDevice` is a no-op (one device: the
-  mixer plays through cpal's default output); the camera selector is behind
-  the VideoCaptureService engine feature, which reads false.
-- TopbarPlus's icons drew over the Chrome top bar's menu and chat buttons.
-  TopbarPlus is a ScreenGui with ScreenInsets TopbarSafeInsets, placed by
-  the engine at this build's own bar (mech GUI_TOPBAR_LEFT_CHAT: 128 px
-  from the left), while the Chrome unibar reaches 164 px. The CoreScripts
-  say where the free area is: CoreGuiCommon's keep-out-area store (and the
-  older KeepOutAreasHandler) takes the unibar's, menu icon's and health
-  bar's boxes and calls `GuiService:SetTopbarInset(Rect)` with the widest
-  strip between them. GuiService.TopbarInset already returned that rect;
-  now it also places TopbarSafeInsets ScreenGuis (World::topbar_inset ->
-  the play view -> Gui::topbar_inset in gui_input.rs, runtime_ext.rs's
-  AbsolutePosition and GetInsetArea): with the CoreScripts on, TopbarPlus
-  starts at 164 px, after the chat button (test
-  core_scripts_topbar_inset_places_topbar_safe_insets_guis). The Chrome
-  bar mounts a few seconds into Play (React renders it as its modules
-  load; 12-15 s on the 2-CPU test machine); until then TopbarPlus sits at
-  the first inset (0, the store's before any area), as on Roblox.
-- `StarterGui:SetCore("TopbarEnabled" / "ChatActive")` and
-  `GetCore("TopbarEnabled")` went to the CoreScripts' SetCore / GetCore
-  registry even when no CoreScript had registered the key, which swallowed
-  them (GetCore("TopbarEnabled") nil; TopbarPlus's IconController polls
-  it, and rustudio's own top bar never hid). Those two keys now fall
-  through to the engine when unregistered (domains/services.rs).
-
 ## Next (open, by how much they block real games)
 
 1. **Soft spot lights** (render): Studio spreads a SpotLight's light well
@@ -688,17 +371,14 @@ CoreScripts on, on a phone):
 4. ~~GuiService.MenuOpened / MenuClosed with an in-game Esc menu~~ (round 13).
 5. Gamepad input (GamepadConnected / Disconnected, gamepad KeyCodes).
 6. The rest of `missing_game_members_by_class` in the coverage report.
-7. ~~Message / Hint drew nothing~~ (place 2828's regen scripts show
-   "Regenerating …" with one): drawn as Studio 0.747's `Message::render2d` /
-   `Hint::render2d` do (MECHANICS.md, GUI).
-8. Model / BasePart `MakeJoints` is a no-op (Roblox makes Snap / Weld joints
-   from touching parts' SurfaceTypes); joints saved in a model still load as
-   instances.
-9. ~~Touch for games~~ (Android, docs/ANDROID.md "Fingers in Play"): on a
+7. ~~Touch for games~~ (Android, docs/ANDROID.md "Fingers in Play"): on a
    touch screen `UserInputService.TouchEnabled` / `TouchScreenEnabled` /
    `PreferredInput == Touch`, one InputObject per finger through
    `InputBegan / Changed / Ended` and `TouchStarted / Moved / Ended`,
-   ContextActionService `UserInputType.Touch` bindings, the input action
+   ContextActionService `UserInputType.Touch` bindings and the
+   touch-button CoreScript's feed (`BoundActionAdded / Removed / Changed`,
+   `GetActionButtonEvent`, `FireActionButtonFoundSignal`: ContextActionTouch
+   draws `createTouchButton` buttons when the CoreScripts run), the input action
    system's `TouchPosition / TouchDelta / TouchPinch` with `UIButton` /
    `UIModifier`, GuiObject `InputBegan(Touch)` / `TouchTap`, the gestures
    (`TouchTap`, `TouchTapInWorld`, `TouchLongPress`, `TouchPan`,

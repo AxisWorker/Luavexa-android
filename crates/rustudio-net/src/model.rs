@@ -906,7 +906,7 @@ fn to_variant(v: &PropValue, name: &str) -> Option<Variant> {
         PropValue::SharedString(bytes) | PropValue::CachedSharedString { bytes, .. } => {
             Variant::SharedString(rbx_types::SharedString::new(bytes.clone()))
         }
-        PropValue::Enum(e) | PropValue::EnumItem { value: e, .. } => Variant::Enum(rbx_types::Enum::from_u32(*e)),
+        PropValue::Enum(e) => Variant::Enum(rbx_types::Enum::from_u32(*e)),
         PropValue::Vector2([x, y]) => Variant::Vector2(rbx_types::Vector2::new(*x, *y)),
         PropValue::Vector3([x, y, z]) => Variant::Vector3(rbx_types::Vector3::new(*x, *y, *z)),
         PropValue::Color3([r, g, b]) => Variant::Color3(rbx_types::Color3::new(*r, *g, *b)),
@@ -1055,35 +1055,6 @@ mod tests {
         assert_eq!(m.dom.get_by_ref(lighting).unwrap().parent(), m.dom.root_ref());
         assert_eq!(m.dom.get_by_ref(lighting).unwrap().properties.get(&rbx_dom_weak::ustr("GlobalShadows")), Some(&Variant::Bool(true)));
         assert_eq!(m.dom.get_by_ref(m.reference(0x30).unwrap()).unwrap().parent(), rf);
-    }
-
-    /// The constructor names past the short list (a SpecialMesh left as
-    /// "Mesh" comes without a Name); an explicit Name still wins, and a
-    /// parked child gets the same treatment.
-    #[test]
-    fn default_names_apply_to_direct_and_parked_children() {
-        let mut m = LiveModel::new();
-        m.apply(RepOp::NewInstance { id: 1, class: "DataModel".into(), parent: None, props: vec![] });
-        // The mesh arrives before its part: parked, then attached under the part.
-        m.apply(RepOp::NewInstance { id: 3, class: "SpecialMesh".into(), parent: Some(2), props: vec![] });
-        m.apply(RepOp::NewInstance { id: 4, class: "StringValue".into(), parent: Some(2), props: vec![("Name".into(), PropValue::String("Named".into()))] });
-        m.apply(RepOp::NewInstance { id: 2, class: "Part".into(), parent: Some(1), props: vec![("Name".into(), PropValue::String("ring".into()))] });
-        m.apply(RepOp::NewInstance { id: 5, class: "WedgePart".into(), parent: Some(1), props: vec![] });
-        let part = m.reference(2).unwrap();
-        let kids: Vec<(String, String)> = m
-            .dom
-            .get_by_ref(part)
-            .unwrap()
-            .children()
-            .iter()
-            .map(|c| {
-                let i = m.dom.get_by_ref(*c).unwrap();
-                (i.class.to_string(), i.name.clone())
-            })
-            .collect();
-        assert_eq!(kids, vec![("SpecialMesh".to_string(), "Mesh".to_string()), ("StringValue".to_string(), "Named".to_string())]);
-        assert_eq!(m.dom.get_by_ref(m.reference(5).unwrap()).unwrap().name, "Wedge");
-        assert_eq!(m.parked_count(), 0);
     }
 
     #[test]
@@ -1371,5 +1342,36 @@ mod tests {
         assert_eq!(m.dom().get_by_ref(second).unwrap().class.as_str(), "ModuleScript");
         assert_eq!((m.server_id(first), m.server_id(second)), (None, None));
         assert!(m.lost_referent(first) && m.lost_referent(second));
+    }
+
+    /// The constructor names past the short list (a SpecialMesh left as
+    /// "Mesh" comes without a Name); an explicit Name still wins, and a
+    /// parked child gets the same treatment.
+    #[test]
+    fn default_names_apply_to_direct_and_parked_children() {
+        let mut m = LiveModel::new();
+        m.apply(RepOp::NewInstance { id: 1, class: "DataModel".into(), parent: None, props: vec![] });
+        // The mesh arrives before its part: parked, then attached under the part.
+        m.apply(RepOp::NewInstance { id: 3, class: "SpecialMesh".into(), parent: Some(2), props: vec![] });
+        m.apply(RepOp::NewInstance { id: 4, class: "StringValue".into(), parent: Some(2), props: vec![("Name".into(), PropValue::String("Named".into()))] });
+        assert_eq!(m.parked_count(), 2);
+        assert_eq!(m.parked_sample(1).len(), 1);
+        m.apply(RepOp::NewInstance { id: 2, class: "Part".into(), parent: Some(1), props: vec![("Name".into(), PropValue::String("ring".into()))] });
+        m.apply(RepOp::NewInstance { id: 5, class: "WedgePart".into(), parent: Some(1), props: vec![] });
+        let part = m.reference(2).unwrap();
+        let kids: Vec<(String, String)> = m
+            .dom()
+            .get_by_ref(part)
+            .unwrap()
+            .children()
+            .iter()
+            .map(|c| {
+                let i = m.dom().get_by_ref(*c).unwrap();
+                (i.class.to_string(), i.name.clone())
+            })
+            .collect();
+        assert_eq!(kids, vec![("SpecialMesh".to_string(), "Mesh".to_string()), ("StringValue".to_string(), "Named".to_string())]);
+        assert_eq!(m.dom().get_by_ref(m.reference(5).unwrap()).unwrap().name, "Wedge");
+        assert_eq!(m.parked_count(), 0);
     }
 }

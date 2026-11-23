@@ -4,6 +4,7 @@ local create, fire = ...
 local M = __rs_lua_methods
 -- The running thread's identity (src/security.rs; the global goes after load).
 local rs_identity = __rs_identity
+local rs_call_action = __rs_call_action
 
 -- Studio's micro-profiler markers (no profiler here). Their stack lives
 -- for one resumption of a thread (__rs_profile: +1 / -1, false when there
@@ -70,12 +71,8 @@ local LuaSignal = {}
 LuaSignal.__index = LuaSignal
 -- A userdata like the engine's signals (typeof "RBXScriptSignal").
 function LuaSignal.new() return __rs_make_signal({ handlers = {} }, LuaSignal) end
--- A handler runs at the identity of the thread that connected it, as the
--- engine's signals do (a CoreScript's handler on UserGameSettings.Changed
--- keeps its capabilities whoever changes the setting).
-local sig_identity, sig_spawn_as = __rs_identity, __rs_spawn_as
 function LuaSignal:Connect(fn)
-    local c = { Connected = true, fn = fn, ident = sig_identity() }
+    local c = { Connected = true, fn = fn }
     local list = self.handlers
     function c.Disconnect() c.Connected = false; local i = table.find(list, c); if i then table.remove(list, i) end end
     c.disconnect = c.Disconnect
@@ -95,7 +92,7 @@ function LuaSignal:Wait()
 end
 function LuaSignal:Fire(...)
     for _, c in table.clone(self.handlers) do
-        if c.Connected then sig_spawn_as(c.ident, c.fn, ...) end
+        if c.Connected then task.spawn(c.fn, ...) end
     end
 end
 
@@ -106,77 +103,72 @@ end
 -- character with the camera).
 local ugs_values = {
     MouseSensitivity = 0.52,
+    MouseSensitivityFirstPerson = Vector2.new(1, 1),
+    MouseSensitivityThirdPerson = Vector2.new(1, 1),
     ComputerCameraMovementMode = Enum.ComputerCameraMovementMode.Default,
     ComputerMovementMode = Enum.ComputerMovementMode.Default,
     TouchCameraMovementMode = Enum.TouchCameraMovementMode.Default,
     TouchMovementMode = Enum.TouchMovementMode.Default,
     ControlMode = Enum.ControlMode.MouseLockSwitch,
     RotationType = Enum.RotationType.MovementRelative,
-    SavedQualityLevel = Enum.SavedQualitySetting.Automatic,
+    SavedQualityLevel = Enum.SavedQualitySetting.QualityLevel10,
+    GraphicsQualityLevel = 0,
+    QualityResetLevel = 0,
+    FramerateCap = 0,
     MasterVolume = 1,
+    MasterVolumeStudio = 1,
+    PartyVoiceVolume = 1,
+    VoiceChatVolume = 1,
     Fullscreen = false,
     GamepadCameraSensitivity = 0.2,
     CameraYInverted = false,
-    VRSmoothRotationEnabled = false,
-    VignetteEnabled = true,
-    HasEverUsedVR = false,
-    ChatVisible = true,
-    PlayerHeight = 5,
-    -- The settings only the CoreScripts read and write (RobloxScriptSecurity
-    -- in the API dump), at a fresh install's values (estimates; transparency
-    -- 1 and Medium text are GuiService's documented defaults).
-    PreferredTransparency = 1,
-    -- (the per-axis sensitivities start at MouseSensitivity's 0.52: estimate)
-    MouseSensitivityFirstPerson = Vector2.new(0.52, 0.52),
-    MouseSensitivityThirdPerson = Vector2.new(0.52, 0.52),
-    PreferredTextSize = Enum.PreferredTextSize.Medium,
-    StudioPreferredTextSize = Enum.PreferredTextSize.Medium,
-    ReducedMotion = false,
-    ReadAloud = false,
-    BadgeVisible = true,
-    PlayerListVisible = true,
-    PlayerNamesEnabled = true,
-    PerformanceStatsVisible = false,
-    OnScreenProfilerEnabled = false,
-    MicroProfilerWebServerEnabled = false,
-    MicroProfilerWebServerIP = "",
-    MicroProfilerWebServerPort = 0,
-    StartMaximized = false,
-    StartScreenPosition = Vector2.zero,
-    StartScreenSize = Vector2.zero,
-    CameraMode = Enum.CustomCameraMode.Default,
-    PeoplePageLayout = Enum.PeoplePageLayout.Card,
-    UIScaleMultiplierHundredths = 100,
-    UiNavigationKeyBindEnabled = true,
-    GraphicsQualityLevel = 0,
-    GraphicsOptimizationMode = Enum.GraphicsOptimizationMode.Balanced,
-    MaxQualityEnabled = false,
-    QualityResetLevel = 0,
-    FramerateCap = 0,
-    HapticStrength = 1,
-    PartyVoiceVolume = 1,
-    VoiceChatVolume = 1,
-    MasterVolumeStudio = 1,
-    ChatTranslationEnabled = false,
-    ChatTranslationToggleEnabled = false,
-    ChatTranslationFTUXShown = false,
-    ChatTranslationLocale = "",
-    DefaultCameraID = "",
-    OnboardingsCompleted = "",
     IsUsingCameraYInverted = false,
     IsUsingGamepadCameraSensitivity = false,
-    AllTutorialsDisabled = false,
-    UsedCoreGuiIsVisibleToggle = false,
-    UsedCustomGuiIsVisibleToggle = false,
-    UsedHideHudShortcut = false,
     VREnabled = false,
-    VRComfortSetting = Enum.VRComfortSetting.Comfort,
-    VRSafetyBubbleMode = Enum.VRSafetyBubbleMode.NoOne,
-    VRRotationIntensity = 1,
+    VRSmoothRotationEnabled = false,
     VRSmoothRotationEnabledCustomOption = false,
     VRThirdPersonFollowCamEnabled = false,
     VRThirdPersonFollowCamEnabledCustomOption = false,
+    VRRotationIntensity = 1,
+    VignetteEnabled = true,
     VignetteEnabledCustomOption = true,
+    HasEverUsedVR = false,
+    ChatVisible = true,
+    PlayerListVisible = true,
+    PerformanceStatsVisible = false,
+    BadgeVisible = true,
+    AllTutorialsDisabled = false,
+    ChatTranslationEnabled = true,
+    ChatTranslationFTUXShown = false,
+    ChatTranslationToggleEnabled = true,
+    ChatTranslationLocale = "en-us",
+    DefaultCameraID = "",
+    HapticStrength = 0,
+    MaxQualityEnabled = false,
+    MicroProfilerWebServerEnabled = false,
+    MicroProfilerWebServerIP = "",
+    MicroProfilerWebServerPort = 0,
+    OnScreenProfilerEnabled = false,
+    OnboardingsCompleted = "",
+    PlayerHeight = 5,
+    PlayerNamesEnabled = true,
+    PreferredTextSize = Enum.PreferredTextSize.Medium,
+    StudioPreferredTextSize = Enum.PreferredTextSize.Medium,
+    PeoplePageLayout = (function()
+        local ok, v = pcall(function() return Enum.PeoplePageLayout.Card end)
+        return ok and v or nil
+    end)(),
+    PreferredTransparency = 1,
+    ReadAloud = false,
+    ReducedMotion = false,
+    StartMaximized = false,
+    StartScreenPosition = Vector2.zero,
+    StartScreenSize = Vector2.new(1280, 720),
+    UIScaleMultiplierHundredths = 100,
+    UiNavigationKeyBindEnabled = true,
+    UsedCoreGuiIsVisibleToggle = false,
+    UsedCustomGuiIsVisibleToggle = false,
+    UsedHideHudShortcut = false,
 }
 -- Studio's are Instances: a
 -- UserSettings named "GlobalBasicSettings" holding the UserGameSettings;
@@ -358,23 +350,26 @@ end
 function M.TweenPosition(self, pos, dir, style, t, override, cb)
     return gui_tween(self, { Position = pos }, dir, style, t, override, cb)
 end
+M.TweenPositionInternal = M.TweenPosition
 function M.TweenSize(self, size, dir, style, t, override, cb)
     return gui_tween(self, { Size = size }, dir, style, t, override, cb)
 end
+M.TweenSizeInternal = M.TweenSize
 function M.TweenSizeAndPosition(self, size, pos, dir, style, t, override, cb)
     return gui_tween(self, { Size = size, Position = pos }, dir, style, t, override, cb)
 end
--- The CoreScripts' own copies (RobloxScriptSecurity, same parameters): the
--- same tweens, kept apart from a game's in Roblox (estimate: one tween per
--- object here).
-M.TweenPositionInternal = M.TweenPosition
-M.TweenSizeInternal = M.TweenSize
 M.TweenSizeAndPositionInternal = M.TweenSizeAndPosition
 
--- Humanoid:GetLimb(part) → Enum.Limb (R6 names), GetBodyPartR15(part) →
+-- Humanoid:GetLimb(part) → Enum.Limb (R6 and R15 names), GetBodyPartR15(part) →
 -- Enum.BodyPartR15, GetMoveVelocity() = MoveDirection × WalkSpeed.
-local limbs = { Head = "Head", Torso = "Torso", ["Left Arm"] = "LeftArm", ["Right Arm"] = "RightArm",
-    ["Left Leg"] = "LeftLeg", ["Right Leg"] = "RightLeg" }
+local limbs = {
+    Head = "Head",
+    Torso = "Torso", UpperTorso = "Torso", LowerTorso = "Torso",
+    ["Left Arm"] = "LeftArm", LeftUpperArm = "LeftArm", LeftLowerArm = "LeftArm", LeftHand = "LeftArm",
+    ["Right Arm"] = "RightArm", RightUpperArm = "RightArm", RightLowerArm = "RightArm", RightHand = "RightArm",
+    ["Left Leg"] = "LeftLeg", LeftUpperLeg = "LeftLeg", LeftLowerLeg = "LeftLeg", LeftFoot = "LeftLeg",
+    ["Right Leg"] = "RightLeg", RightUpperLeg = "RightLeg", RightLowerLeg = "RightLeg", RightFoot = "RightLeg",
+}
 function M.GetLimb(self, part)
     return Enum.Limb[limbs[part and part.Name or ""] or "Unknown"]
 end
@@ -538,12 +533,22 @@ local function marker_frames(curve)
     return frames
 end
 local function parse_curve(clip)
-    local joints, frames, length = {}, {}, 0
+    local joints, frames, facs, length = {}, {}, {}, 0
     for _, folder in clip:GetDescendants() do
         if folder:IsA("MarkerCurve") then
             for _, frame in marker_frames(folder) do
                 table.insert(frames, frame)
                 length = math.max(length, frame.t)
+            end
+        elseif folder:IsA("Folder") and folder.Name == "FaceControls" then
+            for _, channel in folder:GetChildren() do
+                if channel:IsA("FloatCurve") then
+                    local keys = curve_keys(channel)
+                    if #keys > 0 then
+                        length = math.max(length, keys[#keys].t)
+                        facs[channel.Name] = keys
+                    end
+                end
             end
         elseif folder:IsA("Folder") then
             local channels = {}
@@ -568,7 +573,12 @@ local function parse_curve(clip)
                         order = channel:IsA("EulerRotationCurve") and channel.RotationOrder or nil}
                 end
             end
-            if next(channels) then joints[folder.Name] = {curves = channels} end
+            if next(channels) then
+                local parent = if folder.Parent:IsA("Folder") then folder.Parent.Name else ""
+                local children = joints[parent] or {}
+                children[folder.Name] = {curves = channels}
+                joints[parent] = children
+            end
         end
     end
     -- Studio 0.744 names a curve clip's end "End": Laser Tag's Equip and
@@ -576,15 +586,16 @@ local function parse_curve(clip)
     -- as they finish, before Stopped; KeyframeSequences don't.
     if length > 0 then table.insert(frames, {t = length, name = "End", markers = {}}) end
     table.sort(frames, function(a,b) return a.t < b.t end)
-    return {joints = joints, frames = frames, length = length, loop = clip.Loop, priority = clip.Priority, curve = true}
+    return {joints = joints, frames = frames, facs = facs, length = length, loop = clip.Loop, priority = clip.Priority, curve = true}
 end
 
 local function parse_sequence(kfs)
     if kfs:IsA("CurveAnimation") then return parse_curve(kfs) end
-    -- Every Pose with Weight > 0 under each Keyframe (by joint name, in tree
-    -- order) and each Keyframe's markers, read natively (__rs_kfs_parts).
+    -- Native extraction keeps each Pose under its parent Pose name.
     local joints, frames, length = __rs_kfs_parts(kfs)
-    for _, list in joints do table.sort(list, function(x, y) return x.t < y.t end) end
+    for _, children in joints do
+        for _, list in children do table.sort(list, function(x, y) return x.t < y.t end) end
+    end
     table.sort(frames, function(x, y) return x.t < y.t end)
     return { joints = joints, frames = frames, length = length, loop = kfs.Loop, priority = kfs.Priority }
 end
@@ -594,17 +605,16 @@ end
 local function load_sequence(id)
     if sequences[id] ~= nil then return sequences[id] or nil end
     local kfs = registered[id]
-    if not kfs and not string.find(id, "rbxtemp", 1, true) then
-        local n = tonumber(string.match(id, "(%d+)%s*$"))
+    local temporary = string.find(id, "rbxtemp", 1, true)
+    local n = tonumber(string.match(id, "(%d+)%s*$"))
+    if not kfs and not temporary then
         if n then
             local state = __rs_asset_ready(n)
             if state == false then return nil, true end
             if state == true then
                 -- Decoded natively (anim domain): Studio's Animator loads its
-                -- clips on either side, without InsertService. The decode
-                -- runs on a worker: nil, true until it is done.
-                local ok, model, decoding = pcall(__rs_anim_asset, n)
-                if ok and decoding then return nil, true end
+                -- clips on either side, without InsertService.
+                local ok, model = pcall(__rs_anim_asset, n)
                 if ok and model then
                     kfs = model:FindFirstChildWhichIsA("KeyframeSequence", true)
                         or model:FindFirstChildWhichIsA("CurveAnimation", true)
@@ -621,8 +631,14 @@ local function load_sequence(id)
     -- the signed-in account's, or no such asset): the track then never
     -- plays and never fires Stopped, and the game waits on it — LBG's
     -- cutscenes end at the camera rig clip's Stopped.
-    if not seq and not string.find(id, "rbxtemp", 1, true) then
-        warn("Failed to load animation - sanitized ID: " .. tostring(id))
+    if not seq and not temporary then
+        if n then
+            warn("Failed to load animation with sanitized ID rbxassetid://" .. n
+                .. ": Animation failed to load, assetId: https://assetdelivery.roblox.com/v1/asset?id="
+                .. n .. "&serverplaceid=" .. game.PlaceId)
+        else
+            warn("Failed to load animation - sanitized ID: " .. tostring(id))
+        end
     end
     return seq or nil
 end
@@ -788,7 +804,17 @@ M.GetProductInfoAsync = product_info
 -- and box queries with a CollisionGroup skip those groups.
 local function group_list() return __rs_cg("list") end
 function M.RegisterCollisionGroup(self, name) __rs_cg("register", tostring(name)) end
-M.CreateCollisionGroup = M.RegisterCollisionGroup
+local collisionGroupWarnings = {}
+local function collisionGroupWarning(method, replacement)
+    if collisionGroupWarnings[method] then return end
+    collisionGroupWarnings[method] = true
+    warn(method .. " is deprecated, please use " .. replacement
+        .. " instead. More info: https://devforum.roblox.com/t/updates-to-collision-groups/1990215")
+end
+function M.CreateCollisionGroup(self, name)
+    collisionGroupWarning("CreateCollisionGroup", "RegisterCollisionGroup")
+    return __rs_cg("register", tostring(name))
+end
 function M.UnregisterCollisionGroup(self, name) __rs_cg("unregister", tostring(name)) end
 M.RemoveCollisionGroup = M.UnregisterCollisionGroup
 function M.RenameCollisionGroup(self, from, to) __rs_cg("rename", tostring(from), tostring(to)) end
@@ -808,10 +834,19 @@ M.GetCollisionGroups = function(self)
     return out
 end
 function M.GetCollisionGroupId(self, name) return __rs_cg("id", tostring(name)) end
-function M.SetPartCollisionGroup(self, part, name) part.CollisionGroup = name end
+function M.SetPartCollisionGroup(self, part, name)
+    collisionGroupWarning("SetPartCollisionGroup", "BasePart.CollisionGroup")
+    part.CollisionGroup = name
+end
 -- Roblox allows 32 collision groups (Default included).
 function M.GetMaxCollisionGroups(self) return 32 end
-function M.GetCollisionGroupName(self, id) return __rs_cg("name", tostring(math.floor(tonumber(id) or -1))) end
+function M.GetCollisionGroupName(self, id)
+    if not collisionGroupWarnings.GetCollisionGroupName then
+        collisionGroupWarnings.GetCollisionGroupName = true
+        warn("GetCollisionGroupName is deprecated. More info: https://devforum.roblox.com/t/updates-to-collision-groups/1990215")
+    end
+    return __rs_cg("name", tostring(math.floor(tonumber(id) or -1)))
+end
 function M.CollisionGroupContainsPart(self, name, part)
     return part.CollisionGroup == name
 end
@@ -844,70 +879,110 @@ local function action_matches(k, input)
     end
     return false
 end
--- An action runs at the identity of the thread that bound it, as signal
--- handlers do (the menu's Escape, a CoreScript's, reads
--- GuiService.SelectedCoreObject, RobloxScript).
-local function bind(name, fn, touch, priority, ...)
+local core_actions = {}
+-- An action's info table (GetBoundActionInfo; the touch-button CoreScript's
+-- functionInfoTable): its title / image / description / position too once
+-- SetTitle… gave them.
+local function action_info(a)
+    return {
+        inputTypes = a.inputs, priorityLevel = a.priority, stackOrder = a.seq, createTouchButton = a.touch == true,
+        title = a.title, image = a.image, description = a.description, position = a.position,
+    }
+end
+-- The touch-button CoreScript (ContextActionTouch, which StarterScript runs
+-- on a touch screen) draws a button in PlayerGui.ContextActionGui for each
+-- action bound with createTouchButton, from these RobloxScriptSecurity
+-- events: BoundActionAdded(name, createTouchButton, info, isCore),
+-- BoundActionRemoved(name, info, isCore), BoundActionChanged(name, field,
+-- { [field] = value }); GetButton asks it with GetActionButtonEvent(name)
+-- and it answers with FireActionButtonFoundSignal(name, button).
+local function cas_fire(...) fire(game:GetService("ContextActionService"), ...) end
+local action_buttons = {}
+local function bind_in(tbl, name, fn, touch, priority, ...)
+    if tbl[name] then cas_fire("BoundActionRemoved", name, action_info(tbl[name]), tbl == core_actions) end
     action_seq += 1
-    actions[name] = { name = name, fn = fn, inputs = { ... }, priority = priority, seq = action_seq, touch = touch, ident = sig_identity() }
+    tbl[name] = { fn = fn, inputs = { ... }, priority = priority, seq = action_seq, touch = touch, ident = rs_identity() }
+    action_buttons[name] = nil
+    cas_fire("BoundActionAdded", name, touch == true, action_info(tbl[name]), tbl == core_actions)
 end
--- One action's handler at its binder's identity: (ok, result). One that
--- yields has no result yet: nil, which sinks the input (estimate: Roblox
--- documents a handler returning nothing as Sink, not one that yields).
-local function call_action(a, state, input)
-    local out
-    sig_spawn_as(a.ident, function()
-        out = table.pack(pcall(a.fn, a.name, state, input))
-    end)
-    if not out then return true, nil end
-    return out[1], out[2]
+local function unbind_in(tbl, name)
+    local a = tbl[name]
+    if not a then return end
+    tbl[name] = nil
+    action_buttons[name] = nil
+    cas_fire("BoundActionRemoved", name, action_info(a), tbl == core_actions)
 end
--- The CoreScripts' own actions (BindCoreAction, RobloxScriptSecurity): a
--- stack of their own ahead of every game action, so the menu's Escape and
--- the chat's "/" reach them first (estimate: Roblox documents only that core
--- bindings exist). Kept under a key games can't name.
-local CORE = "\0core:"
-function M.BindCoreAction(self, name, fn, touch, ...)
-    bind(name, fn, touch, Enum.ContextActionPriority.Medium.Value, ...)
-    actions[CORE .. name], actions[name] = actions[name], nil
-    actions[CORE .. name].core = true
+local function bind(name, fn, touch, priority, ...)
+    bind_in(actions, name, fn, touch, priority, ...)
 end
-function M.BindCoreActionAtPriority(self, name, fn, touch, priority, ...)
-    bind(name, fn, touch, tonumber(priority) or Enum.ContextActionPriority.Medium.Value, ...)
-    actions[CORE .. name], actions[name] = actions[name], nil
-    actions[CORE .. name].core = true
-end
-function M.UnbindCoreAction(self, name) actions[CORE .. tostring(name)] = nil end
 function M.BindAction(self, name, fn, touch, ...)
     bind(name, fn, touch, Enum.ContextActionPriority.Medium.Value, ...)
 end
 function M.BindActionAtPriority(self, name, fn, touch, priority, ...)
     bind(name, fn, touch, tonumber(priority) or Enum.ContextActionPriority.Medium.Value, ...)
 end
-function M.UnbindAction(self, name) actions[name] = nil end
-function M.UnbindAllActions(self) table.clear(actions) end
+function M.UnbindAction(self, name) unbind_in(actions, name) end
+function M.UnbindAllActions(self)
+    for name in actions do unbind_in(actions, name) end
+end
+function M.BindCoreAction(self, name, fn, touch, ...)
+    bind_in(core_actions, name, fn, touch, Enum.ContextActionPriority.Medium.Value, ...)
+end
+function M.BindCoreActionAtPriority(self, name, fn, touch, priority, ...)
+    bind_in(core_actions, name, fn, touch, tonumber(priority) or Enum.ContextActionPriority.Medium.Value, ...)
+end
+function M.UnbindCoreAction(self, name) unbind_in(core_actions, name) end
+function M.GetBoundCoreActionInfo(self, name)
+    local a = core_actions[name]
+    if not a then return {} end
+    return action_info(a)
+end
+function M.GetAllBoundCoreActionInfo(self)
+    local out = {}
+    for name in core_actions do out[name] = M.GetBoundCoreActionInfo(self, name) end
+    return out
+end
 function M.GetBoundActionInfo(self, name)
     local a = actions[name]
     if not a then return {} end
-    return { inputTypes = a.inputs, priorityLevel = a.priority, stackOrder = a.seq, createTouchButton = a.touch == true }
+    return action_info(a)
 end
 function M.GetAllBoundActionInfo(self)
     local out = {}
-    for name, a in actions do
-        if not a.core then out[name] = M.GetBoundActionInfo(self, name) end
-    end
+    for name in actions do out[name] = M.GetBoundActionInfo(self, name) end
     return out
 end
-function M.GetBoundCoreActionInfo(self, name) return M.GetBoundActionInfo(self, CORE .. tostring(name)) end
-function M.GetAllBoundCoreActionInfo(self)
-    local out = {}
-    for _, a in actions do
-        if a.core then out[a.name] = M.GetBoundActionInfo(self, CORE .. a.name) end
+-- The action's touch button, from the CoreScript (nil when it has none: no
+-- createTouchButton, no touch screen, or the CoreScripts not running). Roblox
+-- yields for the answer; here two frames, the signal drains between.
+function M.GetButton(self, name)
+    local a = actions[name] or core_actions[name]
+    if not a or a.touch ~= true then return nil end
+    if action_buttons[name] == nil then
+        cas_fire("GetActionButtonEvent", name)
+        for _ = 1, 2 do
+            if action_buttons[name] ~= nil then break end
+            task.wait()
+        end
     end
-    return out
+    local b = action_buttons[name]
+    if b == false then return nil end
+    return b
 end
-function M.GetButton() return nil end
-for _, n in { "SetTitle", "SetDescription", "SetImage", "SetPosition", "BindActivate", "UnbindActivate", "BindCoreActivate", "UnbindCoreActivate" } do
+function M.FireActionButtonFoundSignal(self, name, button)
+    action_buttons[name] = button or false
+end
+-- SetTitle / SetImage / SetDescription / SetPosition: kept on the action and
+-- told to the touch-button CoreScript (an empty string or nil clears).
+for field, method in { title = "SetTitle", image = "SetImage", description = "SetDescription", position = "SetPosition" } do
+    M[method] = function(self, name, value)
+        local a = actions[name] or core_actions[name]
+        if not a then return end
+        a[field] = value
+        cas_fire("BoundActionChanged", name, field, { [field] = value })
+    end
+end
+for _, n in { "BindActivate", "UnbindActivate" } do
     M[n] = function() end
 end
 
@@ -917,16 +992,20 @@ local function run_actions(input, state)
     local list
     if state == Enum.UserInputState.Begin or not took[input] then
         list = {}
-        for name, a in actions do
-            for _, k in a.inputs do
-                if action_matches(k, input) then
-                    table.insert(list, { name = name, a = a })
-                    break
+        local function collect(tbl, core_rank)
+            for name, a in tbl do
+                for _, k in a.inputs do
+                    if action_matches(k, input) then
+                        table.insert(list, { name = name, a = a, tbl = tbl, core = core_rank })
+                        break
+                    end
                 end
             end
         end
+        collect(core_actions, 1)
+        collect(actions, 0)
         table.sort(list, function(x, y)
-            if (x.a.core == true) ~= (y.a.core == true) then return x.a.core == true end
+            if x.core ~= y.core then return x.core > y.core end
             if x.a.priority ~= y.a.priority then return x.a.priority > y.a.priority end
             return x.a.seq > y.a.seq
         end)
@@ -935,8 +1014,8 @@ local function run_actions(input, state)
     end
     local got, sunk = {}, false
     for _, e in list do
-        if actions[e.name] == e.a then
-            local ok, r = call_action(e.a, state, input)
+        if e.tbl[e.name] == e.a then
+            local ok, r = rs_call_action(e.a.ident, e.a.fn, e.name, state, input)
             if not ok then
                 task.spawn(error, r, 0)
             end
@@ -1022,11 +1101,8 @@ local mouse_delta = Vector2.zero
 -- (TouchEnabled), Keyboard on a computer. The PlayerModule's ControlModule
 -- reads it once, as it starts, to pick its controls: Touch gets the
 -- thumbstick and TouchGui's JumpButton before a finger has landed, and
--- games look for that JumpButton when they build their own touch buttons
--- (LBG's ClientRenderer `SetSettings`, sent when the player joins: with
--- Keyboard here, no JumpButton existed until the first finger, so the
--- game's Dash / M1 / Block buttons only came with the next spawn's
--- re-send). Decided on first use: the library loads before the DataModel.
+-- games look for that JumpButton when they build their own touch buttons.
+-- Decided on first use: the library loads before the DataModel.
 local last_input_type = nil
 local function last_input()
     if last_input_type == nil then
@@ -1159,7 +1235,21 @@ function M.GetSupportedGamepadKeyCodes() return {} end
 function M.IsGamepadButtonDown() return false end
 function M.GamepadSupports() return false end
 function M.IsNavigationGamepad() return false end
-function M.GetStringForKeyCode(self, k) return typeof(k) == "EnumItem" and k.Name or "" end
+local KEYPAD_STRINGS = {
+    [256] = "0", [257] = "1", [258] = "2", [259] = "3", [260] = "4",
+    [261] = "5", [262] = "6", [263] = "7", [264] = "8", [265] = "9",
+    [266] = ".", [267] = "/", [268] = "*", [269] = "-", [270] = "+", [272] = "=",
+}
+function M.GetStringForKeyCode(self, k)
+    if typeof(k) ~= "EnumItem" or k.EnumType ~= Enum.KeyCode then return "" end
+    local v = k.Value
+    if v >= 32 and v <= 126 then
+        local ch = string.char(v)
+        if v >= 97 and v <= 122 then return string.upper(ch) end
+        return ch
+    end
+    return KEYPAD_STRINGS[v] or ""
+end
 function M.GetImageForKeyCode() return "" end
 -- The device's motion sensors (src/device_sensors.rs; Android's): one
 -- InputObject each, as Roblox's (UserInputType Accelerometer / Gyro;
@@ -1249,18 +1339,38 @@ function M.GetGuiInset()
 end
 function M.GetEmotesMenuOpen() return false end
 function M.GetInspectMenuEnabled() return false end
--- PlayerScripts: the camera / movement mode lists the PlayerModule
--- registers and the settings menu (a CoreScript) reads back with
--- GetRegistered* (RobloxScriptSecurity). One list per kind per DataModel.
-local registered_modes = {}
-for _, kind in { "TouchCameraMovementMode", "ComputerCameraMovementMode", "TouchMovementMode", "ComputerMovementMode" } do
-    registered_modes[kind] = {}
-    M["Register" .. kind] = function(self, mode)
-        if not table.find(registered_modes[kind], mode) then table.insert(registered_modes[kind], mode) end
+-- PlayerScripts: the camera / movement mode lists shown in the settings menu.
+__rs_ps_modes = {
+    ComputerCamera = {},
+    ComputerMovement = {},
+    TouchCamera = {},
+    TouchMovement = {},
+}
+local function reg_ps_mode(self, bucket, event_name, mode)
+    if mode == nil then return end
+    local list = __rs_ps_modes[bucket]
+    for _, v in ipairs(list) do
+        if v == mode then return end
     end
-    M["Clear" .. kind .. "s"] = function() table.clear(registered_modes[kind]) end
-    M["GetRegistered" .. kind .. "s"] = function() return table.clone(registered_modes[kind]) end
+    table.insert(list, mode)
+    fire(self, event_name, mode)
 end
+function M.RegisterComputerCameraMovementMode(self, mode)
+    reg_ps_mode(self, "ComputerCamera", "ComputerCameraMovementModeRegistered", mode)
+end
+function M.RegisterComputerMovementMode(self, mode)
+    reg_ps_mode(self, "ComputerMovement", "ComputerMovementModeRegistered", mode)
+end
+function M.RegisterTouchCameraMovementMode(self, mode)
+    reg_ps_mode(self, "TouchCamera", "TouchCameraMovementModeRegistered", mode)
+end
+function M.RegisterTouchMovementMode(self, mode)
+    reg_ps_mode(self, "TouchMovement", "TouchMovementModeRegistered", mode)
+end
+function M.ClearComputerCameraMovementModes() table.clear(__rs_ps_modes.ComputerCamera) end
+function M.ClearComputerMovementModes() table.clear(__rs_ps_modes.ComputerMovement) end
+function M.ClearTouchCameraMovementModes() table.clear(__rs_ps_modes.TouchCamera) end
+function M.ClearTouchMovementModes() table.clear(__rs_ps_modes.TouchMovement) end
 
 -------------------------------------------------------------------- Camera
 -- Rays and projections from the camera's CFrame, FieldOfView (vertical) and
@@ -1421,9 +1531,6 @@ function M.SetSharedTable(self, name, t) shared_tables[name] = t end
 ---------------------------------------------------------------- RunService
 -- Bound functions run every frame in priority order (lowest first), before
 -- RenderStepped's own connections; one that yields doesn't hold up the rest.
--- Each runs at the identity of the script that bound it (a CoreScript's
--- bind keeps its capabilities whoever bound first).
-local rs_identity, rs_spawn_as = __rs_identity, __rs_spawn_as
 local render_steps, render_order, render_conn = {}, {}, nil
 local function render_sort()
     render_order = {}
@@ -1434,12 +1541,19 @@ local render_seq = 0
 function M.BindToRenderStep(self, name, priority, fn)
     render_seq += 1
     local p = if typeof(priority) == "EnumItem" then priority.Value else tonumber(priority)
-    render_steps[name] = { p = p or 0, n = render_seq, fn = fn, ident = rs_identity() }
+    local ident = if __rs_get_identity then __rs_get_identity() else 2
+    render_steps[name] = { p = p or 0, n = render_seq, fn = fn, ident = ident }
     render_sort()
     if not render_conn then
         render_conn = self.RenderStepped:Connect(function(dt)
             for _, e in render_order do
-                if render_steps[e.name] and render_steps[e.name].fn == e.fn then rs_spawn_as(e.ident, e.fn, dt) end
+                if render_steps[e.name] and render_steps[e.name].fn == e.fn then
+                    if __rs_spawn_with_identity then
+                        __rs_spawn_with_identity(e.name, e.ident, e.fn, dt)
+                    else
+                        task.spawn(e.fn, dt)
+                    end
+                end
             end
         end)
     end
@@ -1480,12 +1594,18 @@ function __rs_seat(humanoid, seat, root)
             y = y + seat_att(leg, "LeftHipRigAttachment").Z - leg.Size.Z * 0.5
         end
     end
+    local c0 = CFrame.new(0, seat.Size.Y * 0.5, 0) * turn
+    local c1 = CFrame.new(0, y, 0) * turn
+    -- Move the character's root to the seat first (CFrame write carries the
+    -- welded character assembly once) so activating SeatWeld does not pull
+    -- an unanchored vehicle toward the character's old position.
+    root.CFrame = seat.CFrame * c0 * c1:Inverse()
     local w = Instance.new("Weld")
     w.Name = "SeatWeld"
     w.Part0 = seat
     w.Part1 = root
-    w.C0 = CFrame.new(0, seat.Size.Y * 0.5, 0) * turn
-    w.C1 = CFrame.new(0, y, 0) * turn
+    w.C0 = c0
+    w.C1 = c1
     w.Parent = seat
     __rs_set_raw(seat, "Occupant", humanoid)
     __rs_set_raw(humanoid, "SeatPart", seat)
@@ -1497,6 +1617,12 @@ function __rs_unseat(humanoid, seat)
             if w.Name == "SeatWeld" and w:IsA("Weld") then w:Destroy() end
         end
         if seat.Occupant == humanoid then __rs_set_raw(seat, "Occupant", nil) end
+        if seat:IsA("VehicleSeat") then
+            seat.Throttle = 0
+            seat.ThrottleFloat = 0
+            seat.Steer = 0
+            seat.SteerFloat = 0
+        end
     end
     __rs_set_raw(humanoid, "SeatPart", nil)
     humanoid.Sit = false

@@ -1086,14 +1086,11 @@ pub fn build_grid(
         (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
         _ => false,
     };
-    // (a turned sun keeps the kept build: skylight and occupancy don't
-    // depend on it, only the sun channel is swept again below)
     let kept = kept.filter(|(st, _, l)| {
-        st.origin == origin && st.shadows == shadows && same_terrain(&st.terrain) && l.origin == origin
+        st.origin == origin && st.shadows == shadows && st.sun == sun_bits && same_terrain(&st.terrain) && l.origin == origin
             && std::env::var_os("RUSTUDIO_LIGHTGRID_FULL").is_none()
     });
     if let Some((mut state, occ, mut locals)) = kept {
-        let sun_turned = state.sun != sun_bits;
         // The chunks a part that came, went or changed touches.
         let c = mech::LIGHTGRID_CHUNKS;
         let mut dirty = vec![false; c[0] * c[1] * c[2]];
@@ -1173,20 +1170,7 @@ pub fn build_grid(
         state.prims = table;
         let mut touched = None;
         skylight_update(&occ, &changed, &mut state.data, &mut state.sky_leave, &mut touched);
-        if shadows && sun_turned {
-            // The whole sun channel for the new sun (as a build from scratch
-            // over these voxels: no direction leaves it 255).
-            let mut grid = LightGrid { origin, data: std::mem::take(&mut state.data), local: Vec::new() };
-            if sun_params(sun).is_some() {
-                sunlight_leaving(&occ, &mut grid, sun, Some(&mut state.sun_leave));
-            } else {
-                grid.data.iter_mut().skip(1).step_by(2).for_each(|b| *b = 255);
-                state.sun_leave.fill(255);
-            }
-            state.data = grid.data;
-            state.sun = sun_bits;
-            touched = Some(([0; 3], [nx - 1, ny - 1, nz - 1]));
-        } else if shadows {
+        if shadows {
             sunlight_update(&occ, &changed, sun, &mut state.data, &mut state.sun_leave, &mut touched);
         }
         let patches = locals.refresh_occupancy(&occ, &changed_boxes);
@@ -1427,22 +1411,14 @@ mod tests {
         let mut local = first.grid.local.clone();
         let mut shown_grid = first.grid.data.clone();
         let mut kept = Some((first.state, first.occ, first.locals));
-        // (the sun turns at step 2 and again, alone, at step 5)
-        for step in 0..6 {
-            if step < 5 {
-                for _ in 0..(1 + step * 3) {
-                    let i = (rnd() * prims.len() as f32) as usize % prims.len();
-                    prims[i].0.pos += Vec3::new(rnd() * 6.0 - 3.0, rnd() * 4.0 - 2.0, rnd() * 6.0 - 3.0);
-                }
+        for step in 0..5 {
+            for _ in 0..(1 + step * 3) {
+                let i = (rnd() * prims.len() as f32) as usize % prims.len();
+                prims[i].0.pos += Vec3::new(rnd() * 6.0 - 3.0, rnd() * 4.0 - 2.0, rnd() * 6.0 - 3.0);
             }
             if step == 1 { prims.remove(7); }
             if step == 2 { let p = prim(&mut rnd); prims.push(p); }
             if step == 3 { prims[3].0.size *= 1.5; prims.swap(10, 400); }
-            let sun = match step {
-                0 | 1 => sun,
-                2..=4 => Vec3::new(-0.3, 0.7, 0.5).normalize(),
-                _ => Vec3::new(0.2, 0.9, 0.1).normalize(),
-            };
             let inc = build_grid(origin, &prims, terrain.clone(), true, sun, &lights, kept.take());
             assert!(inc.incremental, "step {step}");
             for p in &inc.patches { inc.locals.write(&mut local, p.lo, p.hi, &p.data); }
@@ -1981,7 +1957,9 @@ fn encode_local(c: Vec3) -> [u8; 4] {
 /// then Y, as the texture), from the unfiltered `raw`: the separable
 /// uniform 3x3x3 filter, in the full build's order, so the voxels come out
 /// as a full build gives them.
-fn filter_region(raw: &[Vec3], dims: [usize; 3], lo: [usize; 3], hi: [usize; 3]) -> Vec<u8> {
+fn filter_region(
+    raw: &[Vec3], dims: [usize; 3], lo: [usize; 3], hi: [usize; 3], scratch: &mut [Vec<f32>; 2],
+) -> Vec<u8> {
     let [nx, _, nz] = dims;
     // What the filter reads: one voxel more on every side (in the grid).
     let slo = [0, 1, 2].map(|k| lo[k].saturating_sub(1));
@@ -1990,14 +1968,14 @@ fn filter_region(raw: &[Vec3], dims: [usize; 3], lo: [usize; 3], hi: [usize; 3])
     // The sub-volume as plain floats (3 a voxel; X fastest, then Z, then Y).
     let row = size[0] * 3;
     let layer = row * size[2];
-    // (scratch kept per thread: every float is written before it's read)
-    thread_local! {
-        static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    let [sub, tmp] = scratch;
+    let len = layer * size[1];
+    if sub.len() < len {
+        sub.resize(len, 0.0);
+        tmp.resize(len, 0.0);
     }
-    SCRATCH.with(|scratch| {
-    let (sub, tmp) = &mut *scratch.borrow_mut();
-    sub.resize(layer * size[1], 0.0);
-    tmp.resize(layer * size[1], 0.0);
+    let sub = &mut sub[..len];
+    let tmp = &mut tmp[..len];
     for y in slo[1]..=shi[1] {
         for z in slo[2]..=shi[2] {
             let from = (y * nz + z) * nx;
@@ -2103,7 +2081,6 @@ fn filter_region(raw: &[Vec3], dims: [usize; 3], lo: [usize; 3], hi: [usize; 3])
         }
     }
     out
-    })
 }
 
 /// The local channel as it is kept between frames: the unfiltered sum of
@@ -2122,6 +2099,9 @@ pub struct LocalLights {
     /// Per light (as `lights`): its box and weight field, None when it
     /// reaches no voxel.
     kept: Vec<Option<Kept>>,
+    /// Reuse the filter volumes even when successive updates run on
+    /// different short-lived workers.
+    filter_scratch: [Vec<f32>; 2],
 }
 
 /// A re-light of part of the local channel: its first and last voxel and
@@ -2160,7 +2140,10 @@ impl LocalLights {
     fn build_dims(occ: &Occupancy, lights: &[crate::render::LightRaw], dims: [usize; 3]) -> (LocalLights, Vec<u8>) {
         let len = dims.iter().product::<usize>();
         let kept = Self::keep(occ, lights, dims, &Default::default());
-        let mut me = LocalLights { origin: occ.origin, dims, raw: Vec::new(), lights: lights.to_vec(), kept };
+        let mut me = LocalLights {
+            origin: occ.origin, dims, raw: Vec::new(), lights: lights.to_vec(), kept,
+            filter_scratch: Default::default(),
+        };
         let mut active: Option<([usize; 3], [usize; 3])> = None;
         let all = ([0; 3], [dims[0] - 1, dims[1] - 1, dims[2] - 1]);
         for (l, k) in me.lights.iter().zip(&me.kept) {
@@ -2175,7 +2158,7 @@ impl LocalLights {
         let mut out: Vec<u8> = zero.iter().copied().cycle().take(len * 4).collect();
         if let Some((lo, hi)) = active {
             let (lo, hi) = grow(lo, hi, dims);
-            let patch = filter_region(&me.raw, dims, lo, hi);
+            let patch = filter_region(&me.raw, dims, lo, hi, &mut me.filter_scratch);
             me.write(&mut out, lo, hi, &patch);
         }
         (me, out)
@@ -2313,7 +2296,7 @@ impl LocalLights {
                     add_field(&mut self.raw, self.dims, Vec3::from_slice(&l.color), k, lo, hi);
                 }
             }
-            patches.push(LocalPatch { lo, hi, data: filter_region(&self.raw, self.dims, lo, hi) });
+            patches.push(LocalPatch { lo, hi, data: filter_region(&self.raw, self.dims, lo, hi, &mut self.filter_scratch) });
         }
         patches
     }

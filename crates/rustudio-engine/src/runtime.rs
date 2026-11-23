@@ -27,7 +27,6 @@ use rbx_reflection::{DataType, PropertyKind, PropertyTag, Scriptability};
 use rustudio_core::log::Level;
 use rustudio_core::doc::{self, Document};
 use crate::ltypes::*;
-use self::domains::world::part::EnterPose;
 use rustudio_core::math::Xform;
 use rustudio_core::mech;
 
@@ -92,6 +91,7 @@ pub enum RepOp {
     /// Instance:Destroy() of the instance and its subtree, sent once (Studio's
     /// DestroyInstance item); the client destroys its copy.
     Destroy(Ref),
+    Persistence(Ref, Ref, bool),
 }
 
 /// A Lua value that can cross between the server and client VMs (functions
@@ -137,6 +137,8 @@ pub struct RemoteMsg {
 
 /// Everything Lua callbacks touch, stored as Lua app data.
 pub struct World {
+    /// A privileged DataModel:Shutdown call asks the host to end Play.
+    pub shutdown_requested: bool,
     pub doc: Option<Document>,
     pub mode: RunMode,
     pub side: Side,
@@ -144,6 +146,8 @@ pub struct World {
     pub has_peer: bool,
     /// Server changes waiting to replicate to the client.
     pub rep: Vec<RepOp>,
+    pub stream_requests: Vec<crate::replicate::StreamRequest>,
+    pub persistent_players: HashMap<Ref, HashSet<Ref>>,
     /// Remote calls waiting to cross to the other side.
     pub outbox: Vec<RemoteMsg>,
     pub time: f64,
@@ -178,6 +182,9 @@ pub struct World {
     pub died: Vec<Ref>,
     /// Players that asked for a new character (Player:LoadCharacter).
     pub load_character: Vec<Ref>,
+    /// How this Play session's player arrived (a play-testing teleport's
+    /// data: Player:GetJoinData); None for a Play joined without one.
+    pub teleport_arrival: Option<crate::play_teleport::Arrival>,
     /// Player.Character set by a server script this frame (player, model;
     /// a none model for nil): Play's session makes it the character
     /// (play.rs `adopt_character`), as Roblox treats the write as a spawn.
@@ -189,14 +196,8 @@ pub struct World {
     /// StarterGui:SetCore("TopbarEnabled", false) hid Roblox's top bar
     /// (the menu button and the chat button over the game view).
     pub topbar_off: bool,
-    /// GuiService:SetTopbarInset from Roblox's own CoreScripts when they run
-    /// (gui_input.luau; their KeepOutAreasHandler: the top bar's widest
-    /// strip clear of the unibar, health bar and the rest): x1, y1, x2, y2
-    /// in screen pixels from the top-left of the view. A ScreenGui with
-    /// ScreenInsets TopbarSafeInsets is this rect (gui_input.rs roots,
-    /// runtime_ext.rs AbsolutePosition); None: this build's drawn bar
-    /// (mech::gui_topbar_left).
-    pub topbar_inset: Option<[f32; 4]>,
+    /// The free area published by the active top-bar CoreScript.
+    pub topbar_inset: Option<LRect>,
     /// Current Enum.HumanoidStateType name per Humanoid (Humanoid:GetState).
     pub humanoid_states: HashMap<Ref, &'static str>,
     /// Humanoid:SetStateEnabled(state, false) per Humanoid (state names).
@@ -210,11 +211,6 @@ pub struct World {
     /// dresses those models with its clothing, face and accessories).
     pub avatar: Option<crate::avatar::AvatarLook>,
     pub avatar_descs: HashSet<Ref>,
-    /// AvatarEditorService:BustAvatarFetchCache was called: the host fetches
-    /// the avatar again (the next character and `avatar` get the new one).
-    pub avatar_fetch_busted: bool,
-    /// DataModel:Shutdown (the menu's Leave): the host ends the session.
-    pub shutdown_requested: bool,
     /// Instances with at least one connection or waiter (fires on others are dropped early).
     pub listening: rustc_hash::FxHashSet<Ref>,
     /// Instances something ever connected to (or waited on) for a touch event
@@ -259,6 +255,7 @@ pub struct World {
     /// ViewportSize: what `ext::fire_layout_changes` compares the new layout
     /// with.
     pub abs_seen: HashMap<Ref, ext::AbsBox>,
+    pub scroll_seen: HashMap<Ref, ([f32; 2], [f32; 2])>,
     pub viewport_seen: Option<[f32; 2]>,
     /// GUI instances with live connections or waiters.
     pub gui_listening: rustc_hash::FxHashSet<Ref>,
@@ -276,16 +273,20 @@ pub struct World {
     pub abs_scan: u64,
     pub abs_dirty: rustc_hash::FxHashSet<Ref>,
     pub abs_all: bool,
+    pub(crate) layout_dirty: rustc_hash::FxHashSet<Ref>,
+    pub(crate) read_layout: rustc_hash::FxHashMap<Ref, ext::ReadLayout>,
     /// The collector (`Runtime::collect`): how many unparented instances
     /// were left watched after its last pass, and whether that pass saw new
     /// ones or freed any (`Runtime::gc_step` works faster then).
     pub orphans_seen: usize,
     pub gc_busy: bool,
-    /// Where in the watched list the collector's next pass starts (each pass
-    /// stops at its budget, mech::GC_PASS_MS, and the next goes on from there).
-    pub gc_cursor: usize,
+    /// Unparented targets kept alive by Instance `Variant::Ref` properties
+    /// (e.g. `VRInventorySelector.SelectionImageObject = selectorImage`).
+    // Indexed by owner so collecting an unrelated instance takes one lookup.
+    prop_ref_edges: HashMap<Ref, Vec<(rbx_dom_weak::Ustr, Ref)>>,
+    pub prop_ref_counts: HashMap<Ref, usize>,
     /// Roblox's CoreScripts and CorePackages put in this DataModel
-    /// (`Runtime::install_core_scripts`): the modules' bytecode by instance
+    /// (`Runtime::start_core_scripts`): the modules' bytecode by instance
     /// and the CoreScripts by name.
     pub core_scripts: rustudio_core::core_scripts::Installed,
 }
@@ -396,10 +397,12 @@ impl World {
 
     /// Queues scripts at and under `r` that now run here.
     fn queue_scripts(&mut self, r: Ref) {
-        let refs: Vec<Ref> = std::iter::once(r)
-            .chain(self.d().dom.descendants_of(r).map(|i| i.referent()))
-            .collect();
-        for s in refs {
+        let refs: Vec<Ref> = self.d().dom.descendants_of(r).map(|i| i.referent()).collect();
+        self.queue_subtree_scripts(&refs);
+    }
+
+    fn queue_subtree_scripts(&mut self, refs: &[Ref]) {
+        for &s in refs {
             if !self.started.contains(&s)
                 && self
                     .d()
@@ -460,9 +463,18 @@ impl Sched {
 struct Conn {
     id: u64,
     func: Function,
+    owner: Option<Ref>,
     once: bool,
     /// The connecting thread's identity: handlers run at it (security.rs).
     ident: u8,
+}
+
+/// Maximum pre-connect invocations buffered per `(RemoteEvent, event)` before
+/// dropping and warning once (matches Roblox's RemoteEvent invocation queue).
+const REMOTE_QUEUE_LIMIT: usize = 256;
+
+fn is_remote_event_signal(name: &str) -> bool {
+    matches!(name, "OnClientEvent" | "OnServerEvent")
 }
 
 #[derive(Default)]
@@ -477,6 +489,13 @@ struct Signals {
     /// Signal names indexed by instance so Destroy and GUI listener cleanup
     /// can look up handlers without walking the other instances' signals.
     conn_names: rustc_hash::FxHashMap<Ref, Vec<String>>,
+    /// Active and queued AncestryChanged handlers by their callback's script.
+    /// Destroy can stop a script without inspecting other scripts' callbacks.
+    script_connections: rustc_hash::FxHashMap<Ref, rustc_hash::FxHashMap<(Ref, String), usize>>,
+    /// Pre-connect invocations queued for reliable `RemoteEvent`s while no
+    /// listener or waiter is attached to `OnClientEvent` / `OnServerEvent`.
+    remote_queue: rustc_hash::FxHashMap<(Ref, String), VecDeque<Vec<Value>>>,
+    remote_queue_warned: rustc_hash::FxHashSet<(Ref, String)>,
 }
 
 impl Signals {
@@ -485,6 +504,53 @@ impl Signals {
         if !names.iter().any(|n| n == name) {
             names.push(name.to_owned());
         }
+    }
+
+    fn note_connection(&mut self, key: &(Ref, String), owner: Option<Ref>) {
+        if let Some(owner) = owner {
+            let keys = self.script_connections.entry(owner).or_default();
+            *keys.entry(key.clone()).or_default() += 1;
+        }
+    }
+
+    fn forget_connection(&mut self, key: &(Ref, String), owner: Option<Ref>) {
+        let Some(owner) = owner else { return };
+        if let Some(keys) = self.script_connections.get_mut(&owner) {
+            if let Some(count) = keys.get_mut(key) {
+                *count -= 1;
+                if *count == 0 {
+                    keys.remove(key);
+                }
+            }
+            if keys.is_empty() {
+                self.script_connections.remove(&owner);
+            }
+        }
+    }
+
+    fn remove_connections(&mut self, key: &(Ref, String), retired: bool, mut remove: impl FnMut(&Conn) -> bool) -> bool {
+        let list = if retired {
+            self.destroyed_ancestry.get_mut(&key.0).map(|(_, list)| list)
+        } else {
+            self.conns.get_mut(key)
+        };
+        let Some(list) = list else { return false };
+        let before = list.len();
+        let mut owners = Vec::new();
+        list.retain(|conn| {
+            if !remove(conn) {
+                return true;
+            }
+            if let Some(owner) = conn.owner {
+                owners.push(owner);
+            }
+            false
+        });
+        let became_empty = before != 0 && list.is_empty();
+        for owner in owners {
+            self.forget_connection(key, Some(owner));
+        }
+        became_empty
     }
 
     fn has_listener(&self, r: Ref) -> bool {
@@ -508,15 +574,6 @@ fn prune_layout_listener(lua: &Lua, r: Ref) {
     }
 }
 
-fn prune_layout_listeners(lua: &Lua) {
-    if let (Ok(mut w), Ok(s)) = (world(lua), signals(lua)) {
-        let inactive: Vec<_> = w.gui_listening.iter().chain(&w.layout_listening).copied()
-            .filter(|r| !s.has_listener(*r)).collect();
-        for r in inactive {
-            w.forget_layout_listener(r);
-        }
-    }
-}
 
 #[derive(Default)]
 pub struct Cache {
@@ -539,7 +596,11 @@ pub struct Cache {
     /// Rust methods that run as Lua instead (media's *Async ones yield a
     /// frame after answering): name → the Lua function, called with self.
     pub overrides: HashMap<&'static str, Function>,
-    callbacks: HashMap<(Ref, String), Function>,
+    /// Instance callback writes (OnInvoke, OnServerInvoke, OnClientInvoke),
+    /// paired with the thread identity that assigned them (so a CoreScript
+    /// callback like TextChannel.OnIncomingMessage runs with Core capabilities
+    /// even when triggered by a game script's SendAsync).
+    callbacks: HashMap<(Ref, String), (Function, u8)>,
 }
 
 struct Budget {
@@ -627,6 +688,14 @@ mod interrupt_watchdog {
 
 // ------------------------------------------------------------- utilities
 
+pub(crate) fn flush_immediate(lua: &Lua) {
+    signal_timing::flush_immediate(lua);
+}
+
+pub(crate) fn fire_filtered(lua: &Lua, r: Ref, name: &str, args: &[Value], core_only: bool) {
+    signal_timing::deliver_filtered(lua, r, name, args, core_only);
+}
+
 /// Fixed-step runs (a World that is not `realtime`, i.e. RUSTUDIO_FIXED_DT Play):
 /// a wall-clock epoch time (tick(), GetServerTimeNow) as a fixed epoch plus game
 /// time, so scripts that read it behave the same on every run. None otherwise.
@@ -667,10 +736,13 @@ impl World {
         World {
             signal_mode: signal_timing::SignalMode::of(&doc),
             doc: Some(doc),
+            shutdown_requested: false,
             mode,
             side: Side::Server,
             has_peer: false,
             rep: Vec::new(),
+            stream_requests: Vec::new(),
+            persistent_players: HashMap::new(),
             outbox: Vec::new(),
             time: 0.0,
             realtime: false,
@@ -685,6 +757,7 @@ impl World {
             velocity_requests: Vec::new(),
             died: Vec::new(),
             load_character: Vec::new(),
+            teleport_arrival: None,
             character_set: Vec::new(),
             keys_down: HashSet::new(),
             core_gui_off: HashSet::new(),
@@ -695,14 +768,13 @@ impl World {
             groups: rustudio_core::collision_groups::shared(),
             avatar: None,
             avatar_descs: HashSet::new(),
-            avatar_fetch_busted: false,
-            shutdown_requested: false,
             listening: Default::default(),
             touch_refs: Default::default(),
             touch_rev: 0,
             item_changed: false,
             class_watches: Vec::new(),
             abs_seen: HashMap::new(),
+            scroll_seen: HashMap::new(),
             viewport_seen: None,
             gui_listening: Default::default(),
             layout_listening: Default::default(),
@@ -712,9 +784,12 @@ impl World {
             abs_scan: 0,
             abs_dirty: Default::default(),
             abs_all: true,
+            layout_dirty: Default::default(),
+            read_layout: Default::default(),
             orphans_seen: 0,
             gc_busy: true,
-            gc_cursor: 0,
+            prop_ref_edges: HashMap::new(),
+            prop_ref_counts: HashMap::new(),
             core_scripts: Default::default(),
             requests: Default::default(),
             input: Default::default(),
@@ -740,6 +815,16 @@ impl World {
             .expect("play document present while Lua runs")
     }
 
+    pub fn topbar_inset(&self, width: f32) -> LRect {
+        if self.mode == RunMode::Edit {
+            return LRect { min: glam::Vec2::ZERO, max: glam::Vec2::ZERO };
+        }
+        self.topbar_inset.unwrap_or_else(|| {
+            let chat = self.side != Side::Client || !self.core_gui_off.contains("Chat");
+            crate::gui::fallback_topbar_inset(width, chat)
+        })
+    }
+
     /// Notes a server change for replication (clients don't replicate back).
     pub fn record(&mut self, op: RepOp) {
         if self.side == Side::Server && self.has_peer {
@@ -757,7 +842,16 @@ impl World {
 
     fn note_listener(&mut self, r: Ref, seed_box: bool) {
         let first = self.listening.insert(r);
-        if self.destroyed.contains(&r) || self.gui_listening.contains(&r) || self.layout_listening.contains(&r) {
+        if self.destroyed.contains(&r) {
+            return;
+        }
+        if self.gui_listening.contains(&r) {
+            if seed_box {
+                ext::seed_unlaid(self, r);
+            }
+            return;
+        }
+        if self.layout_listening.contains(&r) {
             return;
         }
         let Some(class) = self.d().class_of(r) else { return };
@@ -766,7 +860,7 @@ impl World {
             if first && seed_box {
                 ext::seed_unlaid(self, r);
             }
-            if self.side == Side::Client {
+            if self.side == Side::Client || self.mode == RunMode::Edit {
                 self.listen_new.insert(r);
             }
         } else if doc::is_a(&class, "UIGridStyleLayout") {
@@ -1006,13 +1100,9 @@ impl UserData for LConn {
                                 let this = this.borrow::<LConn>()?.clone();
                                 {
                                     let mut s = signals(lua)?;
-                                    if let Some(v) = s.conns.get_mut(&this.key) {
-                                        v.retain(|c| c.id != this.id);
-                                    }
+                                    s.remove_connections(&this.key, false, |c| c.id == this.id);
                                     if this.key.1 == "AncestryChanged" {
-                                        if let Some((_, v)) = s.destroyed_ancestry.get_mut(&this.key.0) {
-                                            v.retain(|c| c.id != this.id);
-                                        }
+                                        s.remove_connections(&this.key, true, |c| c.id == this.id);
                                     }
                                 }
                                 prune_layout_listener(lua, this.key.0);
@@ -1158,6 +1248,11 @@ fn prop_desc(class: &str, name: &str) -> Option<(&'static str, DataType<'static>
     if name == "Pitch" && class == "Sound" {
         return prop_desc(class, "PlaybackSpeed");
     }
+    // Camera.CoordinateFrame is a legacy alias of Camera.CFrame (used by
+    // classic CameraScript, RbxStamper, etc.), absent from rbx_reflection_database.
+    if name == "CoordinateFrame" && class == "Camera" {
+        return prop_desc(class, "CFrame");
+    }
     let db = doc::db();
     let c = db.classes.get(class)?;
     for cls in db.superclasses_iter(c) {
@@ -1234,17 +1329,18 @@ fn bad_assign(prop: &str, expected: &str, got: &Value) -> mlua::Error {
     ))
 }
 
-/// A Lua string as text for a property, attribute or name. Roblox takes
-/// any bytes there (a script's `string.sub` can cut a name mid-character);
-/// rustudio's properties hold UTF-8, so the bytes that aren't are left out
-/// (estimate: what is read back never grows past what was set, so a
-/// shorten-until-it-fits loop still ends).
-pub fn lua_text(s: &mlua::String) -> String {
-    let b = s.as_bytes();
-    match std::str::from_utf8(&b) {
-        Ok(t) => t.to_owned(),
-        Err(_) => b.utf8_chunks().map(|c| c.valid()).collect(),
-    }
+/// Studio packs Color3uint8 using a truncating signed conversion, then keeps
+/// the low byte. Values outside the signed conversion range produce zero.
+fn pack_color3uint8(c: Color3) -> Color3uint8 {
+    let channel = |value: f32| {
+        let scaled = value * 255.0;
+        if (-2_147_483_648.0..2_147_483_648.0).contains(&scaled) {
+            scaled as i32 as u8
+        } else {
+            0
+        }
+    };
+    Color3uint8::new(channel(c.r), channel(c.g), channel(c.b))
 }
 
 /// Converts a Lua value to a property's type. `existing` keeps the stored
@@ -1276,20 +1372,20 @@ fn lua_to_variant(
         VariantType::Float32 => Variant::Float32(number()? as f32),
         VariantType::Float64 => Variant::Float64(number()?),
         VariantType::String => match v {
-            Value::String(s) => Variant::String(lua_text(s)),
+            Value::String(s) => Variant::String(s.to_str()?.to_string()),
             Value::Number(n) => Variant::String(n.to_string()),
             Value::Integer(n) => Variant::String(n.to_string()),
             _ => return Err(bad_assign(prop, "string", v)),
         },
         VariantType::ContentId => match v {
-            Value::String(s) => Variant::ContentId(ContentId::from(lua_text(s))),
+            Value::String(s) => Variant::ContentId(ContentId::from(s.to_str()?.to_string())),
             Value::UserData(_) if opt_ud::<editable::LContent>(v).is_some() => Variant::ContentId(ContentId::from(
                 opt_ud::<editable::LContent>(v).and_then(|c| c.0.as_uri().map(str::to_string)).unwrap_or_default(),
             )),
             _ => return Err(bad_assign(prop, "string", v)),
         },
         VariantType::Content => match v {
-            Value::String(s) => Variant::Content(Content::from(lua_text(s))),
+            Value::String(s) => Variant::Content(Content::from(s.to_str()?.to_string())),
             Value::Nil => Variant::Content(Content::none()),
             Value::UserData(_) if opt_ud::<editable::LContent>(v).is_some() => {
                 opt_ud::<editable::LContent>(v).map(|c| c.variant()).unwrap_or(Variant::Content(Content::none()))
@@ -1312,7 +1408,7 @@ fn lua_to_variant(
             let c = opt_ud::<LColor3>(v).ok_or_else(|| bad_assign(prop, "Color3", v))?;
             let c3 = Color3::new(c.0[0], c.0[1], c.0[2]);
             if ty == VariantType::Color3uint8 || matches!(existing, Some(Variant::Color3uint8(_))) {
-                Variant::Color3uint8(Color3uint8::from(c3))
+                Variant::Color3uint8(pack_color3uint8(c3))
             } else {
                 Variant::Color3(c3)
             }
@@ -1401,7 +1497,7 @@ fn inst_meta(lua: &Lua, r: Ref) -> mlua::Result<(String, String, Ref)> {
         .d()
         .dom
         .get_by_ref(r)
-        .ok_or_else(gone_err)?;
+        .ok_or_else(|| rt_err("attempt to use an Instance that no longer exists"))?;
     Ok((i.class.to_string(), i.name.clone(), i.parent()))
 }
 
@@ -1412,12 +1508,8 @@ pub fn inst_class(lua: &Lua, r: Ref) -> mlua::Result<(rbx_dom_weak::Ustr, Ref)> 
         .d()
         .dom
         .get_by_ref(r)
-        .ok_or_else(gone_err)?;
+        .ok_or_else(|| rt_err("attempt to use an Instance that no longer exists"))?;
     Ok((i.class, i.parent()))
-}
-
-fn gone_err() -> mlua::Error {
-    rt_err("attempt to use an Instance that no longer exists")
 }
 
 /// What `inst.key` is for a class, as far as it depends only on the class:
@@ -1828,7 +1920,7 @@ fn index_entry_fast(lua: &Lua, r: Ref, key: &str, atom: i32) -> (mlua::Result<Fv
             .d()
             .dom
             .get_by_ref(r)
-            .ok_or_else(gone_err)?;
+            .ok_or_else(|| rt_err("attempt to use an Instance that no longer exists"))?;
         let class_u = i.class;
         let rt = routes::route(class_u, key, atom);
         let got = if rt.child_only {
@@ -1841,7 +1933,12 @@ fn index_entry_fast(lua: &Lua, r: Ref, key: &str, atom: i32) -> (mlua::Result<Fv
                 Got::Full(i.parent())
             } else {
                 let d = w.d();
-                match i.children().iter().copied().find(|c| d.dom.get_by_ref(*c).is_some_and(|c| c.name == key)) {
+                let hide_core = d.dom.root_ref() == r && security::hides_core_services(lua);
+                match i.children().iter().copied().find(|c| {
+                    d.dom.get_by_ref(*c).is_some_and(|c| {
+                        c.name == key && !(hide_core && security::is_hidden_service_class(&c.class))
+                    })
+                }) {
                     Some(c) => Got::Parent(c),
                     None => Got::Full(i.parent()),
                 }
@@ -1849,9 +1946,14 @@ fn index_entry_fast(lua: &Lua, r: Ref, key: &str, atom: i32) -> (mlua::Result<Fv
         } else if key == "Position" && rt.core_special && rt.domains == 0 && !rt.ext
             && !rt.restricted && doc::is_a(class_u.as_str(), "BasePart")
         {
-            let pos = match w.d().prop(r, "CFrame") {
+            thread_local!(static CFRAME_KEY: rbx_dom_weak::Ustr = ustr("CFrame"));
+            let cf_key = CFRAME_KEY.with(|k| *k);
+            let pos = match i.properties.get(&cf_key) {
                 Some(Variant::CFrame(cf)) => Vec3::new(cf.position.x, cf.position.y, cf.position.z),
-                _ => Vec3::ZERO,
+                _ => match w.d().prop_key(r, cf_key) {
+                    Some(Variant::CFrame(cf)) => Vec3::new(cf.position.x, cf.position.y, cf.position.z),
+                    _ => Vec3::ZERO,
+                },
             };
             Got::Position(pos)
         } else if !rt.plain {
@@ -1984,7 +2086,19 @@ pub(crate) fn native_call(lua: &Lua, r: Ref, name: &str, atom: i32, args: &[NArg
         _ => None,
     };
     if m == "GetChildren" && rt.method.core && (args.is_empty() || matches!(args, [NArg::Nil])) {
-        let value = child_result(instance.children());
+        let hide_core = w.d().dom.root_ref() == r && security::hides_core_services(lua);
+        let value = if hide_core {
+            let d = w.d();
+            let kids: Vec<Ref> = instance
+                .children()
+                .iter()
+                .copied()
+                .filter(|c| d.dom.get_by_ref(*c).is_none_or(|i| !security::is_hidden_service_class(&i.class)))
+                .collect();
+            child_result(&kids)
+        } else {
+            child_result(instance.children())
+        };
         rustudio_core::telemetry::touch(class, name);
         return Some(Ok((value, true)));
     }
@@ -1992,7 +2106,12 @@ pub(crate) fn native_call(lua: &Lua, r: Ref, name: &str, atom: i32, args: &[NArg
     // as an Instance array through the weak cache instead of an mlua table
     // built one inst_value at a time.
     if m == "GetDescendants" && rt.method.core && (args.is_empty() || matches!(args, [NArg::Nil])) {
-        let refs: Vec<Ref> = w.d().dom.descendants_of(r).map(|i| i.referent()).filter(|x| *x != r).collect();
+        let d = w.d();
+        let refs: Vec<Ref> = if d.dom.root_ref() == r && security::hides_core_services(lua) {
+            descendants_skip_hidden(d, r)
+        } else {
+            d.dom.descendants_of(r).map(|i| i.referent()).filter(|x| *x != r).collect()
+        };
         rustudio_core::telemetry::touch(class, name);
         return Some(Ok((child_result(&refs), true)));
     }
@@ -2023,14 +2142,18 @@ pub(crate) fn native_call(lua: &Lua, r: Ref, name: &str, atom: i32, args: &[NArg
     if m == "FindFirstChild" && rt.method.core && instance.children().len() < CHILD_INDEX_MIN {
         let child_name = str1()?;
         if matches!(args.get(1), None | Some(NArg::Nil | NArg::Bool(false))) {
-            let child = instance.children().iter().copied().find(|r| {
-                w.d().dom.get_by_ref(*r).is_some_and(|i| i.name == child_name)
+            let is_root = w.d().dom.root_ref() == r;
+            let hide_core = is_root && security::hides_core_services(lua);
+            let child = instance.children().iter().copied().find(|c| {
+                w.d().dom.get_by_ref(*c).is_some_and(|i| {
+                    i.name == child_name && !(hide_core && security::is_hidden_service_class(&i.class))
+                })
             });
             // (`game:FindFirstChild("Run Service")`, a service by its
             // Roblox name: find_named_child's alias, the slow way)
             let aliased = child.is_none()
                 && mech::service_class_for_name(child_name).is_some()
-                && w.d().dom.root_ref() == r;
+                && is_root;
             if !aliased {
                 rustudio_core::telemetry::touch(class, name);
                 return Some(Ok((Fv::Inst(child.unwrap_or_else(Ref::none)), true)));
@@ -2210,6 +2333,14 @@ fn joint_pose_property(class: &str, name: &str) -> bool {
     }
 }
 
+fn camera_zoom_opposite(class: &str, property: &str) -> Option<&'static str> {
+    match (class, property) {
+        ("Player" | "StarterPlayer", "CameraMinZoomDistance") => Some("CameraMaxZoomDistance"),
+        ("Player" | "StarterPlayer", "CameraMaxZoomDistance") => Some("CameraMinZoomDistance"),
+        _ => None,
+    }
+}
+
 /// `inst.key = value` for a reflected property stored as given: no domain,
 /// runtime_ext or capability rule takes the member, it isn't one of
 /// newindex_routed's own (Name, Parent, Attachment / BasePart frames, a
@@ -2260,7 +2391,9 @@ pub(crate) fn typed_write(lua: &Lua, r: Ref, key: &str, atom: i32, val: FastVal)
         return Some(store_prop_in_world(lua, w, r, *CFRAME, value).map(|_| no_dispatch));
     }
     let canon = info.canon.as_str();
-    if key == "FontSize" || canon == "Disabled" || (canon == "Health" && class == "Humanoid") {
+    if key == "FontSize" || canon == "Disabled" || (canon == "Health" && class == "Humanoid")
+        || camera_zoom_opposite(class, canon).is_some()
+    {
         return None;
     }
     let (ty, _) = info.ty?;
@@ -2286,7 +2419,7 @@ pub(crate) fn typed_write(lua: &Lua, r: Ref, key: &str, atom: i32, val: FastVal)
                     None => matches!(w.d().prop_key(r, info.canon), Some(Variant::Color3uint8(_))),
                 };
             if uint8 {
-                Variant::Color3uint8(Color3uint8::from(c3))
+                Variant::Color3uint8(pack_color3uint8(c3))
             } else {
                 Variant::Color3(c3)
             }
@@ -2320,6 +2453,7 @@ pub(crate) fn typed_write(lua: &Lua, r: Ref, key: &str, atom: i32, val: FastVal)
     // listener, outside Edit; ScreenGui's twinned inset properties excepted).
     let mut w = w;
     if quiet && w.mode != RunMode::Edit && class_u != "ScreenGui"
+        && canon != "CanvasPosition"
         && !joint_pose_property(class, canon) && store_in_place(&mut w, r, info.canon, &value)
     {
         if carry.is_some() {
@@ -2397,9 +2531,18 @@ fn index_routed(
         routes::Special::ScriptEnabled => return Ok(Value::Boolean(script_enabled_here(lua, r)?)),
     }
     match rt.disp {
-        // Callbacks can only be set: Studio's __index (Luau bridge,
-        //) refuses to read one, set or not.
+        // Callbacks can only be set by game scripts: Studio's __index (Luau
+        // bridge) refuses to read one, set or not. CoreScripts
+        // (RobloxScriptSecurity) may read callbacks like TextChatService's
+        // OnChatWindowAdded / OnBubbleAdded to invoke developer hooks.
         Disp::Callback => {
+            if security::current(lua) >= security::CORE {
+                return Ok(cache(lua)?
+                    .callbacks
+                    .get(&(r, key.to_string()))
+                    .map(|(f, _)| Value::Function(f.clone()))
+                    .unwrap_or(Value::Nil));
+            }
             return Err(rt_err(format!(
                 "{key} is a callback member of {class}; you can only set the callback value, get is not available"
             )));
@@ -2597,13 +2740,34 @@ fn prop_get_special(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<O
                     lua.create_userdata(LBrickColor(nearest_brick(rgb)))?,
                 )));
             }
-            "AssemblyLinearVelocity" | "Velocity" => {
+            "AssemblyLinearVelocity" => {
                 let v = world(lua)?
                     .velocities
                     .get(&r)
                     .copied()
                     .unwrap_or(Vec3::ZERO);
                 return Ok(Some(LVector3(v).into_value()));
+            }
+            "Velocity" => {
+                let (v, doc_id) = {
+                    let w = world(lua)?;
+                    (
+                        w.velocities.get(&r).copied().unwrap_or(Vec3::ZERO),
+                        w.d().id,
+                    )
+                };
+                let (spin, com) = rustudio_physics::physics::live::with_stats(doc_id, |s| {
+                    s.spin.get(&r).copied()
+                })
+                .flatten()
+                .unwrap_or((Vec3::ZERO, Vec3::ZERO));
+                let pt_v = if spin != Vec3::ZERO {
+                    let pos = part_xform(lua, r)?.pos;
+                    v + spin.cross(pos - com)
+                } else {
+                    v
+                };
+                return Ok(Some(LVector3(pt_v).into_value()));
             }
             _ => {}
         }
@@ -2620,7 +2784,7 @@ fn prop_get_plain(
 ) -> mlua::Result<Option<Value>> {
     // (set_callback keeps only these)
     if matches!(key, "OnInvoke" | "OnServerInvoke" | "OnClientInvoke") {
-        if let Some(f) = cache(lua)?.callbacks.get(&(r, key.to_string())) {
+        if let Some((f, _)) = cache(lua)?.callbacks.get(&(r, key.to_string())) {
             return Ok(Some(Value::Function(f.clone())));
         }
     }
@@ -2711,11 +2875,11 @@ fn prop_get_plain(
 }
 
 pub fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
-    set_parent_opts(lua, r, new_parent, true, true, EnterPose::Full)
+    set_parent_opts(lua, r, new_parent, true, true, domains::world::part::EnterPose::Full)
 }
 
-fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scripts: bool, pose: EnterPose) -> mlua::Result<()> {
-    let (old, descendants, lost, snaps, enters_ws, stopped, gripped) = {
+fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scripts: bool, pose: domains::world::part::EnterPose) -> mlua::Result<()> {
+    let (old, descendants, lost, snaps, enters_ws, stopped, gripped, ungripped, edit_sound) = {
         let mut w = world(lua)?;
         let old = w
             .d()
@@ -2757,6 +2921,18 @@ fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scr
         let in_ws = |d: &Document, p: Ref| p.is_some() && d.workspace().is_some_and(|ws| p == ws || d.is_ancestor(ws, p));
         let enters_ws = w.mode != RunMode::Edit && !in_ws(w.d(), old) && in_ws(w.d(), new_parent);
         let lost = primary_parts_leaving(&w, r, old, new_parent);
+        let root = w.d().dom.root_ref();
+        if replicate && w.mode != RunMode::Edit && (w.side == Side::Client || !w.has_peer)
+            && w.d().is_ancestor(root, r) && new_parent != root && !w.d().is_ancestor(root, new_parent)
+        {
+            let removed: Vec<_> = w.d().dom.descendants_of(r)
+                .filter_map(|instance| crate::audio_scene::on_remove(w.d(), instance.referent(), w.input.sound_listener))
+                .collect();
+            w.requests.removed_sounds.extend(removed);
+        }
+        if old.is_some() && w.d().class_of(r).is_some_and(|c| doc::is_a(&c, "GuiBase2d") || doc::is_a(&c, "UIComponent")) {
+            ext::invalidate_layout_parent(&mut w, old);
+        }
         w.dm().dom.transfer_within(r, new_parent);
         if new_parent.is_none() {
             w.orphans.insert(r);
@@ -2783,14 +2959,13 @@ fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scr
             w.requests.explosions.push(r);
         }
         w.structure_changed = true;
+        let descendants: Vec<Ref> = w.d().dom.descendants_of(r).map(|i| i.referent()).collect();
         // Scripts arriving where they run start (next dispatch), as in Roblox.
         if new_parent.is_some() {
-            w.queue_scripts(r);
+            w.queue_subtree_scripts(&descendants);
         }
-        let descendants: Vec<Ref> = w.d().dom.descendants_of(r).map(|i| i.referent()).collect();
         let snaps = if enters_ws {
-            let _s = rustudio_core::bench::scope("sp_weld_snaps");
-            let (snaps, activated) = weld_snaps(w.d(), r);
+            let (snaps, activated) = weld_snaps(w.d(), &descendants);
             for (weld, rel) in activated {
                 set_weld_offset(w.dm(), weld, Some(rel));
             }
@@ -2807,8 +2982,10 @@ fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scr
         } else {
             HashSet::new()
         };
-        let gripped = if w.mode != RunMode::Edit { crate::tool_grip::gripped_handles(w.d(), r, enters_ws) } else { Vec::new() };
-        (old, descendants, lost, snaps, enters_ws, stopped, gripped)
+        let edit_sound = w.mode == RunMode::Edit && w.d().class_of(r).as_deref() == Some("Sound");
+        let gripped = if w.mode != RunMode::Edit { crate::tool_grip::gripped_tools(w.d(), r, enters_ws) } else { Vec::new() };
+        let ungripped = if w.mode != RunMode::Edit { crate::tool_grip::ungripped_welds(w.d(), r, old) } else { Vec::new() };
+        (old, descendants, lost, snaps, enters_ws, stopped, gripped, ungripped, edit_sound)
     };
     for (model, pivot) in lost {
         store_prop(lua, model, "PrimaryPart", Variant::Ref(Ref::none()))?;
@@ -2818,23 +2995,64 @@ fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scr
         store_prop(lua, part, "CFrame", Variant::CFrame(xf.to_cframe()))?;
     }
     if enters_ws {
-        let _s = rustudio_core::bench::scope("sp_enter_pose");
         let mut w = world(lua)?;
         let moves = domains::world::part::entering_joint_moves(w.d(), &descendants, pose);
         apply_assembly_pose(&mut w, moves);
     }
-    {
-        let _s = rustudio_core::bench::scope("sp_signals");
-        fire_parent_signals(lua, r, old, new_parent, descendants)?;
+    fire_parent_signals(lua, r, old, new_parent, descendants)?;
+    if edit_sound {
+        domains::media::touch_sound(lua, r)?;
     }
     // After the hierarchy signals (Studio: an AncestryChanged handler on the Tool still
     // reads CanCollide true; EquipTool has returned with it false): the queued
     // Immediate fires run first.
-    if !gripped.is_empty() {
+    if !gripped.is_empty() || !ungripped.is_empty() {
         signal_timing::flush_immediate(lua);
     }
-    for handle in gripped {
-        store_prop(lua, handle, "CanCollide", Variant::Bool(false))?;
+    for weld in ungripped {
+        let still_exists = world(lua).is_ok_and(|w| w.d().exists(weld));
+        if still_exists {
+            set_parent_opts(lua, weld, Ref::none(), replicate, false, domains::world::part::EnterPose::Full)?;
+        }
+    }
+    for g in gripped {
+        if g.turn_off_collide {
+            store_prop(lua, g.handle, "CanCollide", Variant::Bool(false))?;
+        }
+        let existing = {
+            let w = world(lua)?;
+            let d = w.d();
+            d.dom.get_by_ref(g.hand).and_then(|h| {
+                h.children().iter().copied().find(|c| {
+                    d.dom.get_by_ref(*c).is_some_and(|i| {
+                        i.name == "RightGrip"
+                            && doc::is_a(&i.class, "Weld")
+                            && matches!(d.prop(*c, "Part1"), Some(Variant::Ref(p1)) if p1 == g.handle)
+                    })
+                })
+            })
+        };
+        if let Some(weld) = existing {
+            store_prop(lua, weld, "Part0", Variant::Ref(g.hand))?;
+            store_prop(lua, weld, "C0", Variant::CFrame(g.c0))?;
+            store_prop(lua, weld, "C1", Variant::CFrame(g.c1))?;
+        } else {
+            let weld = {
+                let mut w = world(lua)?;
+                let b = rbx_dom_weak::InstanceBuilder::new("Weld")
+                    .with_name("RightGrip")
+                    .with_property("Part0", Variant::Ref(g.hand))
+                    .with_property("Part1", Variant::Ref(g.handle))
+                    .with_property("C0", Variant::CFrame(g.c0))
+                    .with_property("C1", Variant::CFrame(g.c1));
+                let root = w.d().dom.root_ref();
+                let wref = w.dm().dom.insert(root, b);
+                w.dm().dom.transfer_within(wref, Ref::none());
+                w.orphans.insert(wref);
+                wref
+            };
+            set_parent_opts(lua, weld, g.hand, replicate, false, domains::world::part::EnterPose::Full)?;
+        }
     }
     if !stopped.is_empty() {
         signal_timing::flush_immediate(lua);
@@ -2861,8 +3079,7 @@ fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scr
 /// takes its parts' offset as it enters the Workspace (Studio 0.747,
 /// measured in Studio). Snapping those to identity pulled every welded
 /// trim of a cloned rig into its limb.
-fn weld_snaps(d: &Document, r: Ref) -> (Vec<(Ref, Xform)>, Vec<(Ref, Xform)>) {
-    let inside: HashSet<Ref> = std::iter::once(r).chain(d.dom.descendants_of(r).map(|i| i.referent())).collect();
+fn weld_snaps(d: &Document, subtree: &[Ref]) -> (Vec<(Ref, Xform)>, Vec<(Ref, Xform)>) {
     let cf = |x: Ref| match d.prop(x, "CFrame") {
         Some(Variant::CFrame(c)) => Some(Xform::from_cframe(&c)),
         _ => None,
@@ -2874,7 +3091,7 @@ fn weld_snaps(d: &Document, r: Ref) -> (Vec<(Ref, Xform)>, Vec<(Ref, Xform)>) {
     // (Part0, Part1, Part0⁻¹ · Part1) for each enabled weld between live parts.
     let mut welds: Vec<(Ref, Ref, Xform)> = Vec::new();
     let mut activated: Vec<(Ref, Xform)> = Vec::new();
-    for x in &inside {
+    for x in subtree {
         let Some(i) = d.dom.get_by_ref(*x) else { continue };
         if i.class != "WeldConstraint" || !rustudio_core::body::joint_enabled(d, *x) {
             continue;
@@ -2900,6 +3117,7 @@ fn weld_snaps(d: &Document, r: Ref) -> (Vec<(Ref, Xform)>, Vec<(Ref, Xform)>) {
     if welds.is_empty() {
         return (Vec::new(), activated);
     }
+    let inside: HashSet<Ref> = subtree.iter().copied().collect();
     welds.sort_by_key(|(a, b, _)| (format!("{a:?}"), format!("{b:?}")));
     let mut at: HashMap<Ref, Xform> = HashMap::new();
     let mut queue: VecDeque<Ref> = VecDeque::new();
@@ -3106,8 +3324,6 @@ pub fn fire_parent_signals_opts(
     descendants: Vec<Ref>,
     removing: bool,
 ) -> mlua::Result<()> {
-    let me = inst_value(lua, r)?;
-    let pname = Value::String(lua.create_string("Parent")?);
     // The ancestor chains the subtree left and joined, and whether each
     // reaches the DataModel: tagged instances entering or leaving it fire
     // CollectionService's InstanceAdded / InstanceRemoved signals (Roblox
@@ -3153,7 +3369,6 @@ pub fn fire_parent_signals_opts(
     // moved instance and each of its descendants, as in Roblox. Values are
     // only made for ancestors someone listens to (maps move thousands).
     let mut values: HashMap<Ref, Value> = HashMap::new();
-    values.insert(r, me.clone());
     let mut value_of = |d: Ref| -> mlua::Result<Value> {
         if let Some(v) = values.get(&d) {
             return Ok(v.clone());
@@ -3239,6 +3454,15 @@ pub fn fire_parent_signals_opts(
             Vec::new()
         }
     };
+    let (needs_child, needs_property) = {
+        let w = world(lua)?;
+        (
+            !ancestry.is_empty() || w.listening.contains(&old) || w.listening.contains(&new_parent),
+            w.item_changed || w.listening.contains(&r),
+        )
+    };
+    let me = if needs_child { value_of(r)? } else { Value::Nil };
+    let pname = if needs_property { Value::String(lua.create_string("Parent")?) } else { Value::Nil };
     let parent = if ancestry.is_empty() { Value::Nil } else { inst_value(lua, new_parent)? };
     let mut w = world(lua)?;
     if old.is_some() {
@@ -3270,7 +3494,7 @@ pub fn fire_parent_signals_opts(
     Ok(())
 }
 
-fn store_prop(lua: &Lua, r: Ref, name: &str, v: Variant) -> mlua::Result<()> {
+pub(crate) fn store_prop(lua: &Lua, r: Ref, name: &str, v: Variant) -> mlua::Result<()> {
     store_prop_key(lua, r, ustr(name), v)
 }
 
@@ -3287,6 +3511,9 @@ fn store_prop_in_world(
     v: Variant,
 ) -> mlua::Result<()> {
     let name = key.as_str();
+    if name == "Contents" {
+        domains::players_chat::loc::bump_contents_gen();
+    }
     // A plugin's change of the edit DataModel goes into ChangeHistoryService
     // (doc_history.rs; Source is the script editor's own undo, as Studio's).
     let before = (w.mode == RunMode::Edit && name != "Source" && w.d().records_change(r))
@@ -3297,6 +3524,59 @@ fn store_prop_in_world(
     } else {
         None
     };
+    let mut v = v;
+    if name == "CanvasPosition" {
+        if let Variant::Vector2(cp) = v {
+            let is_sf = w.d().class_of(r).is_some_and(|c| c == "ScrollingFrame");
+            if is_sf {
+                let (cs, acs) = {
+                    let d = w.d();
+                    let cs = match d.prop(r, "CanvasSize") {
+                        Some(Variant::UDim2(u)) => {
+                            [u.x.scale, u.x.offset as f32, u.y.scale, u.y.offset as f32]
+                        }
+                        _ => [0.0, 0.0, 2.0, 0.0],
+                    };
+                    let acs = rustudio_render::scene::enum_u32(d.prop(r, "AutomaticCanvasSize"))
+                        .unwrap_or(0);
+                    (cs, acs)
+                };
+                let clamped = if let Some(b) = w.input.gui_layout.get(&r).copied() {
+                    b.canvas_for(cs).or(b.canvas).map(|canvas| {
+                        let win = b.window.unwrap_or(b.size);
+                        let max_x = (canvas[0] - win[0]).max(0.0);
+                        let max_y = (canvas[1] - win[1]).max(0.0);
+                        rbx_dom_weak::types::Vector2::new(
+                            cp.x.clamp(0.0, max_x),
+                            cp.y.clamp(0.0, max_y),
+                        )
+                    })
+                } else {
+                    let ab = ext::abs_now(&mut w, r);
+                    if ab.size[0] > 0.0 || ab.size[1] > 0.0 {
+                        let nx = if acs & 1 != 0 {
+                            cp.x.max(0.0)
+                        } else {
+                            let max_x = ((cs[0] * ab.size[0] + cs[1]).max(ab.size[0]) - ab.size[0]).max(0.0);
+                            cp.x.clamp(0.0, max_x)
+                        };
+                        let ny = if acs & 2 != 0 {
+                            cp.y.max(0.0)
+                        } else {
+                            let max_y = ((cs[2] * ab.size[1] + cs[3]).max(ab.size[1]) - ab.size[1]).max(0.0);
+                            cp.y.clamp(0.0, max_y)
+                        };
+                        Some(rbx_dom_weak::types::Vector2::new(nx, ny))
+                    } else {
+                        None
+                    }
+                };
+                if let Some(c) = clamped {
+                    v = Variant::Vector2(c);
+                }
+            }
+        }
+    }
     let changed = {
         let Some(inst) = w.dm().dom.get_by_ref_mut(r) else {
             return Err(rt_err("the Instance no longer exists"));
@@ -3326,6 +3606,23 @@ fn store_prop_in_world(
         }
         (old.as_ref() != Some(&v), unset)
     };
+    let target = match &v {
+        Variant::Ref(target) if target.is_some() => Some(*target),
+        _ => None,
+    };
+    if let Some(edges) = w.prop_ref_edges.get_mut(&r) {
+        if let Some(index) = edges.iter().position(|(prop, _)| *prop == key) {
+            let (_, old_target) = edges.swap_remove(index);
+            if edges.is_empty() {
+                w.prop_ref_edges.remove(&r);
+            }
+            release_prop_ref(&mut w.prop_ref_counts, old_target);
+        }
+    }
+    if let Some(target) = target {
+        w.prop_ref_edges.entry(r).or_default().push((key, target));
+        *w.prop_ref_counts.entry(target).or_insert(0) += 1;
+    }
     // A property never set reads its default: writing that same value
     // changes nothing and fires nothing (Studio: Anchored = false on a new
     // Part fires no Changed, captures/misc2.txt).
@@ -3549,19 +3846,12 @@ fn set_attr(lua: &Lua, r: Ref, name: &str, var: Option<Variant>) -> mlua::Result
     Ok(())
 }
 
-/// Whether `key` is a callback of `r`'s class in the API dump.
-fn api_callback(lua: &Lua, r: Ref, key: &str) -> bool {
-    let Some(class) = world(lua).ok().and_then(|w| w.d().class_of(r)) else { return false };
-    rustudio_core::api::get()
-        .and_then(|a| a.lookup(&class, key))
-        .is_some_and(|(_, m)| matches!(m.kind, rustudio_core::api::Kind::Callback))
-}
-
-fn set_callback(lua: &Lua, r: Ref, key: &str, value: Value) -> mlua::Result<()> {
+pub(crate) fn set_callback(lua: &Lua, r: Ref, key: &str, value: Value) -> mlua::Result<()> {
+    let ident = security::current(lua);
     let mut c = cache(lua)?;
     match value {
         Value::Function(f) => {
-            c.callbacks.insert((r, key.to_string()), f);
+            c.callbacks.insert((r, key.to_string()), (f, ident));
         }
         _ => {
             c.callbacks.retain(|k, _| !(k.0 == r && k.1 == key));
@@ -3654,10 +3944,13 @@ fn newindex_routed(
             return Ok(());
         }
     }
+    if matches!(rt.disp, Disp::Callback) {
+        return set_callback(lua, r, key, value);
+    }
     match key {
         "Name" => {
             let s = match &value {
-                Value::String(s) => lua_text(s),
+                Value::String(s) => s.to_str()?.to_string(),
                 Value::Number(n) => n.to_string(),
                 _ => return Err(bad_assign("Name", "string", &value)),
             };
@@ -3697,10 +3990,6 @@ fn newindex_routed(
         "OnInvoke" | "OnServerInvoke" | "OnClientInvoke" => {
             return set_callback(lua, r, key, value)
         }
-        // Any other callback member of the API dump (GuiService.
-        // SendCoreUiNotification, which NotificationScript2 assigns): kept
-        // for whatever invokes it.
-        _ if api_callback(lua, r, key) => return set_callback(lua, r, key, value),
         // Script.Enabled is Disabled turned round: places save Disabled, and
         // that is what decides whether it runs. Place B Newer's
         // MusicSystemInitializer parents ModernMusicGui and then sets its
@@ -3831,7 +4120,9 @@ fn newindex_routed(
             "AssemblyLinearVelocity" | "Velocity" => {
                 let v =
                     opt_ud::<LVector3>(&value).ok_or_else(|| bad_assign(key, "Vector3", &value))?;
-                world(lua)?.velocity_requests.push((r, v.0));
+                let mut w = world(lua)?;
+                w.velocities.insert(r, v.0);
+                w.velocity_requests.push((r, v.0));
                 return Ok(());
             }
             _ => {}
@@ -3853,18 +4144,25 @@ fn newindex_routed(
         )));
     };
     let canon = info.canon.as_str();
-    // (A property rbx-dom calls read-only that the API dump lets the
-    // CoreScripts write, ScreenGui.OnTopOfCoreBlur: the security check
-    // already ran, so it takes the write.)
-    let api_writable = || {
-        rustudio_core::api::get()
-            .and_then(|a| a.lookup(class, key))
-            .is_some_and(|(_, m)| matches!(m.kind, rustudio_core::api::Kind::Property) && !m.read_only)
-    };
-    if info.read_only && !(security::current(lua) == security::CORE && api_writable()) {
-        return Err(rt_err(format!(
-            "Unable to assign property {key}. Property is read only"
-        )));
+    if info.read_only {
+        // Properties that are only NotScriptable (Scriptability::None, not
+        // PropertyTag::ReadOnly — e.g. TextBox.OverlayNativeInput used by
+        // CoreScripts' ReportAbuse page) are writable by RobloxScript.
+        let core_ok = security::current(lua) >= security::CORE && {
+            let db = doc::db();
+            db.classes
+                .get(class)
+                .and_then(|c| db.superclasses_iter(c).find_map(|cls| cls.properties.get(canon)))
+                .is_some_and(|p| {
+                    !p.tags.contains(&PropertyTag::ReadOnly)
+                        && matches!(p.scriptability, Scriptability::None)
+                })
+        };
+        if !core_ok {
+            return Err(rt_err(format!(
+                "Unable to assign property {key}. Property is read only"
+            )));
+        }
     }
     if !info.acts {
         crate::lua_bridge::plain_write(lua, class, canon);
@@ -3883,6 +4181,17 @@ fn newindex_routed(
     if let Variant::Float32(f) = v {
         if let Some(c) = mech::setter_clamp(class, canon, f) {
             v = Variant::Float32(c);
+        }
+    }
+    // A write to either zoom limit is bounded by the other limit.
+    if let (Some(opposite), Variant::Float32(distance)) = (camera_zoom_opposite(class, canon), &v) {
+        let w = world(lua)?;
+        if let Some(bound) = rustudio_render::scene::f32_of(w.d().prop(r, opposite)) {
+            v = Variant::Float32(if canon == "CameraMinZoomDistance" {
+                distance.min(bound)
+            } else {
+                distance.max(bound)
+            });
         }
     }
     if class == "Humanoid" && canon == "Health" {
@@ -3947,23 +4256,6 @@ pub fn running_script(lua: &Lua) -> Option<Ref> {
     None
 }
 
-/// The script a suspended thread is running: the first Lua frame's.
-fn script_of_thread(lua: &Lua, th: &Thread) -> Option<Ref> {
-    let info = lua.globals().get::<Table>("debug").and_then(|d| d.get::<Function>("info")).ok()?;
-    for level in 0..8 {
-        match info.call::<Option<Function>>((th.clone(), level, "f")) {
-            Ok(Some(f)) => {
-                if let Some(r) = script_of_function(&f) {
-                    return Some(r);
-                }
-            }
-            Ok(None) => {}
-            Err(_) => break,
-        }
-    }
-    unstarted_script(lua, th)
-}
-
 /// A task's entry function precedes its first Lua stack frame. debug.info
 /// on a task.delay or task.defer thread therefore sees no script until it runs.
 fn unstarted_script(lua: &Lua, th: &Thread) -> Option<Ref> {
@@ -3996,48 +4288,59 @@ fn stop_script(lua: &Lua, r: Ref) {
         return;
     }
     // (lists taken out while Lua's debug.info runs)
-    let (mut conns, mut waiters) = match lua.app_data_mut::<Signals>() {
-        Some(mut s) => (std::mem::take(&mut s.conns), std::mem::take(&mut s.waiters)),
-        None => return,
-    };
-    for list in conns.values_mut() {
-        list.retain(|c| script_of_function(&c.func) != Some(r));
+    stop_script_callbacks(lua, &HashSet::from([r]), false);
+}
+
+/// Whether any Lua frame of a suspended thread matches `pred` on its script
+/// ref (ModuleScripts included: a thread that yields inside a required
+/// module's function has the module's frame on top and its caller below).
+fn thread_runs(lua: &Lua, th: &Thread, mut pred: impl FnMut(Ref) -> bool) -> bool {
+    use mlua::ffi;
+    // Inspect the suspended stack directly. Calling debug.info, converting its
+    // result into a Function and looking up its environment for every frame
+    // dominated teardown in clients with many unrelated waiting scripts.
+    let thread = th.state();
+    let owners = unsafe {
+        // Both states belong to this Lua VM. Protect stack growth just as
+        // Luau's debug.info does for inspection of another coroutine.
+        lua.exec_raw::<MultiValue>((), |state| {
+            ffi::luaL_checkstack(state, 67, c"inspect suspended scripts".as_ptr());
+            if thread != state {
+                ffi::lua_rawcheckstack(thread, 1);
+            }
+            let mut frame = std::mem::zeroed::<ffi::lua_Debug>();
+            for level in 0..64 {
+                if ffi::lua_getinfo(thread, level, c"f".as_ptr(), &mut frame) == 0 {
+                    break;
+                }
+                if thread != state {
+                    ffi::lua_xmove(thread, state, 1);
+                }
+                if ffi::lua_iscfunction(state, -1) != 0 {
+                    ffi::lua_pop(state, 1);
+                    continue;
+                }
+                // Replace the frame function with its environment's script,
+                // keeping only userdata for the normal Instance type check.
+                ffi::lua_getfenv(state, -1);
+                ffi::lua_rawgetfield(state, -1, c"script".as_ptr());
+                if ffi::lua_type(state, -1) == ffi::LUA_TUSERDATA {
+                    ffi::lua_replace(state, -3);
+                    ffi::lua_pop(state, 1);
+                } else {
+                    ffi::lua_pop(state, 3);
+                }
+            }
+        })
     }
-    for list in waiters.values_mut() {
-        list.retain(|(_, th)| script_of_thread(lua, th) != Some(r));
-    }
-    if let Some(mut s) = lua.app_data_mut::<Signals>() {
-        // (what connected while the lists were out stays)
-        for (k, mut v) in std::mem::take(&mut s.conns) {
-            conns.entry(k).or_default().append(&mut v);
-        }
-        for (k, mut v) in std::mem::take(&mut s.waiters) {
-            waiters.entry(k).or_default().append(&mut v);
-        }
-        s.conns = conns;
-        s.waiters = waiters;
-    }
-    prune_layout_listeners(lua);
-    retain_scheduled(lua, |th| script_of_thread(lua, th) != Some(r));
+    .unwrap_or_default();
+    owners.iter().filter_map(opt_inst).any(&mut pred) || unstarted_script(lua, th).is_some_and(pred)
 }
 
 /// Whether any Lua frame of a suspended thread runs code of one of `set`'s
-/// scripts (ModuleScripts included: a thread that yields inside a required
-/// module's function has the module's frame on top).
+/// scripts.
 fn thread_runs_any(lua: &Lua, th: &Thread, set: &HashSet<Ref>) -> bool {
-    let Ok(info) = lua.globals().get::<Table>("debug").and_then(|d| d.get::<Function>("info")) else { return false };
-    for level in 0..64 {
-        match info.call::<Option<Function>>((th.clone(), level, "f")) {
-            Ok(Some(f)) => {
-                if script_of_function(&f).is_some_and(|r| set.contains(&r)) {
-                    return true;
-                }
-            }
-            Ok(None) => {}
-            Err(_) => break,
-        }
-    }
-    unstarted_script(lua, th).is_some_and(|r| set.contains(&r))
+    thread_runs(lua, th, |r| set.contains(&r))
 }
 
 /// Ends every thread and connection running code of `set`'s scripts,
@@ -4047,39 +4350,66 @@ fn stop_code_of(lua: &Lua, set: &HashSet<Ref>) {
     if set.is_empty() {
         return;
     }
+    let _scope = rustudio_core::bench::scope("stop_script_subtree");
     if let Ok(mut w) = world(lua) {
-        w.started.retain(|r| !set.contains(r));
+        for r in set {
+            w.started.remove(r);
+        }
     }
-    let (mut conns, mut waiters, mut ancestry) = match lua.app_data_mut::<Signals>() {
-        Some(mut s) => (
-            std::mem::take(&mut s.conns),
-            std::mem::take(&mut s.waiters),
-            std::mem::take(&mut s.destroyed_ancestry),
-        ),
-        None => return,
+    stop_script_callbacks(lua, set, true);
+}
+
+fn stop_script_callbacks(lua: &Lua, set: &HashSet<Ref>, include_retired: bool) {
+    let (mut waiters, mut changed) = {
+        let Ok(mut s) = signals(lua) else { return };
+        let keys: rustc_hash::FxHashSet<_> = set.iter()
+            .filter_map(|r| s.script_connections.get(r))
+            .flat_map(|keys| keys.keys().cloned())
+            .collect();
+        let mut changed = Vec::new();
+        for key in keys {
+            let remove = |c: &Conn| c.owner.is_some_and(|r| set.contains(&r));
+            if s.remove_connections(&key, false, remove) {
+                changed.push(key.0);
+            }
+            if include_retired && key.1 == "AncestryChanged" {
+                s.remove_connections(&key, true, remove);
+            }
+        }
+        (std::mem::take(&mut s.waiters), changed)
     };
-    for list in conns.values_mut() {
-        list.retain(|c| !script_of_function(&c.func).is_some_and(|r| set.contains(&r)));
-    }
-    for (_, list) in ancestry.values_mut() {
-        list.retain(|c| !script_of_function(&c.func).is_some_and(|r| set.contains(&r)));
-    }
-    for list in waiters.values_mut() {
+    for (key, list) in &mut waiters {
+        let before = list.len();
         list.retain(|(_, th)| !thread_runs_any(lua, th, set));
+        if before != 0 && list.is_empty() {
+            changed.push(key.0);
+        }
     }
     if let Some(mut s) = lua.app_data_mut::<Signals>() {
-        for (k, mut v) in std::mem::take(&mut s.conns) {
-            conns.entry(k).or_default().append(&mut v);
-        }
         for (k, mut v) in std::mem::take(&mut s.waiters) {
             waiters.entry(k).or_default().append(&mut v);
         }
-        s.conns = conns;
         s.waiters = waiters;
-        s.destroyed_ancestry.extend(ancestry);
     }
-    prune_layout_listeners(lua);
+    for r in changed {
+        prune_layout_listener(lua, r);
+    }
     retain_scheduled(lua, |th| !thread_runs_any(lua, th, set));
+    retain_invokes(lua, |th| !thread_runs_any(lua, th, set));
+}
+
+fn retain_invokes(lua: &Lua, mut keep: impl FnMut(&Thread) -> bool) {
+    let mut waiting = match lua.app_data_mut::<Invokes>() {
+        Some(mut inv) => std::mem::take(&mut inv.waiting),
+        None => return,
+    };
+    waiting.retain(|_, th| keep(th));
+    if let Some(mut inv) = lua.app_data_mut::<Invokes>() {
+        for (k, v) in std::mem::take(&mut inv.waiting) {
+            waiting.insert(k, v);
+        }
+        inv.waiting = waiting;
+    }
 }
 
 fn retain_scheduled(lua: &Lua, mut keep: impl FnMut(&Thread) -> bool) {
@@ -4133,7 +4463,7 @@ fn arg_str(args: &MultiValue, i: usize, what: &str) -> mlua::Result<String> {
         // Studio's reflected string argument converts what it can
         // (GetService(true) is `'true' is not a valid Service name`,
         // GetService({}) `'{}' …`); only nil is missing.
-        Value::String(s) => Ok(lua_text(&s)),
+        Value::String(s) => Ok(s.to_str()?.to_string()),
         Value::Number(n) => Ok(n.to_string()),
         Value::Integer(n) => Ok(n.to_string()),
         Value::Boolean(b) => Ok(b.to_string()),
@@ -4146,19 +4476,69 @@ fn arg_str(args: &MultiValue, i: usize, what: &str) -> mlua::Result<String> {
     }
 }
 
+/// Descendants of `root` (DataModel), skipping hidden core services (`CoreGui`,
+/// `CorePackages`) and their subtrees so game scripts never see or walk them.
+fn descendants_skip_hidden(d: &Document, root: Ref) -> Vec<Ref> {
+    let mut out = Vec::new();
+    let Some(top) = d.dom.get_by_ref(root) else { return out };
+    for &c in top.children() {
+        let Some(ci) = d.dom.get_by_ref(c) else { continue };
+        if security::is_hidden_service_class(&ci.class) {
+            continue;
+        }
+        for desc in d.dom.descendants_of(c) {
+            out.push(desc.referent());
+        }
+    }
+    out
+}
+
 fn children_of(lua: &Lua, r: Ref) -> mlua::Result<Vec<Ref>> {
-    Ok(world(lua)?
-        .d()
-        .dom
+    let w = world(lua)?;
+    let d = w.d();
+    let hide_core = d.dom.root_ref() == r && security::hides_core_services(lua);
+    Ok(d.dom
         .get_by_ref(r)
-        .map(|i| i.children().to_vec())
+        .map(|i| {
+            if hide_core {
+                i.children()
+                    .iter()
+                    .copied()
+                    .filter(|c| d.dom.get_by_ref(*c).is_none_or(|ci| !security::is_hidden_service_class(&ci.class)))
+                    .collect()
+            } else {
+                i.children().to_vec()
+            }
+        })
         .unwrap_or_default())
 }
 
 fn list(lua: &Lua, refs: Vec<Ref>) -> mlua::Result<Table> {
+    if domains::assets_cloud::scene::any_access_blocked(lua, &refs) {
+        return Err(rt_err("The current thread cannot access 'RealtimeMedia' (lacking capability InternalTest)"));
+    }
     let t = lua.create_table_with_capacity(refs.len(), 0)?;
+    let mut c = cache(lua)?;
+    let weak = c.weak.clone();
     for (i, r) in refs.into_iter().enumerate() {
-        t.set(i + 1, inst_value(lua, r)?)?;
+        if r.is_none() {
+            t.raw_set(i + 1, Value::Nil)?;
+            continue;
+        }
+        let slot = c.instance_slot(r);
+        let val = match weak.as_ref() {
+            Some(weak) => match weak.raw_get::<Value>(slot)? {
+                Value::UserData(u) => Value::UserData(u),
+                _ => {
+                    let u = new_inst_ud(lua, r)?;
+                    weak.raw_set(slot, u.clone())?;
+                    c.fresh.push(r);
+                    Value::UserData(u)
+                }
+            },
+            None => Value::UserData(new_inst_ud(lua, r)?),
+        };
+        t.raw_set(i + 1, val)?;
     }
     Ok(t)
 }
@@ -4171,18 +4551,31 @@ fn find_child(
 ) -> mlua::Result<Option<Ref>> {
     let w = world(lua)?;
     let d = w.d();
+    let hide_core = d.dom.root_ref() == r && security::hides_core_services(lua);
     Ok(if recursive {
-        d.dom
-            .descendants_of(r)
-            .filter(|i| i.referent() != r)
-            .find(|i| pred(i))
-            .map(|i| i.referent())
+        if hide_core {
+            let Some(top) = d.dom.get_by_ref(r) else { return Ok(None) };
+            top.children().iter().copied().find_map(|c| {
+                let ci = d.dom.get_by_ref(c)?;
+                if security::is_hidden_service_class(&ci.class) {
+                    return None;
+                }
+                d.dom.descendants_of(c).find(|i| pred(i)).map(|i| i.referent())
+            })
+        } else {
+            d.dom
+                .descendants_of(r)
+                .filter(|i| i.referent() != r)
+                .find(|i| pred(i))
+                .map(|i| i.referent())
+        }
     } else {
         d.dom.get_by_ref(r).and_then(|i| {
-            i.children()
-                .iter()
-                .copied()
-                .find(|c| d.dom.get_by_ref(*c).is_some_and(&pred))
+            i.children().iter().copied().find(|c| {
+                d.dom
+                    .get_by_ref(*c)
+                    .is_some_and(|ci| !(hide_core && security::is_hidden_service_class(&ci.class)) && pred(ci))
+            })
         })
     })
 }
@@ -4206,7 +4599,6 @@ struct ChildIndex {
 /// Parents with fewer children are just scanned.
 const CHILD_INDEX_MIN: usize = 64;
 
-/// `parent:FindFirstChild(name)`: the first child with that name.
 /// A child of `r` by name (`inst.Name`, FindFirstChild, WaitForChild).
 /// The DataModel's services answer to the Name Roblox's instance has
 /// where that differs from the class, too: RunService is "Run Service"
@@ -4221,7 +4613,7 @@ fn find_named_child(lua: &Lua, r: Ref, name: &str) -> mlua::Result<Option<Ref>> 
         return Ok(None);
     };
     let is_game = world(lua)?.d().dom.root_ref() == r;
-    if !is_game {
+    if !is_game || security::service_hidden(lua, service) {
         return Ok(None);
     }
     // (made if no script asked for it yet, as `game:GetService` does: the
@@ -4235,12 +4627,13 @@ fn find_named_child_plain(lua: &Lua, r: Ref, name: &str) -> mlua::Result<Option<
     let Some(i) = d.dom.get_by_ref(r) else {
         return Ok(None);
     };
+    let hide_core = d.dom.root_ref() == r && security::hides_core_services(lua);
     if i.children().len() < CHILD_INDEX_MIN {
-        return Ok(i
-            .children()
-            .iter()
-            .copied()
-            .find(|c| d.dom.get_by_ref(*c).is_some_and(|c| c.name == name)));
+        return Ok(i.children().iter().copied().find(|c| {
+            d.dom
+                .get_by_ref(*c)
+                .is_some_and(|ci| ci.name == name && !(hide_core && security::is_hidden_service_class(&ci.class)))
+        }));
     }
     drop(w);
     let mut w = world(lua)?;
@@ -4289,7 +4682,11 @@ fn find_named_child_plain(lua: &Lua, r: Ref, name: &str) -> mlua::Result<Option<
         return Ok(None);
     };
     // Still here under that name; with several, the first in child order.
-    list.retain(|c| d.dom.get_by_ref(*c).is_some_and(|ci| ci.parent() == r && ci.name == name));
+    list.retain(|c| {
+        d.dom.get_by_ref(*c).is_some_and(|ci| {
+            ci.parent() == r && ci.name == name && !(hide_core && security::is_hidden_service_class(&ci.class))
+        })
+    });
     Ok(match list.len() {
         0 => None,
         1 => Some(list[0]),
@@ -4335,9 +4732,11 @@ fn service_studio_only(lua: &Lua, class: &str) -> bool {
         class,
         "DebuggerManager" | "StudioService" | "DraggerService" | "LiveSyncService" | "TestCoordinatorService"
     ) && security::current(lua) == security::GAME)
-    // Studio's edit DataModel has no StudioPublishService: a plugin's
-    // GetService gets nil (checks/plugins/services/captures/history2.txt).
-        || class == "StudioPublishService"
+    // Studio's edit DataModel hides StudioPublishService from user plugins and
+    // game scripts, while
+    // built-in Studio plugins (PublishPlaceAs, identity 6) read it directly.
+        || (class == "StudioPublishService"
+            && !matches!(security::current(lua), security::BUILTIN_PLUGIN | security::CORE))
 }
 
 fn get_service(lua: &Lua, class: &str, create: bool) -> mlua::Result<Option<Ref>> {
@@ -4459,6 +4858,19 @@ fn model_pivot(w: &World, r: Ref) -> Xform {
     }
 }
 
+fn primary_part_frame(lua: &Lua, model: Ref, method: &str) -> mlua::Result<(Ref, Xform)> {
+    let w = world(lua)?;
+    let d = w.d();
+    if let Some(Variant::Ref(part)) = d.prop(model, "PrimaryPart") {
+        if let Some(Variant::CFrame(frame)) = d.prop(part, "CFrame") {
+            return Ok((part, Xform::from_cframe(&frame)));
+        }
+    }
+    Err(rt_err(format!(
+        "Model:{method}() failed because no PrimaryPart has been set, or the PrimaryPart no longer exists. Please set Model.PrimaryPart before using this."
+    )))
+}
+
 fn pivot_to(lua: &Lua, r: Ref, target: Xform) -> mlua::Result<()> {
     let (class, _, _) = inst_meta(lua, r)?;
     if doc::is_a(&class, "BasePart") {
@@ -4466,9 +4878,13 @@ fn pivot_to(lua: &Lua, r: Ref, target: Xform) -> mlua::Result<()> {
         store_prop(lua, r, "CFrame", Variant::CFrame(target.to_cframe()))?;
         return carry_assembly(lua, r, before);
     }
+    move_model(lua, r, target, None, doc::is_a(&class, "Model"))
+}
+
+fn move_model(lua: &Lua, r: Ref, target: Xform, primary: Option<(Ref, Xform)>, is_model: bool) -> mlua::Result<()> {
     let (pivot, parts) = {
         let w = world(lua)?;
-        let pivot = model_pivot(&w, r);
+        let pivot = primary.map_or_else(|| model_pivot(&w, r), |(_, frame)| frame);
         let parts: Vec<(Ref, Xform)> = w
             .d()
             .dom
@@ -4482,13 +4898,16 @@ fn pivot_to(lua: &Lua, r: Ref, target: Xform) -> mlua::Result<()> {
         (pivot, parts)
     };
     let delta = cf_mul(&target, &cf_inv(&pivot));
-    for (p, xf) in parts {
-        store_prop(
-            lua,
-            p,
-            "CFrame",
-            Variant::CFrame(cf_mul(&delta, &xf).orthonormalized().to_cframe()),
-        )?;
+    for (part, frame) in parts {
+        let moved = if primary.is_some_and(|(root, _)| part == root) {
+            // The legacy method targets the part's CFrame directly.
+            // Composing a delta and its inverse perturbs the target and
+            // makes repeated exact spawn-frame checks fail.
+            target
+        } else {
+            cf_mul(&delta, &frame).orthonormalized()
+        };
+        store_prop(lua, part, "CFrame", Variant::CFrame(moved.to_cframe()))?;
     }
     // Roblox: after PivotTo the model's pivot *is* the target (GetPivot
     // returns it). With a PrimaryPart that follows from the part having
@@ -4505,7 +4924,7 @@ fn pivot_to(lua: &Lua, r: Ref, target: Xform) -> mlua::Result<()> {
         matches!(d.prop(r, "PrimaryPart"), Some(Variant::Ref(pp))
             if pp.is_some() && matches!(d.prop(pp, "CFrame"), Some(Variant::CFrame(_))))
     };
-    if !primary_moves && doc::is_a(&class, "Model") {
+    if !primary_moves && is_model {
         store_prop(lua, r, "WorldPivotData", Variant::OptionalCFrame(Some(target.to_cframe())))?;
     }
     Ok(())
@@ -4536,7 +4955,7 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
         // the client still has the pair when it gets here.
         w.record(RepOp::Destroy(r));
     }
-    set_parent_opts(lua, r, Ref::none(), true, false, EnterPose::Full)?;
+    set_parent_opts(lua, r, Ref::none(), true, false, domains::world::part::EnterPose::Full)?;
     let immediate = {
         let mut w = world(lua)?;
         if w.mode == RunMode::Edit {
@@ -4575,7 +4994,7 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
             }
             w.fire(d, "Destroying", vec![]);
             drop(w);
-            set_parent_opts(lua, d, Ref::none(), false, false, EnterPose::Full)?;
+            set_parent_opts(lua, d, Ref::none(), false, false, domains::world::part::EnterPose::Full)?;
             world(lua)?.destroyed.insert(d);
             signal_timing::flush_immediate(lua);
             order.push((d, p));
@@ -4620,6 +5039,7 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
         for &x in &listened {
             w.forget_layout_listener(x);
             w.abs_seen.remove(&x);
+            w.scroll_seen.remove(&x);
         }
         (listened, stopped_scripts)
     };
@@ -4627,29 +5047,47 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
         let mut s = signals(lua)?;
         let cutoff = s.next_id;
         let mut retired_ancestry = false;
-        let Signals { conns, conn_names, destroyed_ancestry, .. } = &mut *s;
-        for x in &listened {
-            let Some(names) = conn_names.get_mut(x) else { continue };
-            for name in names.drain(..).collect::<Vec<_>>() {
+        for &x in &listened {
+            let Some(mut names) = s.conn_names.remove(&x) else { continue };
+            names.retain(|name| {
                 if name == "Destroying" {
-                    names.push(name);
-                } else {
-                    let ancestry = name == "AncestryChanged";
-                    if let Some(v) = conns.remove(&(*x, name)) {
-                        if ancestry && !v.is_empty() {
-                            destroyed_ancestry.insert(*x, (cutoff, v));
-                            retired_ancestry = true;
+                    return true;
+                }
+                let key = (x, name.clone());
+                if let Some(v) = s.conns.remove(&key) {
+                    if name == "AncestryChanged" && !v.is_empty() {
+                        if let Some((_, old)) = s.destroyed_ancestry.insert(x, (cutoff, v)) {
+                            for conn in old {
+                                s.forget_connection(&key, conn.owner);
+                            }
+                        }
+                        retired_ancestry = true;
+                    } else {
+                        for conn in v {
+                            s.forget_connection(&key, conn.owner);
                         }
                     }
                 }
-            }
-            if names.is_empty() {
-                conn_names.remove(x);
+                false
+            });
+            if !names.is_empty() {
+                s.conn_names.insert(x, names);
             }
         }
         if retired_ancestry {
             s.next_id += 1;
             world(lua)?.conn_seq = s.next_id;
+        }
+    }
+    if let Ok(mut s) = signals(lua) {
+        if !s.remote_queue.is_empty() || !s.remote_queue_warned.is_empty() {
+            for x in std::iter::once(r).chain(order.iter().map(|x| x.0)) {
+                for ev in ["OnClientEvent", "OnServerEvent"] {
+                    let key = (x, ev.to_string());
+                    s.remote_queue.remove(&key);
+                    s.remote_queue_warned.remove(&key);
+                }
+            }
         }
     }
     // A running Script destroyed with its model also loses its connections
@@ -4683,6 +5121,7 @@ fn detach_quiet_leaf_prefix(lua: &Lua, w: &mut World, parent: Ref, first: Ref) -
     if count == 0 {
         return None;
     }
+    ext::invalidate_layout_parent(w, parent);
     let quiet = w.dm().dom.detach_children_prefix(parent, count);
     for &child in &quiet {
         w.orphans.insert(child);
@@ -4832,7 +5271,7 @@ fn attribute_value(v: &Value) -> mlua::Result<Option<Variant>> {
         Value::Boolean(b) => Some(Variant::Bool(*b)),
         Value::Number(x) => Some(Variant::Float64(*x)),
         Value::Integer(i) => Some(Variant::Float64(*i as f64)),
-        Value::String(s) => Some(Variant::String(lua_text(s))),
+        Value::String(s) => Some(Variant::String(s.to_str()?.to_string())),
         _ => {
             if let Some(e) = opt_ud::<LEnumItem>(v) {
                 Some(Variant::EnumItem(rbx_dom_weak::types::EnumItem {
@@ -4964,13 +5403,18 @@ fn call_method_routed(
             one(Value::Table(list(lua, kids)?))
         }
         "GetDescendants" => {
-            let refs: Vec<Ref> = world(lua)?
-                .d()
-                .dom
-                .descendants_of(this)
-                .map(|i| i.referent())
-                .filter(|r| *r != this)
-                .collect();
+            let w = world(lua)?;
+            let d = w.d();
+            let refs: Vec<Ref> = if d.dom.root_ref() == this && security::hides_core_services(lua) {
+                descendants_skip_hidden(d, this)
+            } else {
+                d.dom
+                    .descendants_of(this)
+                    .map(|i| i.referent())
+                    .filter(|r| *r != this)
+                    .collect()
+            };
+            drop(w);
             one(Value::Table(list(lua, refs)?))
         }
         "IsA" => {
@@ -5090,7 +5534,9 @@ fn call_method_routed(
         }
         "GetPropertyChangedSignal" => {
             let p = arg_str(&args, 1, "string")?;
-            one(signal(lua, this, &format!("Changed:{p}"))?)
+            let (class, _, _) = inst_meta(lua, this)?;
+            let canon = prop_desc(&class, &p).map_or(p.as_str(), |(c, _, _)| c);
+            one(signal(lua, this, &format!("Changed:{canon}"))?)
         }
         "GetAttributeChangedSignal" => {
             let p = arg_str(&args, 1, "string")?;
@@ -5104,7 +5550,11 @@ fn call_method_routed(
             let r = get_service(lua, &c, name == "GetService")?;
             one(opt_ref_value(lua, r)?)
         }
-        "GetPivot" | "GetPrimaryPartCFrame" => {
+        "GetPrimaryPartCFrame" => {
+            let (_, frame) = primary_part_frame(lua, this, name)?;
+            one(LCFrame(frame).into_lua(lua)?)
+        }
+        "GetPivot" => {
             let (class, _, _) = inst_meta(lua, this)?;
             let xf = if doc::is_a(&class, "BasePart") {
                 part_xform(lua, this)?
@@ -5115,7 +5565,12 @@ fn call_method_routed(
         }
         "PivotTo" | "SetPrimaryPartCFrame" => {
             let cf = opt_ud::<LCFrame>(&arg(&args, 1)).ok_or_else(|| rt_err("CFrame expected"))?;
-            pivot_to(lua, this, cf.0)?;
+            if name == "SetPrimaryPartCFrame" {
+                let primary = primary_part_frame(lua, this, name)?;
+                move_model(lua, this, cf.0, Some(primary), true)?;
+            } else {
+                pivot_to(lua, this, cf.0)?;
+            }
             none()
         }
         "MoveTo" => {
@@ -5202,11 +5657,25 @@ fn call_method_routed(
             if name == "FireClient" && opt_inst(&arg(&args, 1)).is_none() {
                 return Err(rt_err("FireClient: player argument must be a Player"));
             }
-            // One client: FireClient(player, …) and FireAllClients(…) both reach it.
+            // One client: FireClient(player, …) and FireAllClients(…) both reach it,
+            // except FireAllClients before any Player has joined has no recipients
+            // (Roblox does not replay pre-join FireAllClients to future players).
             let skip = if name == "FireClient" { 2 } else { 1 };
             let payload: Vec<Xfer> = args.iter().skip(skip).map(|v| export(v, 0)).collect();
             let mut w = world(lua)?;
-            if w.has_peer {
+            let has_recipient = if name == "FireAllClients" {
+                let d = w.d();
+                d.find_child(d.dom.root_ref(), "Players").is_some_and(|players| {
+                    d.dom.get_by_ref(players).is_some_and(|i| {
+                        i.children()
+                            .iter()
+                            .any(|c| d.class_of(*c).is_some_and(|k| k == "Player"))
+                    })
+                })
+            } else {
+                true
+            };
+            if w.has_peer && has_recipient {
                 w.outbox.push(RemoteMsg {
                     inst: this,
                     kind: RemoteKind::Event,
@@ -5307,11 +5776,11 @@ local function connect(self, fn, once)
     gate(self, "connect")
     if type(fn) ~= "function" then
         rs_output("error", "Attempt to connect failed: Passed value is not a function")
-        local c = rs_connect(self.__inst, self.__name, noop, once)
+        local c = rs_connect(self.__inst, self.__name, noop, once, true)
         c:Disconnect()
         return c
     end
-    return rs_connect(self.__inst, self.__name, fn, once)
+    return rs_connect(self.__inst, self.__name, fn, once, false)
 end
 function Signal:Connect(fn) return connect(self, fn, false) end
 function Signal:Once(fn) return connect(self, fn, true) end
@@ -5368,6 +5837,7 @@ end
 -- One module cache per identity: a command-bar require (identity 1) must
 -- not hand game scripts its result, and Studio runs the module again.
 local loaded_by, loading_by = {}, {}
+local asset_modules, asset_loading = {}, {}
 local NIL_RESULT = newproxy(false) -- a module that returned nil, cached
 local FAILED = newproxy(false) -- a module whose code raised
 -- Require by string (Luau's require-by-string, as Studio's own messages
@@ -5424,14 +5894,30 @@ local function require_impl(m, script)
         error(string.format("require(assetId) cannot be called from a client.  assetId = %d", m), 0)
     end
     if type(m) == "number" then
-        -- An asset id: the published model's MainModule, else Studio's
-        -- error (offline Studio prints the same for every id).
-        local ok, model = pcall(function()
-            return game:GetService("InsertService"):LoadAsset(m)
-        end)
-        local main = ok and model and model:FindFirstChild("MainModule", true)
+        -- An asset id: cache the loaded MainModule per id (Studio loads and
+        -- executes each asset module once per VM so multiple scripts requiring
+        -- the same id share its state, even across concurrent yields).
+        local id = m
+        local main = asset_modules[id]
+        if not main then
+            if asset_loading[id] then
+                while asset_loading[id] do task.wait() end
+                main = asset_modules[id]
+            else
+                asset_loading[id] = true
+                local ok, model = pcall(function()
+                    return game:GetService("InsertService"):LoadAsset(id)
+                end)
+                local found = ok and model and model:FindFirstChild("MainModule", true)
+                if found and found:IsA("ModuleScript") then
+                    asset_modules[id] = found
+                    main = found
+                end
+                asset_loading[id] = nil
+            end
+        end
         if not (main and main:IsA("ModuleScript")) then
-            error(string.format('Downloading asset failed for asset id %d.  Is the asset id correct and is the asset type "Model"?', m), 0)
+            error(string.format('Downloading asset failed for asset id %d.  Is the asset id correct and is the asset type "Model"?', id), 0)
         end
         m = main
     end
@@ -5459,15 +5945,19 @@ local function require_impl(m, script)
     loading[m] = running()
     local f = rs_load_module(m)
     local memoryCategory = __ac_scene_mem_begin(m)
-    local res = table.pack(pcall(f))
+    local mod_tb = nil
+    local res = table.pack(xpcall(f, function(err)
+        mod_tb = debug.traceback(nil, 2)
+        return err
+    end))
     __ac_scene_mem_restore(memoryCategory)
     loading[m] = nil
     local ok, r = res[1], res[2]
     if not ok then
-        -- The module's own error goes to Output; the requirer gets Studio's
-        -- generic message, and so does every later require of it.
+        -- The module's own error and stack trace go to Output; the requirer gets
+        -- Studio's generic message, and so does every later require of it.
         loaded[m] = FAILED
-        rs_output("error", tostring(r))
+        rs_output("module_error", tostring(r), mod_tb)
         error("Requested module experienced an error while loading", 0)
     end
     -- One value, which may be nil (a types-only module ends `return nil`);
@@ -5511,7 +6001,7 @@ function __rs_lua_methods.WaitForChild(self, name, timeout)
         if timeout and time() - start >= timeout then return nil end
         if not timeout and not warned and time() - start >= 5 then
             warned = true
-            rs_output("warn", "Infinite yield possible on '" .. full .. ":WaitForChild(\"" .. tostring(name) .. "\")'", src, line)
+            rs_output("warn_stack", "Infinite yield possible on '" .. full .. ":WaitForChild(\"" .. tostring(name) .. "\")'", debug.traceback(nil, 2), line)
         end
     end
 end
@@ -5650,7 +6140,7 @@ impl Runtime {
         // (native_drain), not while Play starts. RUSTUDIO_NATIVE_NOW=1: at
         // the load, as before.
         lua.set_app_data(NativeQueue {
-            on: native_on && !native_at_load_asked(),
+            on: native_on && !std::env::var_os("RUSTUDIO_NATIVE_NOW").is_some_and(|v| v != "0"),
             ..Default::default()
         });
         rustudio_core::load_trace::mark("runtime: Lua made");
@@ -5909,17 +6399,27 @@ impl Runtime {
         })?;
         let rs_wait_signal =
             lua.create_function(|lua, (inst, name, th): (LInst, String, Thread)| {
-                let id = {
+                let (id, item_changed, touch, pending) = {
                     let mut s = signals(lua)?;
                     s.next_id += 1;
                     let id = s.next_id;
                     let item_changed = name == "ItemChanged";
                     let touch = crate::runtime::TOUCH_EVENTS.contains(&name.as_str());
+                    let key = (inst.0, name.clone());
                     s.note_name(inst.0, &name);
-                    s.waiters.entry((inst.0, name)).or_default().push((id, th));
-                    (id, item_changed, touch)
+                    s.waiters.entry(key.clone()).or_default().push((id, th));
+                    let pending = if is_remote_event_signal(&name) {
+                        let item = s.remote_queue.get_mut(&key).and_then(VecDeque::pop_front);
+                        if s.remote_queue.get(&key).is_some_and(VecDeque::is_empty) {
+                            s.remote_queue.remove(&key);
+                            s.remote_queue_warned.remove(&key);
+                        }
+                        item
+                    } else {
+                        None
+                    };
+                    (id, item_changed, touch, pending)
                 };
-                let (id, item_changed, touch) = id;
                 let mut w = world(lua)?;
                 w.item_changed |= item_changed;
                 w.conn_seq = id;
@@ -5927,10 +6427,52 @@ impl Runtime {
                     w.note_touch_interest(inst.0, "Touched");
                 }
                 w.note_listener(inst.0, false);
+                if let Some(vals) = pending {
+                    w.events.push((inst.0, name, vals, id, 0));
+                }
                 Ok(())
             })?;
         let rs_output = lua.create_function(
             |lua, (kind, msg, src, line): (String, String, Option<String>, Option<i64>)| {
+                if kind == "module_error" {
+                    let tb = src.unwrap_or_default();
+                    let mut frames = Vec::new();
+                    for raw in tb.lines() {
+                        let t = raw.trim();
+                        if t.starts_with("rustudio.") {
+                            break;
+                        }
+                        if let Some(f) = parse_frame(t) {
+                            frames.push(f);
+                        }
+                    }
+                    report_frames(lua, &mlua::Error::RuntimeError(msg), frames);
+                    return Ok(());
+                }
+                if kind == "warn_stack" {
+                    let tb = src.unwrap_or_default();
+                    let frames: Vec<_> = tb.lines().filter_map(parse_frame).collect();
+                    let mut w = world(lua)?;
+                    let loc = frames
+                        .first()
+                        .map(|(p, l, _)| format!("{p}:{l}"))
+                        .unwrap_or_default();
+                    let line = if loc.is_empty() { msg } else { format!("{msg}  —  {loc}") };
+                    w.output.push((Level::Warn, line));
+                    if !frames.is_empty() {
+                        let mark = STACK_MARK;
+                        w.output.push((Level::Info, format!("{mark}Stack Begin")));
+                        for (path, ln, func) in &frames {
+                            let text = match func {
+                                Some(f) => format!("Script '{path}', Line {ln} - function {f}"),
+                                None => format!("Script '{path}', Line {ln}"),
+                            };
+                            w.output.push((Level::Info, format!("{mark}{text}  —  {path}:{ln}")));
+                        }
+                        w.output.push((Level::Info, format!("{mark}Stack End")));
+                    }
+                    return Ok(());
+                }
                 let src = src.unwrap_or_default();
                 let src = src.trim_start_matches(['=', '@']);
                 let loc = match line {
@@ -5948,24 +6490,49 @@ impl Runtime {
             },
         )?;
         let rs_connect = lua.create_function(
-            |lua, (inst, name, f, once): (LInst, String, Function, bool)| {
-                let id = {
+            |lua, (inst, name, f, once, dead): (LInst, String, Function, bool, Option<bool>)| {
+                let dead = dead.unwrap_or(false);
+                let (id, pending) = {
                     let mut s = signals(lua)?;
                     s.next_id += 1;
                     let id = s.next_id;
-                    let list = s.conns.entry((inst.0, name.clone())).or_default();
+                    let key = (inst.0, name.clone());
+                    let list = s.conns.entry(key.clone()).or_default();
                     let first = list.is_empty();
-                    list.push(Conn { id, func: f, once, ident: security::current(lua) });
+                    let owner = script_of_function(&f);
+                    list.push(Conn { id, func: f, owner, once, ident: security::current(lua) });
+                    s.note_connection(&key, owner);
                     if first {
                         s.note_name(inst.0, &name);
                     }
-                    id
+                    let pending: Vec<Vec<Value>> = if !dead && is_remote_event_signal(&name) {
+                        if once {
+                            let item = s.remote_queue.get_mut(&key).and_then(VecDeque::pop_front);
+                            if s.remote_queue.get(&key).is_some_and(VecDeque::is_empty) {
+                                s.remote_queue.remove(&key);
+                                s.remote_queue_warned.remove(&key);
+                            }
+                            item.into_iter().collect()
+                        } else {
+                            s.remote_queue_warned.remove(&key);
+                            s.remote_queue
+                                .remove(&key)
+                                .map(|q| q.into_iter().collect())
+                                .unwrap_or_default()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    (id, pending)
                 };
                 if let Some(mut w) = lua.app_data_mut::<World>() {
                     w.conn_seq = id;
                     w.item_changed |= name == "ItemChanged";
                     w.note_touch_interest(inst.0, &name);
                     w.note_listener(inst.0, true);
+                    for vals in pending {
+                        w.events.push((inst.0, name.clone(), vals, id, 0));
+                    }
                 }
                 Ok(LConn {
                     key: (inst.0, name),
@@ -6080,7 +6647,6 @@ impl Runtime {
         g.set(
             "__rs_kfs_parts",
             lua.create_function(|lua, kfs: LInst| {
-                let _s = rustudio_core::bench::scope("anim_kfs_parts");
                 let enum_name = |v: Option<Variant>, e: &str, dflt: &str| match v {
                     Some(Variant::Enum(x)) => LEnumItem::from_value(e, x.to_u32())
                         .map(|i| i.name)
@@ -6094,6 +6660,7 @@ impl Runtime {
                     _ => dflt,
                 };
                 struct PoseRow {
+                    parent: String,
                     name: String,
                     t: f64,
                     cf: Variant,
@@ -6109,9 +6676,10 @@ impl Runtime {
                     fn walk(
                         d: &Document,
                         parent: Ref,
+                        parent_name: &str,
                         t: f64,
                         out: &mut Vec<PoseRow>,
-                        row: &dyn Fn(&Document, Ref, f64) -> Option<PoseRow>,
+                        row: &dyn Fn(&Document, Ref, &str, f64) -> Option<PoseRow>,
                     ) {
                         let Some(i) = d.dom.get_by_ref(parent) else { return };
                         for c in i.children() {
@@ -6119,17 +6687,18 @@ impl Runtime {
                             if !doc::is_a(&ci.class, "Pose") {
                                 continue;
                             }
-                            if let Some(r) = row(d, *c, t) {
+                            if let Some(r) = row(d, *c, parent_name, t) {
                                 out.push(r);
                             }
-                            walk(d, *c, t, out, row);
+                            walk(d, *c, &ci.name, t, out, row);
                         }
                     }
-                    let row = |d: &Document, p: Ref, t: f64| -> Option<PoseRow> {
+                    let row = |d: &Document, p: Ref, parent: &str, t: f64| -> Option<PoseRow> {
                         if num(d.prop(p, "Weight"), 1.0) <= 0.0 {
                             return None;
                         }
                         Some(PoseRow {
+                            parent: parent.into(),
                             name: d.dom.get_by_ref(p)?.name.clone(),
                             t,
                             cf: d
@@ -6146,7 +6715,7 @@ impl Runtime {
                                 continue;
                             }
                             let t = num(d.prop(*k, "Time"), 0.0);
-                            walk(d, *k, t, &mut poses, &row);
+                            walk(d, *k, "", t, &mut poses, &row);
                             let markers = kk
                                 .children()
                                 .iter()
@@ -6167,11 +6736,19 @@ impl Runtime {
                 };
                 let joints = lua.create_table()?;
                 for p in poses {
-                    let list: Table = match joints.raw_get::<Option<Table>>(p.name.as_str())? {
+                    let children: Table = match joints.raw_get::<Option<Table>>(p.parent.as_str())? {
+                        Some(children) => children,
+                        None => {
+                            let children = lua.create_table()?;
+                            joints.raw_set(p.parent, children.clone())?;
+                            children
+                        }
+                    };
+                    let list: Table = match children.raw_get::<Option<Table>>(p.name.as_str())? {
                         Some(l) => l,
                         None => {
                             let l = lua.create_table()?;
-                            joints.raw_set(p.name.as_str(), l.clone())?;
+                            children.raw_set(p.name.as_str(), l.clone())?;
                             l
                         }
                     };
@@ -6291,7 +6868,7 @@ impl Runtime {
                 Ok(match op.as_str() {
                     "register" => {
                         cg.register(&a).map_err(rt_err)?;
-                        Value::Nil
+                        Value::Number((cg.names().len() - 1) as f64)
                     }
                     "unregister" => {
                         rustudio_core::collision_groups::check_name(&a).map_err(rt_err)?;
@@ -6354,9 +6931,88 @@ impl Runtime {
                 Ok(cache(lua)?
                     .callbacks
                     .get(&(inst.0, key))
-                    .cloned()
-                    .map(Value::Function)
+                    .map(|(f, _)| Value::Function(f.clone()))
                     .unwrap_or(Value::Nil))
+            })?,
+        )?;
+        // Invokes a stored callback with the thread identity that assigned it,
+        // returning (true, true, result) on success, (true, false, err) on error,
+        // or (false) if no callback is assigned.
+        g.set(
+            "__rs_call_callback",
+            lua.create_function(|lua, args: MultiValue| {
+                let mut it = args.into_iter();
+                let inst = it.next().and_then(|v| opt_inst(&v)).ok_or_else(|| rt_err("instance expected"))?;
+                let key = match it.next() {
+                    Some(Value::String(s)) => s.to_str()?.to_string(),
+                    _ => return Err(rt_err("callback name expected")),
+                };
+                let entry = cache(lua)?.callbacks.get(&(inst, key)).cloned();
+                let Some((f, ident)) = entry else {
+                    return Ok(MultiValue::from_iter([Value::Boolean(false)]));
+                };
+                let call_args: MultiValue = it.collect();
+                let prev = security::current(lua);
+                security::set_current(lua, ident);
+                let res = f.call::<Value>(call_args);
+                security::set_current(lua, prev);
+                match res {
+                    Ok(v) => Ok(MultiValue::from_iter([Value::Boolean(true), Value::Boolean(true), v])),
+                    Err(e) => Ok(MultiValue::from_iter([
+                        Value::Boolean(true),
+                        Value::Boolean(false),
+                        Value::String(lua.create_string(error_message(&e))?),
+                    ])),
+                }
+            })?,
+        )?;
+        // Context actions resume on a coroutine with the binder's identity.
+        // The library captures this function before it is removed from globals.
+        g.set(
+            "__rs_call_action",
+            lua.create_function(|lua, (ident, f, call_args): (u8, Function, MultiValue)| {
+                let th = lua.create_thread(f)?;
+                security::set_thread(&th, ident);
+                match th.resume::<Value>(call_args) {
+                    Ok(v) => Ok(MultiValue::from_iter([Value::Boolean(true), v])),
+                    Err(e) => Ok(MultiValue::from_iter([
+                        Value::Boolean(false),
+                        Value::String(lua.create_string(error_message(&e))?),
+                    ])),
+                }
+            })?,
+        )?;
+        g.set(
+            "__rs_get_identity",
+            lua.create_function(|lua, ()| Ok(security::current(lua) as i64))?,
+        )?;
+        g.set(
+            "__rs_spawn_with_identity",
+            lua.create_function(|lua, (name, args): (Value, MultiValue)| {
+                let mut it = args.into_iter();
+                let ident = match it.next() {
+                    Some(Value::Integer(n)) => n as u8,
+                    Some(Value::Number(n)) => n as u8,
+                    _ => security::GAME,
+                };
+                let Some(Value::Function(f)) = it.next() else {
+                    return Err(rt_err("__rs_spawn_with_identity: function expected"));
+                };
+                let call_args: Vec<Value> = it.collect();
+                let th = lua.create_thread(f)?;
+                security::set_thread(&th, ident);
+                crate::script_profiler::with_entry(
+                    crate::script_profiler::EntryKind::Event,
+                    || {
+                        let name = match name {
+                            Value::String(s) => Some(format!("BindToRenderStep:{}", s.to_string_lossy())),
+                            _ => Some("BindToRenderStep".to_owned()),
+                        };
+                        (None, name)
+                    },
+                    || resume(lua, &th, call_args),
+                );
+                Ok(())
             })?,
         )?;
         // Engine-owned values that scripts may only read (Humanoid.MoveDirection
@@ -6403,6 +7059,7 @@ impl Runtime {
         lua.load(include_str!("library.luau"))
             .set_name("=rustudio.library")
             .call::<()>((rs_create, rs_fire))?;
+        g.set("__rs_call_action", Value::Nil)?;
         // UserGameSettings' values, for its property hooks (domains/services).
         lua.set_named_registry_value("rs_user_game_settings", g.get::<Table>("__rs_user_game_settings")?)?;
         editable::install(lua)?;
@@ -6536,6 +7193,20 @@ impl Runtime {
         Ok(())
     }
 
+    /// Takes the CoreScripts core_scripts::install put in this side's
+    /// DataModel and starts the engine's entry CoreScript, StarterScript
+    /// (core_scripts.rs), which adds the others.
+    pub fn start_core_scripts(&self, installed: rustudio_core::core_scripts::Installed) -> Result<(), String> {
+        if let Ok(mut w) = world(&self.lua) {
+            w.core_scripts = installed;
+        }
+        match start_core_script(&self.lua, "StarterScript", Ref::none()) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err("the data model patch has no StarterScript".into()),
+            Err(e) => Err(describe_error(&e)),
+        }
+    }
+
     /// Starts a script Play collected, if it is still somewhere it runs, as
     /// in Roblox: Play gathers scripts first and starts them one by one, and
     /// an earlier one can unparent or clone a later one's GUI in between
@@ -6592,24 +7263,6 @@ impl Runtime {
         }
     }
 
-    /// Takes the CoreScripts core_scripts::install put in this side's
-    /// DataModel and starts the engine's entry CoreScript, StarterScript
-    /// (core_scripts.rs), which adds the others.
-    pub fn start_core_scripts(&self, installed: rustudio_core::core_scripts::Installed) -> Result<(), String> {
-        if let Ok(mut w) = world(&self.lua) {
-            w.core_scripts = installed;
-        }
-        // Under CoreGui: StarterScript hands `script.Parent` to
-        // AddCoreScriptLocal for several CoreScripts (StarterScript.lua),
-        // while its chunk keeps the bare name Roblox reports.
-        let core_gui = world(&self.lua).ok().and_then(|w| w.d().find_child(w.d().dom.root_ref(), "CoreGui")).unwrap_or_else(Ref::none);
-        match start_core_script(&self.lua, "StarterScript", core_gui, Some("StarterScript")) {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => Err("the data model patch has no StarterScript".into()),
-            Err(e) => Err(describe_error(&e)),
-        }
-    }
-
     /// Builds this side's world-query cache (rays, region queries) ahead of
     /// the first script query.
     pub fn warm_queries(&self) {
@@ -6649,6 +7302,18 @@ impl Runtime {
 
     pub fn inst(&self, r: Ref) -> Value {
         inst_value(&self.lua, r).unwrap_or(Value::Nil)
+    }
+
+    /// Re-anchors pending timers' wall-clock timestamps to now so synchronous
+    /// Play bootstrap work (client CoreScripts) before frame 1 does not count
+    /// as elapsed wall time against server `task.wait` / `task.delay` timers.
+    pub fn reset_timer_walls(&self) {
+        if let Ok(mut s) = sched(&self.lua) {
+            let now = rustudio_core::sim_clock::now();
+            for t in &mut s.timers {
+                t.wall = now;
+            }
+        }
     }
 
     /// Advances time: resumes due waits and delays, then dispatches.
@@ -6752,7 +7417,7 @@ impl Runtime {
         if w.doc.is_none() {
             return Vec::new();
         }
-        for r in std::mem::take(&mut c.fresh) {
+        for r in c.fresh.drain(..) {
             if w.d().dom.get_by_ref(r).is_some_and(|i| i.parent().is_none()) {
                 w.orphans.insert(r);
             }
@@ -6767,19 +7432,12 @@ impl Runtime {
             return Vec::new();
         }
         let root = w.d().dom.root_ref();
-        let mut candidates: Vec<Ref> = w.orphans.iter().copied().collect();
-        // Each pass starts where the last one stopped (its budget), so the
-        // unparented instances scripts still hold don't take every pass.
-        let from = w.gc_cursor % candidates.len();
-        candidates.rotate_left(from);
+        let candidates: Vec<Ref> = w.orphans.iter().copied().collect();
         let mut looked = 0usize;
         let mut freed: Vec<Ref> = Vec::new();
-        let started = Instant::now();
-        let limit = Duration::from_secs_f64(mech::GC_PASS_MS / 1000.0);
-        w.gc_cursor = 0;
-        for (k, r) in candidates.into_iter().enumerate() {
-            if looked >= budget || started.elapsed() >= limit {
-                w.gc_cursor = from + k;
+        let mut subtree = Vec::new();
+        for r in candidates {
+            if looked >= budget {
                 break;
             }
             let d = w.d();
@@ -6799,24 +7457,37 @@ impl Runtime {
             // every pass was 45-70 ms twice a second.
             let held = |x: Ref| {
                 pinned(x)
+                    || w.prop_ref_counts.get(&x).is_some_and(|&n| n > 0)
                     || c.slots.get(&x).is_some_and(|slot| {
-                        c.weak
-                            .as_ref()
-                            .and_then(|t| t.raw_get::<Value>(*slot).ok())
-                            .is_some_and(|v| !matches!(v, Value::Nil))
+                        // Slots contain only userdata or nil. Luau's
+                        // truth test avoids rooting each checked userdata.
+                        c.weak.as_ref().is_some_and(|t| t.raw_get::<bool>(*slot).unwrap_or(false))
                     })
             };
-            let mut subtree: Vec<Ref> = Vec::new();
-            let mut alive = false;
-            for x in d.dom.descendants_of(r).map(|i| i.referent()) {
+            looked += 1;
+            if held(r) {
+                continue;
+            }
+            // The same list also queues the next nodes in breadth-first
+            // order. Held roots and most transient leaf instances need
+            // no traversal or per-candidate allocation.
+            subtree.clear();
+            subtree.push(r);
+            subtree.extend_from_slice(i.children());
+            let mut next = 1;
+            while let Some(&x) = subtree.get(next) {
+                let Some(child) = d.dom.get_by_ref(x) else {
+                    subtree.truncate(next);
+                    break;
+                };
                 looked += 1;
                 if held(x) {
-                    alive = true;
                     break;
                 }
-                subtree.push(x);
+                subtree.extend_from_slice(child.children());
+                next += 1;
             }
-            if alive {
+            if next != subtree.len() {
                 continue;
             }
             w.orphans.remove(&r);
@@ -6839,15 +7510,21 @@ impl Runtime {
                 w.listening.remove(x);
                 w.forget_layout_listener(*x);
                 w.abs_seen.remove(x);
+                w.scroll_seen.remove(x);
                 w.started.remove(x);
                 w.orphans.remove(x);
                 w.input.sound_pos.remove(x);
+                if let Some(edges) = w.prop_ref_edges.remove(x) {
+                    for (_, target) in edges {
+                        release_prop_ref(&mut w.prop_ref_counts, target);
+                    }
+                }
                 w.input.sound_len.remove(x);
                 w.input.sound_playing.remove(x);
                 w.input.sound_paused.remove(x);
                 w.input.gui_layout.remove(x);
             }
-            freed.extend(subtree);
+            freed.extend_from_slice(&subtree);
         }
         w.orphans_seen = w.orphans.len();
         w.gc_busy = arrived || freed.len() >= mech::GC_BUSY_ORPHANS;
@@ -6861,12 +7538,23 @@ impl Runtime {
         drop(c);
         drop(w);
         if let Some(mut s) = lua.app_data_mut::<Signals>() {
-            s.conns.retain(|(r, _), _| !gone.contains(r));
-            s.conn_names.retain(|r, _| !gone.contains(r));
+            for &r in &freed {
+                let Some(names) = s.conn_names.remove(&r) else { continue };
+                for name in names {
+                    let key = (r, name);
+                    for conn in s.conns.remove(&key).into_iter().flatten() {
+                        s.forget_connection(&key, conn.owner);
+                    }
+                }
+            }
             s.waiters.retain(|(r, _), _| !gone.contains(r));
+            s.remote_queue.retain(|(r, _), _| !gone.contains(r));
+            s.remote_queue_warned.retain(|(r, _)| !gone.contains(r));
         }
         if let Some(mut ix) = lua.app_data_mut::<ChildIndex>() {
-            ix.by_parent.retain(|r, _| !gone.contains(r));
+            for r in &freed {
+                ix.by_parent.remove(r);
+            }
         }
         freed
     }
@@ -6993,7 +7681,12 @@ impl Runtime {
             };
             if deferred.is_empty() && events.is_empty() && !more() {
                 if let Ok(mut s) = signals(lua) {
-                    s.destroyed_ancestry.clear();
+                    for (r, (_, list)) in std::mem::take(&mut s.destroyed_ancestry) {
+                        let key = (r, "AncestryChanged".to_string());
+                        for conn in list {
+                            s.forget_connection(&key, conn.owner);
+                        }
+                    }
                 }
                 return;
             }
@@ -7220,7 +7913,8 @@ pub fn resume(lua: &Lua, th: &Thread, args: Vec<Value>) {
         }
     }
     let prof = crate::script_profiler::begin_resume(lua, th);
-    let r = th.resume::<MultiValue>(MultiValue::from_iter(args));
+    // Engine-scheduled coroutines have no caller waiting for their results.
+    let r = th.resume::<()>(MultiValue::from_vec(args));
     if let Some(p) = prof {
         crate::script_profiler::end_resume(p, th.status() != ThreadStatus::Resumable);
     }
@@ -7244,6 +7938,17 @@ pub fn resume(lua: &Lua, th: &Thread, args: Vec<Value>) {
     }
     if let Err(e) = r {
         report_frames(lua, &e, thread_frames(lua, th));
+    }
+}
+
+/// Releases one tracked Instance property reference.
+fn release_prop_ref(counts: &mut HashMap<Ref, usize>, target: Ref) {
+    if let std::collections::hash_map::Entry::Occupied(mut count) = counts.entry(target) {
+        if *count.get() == 1 {
+            count.remove();
+        } else {
+            *count.get_mut() = count.get().saturating_sub(1);
+        }
     }
 }
 
@@ -7287,20 +7992,6 @@ struct NativeQueue {
     bytes: usize,
     took: std::time::Duration,
     frames: u32,
-}
-
-static NATIVE_AT_LOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Builds every later-made VM's --!native scripts at their load, as before
-/// the queue (a test that profiles a script's first run natively;
-/// RUSTUDIO_NATIVE_NOW=1 asks the same).
-pub fn native_at_load(on: bool) {
-    NATIVE_AT_LOAD.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn native_at_load_asked() -> bool {
-    NATIVE_AT_LOAD.load(std::sync::atomic::Ordering::Relaxed)
-        || std::env::var_os("RUSTUDIO_NATIVE_NOW").is_some_and(|v| v != "0")
 }
 
 /// Native code for queued scripts, within a frame's budget (at least one
@@ -7398,11 +8089,11 @@ fn compile_script(lua: &Lua, r: Ref, shared: &Table) -> mlua::Result<Function> {
 
 /// Starts the CoreScript `name` of Studio's data model patch
 /// (`PatchRoot.CoreScripts`, core_scripts.rs) as a CoreScript instance under
-/// `parent`, at the CoreScript identity. Its chunk is `=` + `chunk`, else
-/// its full name: the names Roblox reports (`StarterScript`,
-/// `CoreGui.RobloxGui.CoreScripts/<Name>`) and security::internal_chunk
-/// knows. None when the patch has no such script.
-pub(crate) fn start_core_script(lua: &Lua, name: &str, parent: Ref, chunk: Option<&str>) -> mlua::Result<Option<Ref>> {
+/// `parent` (none: parentless, as the engine's own StarterScript), at the
+/// CoreScript identity. Its chunk is `=` + its full name, the names Roblox
+/// reports (`StarterScript`, `CoreGui.RobloxGui.CoreScripts/<Name>`) and
+/// security::internal_chunk knows. None when the patch has no such script.
+pub(crate) fn start_core_script(lua: &Lua, name: &str, parent: Ref) -> mlua::Result<Option<Ref>> {
     let (r, code, full) = {
         let mut w = world(lua)?;
         let Some(code) = w.core_scripts.scripts.get(name).cloned() else { return Ok(None) };
@@ -7414,7 +8105,7 @@ pub(crate) fn start_core_script(lua: &Lua, name: &str, parent: Ref, chunk: Optio
         }
         w.structure_changed = true;
         w.started.insert(r);
-        let full = chunk.map(str::to_string).unwrap_or_else(|| w.full_name(r));
+        let full = w.full_name(r);
         (r, code, full)
     };
     let env = crate::globals_parity::new_env(lua, Some(inst_value(lua, r)?))?;
@@ -7652,6 +8343,48 @@ impl Runtime {
                 Err(e) => report(lua, &e),
             }
         }
+        // Roblox queues reliable RemoteEvent invocations arriving before any
+        // script connects to OnClientEvent / OnServerEvent (up to 256 per
+        // remote), flushing them FIFO when a listener attaches.
+        // UnreliableRemoteEvent never queues.
+        if is_remote_event_signal(event) {
+            let is_reliable = lua
+                .app_data_ref::<World>()
+                .is_some_and(|w| w.d().dom.get_by_ref(remote).is_some_and(|i| i.class == "RemoteEvent"));
+            if is_reliable {
+                let key = (remote, event.to_string());
+                let mut warn_overflow = false;
+                let mut queued = false;
+                if let Some(mut s) = lua.app_data_mut::<Signals>() {
+                    let has_listener = s.conns.get(&key).is_some_and(|v| !v.is_empty())
+                        || s.waiters.get(&key).is_some_and(|v| !v.is_empty());
+                    let has_pending = s.remote_queue.get(&key).is_some_and(|q| !q.is_empty());
+                    if !has_listener || has_pending {
+                        let q = s.remote_queue.entry(key.clone()).or_default();
+                        if q.len() < REMOTE_QUEUE_LIMIT {
+                            q.push_back(std::mem::take(&mut vals));
+                        } else if s.remote_queue_warned.insert(key) {
+                            warn_overflow = true;
+                        }
+                        queued = true;
+                    }
+                }
+                if warn_overflow {
+                    if let Some(mut w) = lua.app_data_mut::<World>() {
+                        let full = w.full_name(remote);
+                        w.output.push((
+                            Level::Warn,
+                            format!(
+                                "Remote event invocation queue exhausted for {full}; did you forget to implement {event}?"
+                            ),
+                        ));
+                    }
+                }
+                if queued {
+                    return;
+                }
+            }
+        }
         self.fire(remote, event, vals);
     }
 
@@ -7881,13 +8614,51 @@ impl Runtime {
         }
     }
 
-    /// [`Runtime::apply_parent`] for replication: what enters the Workspace
-    /// was posed by its sender, so only its new parts are posed against the
-    /// parts already here (`EnterPose::Replicated`).
-    pub fn apply_parent_replicated(&self, r: Ref, parent: Ref) {
-        if let Err(e) = set_parent_opts(&self.lua, r, parent, true, true, EnterPose::Replicated) {
+    pub(crate) fn apply_parent_replicated(&self, r: Ref, parent: Ref) {
+        if let Err(e) = set_parent_opts(&self.lua, r, parent, true, true, domains::world::part::EnterPose::Replicated) {
             report(&self.lua, &e);
         }
+    }
+
+    /// Detaches a batch of streamed leaf parts directly under Workspace.
+    /// Their hierarchy signals still queue in replication order.
+    pub(crate) fn stream_out_workspace_parts(&self, parts: &[Ref]) -> bool {
+        let Some(mut world) = self.world_mut() else {
+            return false;
+        };
+        let document = world.d();
+        let Some(workspace) = document.workspace() else {
+            return false;
+        };
+        // A primary part loss, a tool, or a script under a departing part can
+        // require work between individual parent changes.
+        if matches!(document.prop(workspace, "PrimaryPart"), Some(Variant::Ref(r)) if r.is_some())
+            || parts.iter().any(|&r| {
+                document.dom.get_by_ref(r).is_none_or(|instance| {
+                    instance.parent() != workspace
+                        || !instance.children().is_empty()
+                        || !doc::is_a(&instance.class, "BasePart")
+                })
+            })
+        {
+            return false;
+        }
+        let departing: rustc_hash::FxHashSet<_> = parts.iter().copied().collect();
+        world.dm().dom.detach_matching_children(workspace, |r| departing.contains(&r));
+        for &r in parts {
+            world.orphans.insert(r);
+            world.record(RepOp::Parent(r));
+            world.dm().mark_tree(r);
+        }
+        world.structure_changed = true;
+        drop(world);
+
+        for &r in parts {
+            if let Err(e) = fire_parent_signals(&self.lua, r, workspace, Ref::none(), vec![r]) {
+                report(&self.lua, &e);
+            }
+        }
+        true
     }
 
     /// A property the editor (or undo, Team Create, a file sync) changed
@@ -7965,7 +8736,10 @@ mod tests {
     use super::*;
 
     fn run(src: &str) -> Vec<(Level, String)> {
-        let mut d = Document::new_place();
+        run_in_place(Document::new_place(), src)
+    }
+
+    fn run_in_place(mut d: Document, src: &str) -> Vec<(Level, String)> {
         let sss = d
             .find_child(d.dom.root_ref(), "ServerScriptService")
             .unwrap();
@@ -7985,73 +8759,27 @@ mod tests {
         rt.leave().output
     }
 
-    /// Text cut mid-character by `string.sub` (a display name shortened to
-    /// fit) is taken where Roblox takes any bytes: the whole characters stay.
     #[test]
-    fn properties_names_and_attributes_take_non_utf8_strings() {
-        let out = run(r#"
-            local bad = "abcdef\xE2\x80" .. "..."
-            local f = Instance.new("Folder", workspace)
-            local v = Instance.new("StringValue", f)
-            v.Value = bad
-            v.Name = bad
-            f:SetAttribute("a", bad)
-            print("utf8", v.Value, v.Name, f:GetAttribute("a"), f:FindFirstChild(bad) == v)
-        "#);
-        assert!(out.iter().any(|(_, t)| t.starts_with("utf8 abcdef... abcdef... abcdef... true")), "{out:?}");
-        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
-    }
-
-    /// What the CoreScripts' voice manager and the menu's Respawn call:
-    /// AvatarChatService answers a client without voice (its engine feature
-    /// on), and BustAvatarFetchCache asks the host for the avatar again.
-    #[test]
-    fn avatar_chat_service_has_no_features_and_respawn_busts_the_avatar() {
+    fn camera_zoom_limits_clamp_the_property_being_set() {
+        let mut doc = Document::new_place();
+        let players = doc.find_child(doc.dom.root_ref(), "Players").unwrap();
+        doc.dom.insert(players, InstanceBuilder::new("Player").with_name("TestPlayer"));
         let rt = Runtime::new().unwrap();
-        let mut w = World::new(Document::new_place(), RunMode::Play);
-        w.side = Side::Client;
-        rt.enter(w);
+        rt.enter(World::new(doc, RunMode::Run));
         rt.bind_globals().unwrap();
-        let r = security::with_main_identity(&rt.lua, security::CORE, || {
-            rt.lua
-                .load(r#"
-                    local acs = game:GetService("AvatarChatService")
-                    local f = acs:GetClientFeaturesAsync()
-                    print("acs", game:GetEngineFeature("AvatarChatServiceEnabled"), f,
-                        acs:IsEnabled(f, Enum.AvatarChatServiceFeature.UserAudio),
-                        acs:IsEnabled(4 + 32, Enum.AvatarChatServiceFeature.UserAudio),
-                        acs.ClientFeaturesInitialized, acs.ClientFeatures,
-                        #game:GetService("VideoCaptureService"):GetCameraDevices())
-                    game:GetService("AvatarEditorService"):BustAvatarFetchCache()
-                "#)
-                .set_name("=core")
-                .exec()
-        });
-        assert!(r.is_ok(), "{r:?}");
-        assert!(rt.world_mut().unwrap().avatar_fetch_busted);
-        let out = rt.leave().output;
-        assert!(out.iter().any(|(_, t)| t.starts_with("acs true 0 false true true 0 0")), "{out:?}");
-    }
-
-    /// The CoreScripts menu's Leave calls DataModel:Shutdown (LocalUser
-    /// security): it asks the host to end the session; a game script can't.
-    #[test]
-    fn menu_leave_shutdown_asks_the_host_to_end_play() {
-        let rt = Runtime::new().unwrap();
-        let mut w = World::new(Document::new_place(), RunMode::Play);
-        w.side = Side::Client;
-        rt.enter(w);
-        rt.bind_globals().unwrap();
-        let game = security::with_main_identity(&rt.lua, security::GAME, || {
-            rt.lua.load("game:Shutdown()").set_name("=game").exec()
-        });
-        assert!(game.is_err());
-        assert!(!rt.world_mut().unwrap().shutdown_requested);
-        let core = security::with_main_identity(&rt.lua, security::CORE, || {
-            rt.lua.load("game:Shutdown()").set_name("=core").exec()
-        });
-        assert!(core.is_ok(), "{core:?}");
-        assert!(rt.world_mut().unwrap().shutdown_requested);
+        rt.lua.load(r#"
+            for _, instance in {game:GetService("StarterPlayer"), game.Players.TestPlayer} do
+                instance.CameraMinZoomDistance = 1
+                instance.CameraMaxZoomDistance = 50
+                instance.CameraMinZoomDistance = 75
+                assert(instance.CameraMinZoomDistance == 50 and instance.CameraMaxZoomDistance == 50)
+                instance.CameraMaxZoomDistance = 25
+                assert(instance.CameraMinZoomDistance == 50 and instance.CameraMaxZoomDistance == 50)
+                instance.CameraMinZoomDistance = 10
+                instance.CameraMaxZoomDistance = "25"
+                assert(instance.CameraMinZoomDistance == 10 and instance.CameraMaxZoomDistance == 25)
+            end
+        "#).exec().unwrap();
     }
 
     #[test]
@@ -8162,24 +8890,106 @@ mod tests {
 
     #[test]
     fn playing_an_unloaded_sound_keeps_its_play_request() {
-        let out = run(r#"
+        let probe = r#"
             local sound = Instance.new("Sound", workspace)
-            assert(not sound.IsLoaded and sound.TimeLength == 0)
-            local played, loaded = false, false
-            sound.Played:Connect(function()
-                played = true
-                assert(sound.Playing and not sound.IsLoaded and sound.TimeLength == 0)
+            local missingId = "rbxasset://sounds/rustudio-test-file-does-not-exist.ogg"
+            local played, loaded = 0, 0
+            sound.Played:Connect(function(id)
+                played += 1
+                assert(id == missingId)
+                assert(sound.Playing == (not immediate))
+                assert(not sound.IsLoaded and sound.TimeLength == 0)
             end)
-            sound.Loaded:Connect(function() loaded = true end)
-            sound.SoundId = "rbxasset://sounds/rustudio-test-file-does-not-exist.ogg"
+            sound.Loaded:Connect(function() loaded += 1 end)
+            sound.SoundId = missingId
+            assert(not sound.Playing and not sound.IsLoaded and sound.TimeLength == 0)
             sound:Play()
-            assert(sound.Playing and not sound.IsLoaded)
+            assert(sound.Playing and not sound.IsLoaded and sound.TimeLength == 0)
+            assert(played == (if immediate then 1 else 0) and loaded == 0)
             task.wait()
-            assert(played and not loaded and not sound.IsLoaded and sound.TimeLength == 0)
+            assert(sound.Playing and not sound.IsLoaded and sound.TimeLength == 0)
+            assert(played == 1 and loaded == 0)
+            task.wait(0.25)
+            assert(sound.Playing and not sound.IsLoaded and sound.TimeLength == 0)
+            assert(played == 1 and loaded == 0)
             print("sound request checked")
-        "#);
-        assert!(out.iter().all(|(level, _)| *level != Level::Error), "{out:?}");
-        assert!(out.iter().any(|(_, msg)| msg.starts_with("sound request checked")), "{out:?}");
+        "#;
+        for (signal_behavior, immediate) in [(1, true), (2, false)] {
+            let mut d = Document::new_place();
+            let workspace = d.workspace().unwrap();
+            d.dom.get_by_ref_mut(workspace).unwrap().properties.insert(
+                ustr("SignalBehavior2"),
+                Variant::Enum(rbx_dom_weak::types::Enum::from_u32(signal_behavior)),
+            );
+            let out = run_in_place(d, &format!("local immediate = {immediate}\n{probe}"));
+            assert!(out.iter().all(|(level, _)| *level != Level::Error), "{out:?}");
+            assert!(out.iter().any(|(_, msg)| msg.starts_with("sound request checked")), "{out:?}");
+        }
+    }
+
+    #[test]
+    fn controlled_textbox_observes_committed_typing_without_echoing_the_caret() {
+        use signal_timing::SignalMode;
+
+        for signal_mode in [SignalMode::Immediate, SignalMode::Deferred] {
+            let rt = Runtime::new().unwrap();
+            let mut w = World::new(Document::new_place(), RunMode::Play);
+            w.side = Side::Client;
+            w.signal_mode = signal_mode;
+            rt.enter(w);
+            rt.bind_globals().unwrap();
+            rt.step(1.0 / 60.0);
+            let r: Ref = opt_inst(&rt.lua.load(r#"
+                local gui = Instance.new("ScreenGui", game:GetService("StarterGui"))
+                box = Instance.new("TextBox", gui)
+                box.ClearTextOnFocus = true
+                box.TextEditable = true
+                box.Text = "old"
+                box:CaptureFocus()
+                assert(box:IsFocused(), "CaptureFocus did not focus the TextBox")
+                assert(box.Text == "" and box.CursorPosition == 1, "CaptureFocus did not clear Text")
+                events = {}
+                for _, prop in {"Text", "CursorPosition", "SelectionStart"} do
+                    box:GetPropertyChangedSignal(prop):Connect(function()
+                        table.insert(events, string.format("%s:%s:%d:%d",
+                            prop, box.Text, box.CursorPosition, box.SelectionStart))
+                    end)
+                end
+                box:GetPropertyChangedSignal("Text"):Connect(function()
+                    -- A controlled component reads the edit and renders those props back.
+                    local text, caret, selection = box.Text, box.CursorPosition, box.SelectionStart
+                    box.Text = text
+                    box.CursorPosition = caret
+                    box.SelectionStart = selection
+                end)
+                return box
+            "#).eval::<Value>().unwrap()).unwrap();
+            rt.dispatch();
+            crate::gui::share().tb_script_sel.retain(|(box_ref, ..)| *box_ref != r);
+
+            domains::gui_input::apply_textbox_edit(&rt.lua, r, Some("a".into()), Some(2), None);
+            rt.dispatch();
+            rt.lua.load(r#"
+                assert(table.concat(events, ",") == "CursorPosition:a:2:-1,Text:a:2:-1")
+            "#).exec().unwrap();
+            assert!(!crate::gui::share().tb_script_sel.iter().any(|(box_ref, ..)| *box_ref == r));
+
+            rt.lua.load(r#"
+                box:GetPropertyChangedSignal("Text"):Connect(function()
+                    box.CursorPosition = 1
+                end)
+            "#).exec().unwrap();
+            domains::gui_input::apply_textbox_edit(&rt.lua, r, Some("ab".into()), Some(3), None);
+            rt.dispatch();
+            rt.lua.load("assert(box.Text == 'ab' and box.CursorPosition == 1)").exec().unwrap();
+            let mut gui = crate::gui::share();
+            assert!(gui.tb_script_sel.contains(&(r, Some(1), None)));
+            gui.focus = None;
+            gui.focus_req.retain(|req| *req != Some(r));
+            gui.tb_cursor.remove(&r);
+            gui.tb_sel.remove(&r);
+            gui.tb_script_sel.retain(|(box_ref, ..)| *box_ref != r);
+        }
     }
 
     #[test]
@@ -8321,6 +9131,36 @@ mod tests {
         assert!(text[3].starts_with("D nil"), "{text:?}");
     }
 
+    #[test]
+    fn legacy_primary_part_methods_use_the_part_cframe() {
+        let out = run(r#"
+            local model = Instance.new("Model", workspace)
+            local root = Instance.new("Part", model)
+            local sibling = Instance.new("Part", model)
+            local spawn = CFrame.new(-305.21, 182.035, 222.9)
+            local ok, err = pcall(model.GetPrimaryPartCFrame, model)
+            assert(not ok and string.find(err, "no PrimaryPart has been set", 1, true))
+            ok, err = pcall(model.SetPrimaryPartCFrame, model, spawn)
+            assert(not ok and string.find(err, "no PrimaryPart has been set", 1, true))
+
+            root.CFrame = CFrame.new(305.367, 122.1, 99.9) * CFrame.Angles(0.45, 0.584, -0.83)
+            local offset = Vector3.new(0, 3, 2)
+            sibling.CFrame = root.CFrame * CFrame.new(offset)
+            root.PivotOffset = CFrame.new(5, 2, -1)
+            model.PrimaryPart = root
+            model:SetPrimaryPartCFrame(spawn)
+            assert(root.CFrame == spawn, "primary did not land at the spawn CFrame")
+            assert(model:GetPrimaryPartCFrame() == root.CFrame)
+            assert((sibling.Position - spawn:PointToWorldSpace(offset)).Magnitude < 0.001)
+            assert(model:GetPivot() == spawn * root.PivotOffset)
+            print("legacy primary part frame")
+        "#);
+        assert!(
+            out.iter().any(|(level, line)| *level == Level::Info && line.starts_with("legacy primary part frame")),
+            "{out:?}"
+        );
+    }
+
     /// An error lists its Luau frames the way Studio's Output does.
     #[test]
     fn error_stack_lines() {
@@ -8450,7 +9290,8 @@ mod legacy_tests {
             print('pivot', m.WorldPivot.Position.X)\n\
             local f = Instance.new('Frame')\n\
             print('tween', f:TweenSize(UDim2.new(0, 100, 0, 50), 'Out', 'Quad', 0.1), f:TweenSize(UDim2.new(0, 10, 0, 5), 'Out', 'Quad', 0.1, false))\n\
-            print('limb', Instance.new('Humanoid'):GetLimb(Instance.new('Part')).Name)\n\
+            local r15h = Instance.new('Humanoid'); local ra = Instance.new('Part'); ra.Name = 'RightHand'; local ut = Instance.new('Part'); ut.Name = 'UpperTorso'\n\
+            print('limb', r15h:GetLimb(Instance.new('Part')).Name, r15h:GetLimb(ra).Name, r15h:GetLimb(ut).Name)\n\
             print('groups', workspace:GetMaxCollisionGroups(), game:GetService('PhysicsService'):GetCollisionGroupName(0))\n\
             print('sun', math.floor(game.Lighting:GetSunDirection().Magnitude * 100 + 0.5) / 100)\n\
             print('job', game.JobId == '', game.PlaceId)\n\
@@ -8466,7 +9307,7 @@ mod legacy_tests {
         assert!(has("closest -48 3 0"), "{text:?}");
         assert!(has("pivot -50"), "{text:?}");
         assert!(has("tween true false"), "{text:?}");
-        assert!(has("limb Unknown"), "{text:?}");
+        assert!(has("limb Unknown RightArm Torso"), "{text:?}");
         assert!(has("groups 32 Default"), "{text:?}");
         assert!(has("sun 1"), "{text:?}");
         assert!(has("job true 0"), "{text:?}");
@@ -8961,104 +9802,6 @@ mod legacy_tests {
         assert!(has("found true true true true"), "{out:?}");
     }
 
-    /// GuiService.TopbarInset in Play: the 58 px bar from the end of the
-    /// menu and chat buttons to the viewport's right edge, and its
-    /// GetPropertyChangedSignal when the viewport or the chat button
-    /// changes (TopbarPlus and LBG's ClientRenderer wait on it; the edit
-    /// DataModel keeps the empty rect).
-    #[test]
-    fn topbar_inset_is_the_bar_and_follows_the_viewport() {
-        let mut d = Document::new_place();
-        let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
-        let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
-        let src = r#"
-            local GuiService = game:GetService("GuiService")
-            local inset = GuiService.TopbarInset
-            print("first", inset.Min.X, inset.Min.Y, inset.Max.X, inset.Max.Y, inset.Height)
-            changes = 0
-            GuiService:GetPropertyChangedSignal("TopbarInset"):Connect(function() changes += 1 end)
-            task.spawn(function()
-                GuiService:GetPropertyChangedSignal("TopbarInset"):Wait()
-                local i = GuiService.TopbarInset
-                print("waited", i.Min.X, i.Max.X, i.Width, i.Height)
-                game:GetService("StarterGui"):SetCoreGuiEnabled(Enum.CoreGuiType.Chat, false)
-                GuiService:GetPropertyChangedSignal("TopbarInset"):Wait()
-                i = GuiService.TopbarInset
-                print("nochat", i.Min.X, i.Max.X, changes)
-            end)
-        "#;
-        let s = d.dom.insert(
-            sps,
-            InstanceBuilder::new("LocalScript").with_name("T").with_property("Source", src.to_string()),
-        );
-        let rt = Runtime::new().unwrap();
-        let mut w = World::new(d, RunMode::Run);
-        w.side = Side::Client;
-        w.input.view_size = [800.0, 600.0];
-        rt.enter(w);
-        rt.bind_globals().unwrap();
-        rt.run_script(s);
-        rt.step(1.0 / 60.0);
-        rt.step(1.0 / 60.0);
-        world(&rt.lua).unwrap().input.view_size = [1000.0, 600.0];
-        for _ in 0..4 {
-            rt.step(1.0 / 60.0);
-        }
-        let out = rt.leave().output;
-        let has = |p: &str| out.iter().any(|(_, t)| t.starts_with(p));
-        assert!(has("first 128 0 800 58 58"), "{out:?}");
-        assert!(has("waited 128 1000 872 58"), "{out:?}");
-        assert!(has("nochat 72 1000 2"), "{out:?}");
-    }
-
-    /// A ScreenGui with ScreenInsets TopbarSafeInsets (TopbarPlus's) is the
-    /// top bar's free area: it starts after Roblox's buttons, is 58 px tall
-    /// and sits at (left, −58) in GUI coordinates — before it is drawn
-    /// (gui_rect) as well as in GetInsetArea — and follows the chat button.
-    #[test]
-    fn topbar_safe_insets_gui_is_the_bars_free_area() {
-        let mut d = Document::new_place();
-        let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
-        let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
-        let src = r#"
-            local GuiService = game:GetService("GuiService")
-            local gui = Instance.new("ScreenGui")
-            gui.IgnoreGuiInset = true
-            gui.ScreenInsets = Enum.ScreenInsets.TopbarSafeInsets
-            gui.Parent = game:GetService("StarterGui")
-            local frame = Instance.new("Frame")
-            frame.Size = UDim2.new(1, 0, 1, 0)
-            frame.Parent = gui
-            print("gui", gui.AbsolutePosition.X, gui.AbsolutePosition.Y, gui.AbsoluteSize.X, gui.AbsoluteSize.Y)
-            print("frame", frame.AbsolutePosition.X, frame.AbsolutePosition.Y, frame.AbsoluteSize.X, frame.AbsoluteSize.Y)
-            local a = GuiService:GetInsetArea(Enum.ScreenInsets.TopbarSafeInsets)
-            print("area", a.Min.X, a.Min.Y, a.Max.X, a.Max.Y)
-            game:GetService("StarterGui"):SetCoreGuiEnabled(Enum.CoreGuiType.Chat, false)
-            print("nochat", gui.AbsolutePosition.X, gui.AbsoluteSize.X, GuiService:GetInsetArea(Enum.ScreenInsets.TopbarSafeInsets).Min.X, GuiService.TopbarInset.Min.X)
-            gui.ScreenInsets = Enum.ScreenInsets.CoreUISafeInsets
-            print("core", gui.AbsolutePosition.X, gui.AbsolutePosition.Y, gui.AbsoluteSize.X, gui.AbsoluteSize.Y)
-        "#;
-        let s = d.dom.insert(
-            sps,
-            InstanceBuilder::new("LocalScript").with_name("T").with_property("Source", src.to_string()),
-        );
-        let rt = Runtime::new().unwrap();
-        let mut w = World::new(d, RunMode::Run);
-        w.side = Side::Client;
-        w.input.view_size = [800.0, 600.0];
-        rt.enter(w);
-        rt.bind_globals().unwrap();
-        rt.run_script(s);
-        rt.step(1.0 / 60.0);
-        let out = rt.leave().output;
-        let has = |p: &str| out.iter().any(|(_, t)| t.starts_with(p));
-        assert!(has("gui 128 -58 672 58"), "{out:?}");
-        assert!(has("frame 128 -58 672 58"), "{out:?}");
-        assert!(has("area 128 -58 800 0"), "{out:?}");
-        assert!(has("nochat 72 728 72 72"), "{out:?}");
-        assert!(has("core 0 0 800 542"), "{out:?}");
-    }
-
     /// With Roblox's own CoreScripts running, their TopBar's
     /// GuiService:SetTopbarInset (the bar's widest strip clear of the
     /// unibar and the health bar) is where a TopbarSafeInsets ScreenGui
@@ -9120,57 +9863,13 @@ mod legacy_tests {
         let inset = world(&rt.lua).unwrap().topbar_inset;
         let out = rt.leave().output;
         let has = |p: &str| out.iter().any(|(_, t)| t.starts_with(p));
-        assert_eq!(inset, Some([212.0, 0.0, 660.0, 58.0]));
+        assert_eq!(inset, Some(LRect { min: glam::Vec2::new(212.0, 0.0), max: glam::Vec2::new(660.0, 58.0) }));
         assert!(has("inset 212 0 660 58"), "{out:?}");
         assert!(has("changed 212 660 212 448"), "{out:?}");
         assert!(has("gui 212 -58 448 58"), "{out:?}");
         assert!(has("area 212 -58 660 0"), "{out:?}");
         assert!(has("devices table 1 table true 1 string"), "{out:?}");
         assert!(has("device true "), "{out:?}");
-    }
-
-    /// Two things a fighting game's modules do that Roblox takes: index
-    /// the DataModel by RunService's real Name, `game["Run Service"]`
-    /// (rustudio names the service by class; FindFirstChild / WaitForChild
-    /// go by the stored Name and stay nil, as `game:FindFirstChild("Run
-    /// Service")` is on Roblox when a place was saved with the class name),
-    /// and `part.CustomPhysicalProperties = nil` to go back to the
-    /// material's physics (the property reads nil again afterwards).
-    #[test]
-    fn run_service_by_its_roblox_name_and_physical_properties_reset() {
-        let mut d = Document::new_place();
-        let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
-        let src = r#"
-            local rs = game["Run Service"]
-            print("name", rs.ClassName, rs == game:GetService("RunService"), rs == game.RunService)
-            print("found", game:FindFirstChild("Run Service") == rs, game:WaitForChild("Run Service") == rs, workspace:FindFirstChild("Run Service"))
-            print("missing", pcall(function() return game["Run Servic"] end))
-            local part = Instance.new("Part")
-            part.CustomPhysicalProperties = PhysicalProperties.new(2, 0.5, 0.25)
-            print("custom", part.CustomPhysicalProperties.Density, part.CustomPhysicalProperties.Friction)
-            part.CustomPhysicalProperties = nil
-            print("reset", part.CustomPhysicalProperties == nil)
-            print("bad", pcall(function() part.Size = nil end))
-        "#;
-        let s = d.dom.insert(
-            sss,
-            InstanceBuilder::new("Script").with_name("T").with_property("Source", src.to_string()),
-        );
-        let rt = Runtime::new().unwrap();
-        let w = World::new(d, RunMode::Run);
-        rt.enter(w);
-        rt.bind_globals().unwrap();
-        rt.run_script(s);
-        rt.step(1.0 / 60.0);
-        let out = rt.leave().output;
-        let has = |p: &str| out.iter().any(|(_, t)| t.starts_with(p));
-        let says = |p: &str, m: &str| out.iter().any(|(_, t)| t.starts_with(p) && t.contains(m));
-        assert!(has("name RunService true true"), "{out:?}");
-        assert!(has("found true true nil"), "{out:?}");
-        assert!(says("missing false", "Run Servic is not a valid member of DataModel \"Game\""), "{out:?}");
-        assert!(has("custom 2 0.5"), "{out:?}");
-        assert!(has("reset true"), "{out:?}");
-        assert!(says("bad false", "Unable to assign property Size. Vector3 expected, got nil"), "{out:?}");
     }
 
     /// A game's TextBox under the soft keyboard (Android, viewport.rs
@@ -9237,31 +9936,33 @@ mod legacy_tests {
         crate::touch_input::TEST_GAME_TOUCH.with(|c| c.set(None));
     }
 
-    /// BindableFunction:Invoke and RemoteFunction:InvokeServer before the
-    /// callback exists yield until it is set, as Roblox holds them (the
-    /// BindableFunction and RemoteFunction pages): a character's Controls
-    /// LocalScript invoked ClientInvoke 40 ms before the renderer
-    /// LocalScript set its OnInvoke and died with "OnInvoke is not set".
+    /// Roblox's touch-button CoreScript (ContextActionTouch, which
+    /// StarterScript runs when UserInputService.TouchScreenEnabled — its
+    /// own, RobloxScriptSecurity — or TouchEnabled is on) hears
+    /// BoundActionAdded / Changed / Removed as a
+    /// game binds, retitles and unbinds an action with createTouchButton,
+    /// and answers GetButton's GetActionButtonEvent with
+    /// FireActionButtonFoundSignal; an action without a button gets nil.
     #[test]
-    fn invoke_waits_for_the_callback() {
+    fn touch_buttons_reach_the_core_script() {
+        crate::touch_input::TEST_GAME_TOUCH.with(|c| c.set(Some(true)));
         let mut d = Document::new_place();
         let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
         let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
         let src = r#"
-            local bf = Instance.new("BindableFunction")
-            local rf = Instance.new("RemoteFunction")
-            local got, ans
-            task.spawn(function() got = bf:Invoke(21) print("invoke returned", got) end)
-            task.spawn(function() ans = rf:InvokeServer("x") print("invoke server returned", ans) end)
-            print("pending", tostring(got), tostring(ans))
+            local UIS = game:GetService("UserInputService")
+            local CAS = game:GetService("ContextActionService")
+            print("touch", tostring(UIS.TouchEnabled))
             task.wait()
+            CAS:BindAction("Dash", function() end, true, Enum.KeyCode.Q)
+            CAS:BindAction("Quiet", function() end, false, Enum.KeyCode.E)
+            CAS:SetTitle("Dash", "Dash!")
+            CAS:SetPosition("Dash", UDim2.fromOffset(10, 20))
+            local b = CAS:GetButton("Dash")
+            print("button", tostring(b and b.Name), tostring(CAS:GetButton("Quiet")), tostring(CAS:GetButton("None")))
+            CAS:UnbindAction("Dash")
             task.wait()
-            print("still pending", tostring(got), tostring(ans))
-            bf.OnInvoke = function(x) return x * 2 end
-            rf.OnServerInvoke = function(player, s) return s .. "!" end
-            task.wait()
-            task.wait()
-            print("done", tostring(got), tostring(ans))
+            print("done")
         "#;
         let s = d.dom.insert(
             sps,
@@ -9272,54 +9973,56 @@ mod legacy_tests {
         w.side = Side::Client;
         rt.enter(w);
         rt.bind_globals().unwrap();
+        // The CoreScript's half, condensed.
+        let r = security::with_main_identity(&rt.lua, security::CORE, || {
+            rt.lua
+                .load(r#"
+                    local CAS = game:GetService("ContextActionService")
+                    -- (RobloxScriptSecurity, StarterScript's test for a touch screen)
+                    print("screen", tostring(game:GetService("UserInputService").TouchScreenEnabled))
+                    local buttons = {}
+                    CAS.BoundActionAdded:Connect(function(name, touch, info, core)
+                        print("added", name, tostring(touch), tostring(info.createTouchButton), tostring(core))
+                        if touch then
+                            local b = Instance.new("ImageButton")
+                            b.Name = "Button_" .. name
+                            buttons[name] = b
+                        end
+                    end)
+                    CAS.BoundActionChanged:Connect(function(name, field, t)
+                        print("changed", name, field, tostring(t[field]))
+                    end)
+                    CAS.BoundActionRemoved:Connect(function(name, info, core)
+                        print("removed", name, tostring(info.title), tostring(core))
+                        buttons[name] = nil
+                    end)
+                    CAS.GetActionButtonEvent:Connect(function(name)
+                        print("asked", name)
+                        if buttons[name] then CAS:FireActionButtonFoundSignal(name, buttons[name]) end
+                    end)
+                "#)
+                .set_name("=core")
+                .exec()
+        });
+        assert!(r.is_ok(), "{r:?}");
         rt.run_script(s);
-        for _ in 0..8 {
+        for _ in 0..12 {
             rt.step(1.0 / 60.0);
         }
         let out = rt.leave().output;
+        crate::touch_input::TEST_GAME_TOUCH.with(|c| c.set(None));
         let has = |p: &str| out.iter().any(|(_, t)| t.starts_with(p));
-        assert!(has("pending nil nil"), "{out:?}");
-        assert!(has("still pending nil nil"), "{out:?}");
-        assert!(has("invoke returned 42"), "{out:?}");
-        assert!(has("invoke server returned x!"), "{out:?}");
-        assert!(has("done 42 x!"), "{out:?}");
+        assert!(has("touch true"), "{out:?}");
+        assert!(has("screen true"), "{out:?}");
+        assert!(has("added Dash true true false"), "{out:?}");
+        assert!(has("added Quiet false false false"), "{out:?}");
+        assert!(has("changed Dash title Dash!"), "{out:?}");
+        assert!(has("changed Dash position {0, 10}, {0, 20}"), "{out:?}");
+        assert!(has("asked Dash"), "{out:?}");
+        assert!(has("button Button_Dash nil nil"), "{out:?}");
+        assert!(has("removed Dash Dash! false"), "{out:?}");
+        assert!(has("done"), "{out:?}");
         assert!(!out.iter().any(|(l, _)| *l == Level::Error), "{out:?}");
-    }
-
-    /// StarterGui:SetCore("TopbarEnabled" / "ChatActive"): the top bar
-    /// over the game hides, the chat window opens (play_game.rs draws
-    /// both); other SetCore keys are taken quietly, as before.
-    #[test]
-    fn set_core_topbar_and_chat() {
-        let mut d = Document::new_place();
-        let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
-        let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
-        let src = r#"
-            local sg = game:GetService("StarterGui")
-            assert(sg:GetCore("TopbarEnabled") == true, "topbar on at first")
-            sg:SetCore("TopbarEnabled", false)
-            assert(sg:GetCore("TopbarEnabled") == false, "GetCore reads SetCore back")
-            sg:SetCore("ChatActive", true)
-            sg:SetCore("ResetButtonCallback", false)
-            sg:SetCore("SendNotification", { Title = "t", Text = "x" })
-            print("set")
-        "#;
-        let s = d.dom.insert(
-            sps,
-            InstanceBuilder::new("LocalScript").with_name("T").with_property("Source", src.to_string()),
-        );
-        let rt = Runtime::new().unwrap();
-        let mut w = World::new(d, RunMode::Run);
-        w.side = Side::Client;
-        rt.enter(w);
-        rt.bind_globals().unwrap();
-        rt.run_script(s);
-        rt.step(1.0 / 60.0);
-        let w = rt.leave();
-        assert!(w.output.iter().any(|(_, t)| t.starts_with("set")), "{:?}", w.output);
-        assert!(!w.output.iter().any(|(l, _)| *l == Level::Error), "{:?}", w.output);
-        assert!(w.topbar_off);
-        assert_eq!(w.requests.chat_active, Some(true));
     }
 
     /// an admin script's client anti-tamper, condensed (Client.Core.Anti and
@@ -9755,5 +10458,851 @@ mod weld_offset_tests {
         "#);
         assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
         assert_eq!(line(&out, "SAVED"), "0.45 2.00", "{out:?}");
+    }
+
+    #[test]
+    fn run_service_resolves_by_roblox_name() {
+        let out = run(|_| {}, r#"
+            local a = game["Run Service"]
+            local b = game:FindFirstChild("Run Service")
+            local c = game:WaitForChild("Run Service")
+            local d = game:GetService("RunService")
+            local folder = Instance.new("Folder")
+            assert(a == d and b == d and c == d, "Run Service alias")
+            assert(folder:FindFirstChild("Run Service") == nil, "only on DataModel")
+            print("RUN_SVC", a.ClassName)
+        "#);
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "RUN_SVC"), "RunService", "{out:?}");
+    }
+
+    #[test]
+    fn legacy_datamodel_service_indexing() {
+        let out = run(|_| {}, r#"
+            local cp = game.ContentProvider
+            assert(cp == game:GetService("ContentProvider"), "ContentProvider dot")
+            assert(game:FindFirstChild("ContentProvider") == cp, "ContentProvider FindFirstChild")
+            assert(game:WaitForChild("ContentProvider") == cp, "ContentProvider WaitForChild")
+            assert(game.BadgeService == game:GetService("BadgeService"), "BadgeService dot")
+            assert(game.TweenService == game:GetService("TweenService"), "TweenService dot")
+            assert(game.JointsService == game:GetService("JointsService"), "JointsService dot")
+            assert(game["Teleport Service"] == game:GetService("TeleportService"), "Teleport Service alias")
+            assert(game["Script Context"] == game:GetService("ScriptContext"), "Script Context alias")
+            assert(game:FindFirstChild("CoreGui") == nil, "CoreGui hidden")
+            assert(game:FindFirstChild("StudioService") == nil, "StudioService hidden")
+            assert(game:FindFirstChild("DebuggerManager") == nil, "DebuggerManager hidden")
+            assert(game:FindFirstChild("ScriptEditorService") == nil, "ScriptEditorService hidden")
+            assert(game:FindFirstChild("PluginGuiService") == nil, "PluginGuiService hidden")
+            assert(game:FindFirstChild("DataStoreService") == nil, "DataStoreService on-demand")
+            local ok_cg = pcall(function() return game.CoreGui end)
+            local ok_ss = pcall(function() return game.StudioService end)
+            local ok_dm = pcall(function() return game.DebuggerManager end)
+            local ok_se = pcall(function() return game.ScriptEditorService end)
+            local ok_ds = pcall(function() return game.DataStoreService end)
+            assert(not ok_cg and not ok_ss and not ok_dm and not ok_se and not ok_ds, "restricted/on-demand services not indexable")
+            local folder = Instance.new("Folder")
+            assert(folder:FindFirstChild("ContentProvider") == nil, "only on DataModel")
+            local ok_f = pcall(function() return folder.ContentProvider end)
+            assert(not ok_f, "folder.ContentProvider errors")
+            assert(UserSettings().GameSettings.SavedQualityLevel == Enum.SavedQualitySetting.QualityLevel10, "SavedQualityLevel default")
+            local ok_setql, err_setql = pcall(function()
+                UserSettings().GameSettings.SavedQualityLevel = Enum.SavedQualitySetting.Automatic
+            end)
+            assert(not ok_setql and string.find(err_setql, "lacking capability RobloxScript"),
+                "SavedQualityLevel write denied from identity 2: " .. tostring(err_setql))
+            local ok_set, err_set = pcall(settings)
+            assert(not ok_set and string.find(err_set, "lacking capability Plugin"), "settings still denied")
+            print("LEGACY_SVC", cp.ClassName)
+        "#);
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "LEGACY_SVC"), "ContentProvider", "{out:?}");
+    }
+
+    #[test]
+    fn hidden_core_services_invisible_to_game_scripts() {
+        let out = run(
+            |d| {
+                let root = d.dom.root_ref();
+                let cg = d.dom.insert(root, InstanceBuilder::new("CoreGui").with_name("CoreGui"));
+                d.dom.insert(cg, InstanceBuilder::new("ScreenGui").with_name("RobloxGui"));
+                let cp = d.dom.insert(root, InstanceBuilder::new("CorePackages").with_name("CorePackages"));
+                d.dom.insert(cp, InstanceBuilder::new("Folder").with_name("Packages"));
+            },
+            r#"
+                assert(game:FindFirstChild("CoreGui") == nil, "CoreGui FFC hidden")
+                assert(game:FindFirstChild("CorePackages") == nil, "CorePackages FFC hidden")
+                assert(game:FindFirstChildOfClass("CoreGui") == nil, "CoreGui FFCoC hidden")
+                assert(game:FindFirstChild("RobloxGui", true) == nil, "RobloxGui recursive hidden")
+                assert(game:GetService("CoreGui") == nil, "CoreGui GetService hidden")
+                assert(game:GetService("CorePackages") == nil, "CorePackages GetService hidden")
+                assert(not pcall(function() return game.CoreGui end), "game.CoreGui hidden")
+                assert(not pcall(function() return game.CorePackages end), "game.CorePackages hidden")
+                for _, c in game:GetChildren() do
+                    assert(c.ClassName ~= "CoreGui" and c.ClassName ~= "CorePackages", "GetChildren hidden")
+                end
+                for _, d in game:GetDescendants() do
+                    assert(d.Name ~= "RobloxGui" and d.Name ~= "Packages" and d.ClassName ~= "CoreGui" and d.ClassName ~= "CorePackages", "GetDescendants hidden")
+                end
+                print("CORE_HIDDEN", "ok")
+            "#,
+        );
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "CORE_HIDDEN"), "ok", "{out:?}");
+    }
+
+    #[test]
+    fn camera_coordinate_frame_alias() {
+        let out = run(|_| {}, r#"
+            local cam = Instance.new("Camera")
+            local sig = 0
+            cam:GetPropertyChangedSignal("CFrame"):Connect(function() sig += 1 end)
+            cam:GetPropertyChangedSignal("CoordinateFrame"):Connect(function() sig += 10 end)
+            local cf = CFrame.new(10, 20, 30)
+            cam.CoordinateFrame = cf
+            assert(cam.CFrame == cf, "CoordinateFrame write updates CFrame")
+            assert(cam.CoordinateFrame == cf, "CoordinateFrame read matches CFrame")
+            local cf2 = CFrame.new(1, 2, 3)
+            cam.CFrame = cf2
+            assert(cam.CoordinateFrame == cf2, "CFrame write updates CoordinateFrame")
+            assert(sig == 22, "both CFrame and CoordinateFrame signals fired, got " .. tostring(sig))
+            print("CAM_CF_OK", sig)
+        "#);
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "CAM_CF_OK"), "22", "{out:?}");
+    }
+
+    #[test]
+    fn custom_physical_properties_accepts_nil() {
+        let out = run(|_| {}, r#"
+            local p = Instance.new("Part")
+            p.CustomPhysicalProperties = PhysicalProperties.new(2, 0.4, 0.3)
+            assert(p.CustomPhysicalProperties ~= nil)
+            p.CustomPhysicalProperties = nil
+            assert(p.CustomPhysicalProperties == nil, tostring(p.CustomPhysicalProperties))
+            print("CPP", tostring(p.CustomPhysicalProperties))
+        "#);
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "CPP"), "nil", "{out:?}");
+    }
+
+    #[test]
+    fn invoke_waits_for_the_callback() {
+        let out = run(|_| {}, r#"
+            local bf = Instance.new("BindableFunction")
+            local rf = Instance.new("RemoteFunction")
+            local got = {}
+            task.spawn(function()
+                got[1] = bf:Invoke("hi")
+            end)
+            task.spawn(function()
+                got[2] = rf:InvokeServer(21)
+            end)
+            task.wait()
+            bf.OnInvoke = function(x) return x .. "!" end
+            rf.OnServerInvoke = function(_, n) return n * 2 end
+            task.wait()
+            task.wait()
+            print("INV", tostring(got[1]), tostring(got[2]))
+        "#);
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "INV"), "hi! 42", "{out:?}");
+    }
+
+    #[test]
+    fn stop_script_cancels_pending_invoke_through_module() {
+        let mut d = Document::new_place();
+        let rs = d.find_child(d.dom.root_ref(), "ReplicatedStorage").unwrap();
+        let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
+        d.dom.insert(rs, InstanceBuilder::new("RemoteFunction").with_name("GetVal"));
+        d.dom.insert(
+            rs,
+            InstanceBuilder::new("ModuleScript")
+                .with_name("Helper")
+                .with_property("Source", "return function() return game.ReplicatedStorage.GetVal:InvokeServer() end".to_string()),
+        );
+        let holder = d.dom.insert(sss, InstanceBuilder::new("Folder").with_name("Holder"));
+        let scr = d.dom.insert(
+            holder,
+            InstanceBuilder::new("Script")
+                .with_name("Caller")
+                .with_property(
+                    "Source",
+                    "local helper = require(game.ReplicatedStorage.Helper)\nlocal v = helper()\nprint('RESUMED', tostring(v), tostring(script.Parent))\n".to_string(),
+                ),
+        );
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(d, RunMode::Run);
+        w.has_peer = true;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.install_side().unwrap();
+        rt.run_script(scr);
+        let req_id = rt.lua.app_data_ref::<Invokes>().and_then(|i| i.waiting.keys().next().copied());
+        assert!(req_id.is_some(), "InvokeServer should register a pending invoke");
+        rt.apply_destroy(holder);
+        rt.finish_invoke(req_id.unwrap(), true, &[Xfer::Str(b"ok".to_vec())], &|r| Some(r));
+        let out = rt.leave().output;
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert!(!out.iter().any(|(_, s)| s.contains("RESUMED")), "destroyed script should not resume after invoke: {out:?}");
+    }
+
+    #[test]
+    fn native_script_loads_deferred_and_drains_on_step() {
+        let mut d = Document::new_place();
+        let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
+        let s = d.dom.insert(
+            sss,
+            InstanceBuilder::new("Script").with_property(
+                "Source",
+                "--!native\nlocal function sum(n) local t = 0 for i = 1, n do t += i end return t end\nprint('NAT', sum(10))\n".to_string(),
+            ),
+        );
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(d, RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        let queued = rt.lua.app_data_ref::<NativeQueue>().map_or(0, |q| q.items.len());
+        let on = rt.lua.app_data_ref::<NativeQueue>().is_some_and(|q| q.on);
+        if on {
+            assert_eq!(queued, 1, "--!native script queued for deferred native build");
+        }
+        rt.step(1.0 / 60.0);
+        let remaining = rt.lua.app_data_ref::<NativeQueue>().map_or(0, |q| q.items.len());
+        assert_eq!(remaining, 0, "native queue drained on step");
+        let out = rt.leave().output;
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "NAT"), "55", "{out:?}");
+    }
+
+    #[test]
+    fn topbar_inset_safe_insets_and_set_core_topbar_enabled() {
+        let mut d = Document::new_place();
+        let players = d.find_child(d.dom.root_ref(), "Players").unwrap();
+        let p = d.dom.insert(players, InstanceBuilder::new("Player").with_name("Local"));
+        let pg = d.dom.insert(p, InstanceBuilder::new("PlayerGui").with_name("PlayerGui"));
+        let sg = d.dom.insert(
+            pg,
+            InstanceBuilder::new("ScreenGui")
+                .with_name("TopbarGui")
+                .with_property("ScreenInsets", Variant::Enum(rbx_dom_weak::types::Enum::from_u32(3))),
+        );
+        let s = d.dom.insert(
+            pg,
+            InstanceBuilder::new("LocalScript").with_property(
+                "Source",
+                r#"
+                    local gs = game:GetService("GuiService")
+                    local sg = game:GetService("StarterGui")
+                    local gui = script.Parent.TopbarGui
+                    local changed = 0
+                    gs:GetPropertyChangedSignal("TopbarInset"):Connect(function() changed += 1 end)
+                    local r1 = gs.TopbarInset
+                    assert(r1.Min.X == 128 and r1.Height == 58 and r1.Max.X == 1000, tostring(r1))
+                    local area = gs:GetInsetArea(Enum.ScreenInsets.TopbarSafeInsets)
+                    assert(area.Min.X == 128 and area.Min.Y == -58 and area.Max.Y == 0, tostring(area))
+                    assert(gui.AbsolutePosition.X == 128 and gui.AbsolutePosition.Y == -58, tostring(gui.AbsolutePosition))
+                    assert(gui.AbsoluteSize.X == 872 and gui.AbsoluteSize.Y == 58, tostring(gui.AbsoluteSize))
+                    assert(sg:GetCore("TopbarEnabled") == true)
+                    sg:SetCore("TopbarEnabled", false)
+                    assert(sg:GetCore("TopbarEnabled") == false)
+                    task.wait()
+                    sg:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, false)
+                    task.wait()
+                    local r2 = gs.TopbarInset
+                    assert(r2.Min.X == 72 and r2.Height == 58 and changed >= 1, tostring(r2) .. " ch=" .. tostring(changed))
+                    print("TOPBAR", r1.Min.X, r2.Min.X, changed)
+                "#
+                .to_string(),
+            ),
+        );
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(d, RunMode::Play);
+        w.side = Side::Client;
+        w.input.view_size = [1000.0, 600.0];
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        for _ in 0..5 {
+            rt.step(1.0 / 60.0);
+        }
+        let w = rt.leave();
+        let _ = sg;
+        assert!(w.topbar_off, "TopbarEnabled=false reflected in World::topbar_off");
+        let out = w.output;
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert!(out.iter().any(|(_, s)| s.starts_with("TOPBAR 128 72")), "{out:?}");
+    }
+
+    #[test]
+    fn get_last_input_type_defaults_to_device_kind() {
+        let out = run(|_| {}, r#"
+            local uis = game:GetService("UserInputService")
+            print("UIT", tostring(uis:GetLastInputType()))
+        "#);
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "UIT"), "Enum.UserInputType.Keyboard", "{out:?}");
+    }
+
+    #[test]
+    fn collection_service_only_indexes_live_datamodel_members() {
+        let out = run(|_| {}, r#"
+            local tags = game:GetService("CollectionService")
+            local folder = Instance.new("Folder")
+            local part = Instance.new("Part", folder)
+            assert(#tags:GetTagged("LifecycleProbe") == 0)
+            part:AddTag("LifecycleProbe")
+            assert(#tags:GetTagged("LifecycleProbe") == 0)
+            folder.Parent = workspace
+            assert(tags:GetTagged("LifecycleProbe")[1] == part)
+            folder.Parent = nil
+            assert(#tags:GetTagged("LifecycleProbe") == 0)
+            assert(part:HasTag("LifecycleProbe"))
+            folder.Parent = workspace
+            assert(#tags:GetTagged("LifecycleProbe") == 1)
+            folder:Destroy()
+            assert(#tags:GetTagged("LifecycleProbe") == 0)
+        "#);
+        assert!(out.iter().all(|(level, _)| *level != Level::Error), "{out:?}");
+    }
+
+    #[test]
+    fn hsv_extrapolation_and_packed_part_color_match_studio() {
+        let out = run(|_| {}, r#"
+            local part = Instance.new("Part", workspace)
+            local function close(a, b)
+                return math.abs(a.R - b.R) < 1e-5
+                    and math.abs(a.G - b.G) < 1e-5
+                    and math.abs(a.B - b.B) < 1e-5
+            end
+            assert(close(Color3.fromHSV(1, 1, 1), Color3.new(1, 0, 0)))
+            assert(close(Color3.fromHSV(-0.25, 1, 1), Color3.new()))
+            local c = Color3.fromHSV(2, 3, 4)
+            assert(close(c, Color3.new(4, -8, -80)))
+            part.Color = c
+            assert(close(part.Color, Color3.fromRGB(252, 8, 80)))
+            part.Color = Color3.fromHSV(0.8, 0.6, 0.9)
+            assert(close(part.Color, Color3.fromRGB(201, 91, 229)))
+            part.Color = Color3.fromHSV(66, 70, 248)
+            assert(close(part.Color, Color3.fromRGB(8, 216, 128)))
+        "#);
+        assert!(out.iter().all(|(level, _)| *level != Level::Error), "{out:?}");
+    }
+
+    #[test]
+    fn legacy_collision_groups_warn_once_and_apply_changes() {
+        let out = run(|_| {}, r#"
+            local physics = game:GetService("PhysicsService")
+            local part = Instance.new("Part", workspace)
+            local first = physics:CreateCollisionGroup("LegacyFirst")
+            local second = physics:CreateCollisionGroup("LegacySecond")
+            assert(type(first) == "number" and first == physics:GetCollisionGroupId("LegacyFirst"))
+            assert(second == first + 1 and second == physics:GetCollisionGroupId("LegacySecond"))
+            assert(physics:RegisterCollisionGroup("Modern") == nil)
+            assert(physics:GetCollisionGroupName(first) == "LegacyFirst")
+            assert(physics:GetCollisionGroupName(second) == "LegacySecond")
+            physics:SetPartCollisionGroup(part, "LegacyFirst")
+            physics:SetPartCollisionGroup(part, "LegacySecond")
+            assert(physics:IsCollisionGroupRegistered("LegacyFirst"))
+            assert(part.CollisionGroup == "LegacySecond")
+        "#);
+        assert!(out.iter().all(|(level, _)| *level != Level::Error), "{out:?}");
+        for warning in [
+            "CreateCollisionGroup is deprecated, please use RegisterCollisionGroup instead.",
+            "SetPartCollisionGroup is deprecated, please use BasePart.CollisionGroup instead.",
+            "GetCollisionGroupName is deprecated.",
+        ] {
+            assert_eq!(
+                out.iter()
+                    .filter(|(level, msg)| *level == Level::Warn && msg.starts_with(warning))
+                    .count(),
+                1,
+                "{out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_humanoid_description_populates_clothing_and_accessories() {
+        let mut d = Document::empty();
+        let root = d.dom.root_ref();
+        let sss = d.dom.insert(root, InstanceBuilder::new("ServerScriptService").with_name("ServerScriptService"));
+        let s = d.dom.insert(
+            sss,
+            InstanceBuilder::new("Script").with_name("S").with_property(
+                "Source",
+                r#"
+                local Players = game:GetService("Players")
+                local desc = Players:GetHumanoidDescriptionFromUserId(42)
+                print("DESC", desc.Shirt, desc.Pants, desc.Face, desc.HatAccessory, desc.ShouldersAccessory, desc.BackAccessory)
+                local c = desc:Clone()
+                print("CLONE", c.Shirt, c.HatAccessory, c.BackAccessory)
+                "#.to_string(),
+            ),
+        );
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(d, RunMode::Play);
+        w.avatar = Some(crate::avatar::AvatarLook {
+            user_id: 42,
+            r15: true,
+            colors: crate::rig::BodyColors::default(),
+            scales: crate::rig::Scales::default(),
+            proportion: 0.0,
+            body_type: 0.0,
+            shirt: None,
+            pants: None,
+            tshirt: None,
+            face: None,
+            shirt_id: Some(1001),
+            pants_id: Some(1002),
+            tshirt_id: None,
+            face_id: Some(1003),
+            head_id: None,
+            body_part_ids: Vec::new(),
+            accessory_ids: vec![
+                ("Hat".into(), 2001),
+                ("Hat".into(), 2002),
+                ("ShoulderAccessory".into(), 2003),
+                ("BackAccessory".into(), 2004),
+            ],
+            accessories: Vec::new(),
+            body_parts: Vec::new(),
+            head: None,
+            animations: Vec::new(),
+            emotes: Vec::new(),
+            skipped: Vec::new(),
+        });
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        let out = rt.leave().output;
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "DESC"), "1001 1002 1003 2001,2002 2003 2004", "{out:?}");
+        assert_eq!(line(&out, "CLONE"), "1001 2001,2002 2004", "{out:?}");
+    }
+
+    #[test]
+    fn failed_animation_load_warns_with_sanitized_id() {
+        let out = run(|_| {}, r#"
+            local m = Instance.new("Model", workspace)
+            local h = Instance.new("Humanoid", m)
+            local animator = Instance.new("Animator", h)
+            local anim = Instance.new("Animation")
+            anim.AnimationId = "invalid://missing-clip"
+            animator:LoadAnimation(anim)
+        "#);
+        assert!(
+            out.iter().any(|(l, s)| *l == Level::Warn && s.contains("Failed to load animation - sanitized ID: invalid://missing-clip")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn part_velocity_includes_angular_lever_arm() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let part = d.dom.insert(
+            ws,
+            InstanceBuilder::new("Part")
+                .with_name("Corner")
+                .with_property("CFrame", Variant::CFrame(rbx_types::CFrame::new(
+                    rbx_types::Vector3::new(10.0, 2.0, 0.0),
+                    rbx_types::Matrix3::identity(),
+                ))),
+        );
+        let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
+        let s = d.dom.insert(
+            sss,
+            InstanceBuilder::new("Script")
+                .with_name("Probe")
+                .with_property(
+                    "Source",
+                    r#"
+                    local p = workspace:WaitForChild("Corner")
+                    local v, av = p.Velocity, p.AssemblyLinearVelocity
+                    print(string.format("VEL %.2f %.2f %.2f | %.2f %.2f %.2f", v.X, v.Y, v.Z, av.X, av.Y, av.Z))
+                    "#
+                    .to_string(),
+                ),
+        );
+        let doc_id = d.id;
+        let mut w = World::new(d, RunMode::Run);
+        w.velocities.insert(part, Vec3::new(1.0, 2.0, 3.0));
+        let mut stats = rustudio_physics::physics::live::Stats::default();
+        // spin = (0, 0, 2) rad/s about COM (0, 2, 0), part at (10, 2, 0) => spin x r = (0, 20, 0)
+        stats.spin.insert(part, (Vec3::new(0.0, 0.0, 2.0), Vec3::new(0.0, 2.0, 0.0)));
+        rustudio_physics::physics::live::publish(doc_id, stats);
+        let rt = Runtime::new().unwrap();
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        rt.step(1.0 / 60.0);
+        let out = rt.leave().output;
+        rustudio_physics::physics::live::publish(doc_id, Default::default());
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "VEL"), "1.00 22.00 3.00 | 1.00 2.00 3.00", "{out:?}");
+    }
+
+    #[test]
+    fn get_player_by_user_id_coerces_numeric_strings() {
+        let out = run(
+            |d| {
+                let players = d.find_child(d.dom.root_ref(), "Players").unwrap();
+                d.dom.insert(
+                    players,
+                    InstanceBuilder::new("Player")
+                        .with_name("Alice")
+                        .with_property("UserId", 111067068i64),
+                );
+            },
+            r#"
+            local Players = game:GetService("Players")
+            local p1 = Players:GetPlayerByUserId(111067068)
+            local p2 = Players:GetPlayerByUserId("111067068")
+            local p3 = Players:GetPlayerByUserId("not-a-number")
+            print("RES", p1 and p1.Name, p2 and p2.Name, tostring(p3))
+            "#,
+        );
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "RES"), "Alice Alice nil", "{out:?}");
+    }
+
+    #[test]
+    fn collection_service_get_tagged_excludes_non_datamodel() {
+        let out = run(
+            |_| {},
+            r#"
+            local CS = game:GetService("CollectionService")
+            local p = Instance.new("Part")
+            CS:AddTag(p, "Coin")
+            local n0 = #CS:GetTagged("Coin")
+            p.Parent = workspace
+            local n1 = #CS:GetTagged("Coin")
+            p.Parent = nil
+            local n2 = #CS:GetTagged("Coin")
+            p.Parent = workspace
+            local n3 = #CS:GetTagged("Coin")
+            p:Destroy()
+            local n4 = #CS:GetTagged("Coin")
+            print("COUNTS", n0, n1, n2, n3, n4)
+            "#,
+        );
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "COUNTS"), "0 1 0 1 0", "{out:?}");
+    }
+
+    #[test]
+    fn require_module_error_prints_stack_trace() {
+        let out = run(
+            |d| {
+                let rs = d.find_child(d.dom.root_ref(), "ReplicatedStorage").unwrap();
+                d.dom.insert(
+                    rs,
+                    InstanceBuilder::new("ModuleScript")
+                        .with_name("Inner")
+                        .with_property("Source", "local x = 1\nerror('boom inner')\nreturn x"),
+                );
+                d.dom.insert(
+                    rs,
+                    InstanceBuilder::new("ModuleScript")
+                        .with_name("Outer")
+                        .with_property("Source", "local i = require(script.Parent.Inner)\nreturn i"),
+                );
+            },
+            r#"
+            require(game.ReplicatedStorage.Outer)
+            "#,
+        );
+        let texts: Vec<&str> = out.iter().map(|(_, s)| s.as_str()).collect();
+        assert!(
+            texts.iter().any(|s| s.contains("Script 'ReplicatedStorage.Inner', Line 2")),
+            "missing inner module stack frame: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|s| s.contains("Script 'ReplicatedStorage.Outer', Line 1")),
+            "missing outer module stack frame: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn remote_event_queues_invocations_before_connect_and_flushes_fifo() {
+        let mut d = Document::new_place();
+        let rs = d.find_child(d.dom.root_ref(), "ReplicatedStorage").unwrap();
+        let reliable = d.dom.insert(
+            rs,
+            InstanceBuilder::new("RemoteEvent").with_name("Reliable"),
+        );
+        let unreliable = d.dom.insert(
+            rs,
+            InstanceBuilder::new("UnreliableRemoteEvent").with_name("Unreliable"),
+        );
+        let cap_re = d.dom.insert(
+            rs,
+            InstanceBuilder::new("RemoteEvent").with_name("Capped"),
+        );
+        let script = d.dom.insert(
+            rs,
+            InstanceBuilder::new("LocalScript")
+                .with_name("Client")
+                .with_property(
+                    "Source",
+                    r#"
+                    local RS = game:GetService("ReplicatedStorage")
+                    local reliable = RS.Reliable
+                    local unreliable = RS.Unreliable
+                    local capped = RS.Capped
+
+                    local log = {}
+                    reliable.OnClientEvent:Once(function(v)
+                        table.insert(log, "once:" .. tostring(v))
+                    end)
+                    task.spawn(function()
+                        local v = reliable.OnClientEvent:Wait()
+                        table.insert(log, "wait:" .. tostring(v))
+                    end)
+                    local c1
+                    c1 = reliable.OnClientEvent:Connect(function(v)
+                        table.insert(log, "c1:" .. tostring(v))
+                        assert(c1 ~= nil, "connection handle should be assigned before callback")
+                    end)
+                    reliable.OnClientEvent:Connect(function(v)
+                        table.insert(log, "c2:" .. tostring(v))
+                    end)
+
+                    local uCount = 0
+                    unreliable.OnClientEvent:Connect(function()
+                        uCount += 1
+                    end)
+
+                    local capCount = 0
+                    capped.OnClientEvent:Connect(function()
+                        capCount += 1
+                    end)
+
+                    task.wait(0.05)
+                    print("LOG", table.concat(log, ","))
+                    print("UNRELIABLE", uCount)
+                    print("CAPPED", capCount)
+                    "#,
+                ),
+        );
+
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(d, RunMode::Play);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+
+        let nomap = |_: Ref| None;
+        // Deliver 4 invocations to reliable before any listener connects.
+        for n in 1..=4 {
+            rt.deliver_event(reliable, "OnClientEvent", None, &[Xfer::Num(n as f64)], &nomap);
+        }
+        // UnreliableRemoteEvent must drop pre-connect invocations.
+        rt.deliver_event(unreliable, "OnClientEvent", None, &[Xfer::Num(99.0)], &nomap);
+        // Overflow queue past REMOTE_QUEUE_LIMIT (256) to check cap + single warning.
+        for n in 0..(REMOTE_QUEUE_LIMIT + 10) {
+            rt.deliver_event(cap_re, "OnClientEvent", None, &[Xfer::Num(n as f64)], &nomap);
+        }
+
+        rt.run_script(script);
+        rt.dispatch();
+        // Now deliver a live 5th invocation; both c1 and c2 should see it.
+        rt.deliver_event(reliable, "OnClientEvent", None, &[Xfer::Num(5.0)], &nomap);
+        rt.dispatch();
+        for _ in 0..10 {
+            rt.step(1.0 / 60.0);
+        }
+        let out = rt.leave().output;
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(
+            line(&out, "LOG"),
+            "once:1,wait:2,c1:3,c1:4,c1:5,c2:5",
+            "{out:?}"
+        );
+        assert_eq!(line(&out, "UNRELIABLE"), "0", "{out:?}");
+        assert_eq!(line(&out, "CAPPED"), REMOTE_QUEUE_LIMIT.to_string(), "{out:?}");
+        let warns: Vec<&str> = out
+            .iter()
+            .filter(|(l, _)| *l == Level::Warn)
+            .map(|(_, s)| s.as_str())
+            .collect();
+        assert_eq!(warns.len(), 1, "expected exactly one overflow warning: {warns:?}");
+        assert!(warns[0].contains("Remote event invocation queue exhausted"), "{warns:?}");
+    }
+
+    #[test]
+    fn key_code_string_maps_symbols_and_letters() {
+        let out = run(|_| {}, r#"
+            local UIS = game:GetService("UserInputService")
+            local cases = {
+                { Enum.KeyCode.Slash, "/" },
+                { Enum.KeyCode.BackSlash, "\\" },
+                { Enum.KeyCode.Semicolon, ";" },
+                { Enum.KeyCode.Quote, "'" },
+                { Enum.KeyCode.Comma, "," },
+                { Enum.KeyCode.Period, "." },
+                { Enum.KeyCode.LeftBracket, "[" },
+                { Enum.KeyCode.RightBracket, "]" },
+                { Enum.KeyCode.Backquote, "`" },
+                { Enum.KeyCode.Tilde, "~" },
+                { Enum.KeyCode.Minus, "-" },
+                { Enum.KeyCode.Equals, "=" },
+                { Enum.KeyCode.A, "A" },
+                { Enum.KeyCode.One, "1" },
+                { Enum.KeyCode.KeypadPlus, "+" },
+                { Enum.KeyCode.Escape, "" },
+            }
+            for _, c in cases do
+                local got = UIS:GetStringForKeyCode(c[1])
+                assert(got == c[2], c[1].Name .. " expected '" .. c[2] .. "' got '" .. tostring(got) .. "'")
+            end
+            print("OK")
+        "#);
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "OK"), "", "{out:?}");
+    }
+
+    #[test]
+    fn prop_ref_keeps_unparented_instance_alive() {
+        let mut d = Document::empty();
+        let root = d.dom.root_ref();
+        d.dom.insert(root, InstanceBuilder::new("Workspace").with_name("Workspace"));
+        let sss = d.dom.insert(root, InstanceBuilder::new("ServerScriptService").with_name("ServerScriptService"));
+        let s1 = d.dom.insert(
+            sss,
+            InstanceBuilder::new("Script").with_name("S1").with_property(
+                "Source",
+                r#"
+                local btn = Instance.new("TextButton")
+                btn.Name = "RefBtn"
+                btn.Parent = workspace
+                do
+                    local sel = Instance.new("ImageLabel")
+                    sel.Name = "VRSelector"
+                    btn.SelectionImageObject = sel
+                end
+                "#.to_string(),
+            ),
+        );
+        let s2 = d.dom.insert(
+            sss,
+            InstanceBuilder::new("Script").with_name("S2").with_property(
+                "Source",
+                r#"
+                local btn = workspace:FindFirstChild("RefBtn")
+                local kept = btn and btn.SelectionImageObject
+                assert(kept ~= nil and kept.Name == "VRSelector", "orphan ref collected")
+                print("OK")
+                "#.to_string(),
+            ),
+        );
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(d, RunMode::Play));
+        rt.bind_globals().unwrap();
+        rt.run_script(s1);
+        rt.lua.gc_collect().unwrap();
+        rt.lua.gc_collect().unwrap();
+        rt.collect(&|_| false, 1000);
+        rt.run_script(s2);
+        let out = rt.leave().output;
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "OK"), "", "{out:?}");
+    }
+
+    #[test]
+    fn scrolling_frame_canvas_position_clamps_on_write() {
+        let mut d = Document::empty();
+        let root = d.dom.root_ref();
+        let sg = d.dom.insert(root, InstanceBuilder::new("ScreenGui").with_name("G"));
+        let sf = d.dom.insert(
+            sg,
+            InstanceBuilder::new("ScrollingFrame")
+                .with_name("S")
+                .with_property("Size", Variant::UDim2(rbx_dom_weak::types::UDim2::new(
+                    rbx_dom_weak::types::UDim::new(0.0, 200),
+                    rbx_dom_weak::types::UDim::new(0.0, 100),
+                )))
+                .with_property("CanvasSize", Variant::UDim2(rbx_dom_weak::types::UDim2::new(
+                    rbx_dom_weak::types::UDim::new(0.0, 0),
+                    rbx_dom_weak::types::UDim::new(0.0, 150),
+                ))),
+        );
+        let s = d.dom.insert(
+            sg,
+            InstanceBuilder::new("LocalScript").with_name("T").with_property(
+                "Source",
+                r#"
+                local sf = game:FindFirstChild("S", true)
+                sf.CanvasPosition = Vector2.new(50, 999)
+                assert(sf.CanvasPosition == Vector2.new(0, 50), tostring(sf.CanvasPosition))
+                sf.CanvasSize = UDim2.fromOffset(0, 60)
+                sf.CanvasPosition = Vector2.new(0, 500)
+                assert(sf.CanvasPosition == Vector2.new(0, 0), tostring(sf.CanvasPosition))
+                print("OK")
+                "#.to_string(),
+            ),
+        );
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(d, RunMode::Play);
+        w.input.gui_layout.insert(
+            sf,
+            crate::gui::GuiBox {
+                pos: [0.0, 0.0],
+                size: [200.0, 100.0],
+                rot: 0.0,
+                text: None,
+                text_fits: false,
+                canvas: Some([200.0, 150.0]),
+                window: Some([200.0, 100.0]),
+                canvas_fit: Some(crate::gui::CanvasFit {
+                    basis: [200.0, 100.0],
+                    floor: [200.0, 100.0],
+                    scale: 1.0,
+                }),
+            },
+        );
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.run_script_as(s, security::CORE);
+        let out = rt.leave().output;
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "OK"), "", "{out:?}");
+    }
+
+    #[test]
+    fn stats_item_display_name_and_core_action_identity() {
+        let mut d = Document::empty();
+        let root = d.dom.root_ref();
+        let stats = d.dom.insert(root, InstanceBuilder::new("Stats").with_name("Stats"));
+        let perf = d.dom.insert(stats, InstanceBuilder::new("Folder").with_name("PerformanceStats"));
+        d.dom.insert(perf, InstanceBuilder::new("StatsItem").with_name("Memory"));
+        let s = d.dom.insert(
+            root,
+            InstanceBuilder::new("LocalScript").with_name("T").with_property(
+                "Source",
+                r#"
+                local Stats = game:GetService("Stats")
+                local CAS = game:GetService("ContextActionService")
+                local mem = Stats.PerformanceStats.Memory
+                assert(mem.DisplayName == "Memory", tostring(mem.DisplayName))
+                local got = nil
+                CAS:BindAction("CoreTestAction", function(_, st)
+                    if st == Enum.UserInputState.Begin then
+                        got = Stats:GetBrowserTrackerId()
+                    end
+                end, false, Enum.KeyCode.Period)
+                __rs_input_event("Begin", "Keyboard", "Period", 0, 0, 0, 0, 0, false)
+                assert(got == "0", "got=" .. tostring(got))
+                print("OK")
+                "#.to_string(),
+            ),
+        );
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(d, RunMode::Play));
+        rt.bind_globals().unwrap();
+        rt.run_script_as(s, security::CORE);
+        let out = rt.leave().output;
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "OK"), "", "{out:?}");
     }
 }

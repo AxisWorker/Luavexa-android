@@ -3,9 +3,8 @@
 //! (`ViewportPipelines::new` and the lazy builders: dozens of them at the
 //! first frame), and a phone's driver does it slowly: seconds of black
 //! window on an Adreno or Mali, where the vendor's driver keeps no cache
-//! of its own between processes (Mesa's Turnip and PanVK keep a disk
-//! shader cache, src/android/turnip.rs sets its folder, so they gain less
-//! here). With the `PIPELINE_CACHE` feature (Vulkan only) wgpu wraps a
+//! of its own between processes (Mesa's drivers keep a disk shader cache
+//! of their own, so they gain less here). With the `PIPELINE_CACHE` feature (Vulkan only) wgpu wraps a
 //! `VkPipelineCache`; its blob is written to the asset cache folder once
 //! the pipelines are built and handed back to the driver at the next
 //! start, which then skips the compiles it recognises.
@@ -56,7 +55,7 @@ fn file_for(dir: &std::path::Path, info: &wgpu::AdapterInfo) -> Option<PathBuf> 
 /// Makes the process's cache for `device`, primed with the blob a previous
 /// run left under `dir` (the asset cache folder). Nothing happens without
 /// the device feature (the descriptor asks for it where the adapter has
-/// it: offscreen.rs `wgpu_options_with`), or a second time.
+/// it: offscreen.rs `wgpu_options`), or a second time.
 pub fn init(device: &wgpu::Device, info: &wgpu::AdapterInfo, dir: PathBuf) {
     let _ = CACHE.get_or_init(|| {
         if std::env::var_os("RUSTUDIO_NO_PIPELINE_CACHE").is_some() {
@@ -87,7 +86,7 @@ pub fn init(device: &wgpu::Device, info: &wgpu::AdapterInfo, dir: PathBuf) {
             if primed > 0 { format!("primed with {} KB from the last run", primed / 1024) } else { "empty: the first run on this driver".to_string() },
             t0.elapsed().as_millis()
         );
-        if cfg!(target_os = "android") || std::env::var_os("RUSTUDIO_STARTUP_TRACE").is_some() {
+        if rustudio_core::load_trace::startup_trace() {
             eprintln!("[startup] pipeline cache {}", if primed > 0 { format!("primed with {} KB", primed / 1024) } else { "empty (first run on this driver)".to_string() });
         }
         Some(Cache { cache, path, saved: Mutex::new((0, primed)) })

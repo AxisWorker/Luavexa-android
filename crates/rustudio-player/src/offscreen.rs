@@ -187,9 +187,6 @@ pub fn run<A: eframe::App>(
         if let (Some(rs), Some(t)) = (rs.as_ref(), frame.as_ref()) {
             let jobs = ctx.tessellate(out.shapes, ppp);
             let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: size, pixels_per_point: ppp };
-            // (egui shows the viewport texture the frame drew: its commands
-            // are submitted first)
-            rustudio_render::render_thread::wait();
             let mut renderer = rs.renderer.write();
             for (id, deltas) in &textures_delta.set {
                 for delta in deltas {
@@ -214,7 +211,7 @@ pub fn run<A: eframe::App>(
                 });
                 renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
             }
-            rustudio_render::gpu_timing::submit_finished(&rs.device, &rs.queue, "gpu: egui (offscreen)", extra.into_iter().chain([enc.finish()]));
+            rustudio_render::gpu_timing::submit(&rs.device, &rs.queue, "gpu: egui (offscreen)", extra.into_iter().chain([enc.finish()]));
             for id in &textures_delta.free {
                 renderer.free_texture(id);
             }
@@ -321,8 +318,8 @@ pub fn wgpu_options_with(
                 // RUSTUDIO_GPU_TIMING: timestamp queries (gpu_timing.rs).
                 d.required_features |= rustudio_render::gpu_timing::features(adapter.features());
                 // The driver's pipeline cache, kept between runs (Vulkan;
-                // pipeline_cache.rs): a phone's second start skips the
-                // shader compiles of its first.
+                // pipeline_cache.rs): a second start skips the shader compiles
+                // of its first.
                 d.required_features |= adapter.features() & egui_wgpu::wgpu::Features::PIPELINE_CACHE;
                 // GPU memory in blocks sized for memory use (8-64 MB), not
                 // wgpu's default 128-256 MB device blocks: the allocator keeps

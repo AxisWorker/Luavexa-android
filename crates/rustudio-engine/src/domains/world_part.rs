@@ -263,8 +263,10 @@ fn build(d: &Document) -> Graph {
         }
         let r = inst.referent();
         let rec = joint_rec(d, ws, r, kind, class.as_str());
-        if let Some(e) = rec.edge {
-            edges.push(e);
+        if let Some((a, b)) = rec.edge {
+            g.best.entry(a).or_insert(r);
+            g.best.entry(b).or_insert(r);
+            edges.push((a, b));
         }
         g.add_rec(r, rec);
     }
@@ -409,7 +411,6 @@ impl Graph {
     fn update(&mut self, d: &Document, marks: &[doc::Mark]) {
         let mut dj: HashSet<Ref> = HashSet::new();
         let mut dp: HashSet<Ref> = HashSet::new();
-        let touching = rustudio_core::bench::scope("jg_touch");
         for m in marks {
             match *m {
                 doc::Mark::Prop(r, name) => {
@@ -429,15 +430,10 @@ impl Graph {
                 }
             }
         }
-        drop(touching);
         if dj.is_empty() && dp.is_empty() {
             return;
         }
         let _b = rustudio_core::bench::scope("joint_graph_update");
-        rustudio_core::bench::add("count: jg_marks", marks.len() as f64, 1);
-        rustudio_core::bench::add("count: jg_joints", dj.len() as f64, 1);
-        rustudio_core::bench::add("count: jg_parts", dp.len() as f64, 1);
-        let recs = rustudio_core::bench::scope("jg_recs");
         let ws = d.workspace();
         // Rigid edges that went away (assemblies may split: redone whole)
         // and edges new to the graph (assemblies only merge: `merge_in`).
@@ -472,10 +468,7 @@ impl Graph {
                 added.extend(new);
             }
         }
-        drop(recs);
-        let _r = rustudio_core::bench::scope("jg_regroup");
         if removed {
-            rustudio_core::bench::add("count: jg_removed", 1.0, 1);
             self.regroup(d, dp);
         } else {
             self.merge_in(d, dp, &dj, &added);
@@ -515,10 +508,7 @@ impl Graph {
                     }
                 }
             }
-            rustudio_core::bench::add("count: jg_regrouped", comp.len() as f64, 1);
-            let sorting = rustudio_core::bench::scope("jg_sort");
             self.sort_members(d, &mut comp);
-            drop(sorting);
             let gi = match self.free.pop() {
                 Some(gi) => gi,
                 None => {
@@ -543,6 +533,7 @@ impl Graph {
         self.free.push(gi);
         for m in members {
             self.group.remove(&m);
+            self.best.remove(&m);
             if queued.insert(m) {
                 todo.push(m);
             }
@@ -648,7 +639,6 @@ impl Graph {
             for p in inserts {
                 keyed.push((keys.cached(self, d, p, dj), p));
             }
-            rustudio_core::bench::add("count: jg_regrouped", keyed.len() as f64, 1);
             let members = if keyed.len() * 8 > base.len() {
                 // (much of it new: one sort)
                 base.extend(keyed.into_iter().map(|(_, p)| p));
@@ -721,6 +711,19 @@ impl Graph {
             v.sort_by_key(|x| x.0.to_string());
             v
         };
+        for (gi, members) in self.groups.iter().enumerate() {
+            if members.is_empty() != self.free.contains(&gi)
+                || members.iter().any(|p| self.group.get(p) != Some(&gi))
+            {
+                out.push(format!("inconsistent assembly slot {gi}"));
+            }
+        }
+        if self.group.len() != self.groups.iter().map(Vec::len).sum::<usize>() {
+            out.push("assembly member index differs".into());
+        }
+        if self.best != other.best {
+            out.push("first rigid joint differs".into());
+        }
         if sorted(&self.joints) != sorted(&other.joints) {
             out.push("joints differ".into());
         }
@@ -791,6 +794,14 @@ impl Graph {
             None => vec![r],
         }
     }
+    pub(crate) fn ungrounded_assemblies(&self) -> impl Iterator<Item = &[Ref]> {
+        self.groups
+            .iter()
+            .zip(&self.roots)
+            .filter(|(members, (_, grounded))| !grounded && members.len() > 1)
+            .map(|(members, _)| members.as_slice())
+    }
+
     pub fn root(&self, d: &Document, r: Ref) -> Ref {
         if anchored(d, r) {
             return r;
@@ -899,36 +910,45 @@ fn joint_pose_moves(
     writes
 }
 
-/// Where the walk of an arrival into `a`'s assembly starts, in the order a
-/// walk from its roots would take them: the parts of the assembly that were
-/// there before and hold an edited joint, its anchored new parts, and its
-/// root when it is an old part. None (walk from the roots) when the root
-/// is a new unanchored part (the new parts carry the old ones then) or
-/// nothing old is in the assembly.
-fn arrival_seeds(d: &Document, g: &Graph, edits: &HashMap<Ref, JointPoseEdit>, arrived: &HashSet<Ref>, a: Ref) -> Option<Vec<Ref>> {
+/// A single existing boundary part can carry the new parts using its
+/// client pose. Multiple boundaries or a new root need the ordinary root
+/// walk to preserve precedence when their joint offsets disagree.
+fn arrival_seeds(
+    d: &Document,
+    g: &Graph,
+    edits: &HashMap<Ref, JointPoseEdit>,
+    arrived: &HashSet<Ref>,
+    a: Ref,
+) -> Option<Vec<Ref>> {
     let gi = *g.group.get(&a)?;
-    let (root, grounded) = g.roots[gi];
-    if !grounded && arrived.contains(&root) {
+    let (root, _) = g.roots[gi];
+    if arrived.contains(&root) {
         return None;
     }
-    let mine = |x: &Ref| g.group.get(x) == Some(&gi);
-    let mut seeds: HashSet<Ref> = edits
-        .keys()
-        .filter_map(|j| g.recs.get(j).and_then(|rec| rec.edge))
-        .flat_map(|(p0, p1)| [p0, p1])
-        .filter(|x| mine(x) && !arrived.contains(x))
-        .collect();
-    seeds.extend(arrived.iter().copied().filter(|x| mine(x) && anchored(d, *x)));
-    if !grounded {
-        seeds.insert(root);
-    }
-    if seeds.iter().all(|x| arrived.contains(x)) {
+    // The incoming subtree can include a weld between two old parts.
+    // Those edits require the normal pose walk through the assembly.
+    if edits.keys().any(|joint| {
+        g.recs.get(joint).and_then(|rec| rec.edge).is_some_and(|(p0, p1)| {
+            g.group.get(&p0) == Some(&gi) && !arrived.contains(&p0) && !arrived.contains(&p1)
+        })
+    }) {
         return None;
     }
-    let mut seeds: Vec<Ref> = seeds.into_iter().collect();
-    let mut at = ChildPositions::default();
-    seeds.sort_by_cached_key(|p| std::cmp::Reverse(bfs_key(d, *p, &mut at)));
-    Some(seeds)
+    let mut boundary = None;
+    for &part in arrived.iter().filter(|p| g.group.get(*p) == Some(&gi)) {
+        if anchored(d, part) {
+            return None;
+        }
+        for &neighbor in g.rigid.get(&part).into_iter().flatten() {
+            if !arrived.contains(&neighbor) {
+                if boundary.is_some_and(|previous| previous != neighbor) {
+                    return None;
+                }
+                boundary = Some(neighbor);
+            }
+        }
+    }
+    boundary.map(|part| vec![part])
 }
 
 /// Breadth-first from `starts` (held where they are) along the rigid
@@ -1450,18 +1470,34 @@ pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) ->
             }
             none()
         })(),
-        // Studio (no streaming in Edit / Run): the player argument is
-        // checked first and only a Player passes; there is nobody to keep.
-        "AddPersistentPlayer" | "RemovePersistentPlayer" if doc::is_a(class, "Model") => {
-            let ok = opt_inst(&arg(args, 1))
-                .is_some_and(|p| world(lua).is_ok_and(|w| w.d().class_of(p).is_some_and(|c| c == "Player")));
-            if ok { none() } else { Err(rt_err("PersistentPerPlayer player not specified.")) }
-        }
-        "GetPersistentPlayers" if doc::is_a(class, "Model") => {
-            list(lua, Vec::new()).map(Value::Table).and_then(one)
-        }
+        "AddPersistentPlayer" | "RemovePersistentPlayer" if doc::is_a(class, "Model") => (|| {
+            let mut w = world(lua)?;
+            let player = opt_inst(&arg(args, 1)).filter(|&p| w.d().class_of(p).is_some_and(|c| c == "Player"))
+                .ok_or_else(|| rt_err("PersistentPerPlayer player not specified."))?;
+            if w.side == Side::Client || !w.has_peer || !crate::replicate_streaming::enabled(w.d()) {
+                return none();
+            }
+            let add = name == "AddPersistentPlayer";
+            let players = w.persistent_players.entry(this).or_default();
+            let changed = if add { players.insert(player) } else { players.remove(&player) };
+            if changed {
+                w.record(RepOp::Persistence(this, player, add));
+            }
+            none()
+        })(),
+        "GetPersistentPlayers" if doc::is_a(class, "Model") => (|| {
+            let w = world(lua)?;
+            let players = w.persistent_players.get(&this).into_iter().flatten()
+                .filter(|&&p| w.d().class_of(p).is_some_and(|c| c == "Player"))
+                .copied().collect::<Vec<_>>();
+            drop(w);
+            list(lua, players).map(Value::Table).and_then(one)
+        })(),
 
         // --------------------------------------------- WorldRoot / Workspace
+        "GetStreamingEnabled" if class == "Workspace" => {
+            world(lua).and_then(|w| one(Value::Boolean(crate::replicate_streaming::enabled(w.d()))))
+        }
         "ArePartsTouchingOthers" if doc::is_a(class, "WorldRoot") => touching_others(lua, args),
         "IsRegion3Empty" | "IsRegion3EmptyWithIgnoreList" if doc::is_a(class, "WorldRoot") => (|| {
             let reg = match arg(args, 1) {
@@ -1972,6 +2008,35 @@ fn destroy(lua: &Lua, r: Ref) -> mlua::Result<()> {
 mod tests {
     use super::*;
     use crate::runtime::{RunMode, Runtime, World};
+
+    #[test]
+    fn moving_a_joint_changes_member_order_and_the_anchored_root() {
+        use rbx_dom_weak::InstanceBuilder;
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let model = d.dom.insert(ws, InstanceBuilder::new("Model"));
+        let a = d.dom.insert(model, InstanceBuilder::new("Part").with_property("Anchored", true));
+        let b = d.dom.insert(model, InstanceBuilder::new("Part"));
+        let c = d.dom.insert(model, InstanceBuilder::new("Part").with_property("Anchored", true));
+        let weld = |part: Ref| InstanceBuilder::new("WeldConstraint").with_property("Part0", part).with_property("Part1", b);
+        let ab = d.dom.insert(model, weld(a));
+        d.dom.insert(model, weld(c));
+        let mut graph = build(&d);
+        assert_eq!(graph.assembly(b), vec![a, b, c]);
+        assert_eq!(graph.root(&d, b), a);
+        let edits = HashMap::from([(ab, JointPoseEdit::Activate)]);
+        assert!(arrival_seeds(&d, &graph, &edits, &HashSet::from([b]), b).is_none());
+        d.dom.transfer_within(ab, a);
+        graph.update(&d, &[doc::Mark::Tree(ab)]);
+        assert_eq!(graph.assembly(b), vec![c, b, a]);
+        assert_eq!(graph.root(&d, b), c);
+        assert_eq!(graph.root(&d, a), a);
+        assert!(graph.diff(&build(&d)).is_empty());
+        d.dom.transfer_within(ab, Ref::none());
+        graph.update(&d, &[doc::Mark::Tree(ab)]);
+        assert_eq!(graph.assembly(b), vec![c, b]);
+        assert!(graph.diff(&build(&d)).is_empty());
+    }
 
     /// The journal-driven graph (merges in place when joints are only
     /// added, regroups otherwise) equals a full build after every edit of

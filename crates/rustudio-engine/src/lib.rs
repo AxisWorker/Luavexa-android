@@ -29,6 +29,7 @@ pub mod touch_input;
 pub mod device_sensors;
 pub mod ltypes;
 pub mod replicate;
+mod replicate_streaming;
 pub mod anim_replicate;
 pub mod rig;
 pub mod runtime;

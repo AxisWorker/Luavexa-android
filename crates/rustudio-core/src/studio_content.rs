@@ -42,10 +42,6 @@ const PACKAGES: &[(&str, &str)] = &[
     ("extracontent-scripts.zip", "ExtraContent/scripts"),
     ("extracontent-models.zip", "ExtraContent/models"),
     ("extracontent-textures.zip", "ExtraContent/textures"),
-    // The CoreScripts' packages the client serves under rbxasset:// (the
-    // Builder Icons font their top bar and menus draw their icons with:
-    // rbxasset://LuaPackages/Packages/_Index/BuilderIcons/…; core_scripts.rs).
-    ("extracontent-luapackages.zip", "ExtraContent/LuaPackages"),
 ];
 /// Single files pulled out of a big package by range requests.
 const SINGLE_FILES: &[(&str, &str)] = &[("RobloxStudio.zip", "ReflectionMetadata.xml")];
@@ -115,25 +111,39 @@ pub fn spawn_background_install_if_missing() {
     }
     if let Some(root) = crate::default_scripts::studio_dir() {
         // Upgrade older rustudio downloads without replacing the rest of
-        // their content: the View Selector, and packages listed since.
+        // their content: packages listed since, the View Selector, the
+        // LuaPackages assets and the Studio UI textures.
         let packages = if root == install_dir() { missing_packages(&root) } else { Vec::new() };
-        if root == install_dir() && (!has_view_selector(&root) || !packages.is_empty()) {
+        let need_vs = !has_view_selector(&root);
+        let need_lp = !has_lua_package_assets(&root);
+        let need_ui = !has_studio_ui_textures(&root);
+        if root == install_dir() && (need_vs || need_lp || need_ui || !packages.is_empty()) {
             if let Some(marker) = std::fs::read_to_string(root.join(MARKER)).ok() {
                 if let Some(version) = marker.split_whitespace().next().and_then(studio_version) {
                     let version = version.to_owned();
                     let _ = std::thread::Builder::new().name("studio-content-upgrade".into()).spawn(move || {
-                        let agent = agent();
+                        let a = agent();
                         if !packages.is_empty() {
                             let names: Vec<&str> = packages.iter().map(|(p, _)| *p).collect();
                             post(false, format!("Studio content: downloading {} (new in this version of rustudio)…", names.join(", ")));
-                            match install_missing_packages(&agent, &version, &root, &|_| {}) {
+                            match install_missing_packages(&a, &version, &root, &|_| {}) {
                                 Ok(()) => post(false, "Studio content: downloaded".into()),
                                 Err(e) => post(true, format!("Couldn't download Studio content: {e}")),
                             }
                         }
-                        if !has_view_selector(&root) {
-                            if let Err(e) = install_view_selector(&agent, &version, &root) {
+                        if need_vs {
+                            if let Err(e) = install_view_selector(&a, &version, &root) {
                                 post(true, format!("Couldn't download Studio's View Selector: {e}"));
+                            }
+                        }
+                        if need_lp {
+                            if let Err(e) = install_lua_package_assets(&a, &version, &root) {
+                                post(true, format!("Couldn't download Studio's LuaPackages assets: {e}"));
+                            }
+                        }
+                        if need_ui {
+                            if let Err(e) = install_studio_ui_textures(&a, &version, &root) {
+                                post(true, format!("Couldn't download Studio's UI textures: {e}"));
                             }
                         }
                     });
@@ -143,7 +153,7 @@ pub fn spawn_background_install_if_missing() {
         return;
     }
     let _ = std::thread::Builder::new().name("studio-content".into()).spawn(|| {
-        post(false, "No Roblox Studio install found: downloading Studio's built-in content (default character, player scripts, fonts, textures, sounds, the CoreScripts' packages; about 70 MB) from Roblox's CDN…".into());
+        post(false, "No Roblox Studio install found: downloading Studio's built-in content (default character, player scripts, fonts, textures, sounds, the CoreScripts' icon font; about 70 MB) from Roblox's CDN…".into());
         // The packages as they come, so a slow connection is seen to get
         // somewhere (the retired textures are a hundred small fetches: one
         // line for all of them).
@@ -200,7 +210,7 @@ fn agent() -> ureq::Agent {
     AGENT.clone()
 }
 
-pub(crate) fn get(agent: &ureq::Agent, url: &str, range: Option<(u64, u64)>) -> Result<Vec<u8>, String> {
+fn get(agent: &ureq::Agent, url: &str, range: Option<(u64, u64)>) -> Result<Vec<u8>, String> {
     let mut req = agent.get(url);
     if let Some((a, b)) = range {
         req = req.header("Range", &format!("bytes={a}-{b}"));
@@ -296,6 +306,73 @@ fn install_view_selector(agent: &ureq::Agent, version: &str, root: &Path) -> Res
     has_view_selector(root).then_some(()).ok_or_else(|| "Studio packages are missing View Selector files".into())
 }
 
+const LUA_PACKAGE_REQUIRED_FILES: &[&str] = &[
+    "Packages/_Index/BuilderIcons/BuilderIcons/BuilderIcons.json",
+    "Packages/_Index/BuilderIcons/BuilderIcons/Font/BuilderIcons-Regular.ttf",
+    "Packages/_Index/BuilderIcons/BuilderIcons/Font/BuilderIcons-Filled.ttf",
+    "Packages/_Index/FoundationImages/FoundationImages/SpriteSheets/img_set_1x_4.png",
+];
+
+fn is_lua_package_asset(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".png")
+        || lower.ends_with(".ttf")
+        || lower.ends_with(".otf")
+        || lower.ends_with(".dds")
+        || lower.ends_with(".webp")
+        || lower.ends_with("buildericons.json")
+}
+
+fn has_lua_package_assets(root: &Path) -> bool {
+    LUA_PACKAGE_REQUIRED_FILES
+        .iter()
+        .all(|rel| root.join("ExtraContent/LuaPackages").join(rel).is_file())
+}
+
+fn install_lua_package_assets(agent: &ureq::Agent, version: &str, root: &Path) -> Result<(), String> {
+    let url = format!("{CDN}/{version}-extracontent-luapackages.zip");
+    let bytes = get(agent, &url, None)?;
+    let zip = Zip::parse(&bytes).map_err(|e| format!("{url}: {e}"))?;
+    let base = root.join("ExtraContent/LuaPackages");
+    for e in &zip.entries {
+        if e.name.ends_with(['/', '\\']) || !is_lua_package_asset(&e.name) {
+            continue;
+        }
+        let data = zip.read(&bytes, e).map_err(|err| format!("{url} {}: {err}", e.name))?;
+        write_file(&base, &e.name, &data)?;
+    }
+    has_lua_package_assets(root)
+        .then_some(())
+        .ok_or_else(|| "Studio packages are missing LuaPackages UI assets".into())
+}
+
+fn has_studio_ui_textures(root: &Path) -> bool {
+    root.join("content/studio_svg_textures/Shared/Utility/Dark/Standard/RadioOn.png").is_file()
+        && root.join("StudioContent/textures/StudioToolbox/RoundedBackground.png").is_file()
+}
+
+fn install_studio_ui_textures(agent: &ureq::Agent, version: &str, root: &Path) -> Result<(), String> {
+    for (pkg, sub) in [
+        ("content-studio_svg_textures.zip", "content/studio_svg_textures"),
+        ("studiocontent-textures.zip", "StudioContent/textures"),
+    ] {
+        let url = format!("{CDN}/{version}-{pkg}");
+        let bytes = get(agent, &url, None)?;
+        let zip = Zip::parse(&bytes).map_err(|e| format!("{url}: {e}"))?;
+        let base = root.join(sub);
+        for e in &zip.entries {
+            if e.name.ends_with(['/', '\\']) {
+                continue;
+            }
+            let data = zip.read(&bytes, e).map_err(|err| format!("{url} {}: {err}", e.name))?;
+            write_file(&base, &e.name, &data)?;
+        }
+    }
+    has_studio_ui_textures(root)
+        .then_some(())
+        .ok_or_else(|| "Studio packages are missing Studio UI textures".into())
+}
+
 pub fn install(progress: &(dyn Fn(&str) + Sync)) -> Result<String, String> {
     let agent = agent();
     let v: serde_json::Value = serde_json::from_slice(&get(&agent, VERSION_URL, None)?)
@@ -313,6 +390,14 @@ pub fn install(progress: &(dyn Fn(&str) + Sync)) -> Result<String, String> {
         if !has_view_selector(&dest) {
             progress("downloading Studio View Selector");
             install_view_selector(&agent, &version, &dest)?;
+        }
+        if !has_lua_package_assets(&dest) {
+            progress("downloading Studio LuaPackages UI assets");
+            install_lua_package_assets(&agent, &version, &dest)?;
+        }
+        if !has_studio_ui_textures(&dest) {
+            progress("downloading Studio UI textures");
+            install_studio_ui_textures(&agent, &version, &dest)?;
         }
         progress("already installed");
         return Ok(version);
@@ -362,6 +447,16 @@ pub fn install(progress: &(dyn Fn(&str) + Sync)) -> Result<String, String> {
         });
         if let Some(e) = failed.lock().ok().and_then(|mut f| f.take()) {
             return Err(e);
+        }
+        // (the retired textures and the View Selector come after the
+        // install: `install_extras`)
+        if !has_lua_package_assets(&partial) {
+            progress("downloading Studio LuaPackages UI assets");
+            install_lua_package_assets(&agent, &version, &partial)?;
+        }
+        if !has_studio_ui_textures(&partial) {
+            progress("downloading Studio UI textures");
+            install_studio_ui_textures(&agent, &version, &partial)?;
         }
         for (pkg, file) in SINGLE_FILES {
             if partial.join(file).is_file() {
@@ -488,22 +583,38 @@ fn write_file(root: &Path, name: &str, data: &[u8]) -> Result<(), String> {
 /// One file out of a remote zip: the end record, the central directory and
 /// that one entry, by range requests.
 fn fetch_one(agent: &ureq::Agent, url: &str, file: &str) -> Result<Vec<u8>, String> {
+    let mut out = fetch_many(agent, url, &[file])?;
+    Ok(out.remove(0).1)
+}
+
+/// Several files out of a remote zip, reading the central directory once.
+fn fetch_many<'a>(agent: &ureq::Agent, url: &str, files: &[&'a str]) -> Result<Vec<(&'a str, Vec<u8>)>, String> {
     let size = content_length(agent, url)?;
     let tail_len = size.min(65_536 + 22);
     let tail = get(agent, url, Some((size - tail_len, size - 1)))?;
     let (cd_off, cd_len) = Zip::end_record(&tail).map_err(|e| format!("{url}: {e}"))?;
     let cd = get(agent, url, Some((cd_off, cd_off + cd_len - 1)))?;
     let entries = Zip::central(&cd).map_err(|e| format!("{url}: {e}"))?;
-    let e = entries
-        .iter()
-        .find(|e| e.name.trim_start_matches(['\\', '/']).eq_ignore_ascii_case(file))
-        .ok_or_else(|| format!("{file} not in {url}"))?;
-    // Local header (30 bytes + name + extra) then the data; read generously.
-    let span = 30 + 1024 + e.comp_size;
-    let chunk = get(agent, url, Some((e.offset, (e.offset + span).min(size) - 1)))?;
-    let mut local = e.clone();
-    local.offset = 0;
-    Zip::read_entry(&chunk, &local)
+    let mut out = Vec::with_capacity(files.len());
+    for &file in files {
+        let want = file.trim_start_matches(['\\', '/']).replace('\\', "/");
+        let e = entries
+            .iter()
+            .find(|e| {
+                e.name
+                    .trim_start_matches(['\\', '/'])
+                    .replace('\\', "/")
+                    .eq_ignore_ascii_case(&want)
+            })
+            .ok_or_else(|| format!("{file} not in {url}"))?;
+        // Local header (30 bytes + name + extra) then the data; read generously.
+        let span = 30 + 1024 + e.comp_size;
+        let chunk = get(agent, url, Some((e.offset, (e.offset + span).min(size) - 1)))?;
+        let mut local = e.clone();
+        local.offset = 0;
+        out.push((file, Zip::read_entry(&chunk, &local)?));
+    }
+    Ok(out)
 }
 
 #[derive(Clone, Debug)]

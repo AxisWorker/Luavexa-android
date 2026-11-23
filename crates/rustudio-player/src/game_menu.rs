@@ -65,7 +65,7 @@ pub struct MenuState {
     /// SettingsHub's MenuStack).
     back: Option<MenuPage>,
     /// When it last opened or closed (egui time), for the shield tween.
-    changed_at: Option<f64>,
+    pub(crate) changed_at: Option<f64>,
     /// Scroll of the page view, per tab.
     scroll: [f32; 5],
     /// Where each button was drawn last frame (self-test clicks them).
@@ -362,7 +362,7 @@ impl Game {
     }
 
     /// The menu over the game view, sliding in and out.
-    pub(super) fn game_menu(&mut self, ui: &mut egui::Ui, rect: Rect) {
+    pub(crate) fn game_menu(&mut self, ui: &mut egui::Ui, rect: Rect) {
         self.inspect_menu(ui, rect);
         let now = self.menu_clock();
         let Some((open, changed)) = self

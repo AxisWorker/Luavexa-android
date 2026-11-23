@@ -131,6 +131,13 @@ impl PlayerApp {
         });
         // Ctrl+F6 (Studio's MicroProfiler key in a game): the profiler overlay;
         // RUSTUDIO_PROFILER_OVERLAY=1 opens it from the start (checks).
+        if let Some(on) = rustudio_engine::gui::share().microprofiler_req.take() {
+            self.profiler = if on {
+                Some(self.profiler.take().unwrap_or_else(rustudio_profiler_ui::ProfilerWindow::new))
+            } else {
+                None
+            };
+        }
         let toggle = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F6))
             || (self.profiler.is_none() && game.frame_no == 2 && std::env::var_os("RUSTUDIO_PROFILER_OVERLAY").is_some());
         if toggle {
@@ -172,11 +179,8 @@ impl PlayerApp {
             .or_else(|| self.run.tick_shots(game, &ctx, |_, _, _| {}));
         self.last_work_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
         crate::profiler_counters::sample(game);
-        if let Some(rs) = game.render_state.as_ref().filter(|_| rustudio_render::gpu_timing::on()) {
-            // (after the frame's submits, which may still be on the render
-            // thread; a job only while GPU spans are timed)
-            let (device, queue) = (rs.device.clone(), rs.queue.clone());
-            rustudio_render::render_thread::run(move || rustudio_render::gpu_timing::end_frame(&device, &queue));
+        if let Some(rs) = game.render_state.as_ref() {
+            rustudio_render::gpu_timing::end_frame(&rs.device, &rs.queue);
         }
         let bench_done = self.run.bench_frame(game, &ctx, self.last_work_ms, dt);
         if let Some(reason) = reason.or(bench_done.then_some("bench")) {
@@ -263,6 +267,20 @@ pub fn run() -> eframe::Result<()> {
                 match HarnessAction::parse(&v, a == "--click") {
                     Some(x) => actions.extend(x),
                     None => eprintln!("{a}: can't read {v:?}"),
+                }
+            }
+            "--dblclick" => {
+                let v = args.next().unwrap_or_default();
+                match HarnessAction::parse_dblclick(&v) {
+                    Some(x) => actions.extend(x),
+                    None => eprintln!("--dblclick: can't read {v:?} (X,Y@SECONDS)"),
+                }
+            }
+            "--paste" => {
+                let v = args.next().unwrap_or_default();
+                match HarnessAction::parse_paste(&v) {
+                    Some(x) => actions.push(x),
+                    None => eprintln!("--paste: can't read {v:?} (TEXT@SECONDS)"),
                 }
             }
             "--move" => {
@@ -460,7 +478,6 @@ pub fn run() -> eframe::Result<()> {
             move |ctx, rs| PlayerApp::new(ctx, rs, None, open, run, demo),
             PlayerApp::frame,
         );
-        drain_render_thread();
         std::process::exit(code.max(EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed)));
     }
     // The standalone player has no redraw pacing of its own (the editor's
@@ -480,20 +497,11 @@ pub fn run() -> eframe::Result<()> {
         let wayland = cc.window_handle().ok().map(|h| matches!(h.as_raw(), RawWindowHandle::Wayland(_)));
         Ok(Box::new(PlayerApp::new(&cc.egui_ctx, cc.wgpu_render_state.clone(), wayland, open, run, demo)))
     }));
-    drain_render_thread();
     let code = EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed);
     if code != 0 {
         std::process::exit(code);
     }
     result
-}
-
-/// The render thread finishes what it was handed before the process exits:
-/// exit handlers tearing the GPU device down under a job still freeing its
-/// buffers crashed the player (SIGSEGV at exit, a coredump's stack). A job's
-/// panic, re-raised by `wait`, doesn't stop the exit.
-fn drain_render_thread() {
-    let _ = std::panic::catch_unwind(rustudio_render::render_thread::wait);
 }
 
 fn window_arg(argv: &[String]) -> Option<(u32, u32)> {

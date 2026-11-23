@@ -24,6 +24,8 @@ pub struct Game {
     pub account: crate::account::Account,
     /// The running Play / Run session, if any.
     pub play: Option<crate::play::PlaySession>,
+    /// Edit-mode on-demand Sound loading and preview playback.
+    pub edit_audio: crate::edit_audio::EditAudio,
     pub(crate) play_thread: Option<crate::play_worker::ThreadedPlay>,
     /// A play-testing teleport's destination, loading (play_teleport.rs).
     pub(crate) teleport_job: Option<crate::play_teleport::TeleportJob>,
@@ -89,11 +91,9 @@ pub struct Game {
     /// Bumped whenever a downloaded asset arrives (parts waiting on one are redone).
     pub asset_gen: u64,
     pub draws_asset_gen: u64,
-    /// matpack::generation(), wrap::generation() and
-    /// skin::base_generation() last seen.
+    /// matpack::generation() and wrap::generation() last seen.
     pub material_gen: u64,
     pub wrap_gen: u64,
-    pub skin_gen: u64,
     /// Uploaded layered-clothing pieces: (fitting, piece) → (mesh, centre, extent).
     pub wrap_meshes: HashMap<(usize, usize), (u32, glam::Vec3, glam::Vec3)>,
     /// Fitting failures already reported.
@@ -172,6 +172,7 @@ impl Game {
             log: Vec::new(),
             account: crate::account::Account::new(),
             play: None,
+            edit_audio: Default::default(),
             play_thread: None,
             teleport_job: None,
             teleport_to: None,
@@ -214,7 +215,6 @@ impl Game {
             draws_asset_gen: 0,
             material_gen: 0,
             wrap_gen: 0,
-            skin_gen: 0,
             wrap_meshes: HashMap::new(),
             wrap_warned: Default::default(),
             terrain_tris: 0,
@@ -298,6 +298,7 @@ impl Game {
     /// menu, and no editor shortcut (F5, Shift+F5, F8) comes first.
     pub fn game_keys(&mut self, ctx: &egui::Context, no_ui: bool) {
         if self.play_game_input() {
+            let core_scripts = self.play.as_ref().is_some_and(|s| s.game.core_scripts_active);
             let esc = ctx.input(|i| {
                 i.events.iter().any(|e| {
                     matches!(
@@ -306,17 +307,17 @@ impl Game {
                     )
                 })
             });
-            // With Roblox's CoreScripts running (core_scripts.rs) their own
-            // menu, hotbar and chat take the keys, Escape included; rustudio's
-            // stand-ins stay out of the way.
-            let core_ui = rustudio_core::rustudio_settings::core_scripts();
-            if esc && !core_ui {
+            // When a TextBox is focused, Escape blurs the TextBox instead of
+            // toggling the Roblox in-game menu.
+            let textbox_focused = self.gui.focus.is_some();
+            if esc && !core_scripts && !textbox_focused {
                 self.toggle_game_menu();
             }
             // Presses this frame: a tap pressed and released within one frame
             // never shows in keys_down, yet scripts must see it. The key
             // positions are physical, like Roblox's KeyCodes (src/keys.rs).
-            // (Escape belongs to the Roblox menu: games never hear it.)
+            // (When CoreScripts run and no TextBox is focused, Escape goes to
+            // the client runtime so SettingsHub's ContextActionService handles it.)
             let taps: Vec<Key> = ctx.input(|i| {
                 i.events
                     .iter()
@@ -327,7 +328,7 @@ impl Game {
                             pressed: true,
                             repeat: false,
                             ..
-                        } if core_ui || physical_key.unwrap_or(*key) != Key::Escape => {
+                        } if (core_scripts && !textbox_focused) || physical_key.unwrap_or(*key) != Key::Escape => {
                             Some(physical_key.unwrap_or(*key))
                         }
                         _ => None,
@@ -335,11 +336,11 @@ impl Game {
                     .collect()
             });
             // The open menu takes the keys (R, L); the game hears none.
-            if !self.game_menu_keys(&taps) {
+            if core_scripts || !self.game_menu_keys(&taps) {
                 // (A focused TextBox has them: game-processed, Enter included.)
                 let processed = self.gui.focus.is_some();
                 if let Some(s) = self.play.as_mut() {
-                    if !processed && !core_ui {
+                    if !processed && !core_scripts {
                         s.game.hotbar_taps.extend(taps.iter().copied());
                     }
                     s.game.key_taps.extend(taps.into_iter().map(|k| (k, processed)));
@@ -347,7 +348,7 @@ impl Game {
             }
             // No UI: the menu has Escape first, and UserInputService hears it
             // too, as processed (play_tick lets it past the open menu).
-            if esc && no_ui {
+            if esc && no_ui && !core_scripts {
                 if let Some(s) = self.play.as_mut() {
                     s.game.key_taps.push((Key::Escape, true));
                 }
@@ -432,9 +433,7 @@ impl Game {
             self.assets.wait_pending(std::time::Duration::from_secs(60));
         }
         let done = self.assets.poll();
-        // (finished decodes, composites and mesh parses from the workers:
-        // the parts waiting on them are redone)
-        if self.textures.poll_decoded() | self.meshes.poll() {
+        if self.textures.poll_decoded() {
             self.asset_gen += 1;
         }
         if rustudio_core::load_trace::on() {
@@ -458,11 +457,6 @@ impl Game {
         let wrap_gen = rustudio_render::wrap::generation();
         if wrap_gen != self.wrap_gen {
             self.wrap_gen = wrap_gen;
-            self.asset_gen += 1;
-        }
-        let skin_gen = rustudio_render::skin::base_generation();
-        if skin_gen != self.skin_gen {
-            self.skin_gen = skin_gen;
             self.asset_gen += 1;
         }
         for msg in std::mem::take(&mut self.assets.messages) {

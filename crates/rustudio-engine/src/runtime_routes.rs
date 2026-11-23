@@ -182,12 +182,6 @@ pub(super) struct Route {
 }
 
 fn compute(class: rbx_dom_weak::Ustr, key: &str) -> Route {
-    // Every class is an Instance: one the reflection database and the API
-    // dump don't list (PlaceSettings, for one) still has IsA, FindFirstChild,
-    // … [Roblox docs: Instance].
-    let known = rustudio_core::doc::db().classes.contains_key(class.as_str())
-        || rustudio_core::api::get().is_some_and(|a| a.classes.contains_key(class.as_str()));
-    let class = if known { class } else { ustr("Instance") };
     let c = class.as_str();
     let special = match key {
         "Name" | "name" => Special::Name,
@@ -990,6 +984,10 @@ unsafe fn fast_namecall(
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     rustudio_core::bench::api_timed("call", name, || {
                         let w = lua.app_data_ref::<World>()?;
+                        // DataModel hides CoreGui/CorePackages from game scripts based on caller identity.
+                        if w.d().dom.root_ref() == r {
+                            return None;
+                        }
                         let instance = w.d().dom.get_by_ref(r)?;
                         if !traversal_routes(instance.class).get_children {
                             return None;

@@ -61,10 +61,6 @@ pub struct ScenePart {
     /// Children / siblings whose changes alter this part's look (meshes,
     /// decals, clothing).
     pub deps: Vec<Ref>,
-    /// The deps whose CFrame changes this part's drawing (Bones skinning
-    /// it, body parts its fitted garments are skinned to); a move of any
-    /// other dep leaves it alone.
-    pub motion_deps: Vec<Ref>,
     /// A MeshPart with Bones / FaceControls (deps from skin.rs): redone
     /// when the rig changes.
     pub skinned: bool,
@@ -121,6 +117,20 @@ pub fn surface_maps(doc: &Document, r: Ref) -> Option<[Option<String>; 3]> {
     let maps = ["NormalMap", "RoughnessMap", "MetalnessMap"].map(|n|
         content_string(doc.prop(sa, n)).or_else(|| content_string(doc.prop(sa, &format!("{n}Content")))));
     maps.iter().any(Option::is_some).then_some(maps)
+}
+
+/// The saved texture-pack asset, when this part has a SurfaceAppearance.
+pub fn surface_appearance_pack(doc: &Document, part: Ref) -> Option<u64> {
+    if !crate::matpack::enabled() {
+        return None;
+    }
+    let sa = doc.dom.get_by_ref(part)?.children().iter().copied()
+        .find(|c| doc.class_of(*c).is_some_and(|k| k == "SurfaceAppearance"))?;
+    let uri = content_string(doc.prop(sa, "TexturePack"))
+        .or_else(|| content_string(doc.prop(sa, "TexturePackContent")))?;
+    rustudio_core::assets::asset_ref(&uri)
+        .filter(|asset| asset.id != 0 && asset.version.is_none())
+        .map(|asset| asset.id)
 }
 
 /// A SurfaceAppearance's emission: EmissiveMaskContent with
@@ -397,29 +407,6 @@ fn style_prop(name: &str) -> bool {
     )
 }
 
-/// Properties that never change how a part looks (physics and replication
-/// state the server streams for moving assemblies): a mark of one re-reads
-/// nothing. With many moving characters, NetworkIsSleeping, Velocity,
-/// numExpectedDirectChildren and CanCollide marks were a share of the
-/// parts re-read every frame (a count of re-read reasons).
-fn inert_prop(name: &str) -> bool {
-    matches!(
-        name,
-        "NetworkIsSleeping"
-            | "Velocity"
-            | "RotVelocity"
-            | "AssemblyLinearVelocity"
-            | "AssemblyAngularVelocity"
-            | "numExpectedDirectChildren"
-            | "CanCollide"
-            | "CanTouch"
-            | "CanQuery"
-            | "Massless"
-            | "CollisionGroup"
-            | "CollisionGroupId"
-    )
-}
-
 /// The parts to draw, kept up to date from the document's change journal so
 /// only changed parts are re-read each frame.
 #[derive(Default)]
@@ -436,10 +423,6 @@ pub struct Scene {
     is_part: HashMap<Ustr, bool>,
     /// Instance → parts whose look depends on it.
     owners: HashMap<Ref, Vec<Ref>>,
-    /// Instance → parts whose drawing also follows its CFrame (a subset
-    /// of `owners`, `ScenePart::motion_deps`): only these are re-read when
-    /// it moves.
-    motion_owners: HashMap<Ref, Vec<Ref>>,
     changes: SceneChanges,
     /// The voxel terrain needs re-meshing.
     pub terrain_dirty: bool,
@@ -608,7 +591,6 @@ impl Scene {
         self.index.clear();
         self.bounds.clear();
         self.owners.clear();
-        self.motion_owners.clear();
         self.changes = SceneChanges {
             full: true,
             ..Default::default()
@@ -629,12 +611,10 @@ impl Scene {
     }
 
     fn insert(&mut self, p: ScenePart) {
-        for (deps, owners) in [(&p.deps, &mut self.owners), (&p.motion_deps, &mut self.motion_owners)] {
-            for d in deps {
-                let o = owners.entry(*d).or_default();
-                if !o.contains(&p.r) {
-                    o.push(p.r);
-                }
+        for d in &p.deps {
+            let o = self.owners.entry(*d).or_default();
+            if !o.contains(&p.r) {
+                o.push(p.r);
             }
         }
         let b = bound_of(&p);
@@ -700,13 +680,10 @@ impl Scene {
                     self.terrain_dirty = true;
                 }
                 doc::Mark::Prop(r, name) => {
-                    if matches!(name.as_str(), "Name" | "Part0" | "Part1" | "Enabled")
+                    if matches!(name.as_str(), "Name" | "Part0" | "Part1" | "Enabled" | "C0" | "C1" | "Attachment0" | "Attachment1")
                         && doc.class_of(r).is_some_and(|c| crate::skin::rig_class(&c))
                     {
                         rig = true;
-                    }
-                    if inert_prop(name.as_str()) {
-                        continue;
                     }
                     if self.index.contains_key(&r) {
                         if name == cframe {
@@ -719,14 +696,7 @@ impl Scene {
                     } else if doc.class_of(r).is_some_and(|c| self.is_part_class(c)) {
                         full.insert(r);
                     }
-                    // A move redraws only the parts that follow it (skinned
-                    // to its Bones, garments fitted over it): an R15 body
-                    // part's atlas colours come from its siblings, but not
-                    // their CFrames (every clothed R15 body part was re-read
-                    // whenever a sibling moved: nearly every character part
-                    // re-read per frame).
-                    let owners = if name == cframe { &self.motion_owners } else { &self.owners };
-                    if let Some(o) = owners.get(&r) {
+                    if let Some(o) = self.owners.get(&r) {
                         // A SurfaceAppearance's Color is instance data in Studio
                         // (a per-frame tint re-reads no textures or meshes).
                         if name.as_str() == "Color" && doc.class_of(r).is_some_and(|c| c == "SurfaceAppearance") {
@@ -863,6 +833,28 @@ impl Scene {
     pub fn get(&self, r: Ref) -> Option<&ScenePart> {
         self.index.get(&r).map(|&i| &self.parts[i])
     }
+
+    /// Recomputes a MeshPart's skinning dependencies after its skinned mesh
+    /// base has been parsed (so BasePart / Bone deps are registered in `owners`).
+    pub fn refresh_skin_deps(&mut self, doc: &Document, r: Ref) {
+        let Some(&i) = self.index.get(&r) else { return };
+        let mesh_id = self.parts[i].mesh_asset.as_ref().map(|a| a.id.as_str());
+        let skin_deps = crate::skin::deps_of(doc, r, mesh_id);
+        if skin_deps.is_empty() {
+            return;
+        }
+        let p = &mut self.parts[i];
+        p.skinned = true;
+        for d in skin_deps {
+            if !p.deps.contains(&d) {
+                p.deps.push(d);
+            }
+            let o = self.owners.entry(d).or_default();
+            if !o.contains(&r) {
+                o.push(r);
+            }
+        }
+    }
 }
 
 fn bound_of(p: &ScenePart) -> Vec4 {
@@ -922,20 +914,6 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
     // Reflectance mixes in the sky's reflection (fs_part, round 26).
     let reflectance = f32_of(doc.prop(r, "Reflectance")).unwrap_or(0.0).clamp(0.0, 1.0);
     let material_id = enum_u32(doc.prop(r, "Material")).unwrap_or(256);
-    // Without its texture maps a material draws its table colour (squared);
-    // the viewport swaps that for the maps once they're loaded.
-    let albedo = crate::matpack::fallback_albedo(material_id, use_2022_materials(doc));
-    let material = match material_id {
-        288 => 1.0,  // Neon
-        272 => 2.0,  // SmoothPlastic
-        1568 => 3.0, // Glass
-        1584 => {
-            alpha *= 0.5; // ForceField
-            3.0
-        }
-        _ => 0.0,
-    };
-
     let class = inst.class.as_str();
     let mut mesh = match class {
         "WedgePart" => MeshKind::Wedge,
@@ -969,28 +947,31 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
 
     // A SpecialMesh child changes the drawn shape; file meshes become placeholders.
     let (sa_texture, mut decals) = surface_details(doc, inst);
-    // A MaterialVariant's ColorMap covers every face, tiled every StudsPerTile.
-    let variant = material_variant(doc, r, material_id);
-    let has_variant = variant.is_some();
-    if let Some((map, studs)) = variant {
-        let tint = [
-            srgb_to_linear(rgb[0]),
-            srgb_to_linear(rgb[1]),
-            srgb_to_linear(rgb[2]),
-        ];
-        // The variant is the base surface. Authored Decals/Textures must
-        // follow it in the decal pass (e.g. SpawnLocation's star over Grid).
-        for face in 0..6 {
-            decals.insert(face as usize, DecalDesc {
-                face,
-                id: map.clone(),
-                color: tint,
-                transparency: 0.0,
-                base_surface: true,
-                tiling: Some([studs, studs, 0.0, 0.0]),
-            });
+    let sa_emissive = surface_emissive(doc, inst);
+    let has_active_sa = sa_texture.is_some() || sa_emissive.is_some() || surface_maps(doc, r).is_some();
+    // Studio's shader dispatch picks SurfaceAppearanceFS whenever a MeshPart
+    // has an active SurfaceAppearance, overriding Material (Neon / Glass /
+    // ForceField) and using the part's raw Color in VARYING2 without the
+    // untextured material table's fallback_albedo darkening.
+    let albedo = if has_active_sa {
+        [1.0; 3]
+    } else {
+        crate::matpack::fallback_albedo(material_id, use_2022_materials(doc))
+    };
+    let material = if has_active_sa {
+        0.0
+    } else {
+        match material_id {
+            288 => 1.0,  // Neon
+            272 => 2.0,  // SmoothPlastic
+            1568 => 3.0, // Glass
+            1584 => {
+                alpha *= 0.5; // ForceField
+                3.0
+            }
+            _ => 0.0,
         }
-    }
+    };
     // Mesh textures cover the part outright, except on characters, where
     // transparent texels show the body Color (skin).
     let character_part = rustudio_core::assets::clothing_role(&inst.name).is_some()
@@ -1013,6 +994,33 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
         texture_id = content_string(doc.prop(r, "TextureID"))
             .or_else(|| content_string(doc.prop(r, "TextureContent")));
         tex_kind = mesh_kind;
+    }
+    // A MaterialVariant's ColorMap covers every face, tiled every StudsPerTile,
+    // except when a SurfaceAppearance or MeshPart TextureID owns the surface.
+    let variant = if has_active_sa || texture_id.is_some() {
+        None
+    } else {
+        material_variant(doc, r, material_id)
+    };
+    let has_variant = variant.is_some();
+    if let Some((map, studs)) = variant {
+        let tint = [
+            srgb_to_linear(rgb[0]),
+            srgb_to_linear(rgb[1]),
+            srgb_to_linear(rgb[2]),
+        ];
+        // The variant is the base surface. Authored Decals/Textures must
+        // follow it in the decal pass (e.g. SpawnLocation's star over Grid).
+        for face in 0..6 {
+            decals.insert(face as usize, DecalDesc {
+                face,
+                id: map.clone(),
+                color: tint,
+                transparency: 0.0,
+                base_surface: true,
+                tiling: Some([studs, studs, 0.0, 0.0]),
+            });
+        }
     }
     let (clothing, tshirt) = character_clothing(doc, inst);
     let r15_look = clothing.as_ref().and_then(|_| r15_look(doc, inst));
@@ -1080,10 +1088,7 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
                 if enum_u32(doc.prop(*c, "BodyPart")) != Some(want) {
                     continue;
                 }
-                let id = match doc.prop(*c, "MeshId") {
-                    Some(Variant::Int64(n)) if n > 0 => Some(format!("rbxassetid://{n}")),
-                    _ => content_string(doc.prop(*c, "MeshContent")),
-                };
+                let id = character_mesh_asset_id(doc, *c);
                 if let Some(id) = id {
                     let standard = if want == 1 { Vec3::new(2.0, 2.0, 1.0) } else { Vec3::new(1.0, 2.0, 1.0) };
                     let scale = character_mesh_scale(size, standard);
@@ -1339,25 +1344,8 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
     } else {
         0
     };
-    // Instances whose CFrame moves this part's drawing: the Bones skinning
-    // it (skin.rs) and, for the body part that draws a fitted garment, the
-    // other body parts (the garment is skinned to them, wrap.rs).
-    let mut motion_deps = if class == "MeshPart" {
-        crate::skin::deps_of(doc, r, mesh_asset.as_ref().map(|a| a.id.as_str()))
-    } else {
-        Vec::new()
-    };
-    let skinned = !motion_deps.is_empty();
-    if class == "MeshPart" && crate::wrap::draws_garment(doc, inst.parent(), r) {
-        if let Some(m) = doc.dom.get_by_ref(inst.parent()) {
-            for c in m.children() {
-                if *c != r && doc.dom.get_by_ref(*c).is_some_and(|i| i.children().iter().any(|k| doc.class_of(*k).is_some_and(|x| x == "WrapTarget"))) {
-                    motion_deps.push(*c);
-                }
-            }
-        }
-    }
-    deps.extend(motion_deps.iter().copied());
+    let skin_deps = (class == "MeshPart")
+        .then(|| crate::skin::deps_of(doc, r, mesh_asset.as_ref().map(|a| a.id.as_str())));
     Some(ScenePart {
         layer: None,
         r,
@@ -1366,7 +1354,7 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
         mesh_asset,
         texture_id,
         tex_kind,
-        emissive: surface_emissive(doc, inst),
+        emissive: sa_emissive,
         decals,
         clothing,
         r15_look,
@@ -1376,9 +1364,25 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
         decal_size: if head_mesh || legacy_shape { draw_size } else { size },
         decal_offset: if legacy_shape { draw_offset } else { Vec3::ZERO },
         // A skinned MeshPart redraws when a Bone or its FaceControls changes (skin.rs).
-        skinned,
-        deps,
-        motion_deps,
+        skinned: skin_deps.as_ref().is_some_and(|d| !d.is_empty()),
+        deps: if class == "MeshPart" {
+            let mut deps = deps;
+            deps.extend(skin_deps.unwrap_or_default());
+            // The body part that draws a fitted garment redraws when the
+            // other body parts move (the garment is skinned to them, wrap.rs).
+            if crate::wrap::draws_garment(doc, inst.parent(), r) {
+                if let Some(m) = doc.dom.get_by_ref(inst.parent()) {
+                    for c in m.children() {
+                        if *c != r && doc.dom.get_by_ref(*c).is_some_and(|i| i.children().iter().any(|k| doc.class_of(*k).is_some_and(|x| x == "WrapTarget"))) {
+                            deps.push(*c);
+                        }
+                    }
+                }
+            }
+            deps
+        } else {
+            deps
+        },
         draw_offset,
         draw_rot,
         light,
@@ -1554,6 +1558,64 @@ mod tint_tests {
             assert!((a.scale - scale).length() < 1e-5, "{:?}", a.scale);
         }
     }
+
+    #[test]
+    fn character_mesh_negative_i32_id_unwraps_to_u32() {
+        let size = |x: f32, y: f32, z: f32| rbx_dom_weak::types::Vector3::new(x, y, z);
+        let cm = InstanceBuilder::new("CharacterMesh")
+            .with_property("BodyPart", rbx_dom_weak::types::Enum::from_u32(3))
+            .with_property("MeshId", -1709562747i64);
+        let arm = InstanceBuilder::new("Part")
+            .with_name("Right Arm")
+            .with_property("Size", size(1.0, 2.0, 1.0));
+        let ar = arm.referent();
+        let model = InstanceBuilder::new("Model")
+            .with_child(InstanceBuilder::new("Humanoid"))
+            .with_child(arm)
+            .with_child(cm);
+        let doc = Document::from_play_dom(
+            WeakDom::new(InstanceBuilder::new("DataModel").with_child(model)),
+            "charmesh-neg".into(),
+        );
+        let p = part_draw(&doc, doc.dom.get_by_ref(ar).unwrap()).unwrap();
+        let a = p.mesh_asset.expect("the unwrapped CharacterMesh");
+        assert_eq!(a.id, "rbxassetid://2585404549");
+    }
+}
+
+/// Resolves a CharacterMesh's asset URI. Legacy XML files serialized MeshId
+/// as a signed 32-bit `<int>`, wrapping asset IDs above `i32::MAX` into
+/// negative numbers (`-1709562747` → `2585404549`); reinterpret those as u32.
+fn character_mesh_asset_id(doc: &Document, r: Ref) -> Option<String> {
+    let from_signed = |n: i64| -> Option<String> {
+        if n > 0 {
+            Some(format!("rbxassetid://{n}"))
+        } else if n < 0 && n >= i32::MIN as i64 {
+            Some(format!("rbxassetid://{}", (n as i32) as u32))
+        } else {
+            None
+        }
+    };
+    match doc.prop(r, "MeshId") {
+        Some(Variant::Int64(n)) if n != 0 => {
+            if let Some(id) = from_signed(n) {
+                return Some(id);
+            }
+        }
+        Some(Variant::Int32(n)) if n != 0 => {
+            return Some(format!("rbxassetid://{}", n as u32));
+        }
+        _ => {}
+    }
+    let content = content_string(doc.prop(r, "MeshContent"))?;
+    if let Some(rest) = content.trim().strip_prefix("rbxassetid://") {
+        if let Ok(n) = rest.parse::<i64>() {
+            if let Some(id) = from_signed(n) {
+                return Some(id);
+            }
+        }
+    }
+    Some(content)
 }
 
 /// A mesh of the Studio install's content/avatar (the classic head, R6
@@ -1599,49 +1661,5 @@ mod tests {
         assert_eq!(scene.parts.len(), 1);
         assert_eq!(scene.parts[0].r, part);
         assert_eq!(scene.parts[0].layer, Some(live));
-    }
-
-    /// An R15 body part's clothing atlas takes its cell colours from its
-    /// siblings, not their CFrames: a moving sibling is a transform write
-    /// (`moved`), its Color redraws the atlas, physics state nothing.
-    #[test]
-    fn a_moving_body_part_leaves_its_siblings_alone() {
-        use rbx_dom_weak::types::{CFrame, Color3uint8, Matrix3, Vector3};
-        let mut doc = Document::new_place();
-        let ws = doc.default_parent();
-        let at = |y: f32| Variant::CFrame(CFrame::new(Vector3::new(0.0, y, 0.0), Matrix3::identity()));
-        let model = doc.insert(ws, InstanceBuilder::new("Model").with_name("Avatar"));
-        doc.insert(model, InstanceBuilder::new("Humanoid"));
-        doc.insert(model, InstanceBuilder::new("Shirt").with_property("ShirtTemplate", Variant::String("rbxassetid://1".into())));
-        let part = |name: &str, mesh: &str, y: f32| {
-            InstanceBuilder::new("MeshPart")
-                .with_name(name)
-                .with_property("MeshId", Variant::String(mesh.into()))
-                .with_property("CFrame", at(y))
-        };
-        let upper = doc.insert(model, part("UpperTorso", "rbxassetid://2", 4.0));
-        let lower = doc.insert(model, part("LowerTorso", "rbxassetid://3", 3.0));
-        let mut scene = Scene::default();
-        scene.sync(&mut doc);
-        scene.take_changes();
-        assert!(scene.get(upper).is_some_and(|p| p.deps.contains(&lower) && !p.motion_deps.contains(&lower)));
-
-        doc.set_prop_live(lower, rbx_dom_weak::ustr("CFrame"), at(2.0));
-        scene.sync(&mut doc);
-        let c = scene.take_changes();
-        assert_eq!(c.moved, vec![lower]);
-        assert!(c.changed.is_empty() && c.restyled.is_empty(), "a move re-read {:?} {:?}", c.changed, c.restyled);
-
-        doc.set_prop_live(lower, rbx_dom_weak::ustr("Color"), Variant::Color3uint8(Color3uint8::new(10, 20, 30)));
-        scene.sync(&mut doc);
-        let c = scene.take_changes();
-        assert_eq!(c.restyled, vec![lower]);
-        assert_eq!(c.changed, vec![upper]);
-
-        doc.set_prop_live(lower, rbx_dom_weak::ustr("NetworkIsSleeping"), Variant::Bool(true));
-        doc.set_prop_live(lower, rbx_dom_weak::ustr("AssemblyLinearVelocity"), Variant::Vector3(Vector3::new(1.0, 0.0, 0.0)));
-        scene.sync(&mut doc);
-        let c = scene.take_changes();
-        assert!(c.changed.is_empty() && c.moved.is_empty() && c.restyled.is_empty() && c.removed.is_empty());
     }
 }

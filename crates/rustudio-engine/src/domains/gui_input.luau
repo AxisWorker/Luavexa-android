@@ -42,9 +42,10 @@ end
 local function argerr(n, fn, want, got)
     error(string.format("invalid argument #%d to '%s' (%s expected, got %s)", n, fn, want, typeof(got)), 0)
 end
--- Players.LocalPlayer (gui_input.rs local_player: read natively, as asked
--- every frame).
-local local_player = G.local_player
+local function local_player()
+    local ok, p = pcall(function() return svc("Players").LocalPlayer end)
+    return ok and p or nil
+end
 local KEY_NONE
 for _, k in Enum.KeyCode:GetEnumItems() do
     if k.Value == 0 then KEY_NONE = k break end
@@ -76,21 +77,43 @@ end
 -- haptic effects), found once and then through DescendantAdded.
 local tracked = { StyleLink = {}, InputContext = {}, ProximityPrompt = {}, HapticEffect = {}, Adorn = {} }
 local tracking = false
+local styles_dirty = true
+local style_recheck_frames = 0
+__rs_styles_dirty = function()
+    styles_dirty = true
+end
+local prompt_order = 0
 local function track(i)
-    local set_ = tracked[i.ClassName]
-    if set_ then set_[i] = true end
+    local class = i.ClassName
+    local set_ = tracked[class]
+    if class == "ProximityPrompt" then
+        if not set_[i] then
+            prompt_order += 1
+            set_[i] = prompt_order
+        end
+    elseif set_ then
+        set_[i] = true
+        if class == "StyleLink" then styles_dirty = true end
+    end
     if i:IsA("HandleAdornment") or i:IsA("HandlesBase") then tracked.Adorn[i] = true end
 end
 local function start_tracking()
     if tracking then return end
     tracking = true
-    for _, d in game:GetDescendants() do track(d) end
+    local classes = G.is_edit()
+        and { "StyleLink", "HandleAdornment", "HandlesBase" }
+        or { "StyleLink", "InputContext", "ProximityPrompt", "HapticEffect", "HandleAdornment", "HandlesBase" }
+    for _, d in G.find_classes(classes) do track(d) end
     -- Natively filtered DescendantAdded / Removing: no Lua call per instance.
-    local added, removing = G.class_signals({ "StyleLink", "InputContext", "ProximityPrompt", "HapticEffect", "HandleAdornment", "HandlesBase" })
+    local added, removing = G.class_signals(classes)
     added:Connect(track)
     removing:Connect(function(i)
-        local set_ = tracked[i.ClassName]
-        if set_ then set_[i] = nil end
+        local cn = i.ClassName
+        local set_ = tracked[cn]
+        if set_ then
+            set_[i] = nil
+            if cn == "StyleLink" then styles_dirty = true end
+        end
         tracked.Adorn[i] = nil
     end)
 end
@@ -99,6 +122,10 @@ end
 local gs_state = {
     paused_notification = true, emotes_open = false, inspect_enabled = true, inspect_open = false,
     nav = true, groups = {},
+    global_inset = { 0, 58, 0, 0 },
+    open_menus = {},
+    selected_core = nil,
+    center_dialogs = {},
 }
 get["GuiService.CoreGuiNavigationEnabled"] = function() return gs_state.nav end
 set["GuiService.CoreGuiNavigationEnabled"] = function(inst, _, v)
@@ -106,44 +133,234 @@ set["GuiService.CoreGuiNavigationEnabled"] = function(inst, _, v)
     if gs_state.nav ~= v then gs_state.nav = v changed(inst, "CoreGuiNavigationEnabled") end
     return true
 end
-get["GuiService.PreferredTextSize"] = function() return Enum.PreferredTextSize.Medium end
-get["GuiService.PreferredTransparency"] = function() return 1 end
-get["GuiService.ReducedMotionEnabled"] = function() return false end
-get["GuiService.ViewportDisplaySize"] = function() return Enum.DisplaySize.Medium end
-
--- GuiService.TopbarInset: the unoccupied top-bar area, from Roblox's
--- left-most controls to the right edge of the device safe area (its
--- reference), published through GetPropertyChangedSignal as the controls
--- or the viewport change. Play's bar is the 58 px one (GetGuiInset; the
--- old bar was 36 — TopbarPlus picks its theme by `Height > 36`, and LBG's
--- ClientRenderer waits for a Height above 0 before it builds its icons, a
--- wait an empty rect never ended); its menu button spans 16..60 and the
--- chat button follows 12 later (play_game.rs top_bar's Roblox constants),
--- so the free area starts 12 past the last of them. The edit DataModel
--- (plugins) has no bar: an empty rect, as its GetGuiInset is zeros. The
--- left edge is this build's bar, not a measurement of Roblox's unibar
--- (mech::GUI_TOPBAR_LEFT / GUI_TOPBAR_LEFT_CHAT: the same numbers place a
--- ScreenGui with ScreenInsets TopbarSafeInsets, which is this rect).
-local topbar_seen
-local function topbar_inset()
-    -- (Roblox's own CoreScripts running: their TopBar's SetTopbarInset is
-    -- the inset, as on Roblox; below, this build's drawn bar)
-    if gs_state.topbar_inset then return gs_state.topbar_inset, "core" end
-    if G.is_edit() then return Rect.new(0, 0, 0, 0), "" end
-    local width = G.view()
-    -- (G.core_gui_on, not StarterGui:GetCoreGuiEnabled through `game`: a
-    -- script reads TopbarInset before this module's first step refreshed
-    -- its `game`, and the answer must follow SetCoreGuiEnabled at once)
-    local chat = not G.is_client() or G.core_gui_on("Chat")
-    local left = 16 + 44 + (chat and 12 + 44 or 0) + 12
-    return Rect.new(left, 0, math.max(left, width), 58), width .. (chat and "c" or "")
+get["GuiService.PreferredTextSize"] = function()
+    return (__rs_user_game_settings and __rs_user_game_settings.PreferredTextSize) or Enum.PreferredTextSize.Medium
 end
-get["GuiService.TopbarInset"] = function() return (topbar_inset()) end
+get["GuiService.PreferredTransparency"] = function()
+    local v = __rs_user_game_settings and __rs_user_game_settings.PreferredTransparency
+    return type(v) == "number" and v or 1
+end
+get["GuiService.ReducedMotionEnabled"] = function()
+    return (__rs_user_game_settings and __rs_user_game_settings.ReducedMotion) == true
+end
+get["GuiService.ViewportDisplaySize"] = function() return Enum.DisplaySize.Medium end
+get["GuiService.IsWindows"] = function() return true end
+get["GuiService.CoreGuiFolder"] = function() return svc("CoreGui") end
+get["GuiService.CoreEffectFolder"] = function() return svc("CoreGui") end
+get["GuiService.DisplayScalingMode"] = function()
+    local ok, v = pcall(function() return Enum.DisplayScalingMode.Auto end)
+    return ok and v or nil
+end
+get["GuiService.ViewportSizeInMM"] = function() return Vector2.new(400, 225) end
+get["GuiService.SelectedCoreObject"] = function() return gs_state.selected_core end
+get["GuiService.SendCoreUiNotification"] = function() return gs_state.send_core_ui_notif end
+set["GuiService.SendCoreUiNotification"] = function(_, _, v)
+    if v ~= nil and type(v) ~= "function" then
+        error("Unable to assign callback SendCoreUiNotification. Function expected, got " .. typeof(v), 0)
+    end
+    gs_state.send_core_ui_notif = v
+    return true
+end
+set["GuiService.SelectedCoreObject"] = function(gs, _, v)
+    if v ~= nil and not isa(v, "GuiObject") then
+        error("Unable to assign property SelectedCoreObject. Object expected, got " .. typeof(v), 0)
+    end
+    local old = gs_state.selected_core
+    if old == v then return true end
+    if old and old.Parent then fire(old, "SelectionLost") end
+    if v then fire(v, "SelectionGained") end
+    gs_state.selected_core = v
+    G.set_selected_core(gs, v)
+    changed(gs, "SelectedCoreObject")
+    return true
+end
+
+methods["GuiService.GetResolutionScale"] = function() return 1 end
+methods["GuiService.GetSafeZoneOffsets"] = function() return { top = 0, bottom = 0, left = 0, right = 0 } end
+methods["GuiService.GetHardwareSafeViewport"] = function()
+    local w, h = G.view()
+    return Vector2.new(w, h)
+end
+local topbar_seen
+methods["GuiService.SetTopbarInset"] = function(gs, rect)
+    if typeof(rect) ~= "Rect" then error("Unable to cast value to Rect", 0) end
+    if G.set_topbar_inset(rect) then
+        topbar_seen = G.topbar_inset()
+        changed(gs, "TopbarInset")
+    end
+end
+methods["GuiService.SetGlobalGuiInset"] = function(_, x1, y1, x2, y2)
+    gs_state.global_inset = { tonumber(x1) or 0, tonumber(y1) or 0, tonumber(x2) or 0, tonumber(y2) or 0 }
+end
+local UNSUPPORTED_SETTINGS_ROWS = {
+    ["Output DeviceFrame"] = true,
+    ["HapticsFrame"] = true,
+    ["In-game friends chat notificationsFrame"] = true,
+}
+local disabled_settings_rows = setmetatable({}, { __mode = "k" })
+local settings_watch_connected = setmetatable({}, { __mode = "k" })
+local function disable_settings_row(row)
+    if not row or disabled_settings_rows[row] then return end
+    disabled_settings_rows[row] = true
+    local function dim(o)
+        if not o then return end
+        if o:IsA("GuiObject") then
+            pcall(function() o.Interactable = false end)
+            pcall(function() o.Active = false end)
+            pcall(function() o.Selectable = false end)
+            if o:IsA("TextLabel") or o:IsA("TextButton") then
+                pcall(function() o.TextTransparency = math.max(o.TextTransparency, 0.55) end)
+            elseif o:IsA("ImageLabel") or o:IsA("ImageButton") then
+                pcall(function()
+                    if o.Image ~= "" then
+                        o.ImageTransparency = math.max(o.ImageTransparency, 0.72)
+                    end
+                end)
+            end
+        elseif o:IsA("UIStroke") then
+            pcall(function() o.Transparency = math.max(o.Transparency, 0.65) end)
+        end
+    end
+    dim(row)
+    for _, d in row:GetDescendants() do
+        dim(d)
+    end
+end
+local function disable_unsupported_settings_rows()
+    local cg = svc("CoreGui")
+    if not cg then return end
+    local rg = cg:FindFirstChild("RobloxGui")
+    if not rg then return end
+    local shield = rg:FindFirstChild("SettingsClippingShield")
+    if not shield then return end
+    local function scan(root)
+        for _, d in root:GetDescendants() do
+            if UNSUPPORTED_SETTINGS_ROWS[d.Name] and d:IsA("GuiObject") then
+                disable_settings_row(d)
+            end
+        end
+    end
+    scan(shield)
+    if not settings_watch_connected[shield] then
+        settings_watch_connected[shield] = true
+        shield.DescendantAdded:Connect(function(d)
+            if UNSUPPORTED_SETTINGS_ROWS[d.Name] and d:IsA("GuiObject") then
+                task.defer(disable_settings_row, d)
+            end
+        end)
+    end
+end
+local function sync_core_menu()
+    G.set_core_menu_open(next(gs_state.open_menus) ~= nil or gs_state.inspect_open)
+end
+methods["GuiService.SetMenuIsOpen"] = function(gs, open, menuName)
+    local key = tostring(menuName or "default")
+    local was = next(gs_state.open_menus) ~= nil or gs_state.inspect_open or G.menu_open()
+    gs_state.open_menus[key] = (open == true) and true or nil
+    sync_core_menu()
+    if open == true then
+        task.defer(disable_unsupported_settings_rows)
+    end
+    local now = next(gs_state.open_menus) ~= nil or gs_state.inspect_open or G.menu_open()
+    if was ~= now then
+        fire(gs, now and "MenuOpened" or "MenuClosed")
+    end
+end
+methods["GuiService.GetErrorMessage"] = function() return "" end
+methods["GuiService.GetErrorCode"] = function() return Enum.ConnectionError.OK end
+methods["GuiService.GetErrorType"] = function() return Enum.ConnectionError.OK end
+methods["GuiService.BroadcastNotification"] = function() end
+methods["GuiService.IsMemoryTrackerEnabled"] = function() return false end
+methods["GuiService.GetAutoUIScaleHundredths"] = function() return 100 end
+methods["GuiService.GetEffectiveUIScaleHundredths"] = function() return 100 end
+methods["GuiService.GetRawScreenScale"] = function() return 1 end
+methods["GuiService.GetScreenResolution"] = function()
+    local w, h = G.view()
+    return Vector2.new(w, h)
+end
+methods["GuiService.GetBrickCount"] = function() return 0 end
+methods["GuiService.GetUiMessage"] = function() return "" end
+methods["GuiService.GetErrorDetails"] = function() return {} end
+methods["GuiService.GetGuiIsVisible"] = function() return true end
+methods["GuiService.CloseStatsBasedOnInputString"] = function() return false end
+methods["GuiService.ShowStatsBasedOnInputString"] = function() return false end
+for _, n in {
+    "ClearError", "ForceTenFootInterface", "AddKey", "RemoveKey", "AddSpecialKey", "RemoveSpecialKey",
+    "SetHardwareSafeAreaInsets", "SetPurchasePromptIsShown", "SetSafeZoneOffsets", "SetUIScaleMultiplier",
+    "SetUiMessage", "ToggleGuiIsVisibleForCaptures", "ToggleGuiIsVisibleIfAllowed",
+    "OnNotificationDisplayed", "OnNotificationInteraction", "OpenBrowserWindow", "OpenNativeOverlay",
+    "SendUIOcclusionMetricsForQueryRegion", "InspectPlayerFromUserIdWithCtx",
+} do
+    methods["GuiService." .. n] = function() end
+end
+methods["GuiService.ToggleFullscreen"] = function()
+    local ok, ugs = pcall(function() return UserSettings():GetService("UserGameSettings") end)
+    if ok and ugs then
+        pcall(function() ugs.Fullscreen = not ugs.Fullscreen end)
+    end
+end
+-- VRService CoreScript members
+methods["VRService.IsVRAppBuild"] = function() return false end
+methods["VRService.IsMaquettes"] = function() return false end
+get["VRService.VRDeviceAvailable"] = function() return false end
+get["VRService.VRDeviceName"] = function() return "" end
+get["VRService.VRSessionState"] = function()
+    local ok, v = pcall(function() return Enum.VRSessionState.Undefined end)
+    return ok and v or nil
+end
+get["VRService.DidPointerHit"] = function() return false end
+get["VRService.LaserDistance"] = function() return 0 end
+get["VRService.PointerHitCFrame"] = function() return CFrame.new() end
+get["VRService.QuestDisplayRefreshRate"] = function() return 0 end
+get["VRService.QuestASWState"] = function() return false end
+get["VRService.LaserPointer"] = function()
+    local ok, v = pcall(function() return Enum.VRLaserPointerMode.Pointer end)
+    return ok and v or nil
+end
+get["VRService.PresentationMode"] = function()
+    local ok, v = pcall(function() return Enum.VRPresentationMode.Stereo end)
+    return ok and v or nil
+end
+methods["GuiService.AddCenterDialog"] = function(_, dialog, dialogType, showFn, hideFn)
+    local list = gs_state.center_dialogs
+    local prev = list[#list]
+    if prev and prev.hide then pcall(prev.hide) end
+    table.insert(list, { dialog = dialog, kind = dialogType, show = showFn, hide = hideFn })
+    if showFn then pcall(showFn) end
+end
+methods["GuiService.RemoveCenterDialog"] = function(_, dialog)
+    local list = gs_state.center_dialogs
+    for i = #list, 1, -1 do
+        if list[i].dialog == dialog then
+            local removed = table.remove(list, i)
+            if removed.hide then pcall(removed.hide) end
+            if i == #list + 1 and list[#list] and list[#list].show then
+                pcall(list[#list].show)
+            end
+            break
+        end
+    end
+end
+
+get["GuiObject.Transparency"] = function(o)
+    return o.BackgroundTransparency
+end
+set["GuiObject.Transparency"] = function(o, _, v)
+    local n = tonumber(v)
+    if n == nil then error("Unable to assign property Transparency. number expected, got " .. typeof(v), 0) end
+    o.BackgroundTransparency = n
+    if o:IsA("TextLabel") or o:IsA("TextButton") or o:IsA("TextBox") then
+        o.TextTransparency = n
+    end
+    return true
+end
+
+get["GuiService.TopbarInset"] = G.topbar_inset
 local function step_topbar()
-    local _, key = topbar_inset()
-    if key == topbar_seen then return end
+    local rect = G.topbar_inset()
+    if rect == topbar_seen then return end
     local first = topbar_seen == nil
-    topbar_seen = key
+    topbar_seen = rect
     if first then return end
     local gs = svc("GuiService")
     if gs then changed(gs, "TopbarInset") end
@@ -160,113 +377,16 @@ methods["GuiService.SendNotification"] = function() error("GuiService:SendNotifi
 methods["GuiService.DismissNotification"] = function() error("GuiService:DismissNotification is not yet enabled!", 0) end
 methods["GuiService.GetGameplayPausedNotificationEnabled"] = function() return gs_state.paused_notification end
 methods["GuiService.SetGameplayPausedNotificationEnabled"] = function(_, on) gs_state.paused_notification = on == true end
-methods["GuiService.SetEmotesMenuOpen"] = function(_, open) gs_state.emotes_open = open == true end
+methods["GuiService.SetEmotesMenuOpen"] = function(self, open)
+    local v = open == true
+    if gs_state.emotes_open ~= v then
+        gs_state.emotes_open = v
+        fire(self, "EmotesMenuOpenChanged", v)
+    end
+end
 LM.GetEmotesMenuOpen = function() return gs_state.emotes_open end
 methods["GuiService.SetInspectMenuEnabled"] = function(_, on) gs_state.inspect_enabled = on == true end
 LM.GetInspectMenuEnabled = function() return gs_state.inspect_enabled end
--- What the CoreScripts tell the engine about their top bar and menus
--- (RobloxScriptSecurity members of the API dump). SetTopbarInset sets the
--- TopbarInset property games read; SetMenuIsOpen(open, name) keeps a set
--- of open core menus behind MenuIsOpen / MenuOpened / MenuClosed.
--- SetGlobalGuiInset is kept but layout keeps mech::GUI_TOP_INSET, the 58
--- pixels the CoreScripts' own top bar asks for (TopBar Constants).
-methods["GuiService.SetTopbarInset"] = function(inst, r)
-    if typeof(r) ~= "Rect" then argerr(1, "SetTopbarInset", "Rect", r) end
-    if gs_state.topbar_inset ~= r then
-        gs_state.topbar_inset = r
-        -- (the layout of TopbarSafeInsets ScreenGuis follows: World::topbar_inset)
-        G.set_topbar_inset(r.Min.X, r.Min.Y, r.Max.X, r.Max.Y)
-        changed(inst, "TopbarInset")
-    end
-end
-methods["GuiService.SetGlobalGuiInset"] = function(_, x1, y1, x2, y2)
-    gs_state.global_inset = { x1, y1, x2, y2 }
-end
-gs_state.core_menus = {}
-methods["GuiService.SetMenuIsOpen"] = function(inst, open, name)
-    local was = next(gs_state.core_menus) ~= nil or gs_state.inspect_open or G.menu_open()
-    gs_state.core_menus[tostring(name)] = if open then true else nil
-    local now = next(gs_state.core_menus) ~= nil or gs_state.inspect_open or G.menu_open()
-    if now ~= was then fire(inst, if now then "MenuOpened" else "MenuClosed") changed(inst, "MenuIsOpen") end
-end
--- A desktop client: no safe-area cut-outs, scale 1, the automatic UI
--- scale at 100 % (estimates: what Studio's Windows client reports isn't
--- measured here).
-methods["GuiService.GetResolutionScale"] = function() return 1 end
-methods["GuiService.GetRawScreenScale"] = function() return 1 end
-methods["GuiService.GetAutoUIScaleHundredths"] = function() return 100 end
-methods["GuiService.GetEffectiveUIScaleHundredths"] = function() return 100 end
-methods["GuiService.SetUIScaleMultiplier"] = function() end
-methods["GuiService.GetSafeZoneOffsets"] = function() return { top = 0, bottom = 0, left = 0, right = 0 } end
-methods["GuiService.GetGuiIsVisible"] = function() return true end
--- No connection error and no UI message in a local Play.
-methods["GuiService.GetErrorMessage"] = function() return "" end
-methods["GuiService.GetUiMessage"] = function() return "" end
-methods["GuiService.GetErrorCode"] = function() return Enum.ConnectionError.OK end
-methods["GuiService.GetErrorType"] = function() return Enum.ConnectionError.OK end
-methods["GuiService.GetErrorDetails"] = function() return {} end
-methods["GuiService.ClearError"] = function() end
--- To the app shell, which a Play session doesn't have.
-methods["GuiService.BroadcastNotification"] = function() end
-methods["GuiService.SetPurchasePromptIsShown"] = function() end
--- The keys the CoreScripts ask to hear (KeyPressed / SpecialKeyPressed) and
--- the safe viewport: the whole view on a desktop (estimate). Browser and
--- native overlays have nowhere to open in a Play session.
-gs_state.keys, gs_state.special_keys = {}, {}
-methods["GuiService.AddKey"] = function(_, k) gs_state.keys[tostring(k)] = true end
-methods["GuiService.RemoveKey"] = function(_, k) gs_state.keys[tostring(k)] = nil end
-methods["GuiService.AddSpecialKey"] = function(_, k) gs_state.special_keys[k] = true end
-methods["GuiService.RemoveSpecialKey"] = function(_, k) gs_state.special_keys[k] = nil end
-methods["GuiService.GetHardwareSafeViewport"] = function()
-    refresh_game()
-    local ws = svc("Workspace")
-    local cam = ws and ws.CurrentCamera
-    return if cam then cam.ViewportSize else Vector2.zero
-end
-methods["GuiService.CloseStatsBasedOnInputString"] = function() return false end
-methods["GuiService.OpenBrowserWindow"] = function() end
-methods["GuiService.OpenNativeOverlay"] = function() end
-methods["GuiService.ToggleFullscreen"] = function() end
--- The Dialog nearest `pos` whose speaker (its parent part, or a model's
--- PrimaryPart / Head) is within its ConversationDistance: the dialogs the
--- CoreScripts' MainBotChatScript2 offers (the API reference's
--- ConversationDistance). "Visible" also wants the speaker on screen.
--- MainBotChatScript2 asks every Heartbeat: the Workspace's Dialogs come
--- from one native walk (G.workspace_dialogs), not GetDescendants.
-local function closest_dialog(pos, visible)
-    refresh_game()
-    local ws = svc("Workspace")
-    if typeof(pos) ~= "Vector3" or not ws then return nil end
-    local cam = ws.CurrentCamera
-    local best, best_d = nil, math.huge
-    for _, d in G.workspace_dialogs() do
-        local p = d.Parent
-        local part = if p and p:IsA("BasePart") then p
-            elseif p and p:IsA("Model") then (p.PrimaryPart or p:FindFirstChild("Head"))
-            else nil
-        if part and part:IsA("BasePart") then
-            local dist = (part.Position - pos).Magnitude
-            local on_screen = not visible or (cam and select(2, cam:WorldToViewportPoint(part.Position)))
-            if dist <= d.ConversationDistance and dist < best_d and on_screen then
-                best, best_d = d, dist
-            end
-        end
-    end
-    return best
-end
-methods["GuiService.GetClosestDialogToPosition"] = function(_, pos) return closest_dialog(pos, false) end
-methods["GuiService.GetClosestVisibleDialogToPosition"] = function(_, pos) return closest_dialog(pos, true) end
--- Center dialogs: shown at once, hidden on removal (no queue: estimate).
-local center_dialogs = {}
-methods["GuiService.AddCenterDialog"] = function(_, dialog, _, show, hide)
-    center_dialogs[dialog] = hide
-    if type(show) == "function" then task.spawn(show) end
-end
-methods["GuiService.RemoveCenterDialog"] = function(_, dialog)
-    local hide = center_dialogs[dialog]
-    center_dialogs[dialog] = nil
-    if type(hide) == "function" then task.spawn(hide) end
-end
 -- The inspect menu (drawn by game_menu.rs). Studio opens it whatever
 -- SetInspectMenuEnabled says (that only hides the player list's button):
 -- MenuOpened and MenuIsOpen at the call, MenuClosed when it closes. It
@@ -275,6 +395,7 @@ local inspect_seq = 0
 local function close_inspect()
     if not gs_state.inspect_open then return end
     gs_state.inspect_open = false
+    sync_core_menu()
     inspect_seq += 1
     G.inspect_set(nil)
     fire(svc("GuiService"), "MenuClosed")
@@ -282,6 +403,7 @@ end
 local function open_inspect(title_fn, desc_fn)
     local was = gs_state.inspect_open
     gs_state.inspect_open = true
+    sync_core_menu()
     inspect_seq += 1
     local seq = inspect_seq
     G.inspect_set({ title = "", robux = 0, items = {}, loading = true })
@@ -345,7 +467,7 @@ methods["GuiService.InspectPlayerFromHumanoidDescription"] = function(_, desc, n
     open_inspect(function() return tostring(name) end, function() return desc end)
 end
 methods["GuiService.CloseInspectMenu"] = function() close_inspect() end
-get["GuiService.MenuIsOpen"] = function() return gs_state.inspect_open or G.menu_open() or next(gs_state.core_menus) ~= nil end
+get["GuiService.MenuIsOpen"] = function() return next(gs_state.open_menus) ~= nil or gs_state.inspect_open or G.menu_open() end
 local function step_inspect()
     if G.inspect_closed() then close_inspect() end
 end
@@ -363,7 +485,7 @@ methods["GuiService.GetInsetArea"] = function(_, insets)
     end
     -- TopbarSafeInsets: the bar's free area (TopbarInset), above y = 0.
     if insets == Enum.ScreenInsets.TopbarSafeInsets and inset > 0 then
-        local bar = topbar_inset()
+        local bar = G.topbar_inset()
         return Rect.new(bar.Min.X, bar.Min.Y - inset, bar.Max.X, bar.Max.Y - inset)
     end
     return Rect.new(0, -inset, w, h - inset)
@@ -527,6 +649,21 @@ end
 methods["ContextActionService.BindActionToInputTypes"] = function(self, name, fn, touch, ...)
     return self:BindAction(name, fn, touch, ...)
 end
+methods["ContextActionService.BindCoreAction"] = function(self, name, fn, touch, ...)
+    return LM.BindCoreAction(self, name, fn, touch, ...)
+end
+methods["ContextActionService.BindCoreActionAtPriority"] = function(self, name, fn, touch, priority, ...)
+    return LM.BindCoreActionAtPriority(self, name, fn, touch, priority, ...)
+end
+methods["ContextActionService.UnbindCoreAction"] = function(self, name)
+    return LM.UnbindCoreAction(self, name)
+end
+methods["ContextActionService.GetBoundCoreActionInfo"] = function(self, name)
+    return LM.GetBoundCoreActionInfo(self, name)
+end
+methods["ContextActionService.GetAllBoundCoreActionInfo"] = function(self)
+    return LM.GetAllBoundCoreActionInfo(self)
+end
 local equipped_tool = nil
 methods["ContextActionService.GetCurrentLocalToolIcon"] = function()
     if equipped_tool and equipped_tool.Parent then return equipped_tool.TextureId end
@@ -545,18 +682,38 @@ local function step_tools()
 end
 
 ------------------------------------------------------------ GuiObject state
--- (Enum.GuiState.Focus only where the API dump has it: Studio 0.744's has
--- Idle, Hover, Press, NonInteractable, so a focused TextBox reads as its
--- pointer state, not an error.)
-local FOCUS_STATE = select(2, pcall(function() return Enum.GuiState.Focus end))
-if typeof(FOCUS_STATE) ~= "EnumItem" then FOCUS_STATE = nil end
-get["GuiObject.GuiState"] = function(o)
+local function compute_gui_state(o)
     if not o.Interactable then return Enum.GuiState.NonInteractable end
-    if focused == o and FOCUS_STATE then return FOCUS_STATE end
     local hovered, pressed = G.hover_state(o)
     if pressed then return Enum.GuiState.Press end
     if hovered then return Enum.GuiState.Hover end
     return Enum.GuiState.Idle
+end
+local last_gui_state = setmetatable({}, { __mode = "k" })
+local function check_gui_state(o)
+    if not o or not pcall(function() return o.Parent end) then return end
+    local now = compute_gui_state(o)
+    if last_gui_state[o] ~= now then
+        last_gui_state[o] = now
+        if next(tracked.StyleLink) ~= nil then
+            style_recheck_frames = 4
+        end
+        changed(o, "GuiState")
+    end
+end
+M.check_gui_state = check_gui_state
+get["GuiObject.GuiState"] = function(o)
+    local now = compute_gui_state(o)
+    last_gui_state[o] = now
+    return now
+end
+set["GuiObject.Interactable"] = function(o, _, v)
+    if type(v) ~= "boolean" then
+        error("Unable to assign property Interactable. bool expected, got " .. typeof(v), 0)
+    end
+    __rs_set_raw(o, "Interactable", v)
+    check_gui_state(o)
+    return true
 end
 local sinks = setmetatable({}, { __mode = "k" })
 get["GuiObject.InputSink"] = function(o) return sinks[o] or Enum.InputSink.None end
@@ -585,11 +742,17 @@ local function objects_at(guis, x, y)
     return G.objects_at(guis, x, y)
 end
 local function screen_guis(pg)
-    local list = {}
-    for _, c in pg:GetChildren() do
-        if c:IsA("ScreenGui") and c.Enabled then table.insert(list, c) end
+    local list, idx = {}, {}
+    for i, c in pg:GetChildren() do
+        if c:IsA("ScreenGui") and c.Enabled then
+            table.insert(list, c)
+            idx[c] = i
+        end
     end
-    table.sort(list, function(a, b) return a.DisplayOrder > b.DisplayOrder end)
+    table.sort(list, function(a, b)
+        if a.DisplayOrder ~= b.DisplayOrder then return a.DisplayOrder > b.DisplayOrder end
+        return idx[a] > idx[b]
+    end)
     return list
 end
 local function check_xy(x, y)
@@ -643,31 +806,11 @@ end
 for _, c in { "TextLabel", "TextButton", "TextBox" } do
     get[c .. ".ContentText"] = content
     get[c .. ".OpenTypeFeaturesError"] = function() return "" end
-    -- Fits when its text was drawn inside its box last frame; not drawn yet,
-    -- its TextBounds measured now against its box (SettingsHub's version
-    -- footer reads TextFits right after making each label and turns
-    -- TextScaled on when it is false: the footer drew huge, over itself).
+    -- Fits when its full text layout fit inside its padded box last frame.
     get[c .. ".TextFits"] = function(o)
-        local x, y, w, h, _, _, tw, th = G.layout(o)
-        if x == nil or tw < 0 then
-            local b, s = o.TextBounds, o.AbsoluteSize
-            return b.X <= s.X + 0.5 and b.Y <= s.Y + 0.5
-        end
-        return tw <= w + 0.5 and th <= h + 0.5
-    end
-    -- Setting Font sets FontFace to Font.fromEnum of it, as Roblox keeps
-    -- the two together (the settings menu's rows set Font =
-    -- Enum.Font.BuilderSans over the default FontFace, and drew in
-    -- LegacyArial at its 1.5× size). Font is stored as usual too.
-    set[c .. ".Font"] = function(o, _, v)
-        if type(v) == "string" then
-            local ok, e = pcall(function() return Enum.Font[v] end)
-            v = ok and e or nil
-        end
-        if typeof(v) == "EnumItem" and string.sub(tostring(v), 1, 10) == "Enum.Font." and v ~= Enum.Font.Unknown then
-            pcall(function() o.FontFace = Font.fromEnum(v) end)
-        end
-        return false
+        local x, _, _, _, _, _, tw, _, _, _, fits = G.layout(o)
+        if x == nil or tw < 0 then return false end
+        return fits == true
     end
 end
 get["TextLabel.LocalizedText"] = function(o) return o.Text end
@@ -676,19 +819,34 @@ get["ImageLabel.IsLoaded"] = function(o) return G.image_loaded(o.Image) end
 get["ImageButton.IsLoaded"] = function(o) return G.image_loaded(o.Image) end
 
 ------------------------------------------------------------------ TextBox
--- CaptureFocus: ClearTextOnFocus empties it, the cursor goes to the end,
--- Focused then UserInputService.TextBoxFocused. ReleaseFocus: cursor and
--- selection to -1, FocusLost(submitted, input) then TextBoxFocusReleased.
+-- CaptureFocus: ClearTextOnFocus empties it (only when TextEditable), the
+-- cursor goes to the end (or clicked glyph), Focused then UserInputService.TextBoxFocused.
+-- ReleaseFocus: cursor and selection to -1, FocusLost(submitted, input) then
+-- TextBoxFocusReleased.
 local cursor, selstart = setmetatable({}, { __mode = "k" }), setmetatable({}, { __mode = "k" })
 local last_text = nil
 local function set_cursor(box, v)
-    if (cursor[box] or 1) ~= v then cursor[box] = v changed(box, "CursorPosition") end
+    if (cursor[box] or 1) == v then return end
+    cursor[box] = v
+    G.sync_tb_sel(box, v, nil)
+    changed(box, "CursorPosition")
 end
 local function set_sel(box, v)
-    if (selstart[box] or -1) ~= v then selstart[box] = v changed(box, "SelectionStart") end
+    if (selstart[box] or -1) == v then return end
+    selstart[box] = v
+    G.sync_tb_sel(box, nil, v)
+    changed(box, "SelectionStart")
 end
-get["TextBox.CursorPosition"] = function(box) return cursor[box] or 1 end
-get["TextBox.SelectionStart"] = function(box) return selstart[box] or -1 end
+get["TextBox.CursorPosition"] = function(box)
+    local v = cursor[box]
+    if v == nil then return 1 end
+    return v
+end
+get["TextBox.SelectionStart"] = function(box)
+    local v = selstart[box]
+    if v == nil then return -1 end
+    return v
+end
 local function int_arg(prop, v)
     v = tonumber(v)
     if v == nil then error("Unable to assign property " .. prop .. ". int expected", 0) end
@@ -696,14 +854,14 @@ local function int_arg(prop, v)
 end
 set["TextBox.CursorPosition"] = function(box, _, v)
     v = int_arg("CursorPosition", v)
-    local n = utf8.len(box.Text) or #box.Text
+    local n = #box.Text
     if focused == box then v = math.clamp(v, 1, n + 1) else v = math.clamp(v, -1, n + 1) end
     set_cursor(box, v)
     return true
 end
 set["TextBox.SelectionStart"] = function(box, _, v)
     v = int_arg("SelectionStart", v)
-    local n = utf8.len(box.Text) or #box.Text
+    local n = #box.Text
     set_sel(box, math.clamp(v, -1, n + 1))
     return true
 end
@@ -713,20 +871,42 @@ end
 local function in_widget(box)
     return box:FindFirstAncestorWhichIsA("PluginGui") ~= nil
 end
-local function gain(box)
-    if box.ClearTextOnFocus then box.Text = "" end
+local function gain(box, click_pos)
+    local cleared = false
+    if box.ClearTextOnFocus and box.TextEditable and box.Text ~= "" then
+        box.Text = ""
+        cleared = true
+    end
     focused = box
     last_text = box.Text
-    set_cursor(box, (utf8.len(box.Text) or #box.Text) + 1)
-    set_sel(box, -1)
+    local n = #last_text
+    local target = (not cleared and click_pos ~= nil) and math.clamp(click_pos, 1, n + 1) or (n + 1)
+    local old_c = cursor[box]
+    if old_c == nil then old_c = 1 end
+    local old_s = selstart[box]
+    if old_s == nil then old_s = -1 end
+    cursor[box] = target
+    selstart[box] = -1
+    G.sync_tb_sel(box, target, -1)
+    if old_c ~= target then changed(box, "CursorPosition") end
+    if old_s ~= -1 then changed(box, "SelectionStart") end
+    check_gui_state(box)
     fire(box, "Focused")
     if not in_widget(box) then fire(svc("UserInputService"), "TextBoxFocused", box) end
 end
 local function lose(box, enter, input)
     if focused ~= box then return end
     focused = nil
-    set_cursor(box, -1)
-    set_sel(box, -1)
+    local old_c = cursor[box]
+    if old_c == nil then old_c = 1 end
+    local old_s = selstart[box]
+    if old_s == nil then old_s = -1 end
+    cursor[box] = -1
+    selstart[box] = -1
+    G.sync_tb_sel(box, -1, -1)
+    if old_c ~= -1 then changed(box, "CursorPosition") end
+    if old_s ~= -1 then changed(box, "SelectionStart") end
+    check_gui_state(box)
     -- A touch screen's Enter is the on-screen keyboard's return key
     -- (Android: src/android/keyboard.rs): Roblox's client fires this
     -- before FocusLost(enterPressed = true) there.
@@ -745,7 +925,7 @@ methods["TextBox.CaptureFocus"] = function(box)
         lose(focused, false, nil)
     end
     G.set_focus(box)
-    gain(box)
+    gain(box, nil)
 end
 methods["TextBox.ReleaseFocus"] = function(box, submitted)
     if focused ~= box then return end
@@ -759,7 +939,10 @@ local function step_focus()
     for _, e in G.focus_events() do
         if e.gained then
             if focused and focused ~= e.box then lose(focused, false, nil) end
-            if focused ~= e.box then gain(e.box) end
+            if focused ~= e.box then
+                local click_pos = G.take_focus_click(e.box)
+                gain(e.box, click_pos)
+            end
         else
             local io
             if e.button == 0 then
@@ -778,31 +961,47 @@ local function step_focus()
             G.set_focus(nil)
             lose(box, false, nil)
         elseif focused.Text ~= last_text then
+            -- Script mutated Text while focused: clamp cursor/selection to new length
+            -- without jumping CursorPosition to end (matches Studio 12a/12b).
             last_text = focused.Text
-            set_cursor(focused, (utf8.len(last_text) or #last_text) + 1)
+            local max_pos = #last_text + 1
+            local c = cursor[focused] or 1
+            if c > max_pos then set_cursor(focused, max_pos) end
+            local s = selstart[focused] or -1
+            if s > max_pos then set_sel(focused, max_pos) end
         end
     end
 end
 
+-- Applies a single UI-side TextBox edit/navigation commit in Studio's exact order:
+-- all fields updated first, then CursorPosition -> SelectionStart -> Text signals.
+function M.apply_textbox_edit(box, new_text, new_cur, new_sel)
+    local old_c = cursor[box]
+    if old_c == nil then old_c = 1 end
+    local old_s = selstart[box]
+    if old_s == nil then old_s = -1 end
+    local text_changed = false
+    if new_text ~= nil and box.Text ~= new_text then
+        G.set_text_silent(box, new_text)
+        if focused == box then last_text = new_text end
+        text_changed = true
+    end
+    local cur_changed = false
+    if new_cur ~= nil and old_c ~= new_cur then
+        cursor[box] = new_cur
+        cur_changed = true
+    end
+    local sel_changed = false
+    if new_sel ~= nil and old_s ~= new_sel then
+        selstart[box] = new_sel
+        sel_changed = true
+    end
+    if cur_changed then changed(box, "CursorPosition") end
+    if sel_changed then changed(box, "SelectionStart") end
+    if text_changed then changed(box, "Text") end
+end
+
 ------------------------------------------------------------- ScrollingFrame
-get["ScrollingFrame.AbsoluteCanvasSize"] = function(sf)
-    local x, y, w, h, cw, ch = G.layout(sf)
-    if x ~= nil and cw >= 0 then return Vector2.new(cw, ch) end
-    local s, c = sf.AbsoluteSize, sf.CanvasSize
-    return Vector2.new(c.X.Scale * s.X + c.X.Offset, c.Y.Scale * s.Y + c.Y.Offset)
-end
--- The part of the frame the canvas shows in: less a scroll bar's width when
--- its inset (ScrollBar: while it shows; Always) keeps it out.
-get["ScrollingFrame.AbsoluteWindowSize"] = function(sf)
-    local s = sf.AbsoluteSize
-    local canvas = get["ScrollingFrame.AbsoluteCanvasSize"](sf)
-    local t = sf.ScrollBarThickness
-    local w, h = s.X, s.Y
-    local vi, hi = sf.VerticalScrollBarInset, sf.HorizontalScrollBarInset
-    if vi == Enum.ScrollBarInset.Always or (vi == Enum.ScrollBarInset.ScrollBar and canvas.Y > s.Y) then w -= t end
-    if hi == Enum.ScrollBarInset.Always or (hi == Enum.ScrollBarInset.ScrollBar and canvas.X > s.X) then h -= t end
-    return Vector2.new(math.max(w, 0), math.max(h, 0))
-end
 -- The wheel scrolls in whole steps here: no fling to slow down.
 methods["ScrollingFrame.GetScrollVelocity"] = function() return Vector2.zero end
 methods["ScrollingFrame.ResetScrollVelocity"] = function() end
@@ -829,8 +1028,16 @@ local function grid_cells(g)
     if vertical then return Vector2.new(lines, along), Vector2.new(cw, ch) end
     return Vector2.new(along, lines), Vector2.new(cw, ch)
 end
-get["UIGridLayout.AbsoluteCellCount"] = function(g) return (grid_cells(g)) end
-get["UIGridLayout.AbsoluteCellSize"] = function(g) return select(2, grid_cells(g)) end
+get["UIGridLayout.AbsoluteCellCount"] = function(g)
+    local x, _, _, _, cx, cy = G.layout(g)
+    if x ~= nil and cx >= 0 then return Vector2.new(cx, cy) end
+    return (grid_cells(g))
+end
+get["UIGridLayout.AbsoluteCellSize"] = function(g)
+    local x, _, _, _, _, _, _, _, wx, wy = G.layout(g)
+    if x ~= nil and wx >= 0 then return Vector2.new(wx, wy) end
+    return select(2, grid_cells(g))
+end
 -- Deprecated: the layout already re-applies itself every frame; a custom
 -- sort function is what SortOrder Custom used to call.
 methods["UIGridStyleLayout.ApplyLayout"] = function() end
@@ -873,31 +1080,56 @@ local function current_page(pl)
 end
 get["UIPageLayout.CurrentPage"] = function(pl) return (current_page(pl)) end
 local tweening = {}
-local function go(pl, page)
-    local cur = current_page(pl)
+local function go(pl, page, dir)
+    local cur, pages = current_page(pl)
     if page == nil or page == cur then return end
+    dir = dir or 0
     local st = pl_state[pl] or {}
     pl_state[pl] = st
     st.page = page
     changed(pl, "CurrentPage")
     if pl.Animated and pl.TweenTime > 0 then
-        tweening[pl] = { from = cur, to = page, t = 0 }
-        G.set_page(pl, cur, page, 0)
+        tweening[pl] = { from = cur, to = page, t = 0, dir = dir, entered = false }
+        G.set_page(pl, cur, page, 0, dir)
     else
         tweening[pl] = nil
-        G.set_page(pl, page, page, 1)
+        G.set_page(pl, page, page, 1, dir)
+        -- Studio fires PageLeave(cur) and PageEnter(page) in layout order of
+        -- the pages when Animated is false, and does not fire Stopped.
+        for _, p in pages do
+            if p == cur then
+                fire(pl, "PageLeave", cur)
+            elseif p == page then
+                fire(pl, "PageEnter", page)
+            end
+        end
     end
 end
 local function step_pages(dt)
+    for _, ev in G.page_scrolls() do
+        local pl = ev.layout
+        if pl and pl.Parent and pl.ScrollWheelInputEnabled then
+            if ev.dir > 0 then
+                methods["UIPageLayout.Next"](pl)
+            elseif ev.dir < 0 then
+                methods["UIPageLayout.Previous"](pl)
+            end
+        end
+    end
     for pl, tw in tweening do
         tw.t += dt
         local dur = math.max(pl.TweenTime, 1e-3)
         local a = math.min(tw.t / dur, 1)
+        if not tw.entered and a > 0 then
+            tw.entered = true
+            fire(pl, "PageEnter", tw.to)
+        end
         local ok, alpha = pcall(function() return svc("TweenService"):GetValue(a, pl.EasingStyle, pl.EasingDirection) end)
-        G.set_page(pl, tw.from, tw.to, ok and alpha or a)
+        G.set_page(pl, tw.from, tw.to, ok and alpha or a, tw.dir)
         if a >= 1 then
             tweening[pl] = nil
             fire(pl, "Stopped", tw.to)
+            fire(pl, "PageLeave", tw.from)
         end
     end
 end
@@ -906,14 +1138,14 @@ methods["UIPageLayout.JumpTo"] = function(pl, page)
         error((typeof(page) == "Instance" and page.ClassName or typeof(page)) .. " passed to PageLayout JumpTo is not a GuiObject", 0)
     end
     local _, pages = current_page(pl)
-    if table.find(pages, page) then go(pl, page) end
+    if table.find(pages, page) then go(pl, page, 0) end
 end
 methods["UIPageLayout.JumpToIndex"] = function(pl, i)
     i = tonumber(i)
     if i == nil then error("Unable to cast value to int", 0) end
     local _, pages = current_page(pl)
     if #pages == 0 then return end
-    go(pl, pages[(math.floor(i) % #pages) + 1])
+    go(pl, pages[(math.floor(i) % #pages) + 1], 0)
 end
 local function shift(pl, d)
     local cur, pages = current_page(pl)
@@ -923,7 +1155,7 @@ local function shift(pl, d)
         if not pl.Circular then return end
         i = (i - 1) % #pages + 1
     end
-    go(pl, pages[i])
+    go(pl, pages[i], d)
 end
 methods["UIPageLayout.Next"] = function(pl) shift(pl, 1) end
 methods["UIPageLayout.Previous"] = function(pl) shift(pl, -1) end
@@ -1298,15 +1530,15 @@ end
 -- the descendants of the link's parent (rules by Priority, later wins;
 -- "$token" values are the sheet's attributes; a property no rule sets any
 -- more gets back the value it had).
--- Held strongly: an instance's Lua object can be collected while the
--- instance lives on (nothing in Lua refers to a parented StyleRule), and
--- weak keys then lost its properties (Foundation's early rules, `.size-full`,
--- stopped styling anything). Destroyed instances are dropped in `prune`.
+-- Strong tables (pruned on tree mutations in prune()): inst_value interns
+-- userdata in a weak-value table, so __mode = "k" would let GC wipe a live
+-- StyleRule's properties as soon as Lua drops its local reference!
 local rule_props = {}
 local rule_trans = {}
 local sheet_derives = {}
 local query_conds = {}
-local styles_dirty = true
+local pseudo_kids = {} -- parent_inst → { [ClassName] = child_inst }
+local pseudo_prefixes = {} -- alt → prefix step array (never mutate alt!)
 local function props_of(r)
     local t = rule_props[r]
     if not t then t = {} rule_props[r] = t end
@@ -1435,7 +1667,7 @@ local function query_active(q, screen)
             local ar = screen.X / math.max(screen.Y, 1)
             if ar < v.Min or ar > v.Max then return false end
         elseif k == "ReducedMotionEnabled" then
-            if v ~= false then return false end
+            if v ~= (get["GuiService.ReducedMotionEnabled"]() == true) then return false end
         end
     end
     return any
@@ -1457,25 +1689,19 @@ local function parse_selector(s)
     for alt in string.gmatch(s, "[^,]+") do
         local steps = {}
         local rel = "desc"
-        alt = alt:gsub(">", " > ")
+        alt = alt:gsub("::", " :: "):gsub(">", " > ")
         for tok in string.gmatch(alt, "%S+") do
             if tok == ">" then
                 rel = "child"
+            elseif tok == "::" then
+                rel = "pseudo"
             elseif tok == "&" then
                 rel = "self"
-            elseif tok:sub(1, 2) == "::" then
-                -- A pseudo-instance ("::UIListLayout"): the rule styles a
-                -- modifier of that class the engine keeps under each
-                -- element the steps before it match (Roblox's style
-                -- sheets: Foundation's ".row ::UIListLayout").
-                table.insert(steps, { pseudo = tok:sub(3):match("^([%a_][%w_]*)") })
-                rel = "desc"
             else
                 local c = { rel = rel, tags = {}, states = {} }
                 local rest = tok
                 if rest:sub(1, 1) == "&" then c.rel = "self" rest = rest:sub(2) end
                 c.class = rest:match("^([%a_][%w_]*)")
-                -- (tags and names may hold "-": Foundation's ".size-full")
                 for kind, name in string.gmatch(rest, "([%.#:])([%w_%-]+)") do
                     if kind == "." then table.insert(c.tags, name)
                     elseif kind == "#" then c.name = name
@@ -1490,170 +1716,59 @@ local function parse_selector(s)
     selector_cache[s] = alts
     return alts
 end
--- Matching runs over a styled tree as G.style_tree lists it (instance,
--- parent index, ClassName, Name, tags), so a rule tested against an
--- element reads no engine property: IsA is kept per ClassName, GuiState
--- per element and match. Ancestors above the root (a child step may cross
--- it) are read on demand and marked `outside`.
-local isa_memo = {} -- ClassName → { class → IsA }
-local function tree_isa(tree, i, class)
-    local cn = tree.class[i]
-    local t = isa_memo[cn]
-    if not t then t = {} isa_memo[cn] = t end
-    local v = t[class]
-    if v == nil then v = tree.inst[i]:IsA(class) t[class] = v end
-    return v
-end
-local function tree_parent(tree, i)
-    local p = tree.parent[i]
-    if p ~= 0 then return if p then p else nil end
-    local up = tree.inst[i].Parent
-    if not up then tree.parent[i] = false return nil end
-    local n = #tree.inst + 1
-    tree.inst[n], tree.class[n], tree.name[n], tree.parent[n] = up, up.ClassName, up.Name, 0
-    local tags = up:GetTags()
-    if #tags > 0 then
-        local s = {}
-        for _, t in tags do s[t] = true end
-        tree.tags[n] = s
-    end
-    tree.outside[n] = true
-    tree.parent[i] = n
-    return n
-end
--- The parent inside the root (nil at the root and above it).
-local function up_in(tree, i)
-    if tree.outside[i] then return nil end
-    local p = tree.parent[i]
-    if not p or p == 0 or tree.outside[p] then return nil end
-    return p
-end
-local function compound_matches(c, tree, i)
-    if c.class and not tree_isa(tree, i, c.class) then return false end
-    if c.name and tree.name[i] ~= c.name then return false end
-    if #c.tags > 0 then
-        local s = tree.tags[i]
-        if not s then return false end
-        for _, t in c.tags do
-            if not s[t] then return false end
-        end
+local function compound_matches(c, o)
+    if c.class and not o:IsA(c.class) then return false end
+    if c.name and o.Name ~= c.name then return false end
+    for _, t in c.tags do
+        if not o:HasTag(t) then return false end
     end
     if #c.states > 0 then
-        if not tree_isa(tree, i, "GuiObject") then return false end
-        local st = tree.state[i]
-        if st == nil then
-            st = get["GuiObject.GuiState"](tree.inst[i]).Name:lower()
-            tree.state[i] = st
-        end
+        if not o:IsA("GuiObject") then return false end
+        local st = get["GuiObject.GuiState"](o).Name:lower()
         for _, s in c.states do
-            if s ~= st then return false end
+            if s == "focus" then
+                if focused ~= o and selected ~= o and gs_state.selected_core ~= o then return false end
+            elseif s ~= st then
+                return false
+            end
         end
     end
     return true
 end
--- Does steps[1..k] (right-most last) match element `node`, with every
--- step inside the root? `scopes`: the instances a nested rule's parent
--- matched (nil: the root).
-local function steps_from(steps, k, tree, node, scopes)
-    local c = steps[k]
-    if not compound_matches(c, tree, node) then return false end
-    if k == 1 then
-        if scopes then
-            if c.rel == "self" then return scopes[tree.inst[node]] == true end
-            if c.rel == "child" then
-                local p = tree_parent(tree, node)
-                return p ~= nil and scopes[tree.inst[p]] == true
-            end
-            -- (up to the root; from above it, to the DataModel's top)
-            local out = tree.outside[node]
-            local p = if out then tree_parent(tree, node) else up_in(tree, node)
-            while p do
-                if scopes[tree.inst[p]] then return true end
-                p = if out then tree_parent(tree, p) else up_in(tree, p)
-            end
-            return false
-        end
-        if tree.outside[node] then return false end
-        if c.rel == "child" then return tree.parent[node] == 1 end
-        return true
-    end
-    if c.rel == "child" then
-        local p = tree_parent(tree, node)
-        return p ~= nil and steps_from(steps, k - 1, tree, p, scopes)
-    end
-    local p = up_in(tree, node)
-    while p do
-        if steps_from(steps, k - 1, tree, p, scopes) then return true end
-        p = up_in(tree, p)
-    end
-    return false
-end
-local function steps_match(steps, tree, i, scopes)
-    return steps_from(steps, #steps, tree, i, scopes)
-end
--- The elements compound `c` can match: those holding its first tag (most
--- of Foundation's selectors are tags), else all of them (nil).
-local NO_NODES = table.freeze({})
-local function candidates(tree, c)
-    if not c.tags or #c.tags == 0 then return nil end
-    local idx = tree.by_tag
-    if not idx then
-        idx = {}
-        for i = 1, tree.n do
-            local s = tree.tags[i]
-            if s then
-                for t in s do
-                    local l = idx[t]
-                    if not l then l = {} idx[t] = l end
-                    table.insert(l, i)
+-- Does `steps` (right-most last) match o, with every step inside `root`?
+-- `scope`: the instances a nested rule's parent matched (nil: the root).
+local function steps_match(steps, o, root, scopes)
+    local function from(i, node)
+        local c = steps[i]
+        if not compound_matches(c, node) then return false end
+        if i == 1 then
+            if scopes then
+                if c.rel == "self" then return scopes[node] == true end
+                local p = node.Parent
+                if c.rel == "child" then return p ~= nil and scopes[p] == true end
+                while p and p ~= root.Parent do
+                    if scopes[p] then return true end
+                    p = p.Parent
                 end
+                return false
             end
+            if c.rel == "child" then return node.Parent == root end
+            return node == root or node:IsDescendantOf(root)
         end
-        tree.by_tag = idx
+        local p = node.Parent
+        if c.rel == "child" then return p ~= nil and from(i - 1, p) end
+        while p and (p == root or p:IsDescendantOf(root)) do
+            if from(i - 1, p) then return true end
+            p = p.Parent
+        end
+        return false
     end
-    return idx[c.tags[1]] or NO_NODES
-end
--- Pseudo-instances (selectors ending "::Class"): element → { class → the
--- modifier rustudio made for it }, kept while a rule wants it.
-local pseudos = {}
-local function pseudo_of(n, class)
-    local t = pseudos[n]
-    if not t then t = {} pseudos[n] = t end
-    local p = t[class]
-    if p and p.Parent == n then return p end
-    local ok, made = pcall(Instance.new, class)
-    if not ok then return nil end
-    made.Name = class
-    made.Archivable = false
-    made.Parent = n
-    t[class] = made
-    return made
+    return from(#steps, o)
 end
 local styled = {} -- inst → { prop → original value }
 local style_targets = {} -- inst → { prop → value } last applied
-local style_own = setmetatable({}, { __mode = "k" }) -- inst → { prop → true } set by the instance itself
-local style_seen = setmetatable({}, { __mode = "k" }) -- inst → { prop → { value read back after styling } }
--- A class's default property values (a fresh instance of it, kept).
-local class_blank = {}
-local function class_default(inst, k)
-    local class = inst.ClassName
-    local blank = class_blank[class]
-    if blank == nil then
-        local ok, made = pcall(Instance.new, class)
-        blank = ok and made or false
-        class_blank[class] = blank
-    end
-    if not blank then return nil end
-    local ok, v = pcall(function() return blank[k] end)
-    return if ok then v else nil
-end
-local function differs(a, b)
-    if a == b then return false end
-    local ta = typeof(a)
-    if ta ~= typeof(b) or ta == "Instance" or ta == "table" then return true end
-    -- (value types compare by value: two equal Fonts / UDim2s)
-    return tostring(a) ~= tostring(b)
-end
+local style_overridden = setmetatable({}, { __mode = "k" }) -- inst → { prop → last script override }
+local step_styles_defaults = {} -- ClassName → { _inst, prop → { default } }
 local function resolve_token(v, sheets)
     if type(v) == "string" and v:sub(1, 1) == "$" then
         local name = v:sub(2)
@@ -1665,258 +1780,326 @@ local function resolve_token(v, sheets)
     end
     return v
 end
-local function collect_rules(sheet, out, seen)
+local function collect_rules(sheet, out, sheets_out, seen)
     if seen[sheet] then return end
     seen[sheet] = true
-    for _, d in sheet_derives[sheet] or {} do collect_rules(d, out, seen) end
+    table.insert(sheets_out, sheet)
+    for _, d in sheet_derives[sheet] or {} do collect_rules(d, out, sheets_out, seen) end
     for _, d in sheet:GetChildren() do
-        if d:IsA("StyleDerive") and d.StyleSheet then collect_rules(d.StyleSheet, out, seen) end
+        if d:IsA("StyleDerive") and d.StyleSheet then collect_rules(d.StyleSheet, out, sheets_out, seen) end
     end
     local function add(base, parent_rule, depth)
         for _, r in rules_of(base) do
             table.insert(out, { rule = r, parent = parent_rule, depth = depth })
             add(r, r, depth + 1)
         end
-    end
-    add(sheet, nil, 0)
-end
--- A sheet's rules as one matching pass reads them (each StyleLink to it
--- shares them): in sheet order with their parsed selectors, whether their
--- StyleQuery holds, and the order rules apply in. Lower Priority first,
--- so higher wins; equal priorities keep the sheet's own order (a later
--- rule wins: Foundation's ".bg-action-standard" transparency over
--- ".x-default-transparency").
-local function compile_sheet(sheet, screen)
-    local rules, seen = {}, {}
-    collect_rules(sheet, rules, seen)
-    local sheets = { sheet }
-    for _, d in sheet_derives[sheet] or {} do table.insert(sheets, d) end
-    local states = false
-    for i, e in rules do
-        local r = e.rule
-        e.i = i
-        e.priority = r.Priority
-        local q = r:FindFirstAncestorWhichIsA("StyleQuery")
-        local selector = r.Selector
-        if (q == nil or query_active(q, screen)) and selector ~= "" then
-            e.alts = parse_selector(selector)
-            for _, alt in e.alts do
-                for _, c in alt do
-                    if c.states and #c.states > 0 then states = true end
-                end
+        for _, c in base:GetChildren() do
+            if c:IsA("StyleQuery") then
+                add(c, parent_rule, depth)
             end
         end
     end
-    local order = table.move(rules, 1, #rules, 1, {})
-    table.sort(order, function(a, b)
-        if a.priority ~= b.priority then return a.priority < b.priority end
-        return a.i < b.i
-    end)
-    local all_sheets = {} -- (every sheet read: derives too)
-    for s in seen do table.insert(all_sheets, s) end
-    return { rules = rules, order = order, sheets = sheets, states = states, all_sheets = all_sheets }
+    add(sheet, nil, 0)
 end
--- A rule's properties with their tokens resolved for its sheet, each
--- { value, transition } (shared by every element it styles).
-local function rule_values(e, sheets)
-    if e.values then return e.values end
-    local out = {}
-    local props = rule_props[e.rule]
-    if props then
-        local tr = rule_trans[e.rule] or {}
-        for k, v in props do
-            local val = resolve_token(v, sheets)
-            if val ~= nil then out[k] = { val, tr[k] or tr["*"] } end
+local last_style_rev, last_style_w, last_style_h, last_hover_sig = -1, -1, -1, -1
+local styles_need_hover = false
+local watched_sheets = {}
+local function hidden_plugin_gui(inst)
+    if not G.is_edit() then return false end
+    local cur = inst
+    while cur do
+        if cur:IsA("PluginGui") then return not cur.Enabled end
+        cur = cur.Parent
+    end
+    return false
+end
+local function style_watch_roots(links)
+    local roots = {}
+    for link in links do
+        table.insert(roots, link)
+        if link.Parent and not hidden_plugin_gui(link) then
+            table.insert(roots, link.Parent)
         end
     end
-    e.values = out
-    return out
+    for sheet in watched_sheets do table.insert(roots, sheet) end
+    return roots
 end
--- One StyleLink's matches: { element, rule values } in the order its
--- rules apply, and the pseudo-instances it wants.
-local function match_link(link, root, cs)
-    local out = { list = {}, pseudo = {} }
-    local tree = if #cs.rules > 0 then G.style_tree(root, link) else nil
-    if not tree then
-        G.style_forget(link)
-        return out
+local function step_styles(style_rev, w, h, hover_sig)
+    local links = tracked.StyleLink
+    if next(links) == nil and next(styled) == nil then
+        if next(watched_sheets) then
+            table.clear(watched_sheets)
+            G.style_watch_reset({})
+        end
+        styles_dirty = false
+        return
     end
-    tree.state = {}
-    local n_nodes = tree.n
-    -- Matches per rule (nested rules match inside their parent's).
-    local matched = {}
-    for _, e in cs.rules do
-        local m = {}
-        local pm = {} -- element → pseudo class
-        if e.alts then
-            local scopes = e.parent and matched[e.parent] or nil
-            if e.parent == nil or scopes then
-                for _, alt in e.alts do
-                    local last = alt[#alt]
-                    if last.pseudo then
-                        local base = alt.base
-                        if not base then
-                            base = table.move(alt, 1, #alt - 1, 1, {})
-                            alt.base = base
+    if style_recheck_frames > 0 then
+        style_recheck_frames -= 1
+        for inst, props in style_targets do
+            if not pcall(function() return inst.Parent end) then continue end
+            for k, last_val in props do
+                local ok_c, cur = pcall(function() return inst[k] end)
+                if ok_c then
+                    local ok_eq, same = pcall(function() return cur == last_val end)
+                    if not (ok_eq and same) then
+                        styles_dirty = true
+                        break
+                    end
+                end
+            end
+            if styles_dirty then break end
+        end
+        if not styles_dirty then
+            for inst, props in style_overridden do
+                if not pcall(function() return inst.Parent end) then continue end
+                for k, ov_val in props do
+                    local ok_c, cur = pcall(function() return inst[k] end)
+                    if ok_c then
+                        local ok_eq, same = pcall(function() return cur == ov_val end)
+                        if not (ok_eq and same) then
+                            styles_dirty = true
+                            break
                         end
-                        if #base == 0 then
-                            for n in scopes or { [root] = true } do pm[n] = last.pseudo end
-                        else
-                            local cand = candidates(tree, base[#base])
-                            for j = 1, if cand then #cand else n_nodes do
-                                local i = if cand then cand[j] else j
-                                local n = tree.inst[i]
-                                if not pm[n] and steps_match(base, tree, i, scopes) then pm[n] = last.pseudo end
+                    end
+                end
+                if styles_dirty then break end
+            end
+        end
+    end
+    local need = styles_dirty
+        or w ~= last_style_w
+        or h ~= last_style_h
+        or (styles_need_hover and hover_sig ~= last_hover_sig)
+    if not need then
+        if style_rev == last_style_rev then return end
+        if not G.style_watch_changed() then
+            last_style_rev = style_rev
+            return
+        end
+    end
+    styles_dirty = false
+    last_style_rev, last_style_w, last_style_h, last_hover_sig = style_rev, w, h, hover_sig
+    styles_need_hover = false
+    local want = {} -- inst → { prop → { value, transition } }
+    table.clear(watched_sheets)
+    local pseudo_wanted = {} -- parent → { [cls] = true }
+    local pseudo_mutated = false
+    local function get_or_make_pseudo(parent, cls)
+        local map = pseudo_kids[parent]
+        local pk = map and map[cls]
+        if pk then
+            local ok_p, pp = pcall(function() return pk.Parent end)
+            if ok_p and pp == parent then
+                pseudo_wanted[parent] = pseudo_wanted[parent] or {}
+                pseudo_wanted[parent][cls] = true
+                return pk
+            end
+            map[cls] = nil
+        end
+        local existing = parent:FindFirstChildOfClass(cls)
+        if existing then return existing end
+        local ok_n, inst = pcall(Instance.new, cls)
+        if not ok_n or not inst then return nil end
+        pcall(function()
+            inst.Name = "__rs_pseudo_" .. cls
+            inst.Archivable = false
+            inst.Parent = parent
+        end)
+        pseudo_kids[parent] = pseudo_kids[parent] or {}
+        pseudo_kids[parent][cls] = inst
+        pseudo_wanted[parent] = pseudo_wanted[parent] or {}
+        pseudo_wanted[parent][cls] = true
+        pseudo_mutated = true
+        return inst
+    end
+    local screen = Vector2.new(w, h - 58)
+    for link in links do
+        local sheet, root = link.StyleSheet, link.Parent
+        if sheet and root and not hidden_plugin_gui(link) and link:IsDescendantOf(game) then
+            local rules = {}
+            local sheets = {}
+            collect_rules(sheet, rules, sheets, {})
+            for _, item in sheets do watched_sheets[item] = true end
+            local nodes = G.style_targets(root)
+            local by_tag, by_name = {}, {}
+            for _, n in nodes do
+                local nm = n.Name
+                local ln = by_name[nm]
+                if ln then table.insert(ln, n) else by_name[nm] = { n } end
+                local tags = n:GetTags()
+                if tags then
+                    for _, tg in tags do
+                        local lt = by_tag[tg]
+                        if lt then table.insert(lt, n) else by_tag[tg] = { n } end
+                    end
+                end
+            end
+            -- Matches per rule (nested rules match inside their parent's).
+            local matched = {}
+            local order = {}
+            for i, e in rules do
+                e.seq = i
+                order[i] = e
+            end
+            for _, e in order do
+                local r = e.rule
+                local active = true
+                local q = r:FindFirstAncestorWhichIsA("StyleQuery")
+                if q and not query_active(q, screen) then active = false end
+                local m = {}
+                local selector = active and r.Selector
+                if selector and selector ~= "" then
+                    local scopes = e.parent and matched[e.parent] or nil
+                    if e.parent == nil or (scopes and next(scopes) ~= nil) then
+                        for _, alt in parse_selector(selector) do
+                            for _, st in alt do
+                                if #st.states > 0 then styles_need_hover = true end
+                            end
+                            local last = alt[#alt]
+                            if last.rel == "pseudo" and last.class then
+                                if #alt == 1 then
+                                    if scopes then
+                                        for n in scopes do
+                                            if n:IsA("GuiBase2d") then
+                                                local pk = get_or_make_pseudo(n, last.class)
+                                                if pk then m[pk] = true end
+                                            end
+                                        end
+                                    end
+                                else
+                                    local prefix = pseudo_prefixes[alt]
+                                    if not prefix then
+                                        prefix = {}
+                                        for pi = 1, #alt - 1 do prefix[pi] = alt[pi] end
+                                        pseudo_prefixes[alt] = prefix
+                                    end
+                                    local plast = prefix[#prefix]
+                                    local cands = nodes
+                                    if plast.name then
+                                        cands = by_name[plast.name]
+                                    elseif plast.tags[1] then
+                                        cands = by_tag[plast.tags[1]]
+                                    end
+                                    if cands then
+                                        for _, n in cands do
+                                            if n:IsA("GuiBase2d") and steps_match(prefix, n, root, scopes) then
+                                                local pk = get_or_make_pseudo(n, last.class)
+                                                if pk then m[pk] = true end
+                                            end
+                                        end
+                                    end
+                                end
+                            else
+                                local cands = nodes
+                                if last.name then
+                                    cands = by_name[last.name]
+                                elseif last.tags[1] then
+                                    cands = by_tag[last.tags[1]]
+                                end
+                                if cands then
+                                    for _, n in cands do
+                                        if not m[n] and steps_match(alt, n, root, scopes) then m[n] = true end
+                                    end
+                                end
                             end
                         end
-                    else
-                        local cand = candidates(tree, last)
-                        for j = 1, if cand then #cand else n_nodes do
-                            local i = if cand then cand[j] else j
-                            local n = tree.inst[i]
-                            if not m[n] and steps_match(alt, tree, i, scopes) then m[n] = true end
+                    end
+                end
+                matched[r] = m
+            end
+            for _, e in order do
+                e.priority = e.rule.Priority
+            end
+            table.sort(order, function(a, b)
+                if a.priority ~= b.priority then return a.priority < b.priority end
+                return a.seq < b.seq
+            end)
+            for _, e in order do
+                local r = e.rule
+                local props = rule_props[r]
+                if props and next(props) then
+                    local tr = rule_trans[r] or {}
+                    for n in matched[r] do
+                        local t = want[n] or {}
+                        want[n] = t
+                        for k, v in props do
+                            local val = resolve_token(v, sheets)
+                            if val ~= nil then t[k] = { val, tr[k] or tr["*"] } end
                         end
                     end
                 end
             end
         end
-        -- (a pseudo rule styles each element's modifier)
-        for n, class in pm do
-            local p = pseudo_of(n, class)
-            if p then m[p] = true out.pseudo[p] = true end
+    end
+    -- Cache per-class defaults so StyleRules never overwrite explicitly set
+    -- instance properties (measured in Studio 0.747: direct property writes
+    -- always take precedence over StyleRule properties).
+    local class_defaults = step_styles_defaults
+    local function is_default_prop(inst, k, cur)
+        local cn = inst.ClassName
+        local cd = class_defaults[cn]
+        if cd == nil then
+            local ok_n, dummy = pcall(Instance.new, cn)
+            cd = ok_n and { _inst = dummy } or false
+            class_defaults[cn] = cd
         end
-        matched[e.rule] = m
-    end
-    for _, e in cs.order do
-        local m = matched[e.rule]
-        if next(m) then
-            local values = rule_values(e, cs.sheets)
-            if next(values) then
-                for n in m do table.insert(out.list, { n, values }) end
-            end
+        if not cd then return false end
+        local dv = cd[k]
+        if dv == nil then
+            local ok_d, v = pcall(function() return cd._inst[k] end)
+            dv = ok_d and { v } or false
+            cd[k] = dv
         end
-    end
-    return out
-end
--- Matching reruns for a StyleLink when its styled tree changed (an
--- element added, moved or removed, a Name / Tags / Interactable written:
--- G.style_changes reads the DataModel's journal), and for all of them when
--- a sheet, a rule's properties or a query condition changed, the view's
--- size did, or (when a rule has a :state) the hovered, pressed or focused
--- object did. Each link keeps its matches; the elements' styles are the
--- links' matches applied in turn.
-local style_compiled = {} -- sheet → compile_sheet's
-local style_links = {} -- StyleLink → { sheet, root, matches }
-local style_last_view, style_last_hover, style_last_focus, style_states = nil, nil, nil, true
-local function step_styles()
-    local links = tracked.StyleLink
-    if next(links) == nil and next(styled) == nil then return end
-    local all, dirty = G.style_changes()
-    local w, h = G.view()
-    local view = w .. "x" .. h
-    local hover = G.style_key()
-    if view ~= style_last_view or styles_dirty then all = true end
-    if style_states and (hover ~= style_last_hover or focused ~= style_last_focus) then all = true end
-    style_last_view, style_last_hover, style_last_focus, styles_dirty = view, hover, focused, false
-    local any = all or dirty ~= nil
-    for link in style_links do
-        if not links[link] then
-            style_links[link] = nil
-            G.style_forget(link)
-            any = true
-        end
-    end
-    for link in links do
-        if not style_links[link] then any = true end
-    end
-    if not any then return end
-    local screen = Vector2.new(w, h - 58)
-    if all then
-        style_compiled = {}
-    end
-    local sheets_changed = all
-    local states = false
-    local want = {} -- inst → { prop → { value, transition } }
-    local wanted_pseudo = {}
-    for link in links do
-        local sheet, root = link.StyleSheet, link.Parent
-        local c = style_links[link]
-        if not (sheet and root and link:IsDescendantOf(game)) then
-            if c then G.style_forget(link) end
-            style_links[link] = { matches = { list = {}, pseudo = {} } }
-        else
-            local cs = style_compiled[sheet]
-            if not cs then
-                cs = compile_sheet(sheet, screen)
-                style_compiled[sheet] = cs
-                sheets_changed = true
-            end
-            states = states or cs.states
-            if all or not c or (dirty and dirty[link]) or c.sheet ~= sheet or c.root ~= root then
-                c = { sheet = sheet, root = root, matches = match_link(link, root, cs) }
-                style_links[link] = c
-            end
-            for _, nv in c.matches.list do
-                local t = want[nv[1]]
-                if not t then t = {} want[nv[1]] = t end
-                for k, v in nv[2] do t[k] = v end
-            end
-            for p in c.matches.pseudo do wanted_pseudo[p] = true end
-        end
-    end
-    style_states = states
-    if sheets_changed then
-        local list = {}
-        for _, cs in style_compiled do
-            for _, s in cs.all_sheets do table.insert(list, s) end
-        end
-        G.style_sheets(list)
+        if not dv then return false end
+        local ok_eq, eq = pcall(function() return cur == dv[1] end)
+        return ok_eq and eq
     end
     -- Apply, remembering originals; restore what nothing sets any more.
-    -- A property the instance has set itself wins over every rule (Roblox's
-    -- styling guide, "Modified properties": a value set on the instance
-    -- overrides the styled one; Foundation's Icon sets FontFace and TextSize
-    -- over its "text-defaults" / "x-default-text-size" rules, so the icon
-    -- draws in Builder Icons at its size, not Builder Sans 8). Set means
-    -- not the class default when first styled, or changed since the style
-    -- wrote it.
     for inst, props in want do
         local orig = styled[inst] or {}
         styled[inst] = orig
         local last = style_targets[inst] or {}
         style_targets[inst] = last
-        local own = style_own[inst]
-        local seen = style_seen[inst] or {}
-        style_seen[inst] = seen
         for k, e in props do
-            if own and own[k] then
-                continue
+            local ok_c, cur = pcall(function() return inst[k] end)
+            if ok_c then
+                if orig[k] == nil then
+                    -- Only style properties still at their class default.
+                    if is_default_prop(inst, k, cur) then
+                        orig[k] = { cur }
+                        if style_overridden[inst] then style_overridden[inst][k] = nil end
+                    else
+                        local ov = style_overridden[inst] or {}
+                        style_overridden[inst] = ov
+                        ov[k] = cur
+                    end
+                elseif last[k] ~= nil then
+                    -- If a script explicitly wrote a different value, yield to it;
+                    -- if it reset the property back to its class default (e.g. React
+                    -- clearing a hover prop), re-apply the StyleSheet value.
+                    local ok_eq, same = pcall(function() return cur == last[k] end)
+                    if not (ok_eq and same) then
+                        if is_default_prop(inst, k, cur) then
+                            orig[k] = { cur }
+                            last[k] = nil
+                            if style_overridden[inst] then style_overridden[inst][k] = nil end
+                        else
+                            orig[k] = nil
+                            last[k] = nil
+                            local ov = style_overridden[inst] or {}
+                            style_overridden[inst] = ov
+                            ov[k] = cur
+                        end
+                    end
+                end
             end
-            local ok, cur = pcall(function() return inst[k] end)
-            if not ok then continue end
-            local set_here = if orig[k] == nil
-                then differs(cur, class_default(inst, k))
-                else not e[2] and seen[k] ~= nil and differs(cur, seen[k][1])
-            if set_here then
-                own = own or {}
-                style_own[inst] = own
-                own[k] = true
-                orig[k] = nil
-                last[k] = nil
-                seen[k] = nil
-                continue
-            end
-            if orig[k] == nil then orig[k] = { cur } end
-            if last[k] ~= e[1] then
+            if orig[k] and last[k] ~= e[1] then
                 last[k] = e[1]
                 if e[2] then
-                    seen[k] = nil
                     pcall(function() svc("TweenService"):Create(inst, e[2], { [k] = e[1] }):Play() end)
                 else
                     pcall(function() inst[k] = e[1] end)
-                    -- (as the property holds it: a Color3 kept in f32)
-                    local okr, now = pcall(function() return inst[k] end)
-                    seen[k] = if okr then { now } else nil
                 end
             end
         end
@@ -1935,14 +2118,27 @@ local function step_styles()
             style_targets[inst] = nil
         end
     end
-    for n, t in pseudos do
-        for class, p in t do
-            if not wanted_pseudo[p] then
-                t[class] = nil
-                pcall(function() p:Destroy() end)
+    -- Clean up pseudo-children no longer matched by any ::ClassName rule.
+    for parent, map in pseudo_kids do
+        local keep = pseudo_wanted[parent]
+        for cls, pk in map do
+            if not (keep and keep[cls]) then
+                pcall(function() pk:Destroy() end)
+                map[cls] = nil
+                styled[pk] = nil
+                style_targets[pk] = nil
+                pseudo_mutated = true
             end
         end
+        if next(map) == nil then pseudo_kids[parent] = nil end
     end
+    local _, new_srev = G.style_state()
+    if pseudo_mutated then
+        last_style_rev = new_srev
+    elseif new_srev ~= last_style_rev then
+        styles_dirty = true
+    end
+    G.style_watch_reset(style_watch_roots(links))
 end
 
 ---------------------------------------------------------- ParticleEmitter2D
@@ -2579,6 +2775,20 @@ get["BillboardGui.CurrentDistance"] = function(b)
     return f32((pos - Vector3.new(x, y, z)).Magnitude)
 end
 
+LM.CaptureSnapshotAsync = function(self)
+    if typeof(self) ~= "Instance" or not self:IsA("ViewportFrame") then
+        error("Expected ':' not '.' calling member function CaptureSnapshotAsync", 0)
+    end
+    local id = G.vf_snap_start(self)
+    local res
+    for _ = 1, 180 do
+        task.wait()
+        res = G.vf_snap_poll(id)
+        if res ~= nil then break end
+    end
+    return res or ""
+end
+
 ------------------------------------------------------- TextGenerator
 -- Studio generates through the place's universe (/user/cloud/v2/
 -- universes/{id}:generateText) with the user's session; it must be in the
@@ -2742,7 +2952,7 @@ local function start_dialog_ui()
         if G.send then G.send(dialog, "SetDialogInUse", on == true) end
     end
     function rrs:WaitForChild() return remote end
-    for _, d in game:GetDescendants() do dialog_track(d) end
+    for _, d in G.find_classes({ "Dialog" }) do dialog_track(d) end
     local dialog_added_sig, dialog_removing_sig = G.class_signals({ "Dialog" })
     dialog_added_sig:Connect(dialog_track)
     dialog_removing_sig:Connect(function(i)
@@ -2790,6 +3000,28 @@ local function start_dialog_ui()
 end
 
 local prompt_ui_started = false
+local function preferred_prompt(candidate, current)
+    return not current or candidate.alignment > current.alignment
+        or (candidate.alignment == current.alignment and candidate.order < current.order)
+end
+local function prompt_clear(prompt, character, origin, direction)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local excluded = {character}
+    local holder = prompt.Parent
+    if isa(holder, "Attachment") then holder = holder.Parent end
+    if holder then table.insert(excluded, holder) end
+    while true do
+        params.FilterDescendantsInstances = excluded
+        local hit = workspace:Raycast(origin, direction, params)
+        if not hit then return true end
+        local part = hit.Instance
+        if not isa(part, "BasePart") or isa(part, "Terrain") or part.Transparency <= 0.95 then
+            return false
+        end
+        table.insert(excluded, part)
+    end
+end
 local function step_prompts()
     if not dialog_ui_started then start_dialog_ui() end
     if not prompt_ui_started and local_player() then
@@ -2816,50 +3048,36 @@ local function step_prompts()
     local char = player and player.Character
     local root = char and (char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart)
     local want = {}
-    if root then
+    local camera = workspace.CurrentCamera
+    if root and camera then
         local origin = root.Position
+        local view = camera.CFrame
         local best_key, best_all = {}, nil
-        local cands = {}
-        for p in tracked.ProximityPrompt do
+        for p, order in tracked.ProximityPrompt do
             if p.Enabled and p:IsDescendantOf(workspace) then
                 local pos = prompt_pos(p)
-                if pos then
-                    local d = (pos - origin).Magnitude
-                    local ok = d <= p.MaxActivationDistance
-                    if ok and p.RequiresLineOfSight then
-                        local params = RaycastParams.new()
-                        params.FilterType = Enum.RaycastFilterType.Exclude
-                        local excl = { char }
-                        local holder = p.Parent
-                        if isa(holder, "Attachment") then holder = holder.Parent end
-                        if holder then table.insert(excl, holder) end
-                        params.FilterDescendantsInstances = excl
-                        local hitr = workspace:Raycast(origin, pos - origin, params)
-                        if hitr then ok = false end
+                if pos and (pos - origin).Magnitude <= p.MaxActivationDistance then
+                    -- UIOffset only positions the drawn widget. Eligibility
+                    -- and priority use the projected world attachment.
+                    local _, on_screen = camera:WorldToViewportPoint(pos)
+                    local sightline = pos - view.Position
+                    if on_screen and (not p.RequiresLineOfSight or prompt_clear(p, char, view.Position, sightline)) then
+                        local ex = p.Exclusivity
+                        local c = { p = p, order = order, alignment = view.LookVector:Dot(sightline.Unit) }
+                        if ex == Enum.ProximityPromptExclusivity.AlwaysShow then
+                            want[p] = true
+                        elseif ex == Enum.ProximityPromptExclusivity.OneGlobally then
+                            if preferred_prompt(c, best_all) then best_all = c end
+                        else
+                            local k = p.KeyboardKeyCode
+                            if preferred_prompt(c, best_key[k]) then best_key[k] = c end
+                        end
                     end
-                    if ok then table.insert(cands, { p = p, d = d }) end
                 end
             end
         end
-        for _, c in cands do
-            local ex = c.p.Exclusivity
-            if ex == Enum.ProximityPromptExclusivity.AlwaysShow then
-                want[c.p] = true
-            elseif ex == Enum.ProximityPromptExclusivity.OneGlobally then
-                if not best_all or c.d < best_all.d then best_all = c end
-            else
-                local k = c.p.KeyboardKeyCode
-                if not best_key[k] or c.d < best_key[k].d then best_key[k] = c end
-            end
-        end
         for _, c in best_key do want[c.p] = true end
-        if best_all then
-            local clash = false
-            for _, c in best_key do
-                if c.d < best_all.d then clash = true end
-            end
-            if not clash then want[best_all.p] = true end
-        end
+        if best_all then want[best_all.p] = true end
     end
     local pps = svc("ProximityPromptService")
     if pps and not pps.Enabled then want = {} end
@@ -2897,48 +3115,69 @@ end
 
 ---------------------------------------------------------------------- step
 -- Drops tracked instances that were destroyed (no Parent read possible).
-local prune
-do
-local function parent_of(i) return i.Parent end
-local function gone(i) return not pcall(parent_of, i) end
-local drop_gone = G.drop_gone
-local style_swept_at = -math.huge
-prune = function()
-    for _, set_ in tracked do drop_gone(set_) end
-    drop_gone(shown_prompts, holds, dialog_set, playing_fx, tweening)
-    if hover_a and gone(hover_a) then hover_a = nil end
-    if press and gone(press.a) then press = nil end
-    if focused and gone(focused) then focused = nil G.set_focus(nil) end
-    if equipped_tool and gone(equipped_tool) then equipped_tool = nil end
-    -- The style tables grow with the CoreScripts' UI (thousands of styled
-    -- objects): swept twice a second, not every frame.
-    local now = os.clock()
-    if now - style_swept_at < 0.5 then return end
-    style_swept_at = now
-    drop_gone(styled, style_targets, rule_props, rule_trans, sheet_derives, query_conds, pseudos)
-end
-end
-
--- step_all's phases, in order; each one's time is bench section gi_<name>
--- (gui_input.rs bench_phase, same order).
-local step_all
-do
-local STEP_PHASES = {
-    prune, step_fx, step_inspect, start_tracking, step_topbar, step_focus, step_tools,
-    step_pages, step_drags, step_adorns, step_mouse, step_prompts, step_styles,
-}
-local CLIENT_FROM = 3 -- the phases from step_inspect on are a client's
-local bench_phase, clock = G.bench_phase, os.clock
-step_all = function(dt)
-    refresh_game()
-    local client = G.is_client()
-    for i, phase in STEP_PHASES do
-        if i >= CLIENT_FROM and not client then return end
-        local t0 = clock()
-        phase(dt)
-        bench_phase(i - 1, (clock() - t0) * 1000)
+local function prune()
+    for _, set_ in tracked do
+        for i in set_ do
+            if not pcall(function() return i.Parent end) then set_[i] = nil end
+        end
+    end
+    for i in shown_prompts do
+        if not pcall(function() return i.Parent end) then shown_prompts[i] = nil holds[i] = nil end
+    end
+    for d in dialog_set do
+        if not pcall(function() return d.Parent end) then dialog_set[d] = nil end
+    end
+    if hover_a and not pcall(function() return hover_a.Parent end) then hover_a = nil end
+    if press and not pcall(function() return press.a.Parent end) then press = nil end
+    if focused and not pcall(function() return focused.Parent end) then focused = nil G.set_focus(nil) end
+    if equipped_tool and not pcall(function() return equipped_tool.Parent end) then equipped_tool = nil end
+    for fx in playing_fx do
+        if not pcall(function() return fx.Parent end) then playing_fx[fx] = nil end
+    end
+    for pl in tweening do
+        if not pcall(function() return pl.Parent end) then tweening[pl] = nil end
+    end
+    for inst in styled do
+        if not pcall(function() return inst.Parent end) then styled[inst] = nil style_targets[inst] = nil end
+    end
+    for _, tbl in { rule_props, rule_trans, sheet_derives, query_conds, pseudo_kids } do
+        for k in tbl do
+            if not pcall(function() return k.Parent end) then tbl[k] = nil end
+        end
     end
 end
+
+local last_prune_rev = -1
+local function step_all(dt)
+    refresh_game()
+    local tree_rev, style_rev, vw, vh, hover_sig = G.style_state()
+    if tree_rev ~= last_prune_rev then
+        last_prune_rev = tree_rev
+        G.profile_step(1, prune)
+    end
+    step_fx()
+    if not G.is_client() then return end
+    local edit = G.is_edit()
+    if not edit then step_inspect() end
+    start_tracking()
+    if not edit then step_topbar() end
+    step_focus()
+    if not edit then step_tools() end
+    step_pages(dt)
+    step_drags()
+    step_adorns()
+    step_mouse()
+    if not edit then step_prompts() end
+    G.profile_step(2, step_styles, style_rev, vw, vh, hover_sig)
+    return styles_dirty
+        or next(playing_fx) ~= nil
+        or next(tweening) ~= nil
+        or active_drag ~= nil
+        or hover_a ~= nil
+        or press ~= nil
+        or mouse_moved
+        or focused ~= nil
+        or next(tracked.Adorn) ~= nil
 end
 
 -- The Play server's plugin widgets (plugin_host/widgets_ui.rs, GUI
@@ -2961,8 +3200,12 @@ function M.focus_now()
 end
 
 function M.step(dt)
-    local ok, err = xpcall(step_all, debug.traceback, dt)
-    if not ok then log("error", "gui_input step: " .. tostring(err):gsub("\n", " | ")) end
+    local ok, res = xpcall(step_all, debug.traceback, dt)
+    if not ok then
+        log("error", "gui_input step: " .. tostring(res):gsub("\n", " | "))
+        return true
+    end
+    return res == true
 end
 
 return M

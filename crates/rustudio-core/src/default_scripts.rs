@@ -16,8 +16,7 @@
 //! Roblox's client reads it today (`input_action_system_on`):
 //!
 //! - Enabled — the Input Action System layout (checked in Vinegar's Studio
-//!   0.747 at Play: checks/humanoid-physics/feel/studio-0.747-starterplayer-
-//!   tree.txt): `StarterPlayer.PlayerModule` (ModuleScript tree with
+//!   0.747 at Play): `StarterPlayer.PlayerModule` (ModuleScript tree with
 //!   CameraModule, ControlModule, PlayerModuleInternal …, the Scripts
 //!   PlayerScriptsLoader (RunContext Client) and InputSetup (RunContext
 //!   Server), and the `InputContexts` folder of InputContext / InputAction /
@@ -31,34 +30,29 @@
 //!   the opt-in gets in Roblox's client: the rollout's phase 1 (through
 //!   2026; phase 2 — Default meaning Enabled — early 2027; devforum "Input
 //!   Action System: PlayerScripts rollout", t/4678416) resolves Default to
-//!   Disabled, so a live Baseplate's
-//!   `Player.PlayerScripts` holds `PlayerScriptsLoader`, `PlayerModule` and
-//!   `RbxCharacterSounds`, and games `require(PlayerScripts.PlayerModule)
-//!   :GetControls()`. StarterPlayerScripts gets `PlayerScriptsLoader`
-//!   (LocalScript), `PlayerModule` (ModuleScript tree: CameraModule,
-//!   ControlModule, CommonUtils — `OldPlayerScripts.rbxp`'s tree) and
-//!   `RbxCharacterSounds` (LocalScript + AtomicBinding), from
+//!   Disabled, so a live Baseplate's `Player.PlayerScripts` holds
+//!   `PlayerScriptsLoader`, `PlayerModule` and `RbxCharacterSounds`, and
+//!   games `require(PlayerScripts.PlayerModule):GetControls()`.
+//!   StarterPlayerScripts gets `PlayerScriptsLoader` (LocalScript),
+//!   `PlayerModule` (ModuleScript tree: CameraModule, ControlModule,
+//!   CommonUtils — `OldPlayerScripts.rbxp`'s tree) and `RbxCharacterSounds`
+//!   (LocalScript + AtomicBinding), from
 //!   `ExtraContent/scripts/PlayerScripts/StarterPlayerScripts` and
 //!   `StarterPlayerScriptsCommon`; the client copies them into
 //!   `Player.PlayerScripts` at join (play.rs). The same layout serves an
-//!   install without the project file. A place's own PlayerModule /
-//!   PlayerScriptsLoader in StarterPlayerScripts wins there (the loader is
-//!   added beside a fork). `mech::PLAYER_SCRIPTS_DEFAULT_IAS` is where Default flips
-//!   when Roblox's phase 2 comes (the 0.747 Studio capture above is of the
-//!   Enabled layout; what a published place's players get is the rollout's
-//!   reading of Default).
+//!   install without the project file. `mech::PLAYER_SCRIPTS_DEFAULT_IAS` is
+//!   where Default flips when Roblox's phase 2 comes.
 //! - Each new character gets `Health` (Script,
 //!   `content/avatar/scripts/humanoidHealthRegenScript.rbxmx`) and `Animate`
 //!   (LocalScript with its animation values: R15
 //!   `content/avatar/scripts/humanoidAnimateR15_DEPRECATED_20260813.rbxm`,
 //!   R6 `content/avatar/scripts/humanoidAnimatePlayEmote.rbxm`).
 //!
-//! A place's own script of the same name in the destination wins, as in
-//! Studio. In the Input Action System layout a custom module in
-//! StarterPlayerScripts can coexist with the default module under
-//! StarterPlayer. A place that forked the old character `Sound` script
-//! (StarterCharacterScripts) keeps its sounds and gets no RbxCharacterSounds
-//! (`own_character_sounds`).
+//! A place's own script of the same name in the destination wins. In the
+//! Input Action System layout a custom module in StarterPlayerScripts can
+//! coexist with the default module under StarterPlayer. A place that forked
+//! the old character `Sound` script (StarterCharacterScripts) keeps its
+//! sounds and gets no RbxCharacterSounds (`own_character_sounds`).
 
 use std::path::{Path, PathBuf};
 
@@ -404,10 +398,9 @@ pub fn insert_player_scripts(doc: &mut Document) -> Result<Vec<&'static str>, St
 /// LocalScript next to PlayerModule, and all it does is require the module
 /// once, which starts its CameraModule and ControlModule. Used when Studio's
 /// content (the real loader) isn't at hand but a PlayerModule is: a place
-/// with its own fork of the module in StarterPlayerScripts (LBG) got no
-/// loader at all without the content, nothing required the fork, and its
-/// MouseLockController (shift lock), camera and controls never ran while
-/// the engine's keyboard stand-in moved the character.
+/// with its own fork of the module in StarterPlayerScripts got no loader at
+/// all without the content, nothing required the fork, and its camera and
+/// controls never ran while the engine's keyboard stand-in moved the character.
 pub const PLAYER_SCRIPTS_LOADER: &str = "\
 -- rustudio: stands in for Roblox's PlayerScriptsLoader, which the client\n\
 -- adds beside PlayerModule. Requiring the module once starts its camera\n\
@@ -453,8 +446,7 @@ fn insert_player_scripts_from(doc: &mut Document, root_dir: &Path) -> Result<Vec
     let base = root_dir.join(PLAYER_SCRIPTS);
     let mut added = Vec::new();
     // The Input Action System layout: StarterPlayer.PlayerModule (see the
-    // module docs). CreateDefaultPlayerModule false: the place forked it. A
-    // place's own modules in StarterPlayerScripts coexist with it.
+    // module docs). CreateDefaultPlayerModule false: the place forked it.
     let create_default = doc.prop(sp, "CreateDefaultPlayerModule") != Some(Variant::Bool(false));
     if input_action_system_on(doc) {
         let project = base.join("PlayerScripts.rbxp");

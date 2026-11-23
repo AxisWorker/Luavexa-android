@@ -5,6 +5,8 @@
 
 #[path = "env_probe_gpu.rs"]
 pub mod env_probe_gpu;
+#[path = "sky_env_filter.rs"]
+mod sky_env_filter;
 #[path = "vf_render.rs"]
 pub mod vf;
 
@@ -30,13 +32,12 @@ const LSHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// One face's uniforms for the light shadow pass, at a dynamic offset.
 const LSHADOW_FACE_STRIDE: u64 = 256;
 
-/// The local light shadow atlas (Studio's Future path: a cube map per
-/// shadowed light, Studio measurements "Local light shadows").
+/// The local light shadow atlas for Realistic lighting.
 pub struct LightShadows {
     moments_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
-    /// ShadowSlot per light (6 view-projections + position / 1 over Range).
+    /// ShadowSlot per light (6 view-projections, plus position and signed inverse far distance).
     slots_buf: wgpu::Buffer,
     /// LFace per face, read at a dynamic offset.
     face_buf: wgpu::Buffer,
@@ -127,11 +128,30 @@ impl LightShadows {
             (proj * Mat4::look_to_rh(pos, a, up), a)
         })
     }
+
+    /// A directional SurfaceLight projects from a virtual point behind the
+    /// emitting rectangle. The near plane is the rectangle itself.
+    fn surface_face(light: &LightRaw, pos: Vec3, range: f32) -> Option<(Mat4, Vec3, Vec3, f32)> {
+        let cos_half = light.dir[3];
+        let half_extent = light.surface_u[3].max(light.surface_v[3]);
+        if light.color[3] < 1.5 || !(0.0 < cos_half && cos_half < 1.0) || half_extent <= 0.0 {
+            return None;
+        }
+        let half_angle = cos_half.acos();
+        let near = (half_extent / half_angle.tan()).max(rustudio_core::mech::LSHADOW_NEAR);
+        let far = near + range;
+        if far <= near {
+            return None;
+        }
+        let axis = Vec3::from_slice(&light.dir[..3]);
+        let up = Vec3::from_slice(&light.surface_v[..3]);
+        let origin = pos - axis * near;
+        let vp = Mat4::perspective_rh(2.0 * half_angle, 1.0, near, far)
+            * Mat4::look_to_rh(origin, axis, up);
+        Some((vp, axis, origin, far.recip()))
+    }
 }
 const SAMPLES: u32 = 4;
-/// DepthOfFieldEffect intensity from which Studio runs the reduced near chain
-/// instead of the full-resolution cheap pass (shader.wgsl DOF_CHEAP_BELOW).
-const DOF_CHEAP_BELOW: f32 = 0.22;
 const SHADOW_SIZE: u32 = rustudio_core::mech::SHADOW_MAP_TEXELS;
 
 #[repr(C)]
@@ -361,6 +381,7 @@ impl PartDraw {
 
 pub struct Frame<'a> {
     pub globals: Globals,
+    pub postfx: crate::postfx::PostFxParams,
     pub quality: Option<crate::quality::Profile>,
     /// Ordinary (not reverse-Z) view-projection, for culling.
     pub cull_view_proj: Mat4,
@@ -391,6 +412,7 @@ const CELL: f32 = rustudio_core::mech::RENDER_CELL;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Pass {
     Opaque,
+    Cutout,
     Decal,
 }
 
@@ -401,10 +423,15 @@ fn pass_of(p: &PartDraw) -> Option<Pass> {
         // equal distances, and translucent hosts draw behind their decals.
         None
     } else if p.tex_mode == TexMode::Cutout && p.texture.is_some() {
-        // SurfaceAppearance AlphaMode Transparency: blended by texel alpha
-        // on an opaque part too, never cut out (Studio 0.747: alpha 0.5 shows
-        // half, 0.31 faintly; checks/sa-color).
-        None
+        // SurfaceAppearance AlphaMode Transparency: opaque parts draw in the
+        // opaque pass with alpha-to-coverage (MSAA) and cast alpha-tested
+        // shadows (Studio's DefaultUnifiedSurfaceAppearanceDitheredFS / DepthFS);
+        // translucent parts (Transparency > 0) blend back-to-front.
+        if p.alpha >= 0.999 && p.material_id != 1584 {
+            Some(Pass::Cutout)
+        } else {
+            None
+        }
     } else if p.alpha >= 0.999 && p.material_id != 1584 {
         Some(Pass::Opaque)
     } else {
@@ -474,6 +501,7 @@ pub mod gpu_check {
         for quality in [None, Some(crate::quality::Profile::at(1)), Some(crate::quality::Profile::at(17))] {
             let frame = Frame {
                 globals,
+                postfx: Default::default(),
                 quality,
                 cull_view_proj: proj * view,
                 fov_y: 1.0,
@@ -494,7 +522,6 @@ pub mod gpu_check {
                 probe: None,
             };
             r.render(&rs, [320, 180], &frame);
-            r.finish_frame(&rs);
         }
         // The env probe's faces and a ViewportFrame: drawn with the startup
         // pipelines into their own targets, so their sample counts must
@@ -504,6 +531,7 @@ pub mod gpu_check {
         let probe = env_probe_gpu::ProbeFrame { centre: Vec3::ZERO, tasks, blend: 0.5, swap: false };
         let frame = Frame {
             globals,
+            postfx: Default::default(),
             quality: None,
             cull_view_proj: proj * view,
             fov_y: 1.0,
@@ -518,7 +546,6 @@ pub mod gpu_check {
             probe: Some(probe),
         };
         r.render(&rs, [320, 180], &frame);
-        r.finish_frame(&rs);
         let (layer, part) = (Ref::new(), Ref::new());
         r.set_layer(part, Some(layer));
         r.set_item(part, vec![PartDraw { custom_mesh: None, ..scene.parts[0].draw }]);
@@ -540,9 +567,6 @@ pub mod gpu_check {
             drop(crate::world_gui::WorldGuiPass::new(&device, &queue, DISPLAY_FORMAT, samples));
             drop(crate::highlight::HighlightPass::new(&device, DISPLAY_FORMAT, DEPTH_FORMAT, samples, std::mem::size_of::<Vertex>() as u64));
         }
-        // (the render thread's commands, then the GPU; a validation error
-        // there is raised again here)
-        crate::render_thread::wait();
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         drop(r);
         let err = crate::gpu_caps::block_on(scope.pop());
@@ -966,6 +990,32 @@ struct StaticLayout {
     /// Bounding spheres (before and after) of in-place caster changes since
     /// the last frame: SunCache drops only the cascades they reach.
     caster_dirty: Vec<(Vec3, f32)>,
+}
+
+/// A prefix of identical slots already lives on the GPU. Any slots with
+/// pending writes are compared only after they have been uploaded, so the
+/// prefix ends at the first such slot even when the two CPU copies agree.
+fn static_upload_start(current: &StaticLayout, next: &[InstanceRaw]) -> usize {
+    const CHUNK: usize = 32;
+    let common = current.raw.len().min(next.len());
+    let clean = current.writes.iter().min().map_or(common, |&slot| common.min(slot as usize));
+    current.raw[..clean].chunks(CHUNK).zip(next[..clean].chunks(CHUNK))
+        .take_while(|(old, new)| bytemuck::cast_slice::<_, u8>(old) == bytemuck::cast_slice::<_, u8>(new))
+        .map(|(unchanged, _)| unchanged.len())
+        .sum()
+}
+
+#[cfg(test)]
+#[test]
+fn static_upload_prefix_respects_unflushed_writes_and_moved_slots() {
+    let mut current = StaticLayout { raw: vec![HIDDEN; 128], ..Default::default() };
+    let mut next = current.raw.clone();
+    assert_eq!(static_upload_start(&current, &next), 128);
+    current.writes.push(93);
+    assert_eq!(static_upload_start(&current, &next), 93);
+    next[65].size[0] = 1.0;
+    assert_eq!(static_upload_start(&current, &next), 64);
+    assert_eq!(static_upload_start(&current, &next[..31]), 31);
 }
 
 /// Whether the shadow passes (vs_shadow: depth only) draw two instances
@@ -1392,7 +1442,7 @@ impl MaterialArrays {
         };
         let albedo = make("material albedo", wgpu::TextureFormat::Rgba8Unorm);
         let surface = make("material surface", wgpu::TextureFormat::Rgba8Unorm);
-        let emission = make("material emission", wgpu::TextureFormat::R8Unorm);
+        let emission = make("material emission and tint", wgpu::TextureFormat::Rg8Unorm);
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("material params"),
             contents: bytemuck::cast_slice(&params),
@@ -1436,7 +1486,7 @@ impl MaterialArrays {
     }
 
     fn upload(&self, queue: &wgpu::Queue, layer: u32, maps: &crate::matpack::Pixels) {
-        for (tex, data, channels) in [(&self.albedo, &maps.albedo, 4), (&self.surface, &maps.surface, 4), (&self.emission, &maps.emissive, 1)] {
+        for (tex, data, channels) in [(&self.albedo, &maps.albedo, 4), (&self.surface, &maps.surface, 4), (&self.emission, &maps.emission_tint, 2)] {
             for (mip, (at, size)) in crate::matpack::mip_levels().into_iter().enumerate() {
                 let at = at / (4 / channels) as usize;
                 let bytes = (size * size * channels) as usize;
@@ -2067,28 +2117,10 @@ struct Target {
     hdr_view: wgpu::TextureView,
     /// The opaque scene's colour, copied for the water pass to look through.
     scene_copy: wgpu::Texture,
-    scene_copy_view: wgpu::TextureView,
     water_bg: wgpu::BindGroup,
     water_depth: wgpu::TextureView,
     glass_bg: wgpu::BindGroup,
     glass_depth: wgpu::TextureView,
-    hdr_bg: wgpu::BindGroup,
-    post_depth_bg: wgpu::BindGroup,
-    dof_bgs: [wgpu::BindGroup; 2],
-    near_bgs: Vec<wgpu::BindGroup>,
-    near_views: Vec<wgpu::TextureView>,
-    dof_views: [wgpu::TextureView; 2],
-    /// Linear bloom pyramid, from half resolution through 1/32 resolution.
-    bloom_view: wgpu::TextureView,
-    bloom_bright_capture: Option<wgpu::Texture>,
-    bloom_textures: Vec<wgpu::Texture>,
-    bloom_levels: Vec<wgpu::TextureView>,
-    bloom_down_bgs: Vec<wgpu::BindGroup>,
-    bloom_up_bgs: Vec<wgpu::BindGroup>,
-    /// Native BlurEffect: 1/4-res ping-pong targets + bind groups
-    /// (downsample -> H -> V; final blurred HDR scene in `blur_views[1]`).
-    blur_views: [wgpu::TextureView; 2],
-    blur_bgs: [wgpu::BindGroup; 3],
     /// SSAO at half resolution: the AO depth, then (occlusion, depth) ping-
     /// ponged through the blurs; a bind group per pass (depth + its input).
     ssao_depth_view: wgpu::TextureView,
@@ -2100,13 +2132,13 @@ struct Target {
 }
 
 struct ViewportPipelines {
-    /// The sample count these pipelines were built for (1 on OpenGL).
-    samples: u32,
     water: crate::water::WaterPass,
     glass_resolve: wgpu::RenderPipeline,
     sky: wgpu::RenderPipeline,
     opaque: wgpu::RenderPipeline,
     opaque_two_sided: wgpu::RenderPipeline,
+    cutout: wgpu::RenderPipeline,
+    cutout_two_sided: wgpu::RenderPipeline,
     opaque_low: Option<[[wgpu::RenderPipeline; 2]; 2]>,
     /// fs_part specialised (shader.wgsl SPEC_*) for runs of untextured,
     /// non-glass/water/ForceField parts in a frame without a debug view:
@@ -2122,17 +2154,16 @@ struct ViewportPipelines {
     glass_culled: wgpu::RenderPipeline,
     transparent: wgpu::RenderPipeline,
     decal_depth: wgpu::RenderPipeline,
+    decal_depth_culled: wgpu::RenderPipeline,
     lines: wgpu::RenderPipeline,
-    post: wgpu::RenderPipeline,
     ssao_layout: wgpu::BindGroupLayout,
     ssao_down: wgpu::RenderPipeline,
     ssao_main: wgpu::RenderPipeline,
-    dof_h: wgpu::RenderPipeline,
-    near_pipelines: Vec<wgpu::RenderPipeline>,
     ssao_blur_x: wgpu::RenderPipeline,
     ssao_blur_y: wgpu::RenderPipeline,
     ssao_apply: wgpu::RenderPipeline,
     terrain: wgpu::RenderPipeline,
+    terrain_low: Option<wgpu::RenderPipeline>,
     overlay: wgpu::RenderPipeline,
     see_pipes: SeePipes,
     see: SeeThrough,
@@ -2266,7 +2297,7 @@ impl ViewportPipelines {
             T::TriangleList,
             None,
             false,
-            C::Always,
+            C::Equal,
             None,
         );
         let opaque = make(
@@ -2291,6 +2322,50 @@ impl ViewportPipelines {
             C::Greater,
             None,
         );
+        let make_cutout = |label: &str, cull: Option<wgpu::Face>| {
+            let fs = if samples > 1 { "fs_part_cutout" } else { "fs_part_cutout_test" };
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&part_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_part"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: T::TriangleList,
+                    cull_mode: cull,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(C::Greater),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: samples,
+                    mask: !0,
+                    alpha_to_coverage_enabled: samples > 1,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: HDR_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: crate::pipeline_cache::current(),
+            })
+        };
+        let cutout = make_cutout("parts-cutout", Some(wgpu::Face::Back));
+        let cutout_two_sided = make_cutout("parts-cutout-two-sided", None);
         // The debug views stay compiled in: without them ANV fuses some of
         // the lighting's shared products differently (one test-place pixel's
         // green rounded a step lower, deterministically); with them every
@@ -2320,6 +2395,9 @@ impl ViewportPipelines {
         let decal_depth = make("decal opaque texel depth", "vs_part", "fs_decal_depth",
             &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
             T::TriangleList, None, true, C::Greater, None);
+        let decal_depth_culled = make("decal opaque texel depth culled", "vs_part", "fs_decal_depth",
+            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+            T::TriangleList, Some(wgpu::Face::Back), true, C::Greater, None);
         let transparent = make(
             "parts-transparent",
             "vs_part",
@@ -2397,13 +2475,13 @@ impl ViewportPipelines {
             bind_group_layouts: &[Some(&bgl), Some(&terrain_bgl)],
             immediate_size: 0,
         });
-        let terrain = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let terrain_pipeline = |constants| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("terrain"),
             layout: Some(&terrain_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_terrain"),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
                 buffers: &[Some(terrain_vertex_layout.clone())],
             },
             primitive: wgpu::PrimitiveState {
@@ -2422,7 +2500,7 @@ impl ViewportPipelines {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_terrain"),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions { constants, ..Default::default() },
                 targets: &[Some(wgpu::ColorTargetState {
                     format: HDR_FORMAT,
                     blend: None,
@@ -2432,6 +2510,8 @@ impl ViewportPipelines {
             multiview_mask: None,
             cache: crate::pipeline_cache::current(),
         });
+        let terrain = terrain_pipeline(&[]);
+        let terrain_low = (samples == 1).then(|| terrain_pipeline(&[("TERRAIN_LOW", 1.0)]));
         let ssao_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ssao"),
             entries: &[
@@ -2460,90 +2540,6 @@ impl ViewportPipelines {
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None,
                 },
             ],
-        });
-        let post_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("post with depth"),
-            bind_group_layouts: &[Some(&bgl), Some(&tex_layout), Some(&ssao_layout)],
-            immediate_size: 0,
-        });
-        let post = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("post"),
-            layout: Some(&post_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_post"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_post"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: DISPLAY_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: crate::pipeline_cache::current(),
-        });
-        let near_fullscreen = |label: &str, fs: &str, targets: usize| {
-            let t = Some(wgpu::ColorTargetState {
-                format: HDR_FORMAT,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&post_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_post"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &vec![t; targets],
-                }),
-                multiview_mask: None,
-                cache: crate::pipeline_cache::current(),
-            })
-        };
-        let near_pipelines = ["fs_near_h", "fs_near_v", "fs_near_mask0", "fs_near_mask1", "fs_near_mask2", "fs_near_mask3", "fs_near_mask4", "fs_near_mask5", "fs_near_edge", "fs_near_bokeh", "fs_near_tent"].iter().map(|fs| near_fullscreen("dof near", fs, 1)).collect();
-        let dof_h = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("dof prepare"),
-            layout: Some(&post_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_post"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_dof_h"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: HDR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: crate::pipeline_cache::current(),
         });
         let ssao_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ssao"),
@@ -2611,12 +2607,13 @@ impl ViewportPipelines {
 
 
         Self {
-            samples,
             water,
             glass_resolve,
             sky,
             opaque,
             opaque_two_sided,
+            cutout,
+            cutout_two_sided,
             opaque_low,
             opaque_plain,
             plain_spec: Default::default(),
@@ -2626,17 +2623,16 @@ impl ViewportPipelines {
             glass_culled,
             transparent,
             decal_depth,
+            decal_depth_culled,
             lines,
-            post,
             ssao_layout,
             ssao_down,
             ssao_main,
-            dof_h,
-            near_pipelines,
             ssao_blur_x,
             ssao_blur_y,
             ssao_apply,
             terrain,
+            terrain_low,
             overlay,
             see_pipes,
             see,
@@ -2725,7 +2721,7 @@ fn opaque_part_pipeline(
             targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::current(),
     })
 }
 
@@ -2798,13 +2794,12 @@ pub struct Renderer {
     /// The viewport's passes per sample count (`sample_slot`), each built
     /// on first use (`ensure_pipelines`): a frame needs the set for its
     /// quality level's samples (quality.rs `samples`: one a pixel up to
-    /// level 16, as a weak GPU's levels are) and the probe's faces the
-    /// `probe_samples` set; a set is some thirty pipelines through the
-    /// driver's compiler, a second or more of a phone's start before the
-    /// first frame.
+    /// level 16, as a weak GPU's levels are) and the probe/ViewportFrame
+    /// passes use `probe_samples` (4x when sampled MSAA is supported, 1x on
+    /// OpenGL); a set is some thirty pipelines through the driver's compiler.
     pipelines: [Option<ViewportPipelines>; 3],
-    /// The sample count the env probe's faces and ViewportFrame targets are
-    /// drawn with (`startup_samples`: 4x, or 1 where the 4x shader can't run).
+    /// Sample count used by the env probe faces and ViewportFrame targets
+    /// (`startup_samples(&caps)`: 4 with sampled MSAA, 1 on OpenGL).
     probe_samples: u32,
     /// The one-sample pipelines being made on a worker since startup, for
     /// a session that will draw with them (Automatic on a weak GPU, Low):
@@ -2827,36 +2822,24 @@ pub struct Renderer {
     material_epoch: Instant,
     /// Fog for the world GUI pass (gui_fog).
     gui_fog: ([f32; 4], [f32; 3]),
+    /// Scene exposure (2^ExposureCompensation) for the world GUI / effects buffer.
+    gui_exposure: f32,
     /// The cascades as the beams read them (matrices, spheres, tiles).
     gui_sun: crate::world_gui::SunCascades,
     gui_lightgrid: [f32; 4],
     gui_sun_params: [f32; 4],
     /// Local lights in lights_buf this frame (the effects read them).
     gui_n_lights: u32,
-    post_dof: bool,
-    /// `render` recorded a frame whose post chain `finish_frame` hasn't yet,
-    /// and the encoder the world GUIs and effects recorded into for it.
-    post_due: bool,
-    post_encoder: Option<wgpu::CommandEncoder>,
-    post_dof_near: bool,
-    dof_v: wgpu::RenderPipeline,
-    /// Studio's SSAO passes (shader.wgsl "SSAO"): depth down, occlusion,
-    /// blur across, blur down, and the multiply into the HDR scene.
-    /// Bloom: bright pass, blur across (two targets), blur down.
-    bloom_bright: wgpu::RenderPipeline,
-    bloom_down: wgpu::RenderPipeline,
-    bloom_up: wgpu::RenderPipeline,
-    post_bloom_size: f32,
-    blur_down: wgpu::RenderPipeline,
-    blur_h: wgpu::RenderPipeline,
-    blur_v: wgpu::RenderPipeline,
-    post_blur_size: f32,
+    postfx: crate::postfx::PostFx,
+    last_postfx: crate::postfx::PostFxParams,
     shadow: wgpu::RenderPipeline,
+    shadow_cutout: wgpu::RenderPipeline,
     /// Each sun cascade's static casters, kept between redraws (SunCache).
     sun_cache: SunCache,
     /// Local light shadow maps (Studio's Future path) and their pass.
     lshadow: LightShadows,
     lshadow_pipe: wgpu::RenderPipeline,
+    lshadow_cutout_pipe: wgpu::RenderPipeline,
     /// The reduced binding set (gpu_caps::GpuCaps::reduced_bindings).
     reduced: bool,
     /// What the GPU can do (gpu_caps.rs).
@@ -2896,7 +2879,14 @@ pub struct Renderer {
     sun: crate::sun_shadow::SunShadows,
     /// Terrain.Clouds' passes (clouds.rs), made on first use.
     clouds: [Option<crate::clouds::CloudsGpu>; 3],
+    sky_tex: wgpu::Texture,
     sky_view: wgpu::TextureView,
+    /// Raw 128px base mip of the current skybox (for baking Atmosphere into
+    /// mips base..levels before GGX prefiltering, matching Studio's
+    /// PrefilteredEnvTexture).
+    sky_base_raw: Option<Vec<u8>>,
+    sky_gen: u64,
+    sky_env_key: Option<SkyEnvKey>,
     /// Studio's indoor environment (textures/sky/indoor512); white 1×1 until
     /// loaded. The scene probe's slots start as it (env_probe_gpu).
     indoor_view: wgpu::TextureView,
@@ -2912,9 +2902,6 @@ pub struct Renderer {
     lightgrid_view: wgpu::TextureView,
     localgrid_tex: wgpu::Texture,
     localgrid_view: wgpu::TextureView,
-    /// Light grid copies taken since the last frame (lightgrid_gpu.rs),
-    /// recorded at the start of the next frame's encoder in arrival order.
-    grid_uploads: Vec<crate::lightgrid_gpu::GridUpload>,
     /// How much of each voxel parts fill, for local lights (lightocc.rs).
     lightocc_tex: wgpu::Texture,
     lightocc_view: wgpu::TextureView,
@@ -2938,6 +2925,8 @@ pub struct Renderer {
     sampler: wgpu::Sampler,
     /// Texture bind groups; index 0 is plain white.
     textures: Vec<wgpu::BindGroup>,
+    /// Unsubmitted texture upload bytes since the last staging flush.
+    pending_upload_bytes: usize,
     /// See-through draws in Studio's encoded blend (SeeThrough).
     /// Per-frame instances: moving and see-through parts, overlay.
     instance_buf: wgpu::Buffer,
@@ -3222,7 +3211,7 @@ impl Renderer {
             view_formats: &[],
         });
         let lightocc_view = lightocc_tex.create_view(&Default::default());
-        let sky_view = Self::cube_view(
+        let (sky_tex, sky_view) = Self::cube_view(
             device,
             queue,
             1,
@@ -3235,7 +3224,7 @@ impl Renderer {
                 vec![255; 4],
             ],
         );
-        let indoor_view = Self::cube_view(
+        let (_, indoor_view) = Self::cube_view(
             device,
             queue,
             1,
@@ -3460,6 +3449,46 @@ impl Renderer {
             multiview_mask: None,
             cache: crate::pipeline_cache::current(),
         });
+        let lshadow_cutout_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("light shadow cutout"),
+            bind_group_layouts: &[Some(&shadow_bgl), Some(&lshadow.face_layout), Some(&tex_layout)],
+            immediate_size: 0,
+        });
+        let lshadow_cutout_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("light shadow cutout"),
+            layout: Some(&lshadow_cutout_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_light_shadow_cutout"),
+                compilation_options: Default::default(),
+                buffers: &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: T::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(C::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_light_shadow_cutout"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: LSHADOW_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: crate::pipeline_cache::current(),
+        });
         // A cascade of the sun's shadow: depth only, both sides (thin
         // parts). No depth bias: the EVSM test's minimum variance is the bias.
         let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3473,6 +3502,37 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_shadow"),
+                compilation_options: Default::default(),
+                buffers: &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: T::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(C::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: None,
+            multiview_mask: None,
+            cache: crate::pipeline_cache::current(),
+        });
+        let shadow_cutout_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow cutout"),
+            bind_group_layouts: &[Some(&shadow_bgl), Some(&sun.pass_layout), Some(&tex_layout)],
+            immediate_size: 0,
+        });
+        let shadow_cutout = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadow cutout"),
+            layout: Some(&shadow_cutout_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_shadow_cutout"),
                 compilation_options: Default::default(),
                 buffers: &[Some(vertex_layout), Some(instance_layout)],
             },
@@ -3489,7 +3549,12 @@ impl Renderer {
                 bias: Default::default(),
             }),
             multisample: Default::default(),
-            fragment: None,
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_shadow_cutout"),
+                compilation_options: Default::default(),
+                targets: &[],
+            }),
             multiview_mask: None,
             cache: crate::pipeline_cache::current(),
         });
@@ -3580,59 +3645,13 @@ impl Renderer {
             multiview_mask: None,
             cache: crate::pipeline_cache::current(),
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("viewport post effects"),
-            bind_group_layouts: &[Some(&bgl), Some(&tex_layout)],
-            immediate_size: 0,
-        });
-        // Exposure, tone mapping, bloom and colour correction into the display texture.
-        let fullscreen = |label: &str, fs: &str, targets: usize| {
-            let t = Some(wgpu::ColorTargetState {
-                format: HDR_FORMAT,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_post"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &vec![t; targets],
-                }),
-                multiview_mask: None,
-                cache: crate::pipeline_cache::current(),
-            })
-        };
-
-        let dof_v = fullscreen("dof down", "fs_dof_v", 1);
-        let bloom_bright = fullscreen("bloom bright", "fs_bloom_bright", 1);
-        let bloom_down = fullscreen("bloom pyramid down", "fs_bloom_down", 1);
-        let bloom_up_desc = wgpu::RenderPipelineDescriptor {
-            label: Some("bloom pyramid up"), layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_post"), compilation_options: Default::default(), buffers: &[] },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_bloom_up"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: HDR_FORMAT, blend: Some(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent::REPLACE }), write_mask: wgpu::ColorWrites::ALL })] }),
-            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: crate::pipeline_cache::current(),
-        };
-        let bloom_up = device.create_render_pipeline(&bloom_up_desc);
-        let blur_down = fullscreen("blur down", "fs_blur_down", 1);
-        let blur_h = fullscreen("blur across", "fs_blur_h", 1);
-        let blur_v = fullscreen("blur down", "fs_blur_v", 1);
         let sky_globals = reduced.then(|| {
             let layout = Self::sky_globals_layout(device);
             let bg = Self::sky_globals_group(device, &layout, &globals_buf, &sky_view, &sky_sampler);
             (layout, bg)
         });
+        let probe_samples = startup_samples(&caps);
+
         let mut meshes: Vec<Mesh> = build_meshes()
             .into_iter()
             .map(|verts| Mesh::upload(device, "mesh", &verts, wgpu::BufferUsages::VERTEX, Some(true)))
@@ -3647,35 +3666,26 @@ impl Renderer {
         let line_cap = 4096;
         let mut r = Renderer {
             pipelines: [None, None, None],
-            probe_samples: startup_samples(&caps),
+            probe_samples,
             lower_pending: None,
             terrain_layout: terrain_bgl,
             skin: crate::skin_gpu::SkinGpu::new(device, caps.compute()),
             gui_fog: ([0.0, 1e9, 0.0, 0.0], [0.0; 3]),
+            gui_exposure: 1.0,
             gui_sun: Default::default(),
             gui_lightgrid: [0.0; 4],
             gui_sun_params: [0.0, 580.0, 0.05, 0.0],
             gui_n_lights: 0,
+            postfx: crate::postfx::PostFx::new(device, queue, HDR_FORMAT, DISPLAY_FORMAT),
+            last_postfx: crate::postfx::PostFxParams::default(),
             world_gui: [None, None, None],
             highlight: [None, None, None],
             adorn: [None, None, None],
             last_view_proj: Mat4::IDENTITY,
             glass_layout,
             material_epoch: Instant::now(),
-            post_dof: false,
-            post_due: false,
-            post_encoder: None,
-            post_dof_near: false,
-            dof_v,
-            bloom_bright,
-            bloom_down,
-            bloom_up,
-            post_bloom_size: 24.0,
-            blur_down,
-            blur_h,
-            blur_v,
-            post_blur_size: 0.0,
             shadow,
+            shadow_cutout,
             sun_cache,
             terrain_shadow,
             terrain_shadow_back,
@@ -3688,6 +3698,7 @@ impl Renderer {
             shadow_globals_bg,
             lshadow,
             lshadow_pipe,
+            lshadow_cutout_pipe,
             reduced,
             caps,
             static_gen: 0,
@@ -3700,7 +3711,11 @@ impl Renderer {
             shadow_view,
             sun,
             clouds: [None, None, None],
+            sky_tex,
             sky_view,
+            sky_base_raw: None,
+            sky_gen: 0,
+            sky_env_key: None,
             indoor_view,
             probe,
             probe_globals_bg,
@@ -3710,7 +3725,6 @@ impl Renderer {
             lightgrid_view,
             localgrid_tex,
             localgrid_view,
-            grid_uploads: Vec::new(),
             lightocc_tex,
             lightocc_view,
             studs_view,
@@ -3724,6 +3738,7 @@ impl Renderer {
             tex_layout,
             sampler,
             textures: Vec::new(),
+            pending_upload_bytes: 0,
             black_view,
             instance_buf: Self::make_buf(
                 device,
@@ -3762,6 +3777,8 @@ impl Renderer {
         let one_sample_likely = rustudio_core::rustudio_settings::weak_gpu()
             || rustudio_core::rustudio_settings::performance_value("quality") == "automatic"
             || rustudio_core::rustudio_settings::performance_value("detail") == "low";
+        // (not when the probe's set is the one-sample set already: OpenGL,
+        // where it would be built twice)
         if r.probe_samples != 1 && one_sample_likely && std::env::var_os("RUSTUDIO_NO_PIPELINE_PREBUILD").is_none() {
             let (device, queue) = (device.clone(), queue.clone());
             let (g, t, gl, tr, reduced) = (r.globals_layout.clone(), r.tex_layout.clone(), r.glass_layout.clone(), r.terrain_layout.clone(), r.reduced);
@@ -3779,8 +3796,6 @@ impl Renderer {
     /// The last frame as shown (RGBA8, top row first): width, height,
     /// pixels. Waits for the GPU; for tests.
     pub fn read_frame(&self, rs: &egui_wgpu::RenderState) -> Option<(u32, u32, Vec<u8>)> {
-        // (the frame's commands are submitted before the copy)
-        crate::render_thread::wait();
         let target = self.target.as_ref()?;
         let [w, h] = target.size;
         let row = (w * 4).div_ceil(256) * 256;
@@ -3846,14 +3861,15 @@ impl Renderer {
         let target = self.target.as_ref()?;
         {
             if let Ok(path) = std::env::var("RUSTUDIO_DUMP_HDR") {
-                let half = [(target.size[0] >> 1).max(1), (target.size[1] >> 1).max(1)];
-                if let Some(texture) = &target.bloom_bright_capture {
-                    if let Some((w,h,data)) = self.read_hdr_texture(rs, texture, half) {
-                        let _ = std::fs::write(format!("{path}.extract-{w}x{h}"), data);
+                if let Some((bloom_tex, bright_cap, half)) = self.postfx.bloom_dump_textures() {
+                    if let Some(texture) = bright_cap {
+                        if let Some((w, h, data)) = self.read_hdr_texture(rs, texture, half) {
+                            let _ = std::fs::write(format!("{path}.extract-{w}x{h}"), data);
+                        }
                     }
-                }
-                if let Some((w,h,data)) = self.read_hdr_texture(rs, &target.bloom_textures[0], half) {
-                    let _ = std::fs::write(format!("{path}.bloom-{w}x{h}"), data);
+                    if let Some((w, h, data)) = self.read_hdr_texture(rs, bloom_tex, half) {
+                        let _ = std::fs::write(format!("{path}.bloom-{w}x{h}"), data);
+                    }
                 }
                 // The scene environment probe's current slot, level 0 (env_probe.rs).
                 for f in 0..6 {
@@ -3872,7 +3888,6 @@ impl Renderer {
     }
 
     fn read_hdr_layer(&self, rs: &egui_wgpu::RenderState, texture: &wgpu::Texture, size: [u32; 2], layer: u32) -> Option<(u32,u32,Vec<u8>)> {
-        crate::render_thread::wait();
         let [w, h] = size;
         let row = (w * 8).div_ceil(256) * 256;
         let buf = rs.device.create_buffer(&wgpu::BufferDescriptor {
@@ -3958,11 +3973,10 @@ impl Renderer {
         mask: Option<(u32, u32, &[u8])>, surface: Option<(u32, u32, &[u8])>,
     ) -> u32 {
         let (sw, sh, sp) = surface.unwrap_or((1, 1, &[128, 128, 255, 0]));
-        // (a packed map made on an asset worker comes with its mip chain)
-        let chain: std::borrow::Cow<[u8]> = if sp.len() > (sw * sh * 4) as usize {
-            std::borrow::Cow::Borrowed(sp)
+        let surface_mips = if sp.len() == (sw * sh * 4) as usize {
+            std::borrow::Cow::Owned(data_mip_chain(sw, sh, sp))
         } else {
-            std::borrow::Cow::Owned(rustudio_core::texture::data_mip_chain(sw, sh, sp))
+            std::borrow::Cow::Borrowed(sp)
         };
         let surface_view = device.create_texture_with_data(queue, &wgpu::TextureDescriptor {
             label: Some("SurfaceAppearance normal roughness metalness"),
@@ -3970,7 +3984,7 @@ impl Renderer {
             mip_level_count: mip_levels(sw, sh), sample_count: 1,
             dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
-        }, wgpu::util::TextureDataOrder::LayerMajor, &chain)
+        }, wgpu::util::TextureDataOrder::LayerMajor, &surface_mips)
             .create_view(&Default::default());
         let mask_view = mask.map(|(w, h, px)| {
             device
@@ -3996,16 +4010,17 @@ impl Renderer {
                 .create_view(&Default::default())
         });
         let (w, h) = (width.max(1), height.max(1));
-        let ready = rustudio_core::texture::ready_mips(rgba);
-        let mips = if rgba.len() == (w * h * 4) as usize {
-            ready.unwrap_or_else(|| rustudio_core::texture::mip_chain(w, h, rgba))
+        let full_levels = mip_levels(w, h);
+        let (mips, levels) = if rgba.len() == (w * h * 4) as usize {
+            let ready = rustudio_core::texture::ready_mips(rgba);
+            let mips = ready.unwrap_or_else(|| rustudio_core::texture::mip_chain(w, h, rgba));
+            (std::borrow::Cow::Owned(mips), full_levels)
         } else {
-            rgba.to_vec()
-        };
-        let levels = if rgba.len() == (w * h * 4) as usize {
-            mip_levels(w, h)
-        } else {
-            1
+            let full_size: usize = (0..full_levels).map(|level| {
+                ((w >> level).max(1) * (h >> level).max(1) * 4) as usize
+            }).sum();
+            let levels = if rgba.len() == full_size { full_levels } else { 1 };
+            (std::borrow::Cow::Borrowed(rgba), levels)
         };
         let tex = device.create_texture_with_data(
             queue,
@@ -4026,6 +4041,13 @@ impl Renderer {
             wgpu::util::TextureDataOrder::LayerMajor,
             &mips,
         );
+        let uploaded = mips.len() + surface_mips.len() + mask.map_or(0, |(_, _, px)| px.len());
+        self.pending_upload_bytes += uploaded;
+        if self.pending_upload_bytes >= 32 * 1024 * 1024 {
+            queue.submit(std::iter::empty());
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            self.pending_upload_bytes = 0;
+        }
         let view = tex.create_view(&Default::default());
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("part texture"),
@@ -4214,7 +4236,8 @@ impl Renderer {
     /// Sets Studio's indoor environment cube (textures/sky/indoor512, faces
     /// in wgpu's cube order like `set_sky`).
     pub fn set_indoor(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, size: u32, faces: &[Vec<u8>; 6]) {
-        self.indoor_view = Self::cube_view(device, queue, size, faces);
+        let (_, view) = Self::cube_view(device, queue, size, faces);
+        self.indoor_view = view;
         // Both probe slots start as this cube (env_probe_gpu fill_default).
         self.probe.fill_default(device, queue, &self.indoor_view, size);
         self.rebind_globals(device);
@@ -4228,7 +4251,7 @@ impl Renderer {
         queue: &wgpu::Queue,
         size: u32,
         faces: &[Vec<u8>; 6],
-    ) -> wgpu::TextureView {
+    ) -> (wgpu::Texture, wgpu::TextureView) {
         // Each face with its mip chain (layer-major): the sky's reflection
         // on rough parts reads a blurred level (shader.wgsl sky_rough).
         let data = cube_mips(size, faces);
@@ -4241,7 +4264,7 @@ impl Renderer {
         queue: &wgpu::Queue,
         size: u32,
         data: &[u8],
-    ) -> wgpu::TextureView {
+    ) -> (wgpu::Texture, wgpu::TextureView) {
         let tex = device.create_texture_with_data(
             queue,
             &wgpu::TextureDescriptor {
@@ -4255,16 +4278,17 @@ impl Renderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::LayerMajor,
             data,
         );
-        tex.create_view(&wgpu::TextureViewDescriptor {
+        let view = tex.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::Cube),
             ..Default::default()
-        })
+        });
+        (tex, view)
     }
 
     fn sky_globals_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -4312,6 +4336,7 @@ impl Renderer {
     }
 
     fn rebind_globals(&mut self, device: &wgpu::Device) {
+        self.vf.globals_gen = self.vf.globals_gen.wrapping_add(1);
         if let Some((layout, bg)) = &mut self.sky_globals {
             *bg = Self::sky_globals_group(device, layout, &self.globals_buf, &self.sky_view, &self.sky_sampler);
         }
@@ -4576,22 +4601,180 @@ impl Renderer {
         size: u32,
         mipped: Option<&[u8]>,
     ) {
+        self.sky_gen = self.sky_gen.wrapping_add(1);
+        self.sky_env_key = None;
+        self.sky_base_raw = None;
         match mipped {
             Some(f) if size > 0 => {
-                self.sky_view = Self::cube_view_mipped(device, queue, size, f);
+                let (tex, view) = Self::cube_view_mipped(device, queue, size, f);
+                self.sky_tex = tex;
+                self.sky_view = view;
                 self.sky_size = size;
+                let pre = rustudio_core::mech::ENV_PREFILTER_SIZE;
+                if size >= pre * 2 {
+                    let levels = mip_levels(size, size) as usize;
+                    let base = (size / pre).trailing_zeros() as usize;
+                    let w = (size >> base) as usize;
+                    let face_len: usize = (0..levels).map(|l| ((size >> l).max(1) as usize).pow(2) * 4).sum();
+                    let base_off: usize = (0..base).map(|l| ((size >> l).max(1) as usize).pow(2) * 4).sum();
+                    let bytes = w * w * 4;
+                    if f.len() >= 6 * face_len {
+                        let mut raw = Vec::with_capacity(6 * bytes);
+                        for face in 0..6 {
+                            let o = face * face_len + base_off;
+                            raw.extend_from_slice(&f[o..o + bytes]);
+                        }
+                        self.sky_base_raw = Some(raw);
+                    }
+                }
             }
             _ => self.sky_size = 0,
         }
         self.rebind_globals(device);
     }
 
-    /// Takes a light grid upload (lightgrid_gpu.rs): its copies are recorded
-    /// first thing in the next frame's encoder.
-    pub fn upload_lightgrid(&mut self, up: crate::lightgrid_gpu::GridUpload) {
-        if !up.is_empty() {
-            self.grid_uploads.push(up);
+    /// Keeps mips `base..levels` of `sky_tex` matching Studio's
+    /// `PrefilteredEnvTexture` when an Atmosphere is active: evaluates
+    /// `AdvSkyLinearEnvFS` (sky + haze + sun glare) at 128px, then builds
+    /// the filtered mip levels.
+    fn update_sky_env(&mut self, queue: &wgpu::Queue, globals: &mut Globals) {
+        let pre = rustudio_core::mech::ENV_PREFILTER_SIZE;
+        let active = globals.atmos[3] > 0.5 && globals.params[3] > 0.5 && self.sky_size >= pre * 2;
+        if active {
+            let Some(base_raw) = self.sky_base_raw.as_deref() else {
+                globals.atmos_glare[3] = 0.0;
+                return;
+            };
+            let key = SkyEnvKey::from_globals(self.sky_gen, globals);
+            if self.sky_env_key != Some(key) {
+                let base = (self.sky_size / pre).trailing_zeros();
+                let mips = prefilter_env_mips(base_raw, pre, Some(globals));
+                for (i, (w, bytes)) in mips.into_iter().enumerate() {
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &self.sky_tex,
+                            mip_level: base + i as u32,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &bytes,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(w * 4),
+                            rows_per_image: Some(w),
+                        },
+                        wgpu::Extent3d {
+                            width: w,
+                            height: w,
+                            depth_or_array_layers: 6,
+                        },
+                    );
+                }
+                self.sky_env_key = Some(key);
+            }
+            globals.atmos_glare[3] = 1.0;
+        } else {
+            globals.atmos_glare[3] = 0.0;
+            if self.sky_env_key.take().is_some() {
+                if let Some(base_raw) = self.sky_base_raw.as_deref() {
+                    let base = (self.sky_size / pre).trailing_zeros();
+                    let mips = prefilter_env_mips(base_raw, pre, None);
+                    for (i, (w, bytes)) in mips.into_iter().enumerate() {
+                        queue.write_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &self.sky_tex,
+                                mip_level: base + i as u32,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            &bytes,
+                            wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(w * 4),
+                                rows_per_image: Some(w),
+                            },
+                            wgpu::Extent3d {
+                                width: w,
+                                height: w,
+                                depth_or_array_layers: 6,
+                            },
+                        );
+                    }
+                }
+            }
         }
+    }
+
+    /// Uploads the light grid (lightgrid.rs: skylight and sun bytes, X, then Z, then Y).
+    pub fn set_lightgrid(&mut self, queue: &wgpu::Queue, data: &[u8]) {
+        let [nx, ny, nz] = crate::lightgrid::dims().map(|n| n as u32);
+        if data.len() != (2 * nx * ny * nz) as usize {
+            return;
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.lightgrid_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(2 * nx),
+                rows_per_image: Some(nz),
+            },
+            wgpu::Extent3d {
+                width: nx,
+                height: nz,
+                depth_or_array_layers: ny,
+            },
+        );
+    }
+
+    /// Uploads the voxels `lo..=hi` of the light grid from the whole grid's
+    /// bytes `data` (as `set_lightgrid` takes them).
+    pub fn set_lightgrid_region(&mut self, queue: &wgpu::Queue, data: &[u8], lo: [usize; 3], hi: [usize; 3]) {
+        let [nx, ny, nz] = crate::lightgrid::dims().map(|n| n as u32);
+        if data.len() != (2 * nx * ny * nz) as usize || (0..3).any(|k| lo[k] > hi[k]) {
+            return;
+        }
+        let size = [0, 1, 2].map(|k| (hi[k] - lo[k] + 1) as u32);
+        // (the texture is X, Z, Y: rows of X along Z, layers along Y)
+        let offset = 2 * ((lo[1] as u64 * nz as u64 + lo[2] as u64) * nx as u64 + lo[0] as u64);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.lightgrid_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: lo[0] as u32, y: lo[2] as u32, z: lo[1] as u32 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(2 * nx), rows_per_image: Some(nz) },
+            wgpu::Extent3d { width: size[0], height: size[2], depth_or_array_layers: size[1] },
+        );
+    }
+
+    pub fn set_localgrid(&mut self, queue: &wgpu::Queue, data: &[u8]) {
+        let [nx, ny, nz] = crate::lightgrid::dims().map(|n| n as u32);
+        if data.len() != (nx * ny * nz * 4) as usize { return; }
+        queue.write_texture(wgpu::TexelCopyTextureInfo {
+            texture: &self.localgrid_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        }, data, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(nx * 4), rows_per_image: Some(nz) },
+        wgpu::Extent3d { width: nx, height: nz, depth_or_array_layers: ny });
+    }
+
+    /// Uploads part of the local light channel (lightgrid::LocalPatch).
+    pub fn set_localgrid_region(&mut self, queue: &wgpu::Queue, p: &crate::lightgrid::LocalPatch) {
+        let size = [0, 1, 2].map(|k| (p.hi[k] - p.lo[k] + 1) as u32);
+        if p.data.len() != (size[0] * size[1] * size[2] * 4) as usize { return; }
+        queue.write_texture(wgpu::TexelCopyTextureInfo {
+            texture: &self.localgrid_tex, mip_level: 0,
+            origin: wgpu::Origin3d { x: p.lo[0] as u32, y: p.lo[2] as u32, z: p.lo[1] as u32 },
+            aspect: wgpu::TextureAspect::All,
+        }, &p.data, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size[0] * 4), rows_per_image: Some(size[2]) },
+        wgpu::Extent3d { width: size[0], height: size[2], depth_or_array_layers: size[1] });
     }
 
     /// Uploads the parts' light occupancy (lightocc.rs: X, then Y, then Z).
@@ -4634,29 +4817,30 @@ impl Renderer {
         self.pipelines[sample_slot(samples)].as_ref().expect("viewport pipelines made by ensure_pipelines")
     }
 
-    /// The viewport's passes for `samples` a pixel, built on first use (the
-    /// one-sample set: the startup worker's, when one was started).
+    /// The viewport's passes for `samples` a pixel, built on first use.
     fn ensure_pipelines(&mut self, rs: &egui_wgpu::RenderState, samples: u32) -> &ViewportPipelines {
         let slot = sample_slot(samples);
         if self.pipelines[slot].is_none() {
-            let t0 = Instant::now();
-            let pending = if samples == 1 { self.lower_pending.take() } else { None };
-            let made = pending
-                .and_then(|rx| {
-                    // (the worker's, when it was started: the same pipelines)
+            if samples == 1 {
+                // (the worker's, when it was started: the same pipelines)
+                if let Some(rx) = self.lower_pending.take() {
                     let _p = rustudio_core::bench::scope("r_pipelines_wait");
-                    rx.recv().ok()
-                })
-                .unwrap_or_else(|| {
-                    ViewportPipelines::new(
-                        &rs.device, &rs.queue, &self.globals_layout, &self.tex_layout, &self.glass_layout,
-                        &self.terrain_layout, samples, self.reduced,
-                    )
-                });
-            if cfg!(target_os = "android") || std::env::var_os("RUSTUDIO_STARTUP_TRACE").is_some() {
-                eprintln!("[startup] viewport pipelines for {samples} sample(s) a pixel built in {} ms", t0.elapsed().as_millis());
+                    if let Ok(p) = rx.recv() {
+                        self.pipelines[slot] = Some(p);
+                    }
+                }
             }
-            self.pipelines[slot] = Some(made);
+            if self.pipelines[slot].is_none() {
+                let t0 = Instant::now();
+                let made = ViewportPipelines::new(
+                    &rs.device, &rs.queue, &self.globals_layout, &self.tex_layout, &self.glass_layout,
+                    &self.terrain_layout, samples, self.reduced,
+                );
+                if rustudio_core::load_trace::startup_trace() {
+                    eprintln!("[startup] viewport pipelines for {samples} sample(s) a pixel built in {} ms", t0.elapsed().as_millis());
+                }
+                self.pipelines[slot] = Some(made);
+            }
         }
         self.pipelines[slot].as_ref().expect("just made")
     }
@@ -4732,101 +4916,8 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&glass_depth) },
             ],
         });
-        // Bloom's half-resolution targets.
+        // SSAO half-resolution target dimensions.
         let half = [size[0].div_ceil(2).max(1), size[1].div_ceil(2).max(1)];
-        let half_tex = |label: &str| {
-            device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d {
-                        width: half[0],
-                        height: half[1],
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: HDR_FORMAT,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                })
-                .create_view(&Default::default())
-        };
-        let bloom_textures: Vec<_> = (1..=5).map(|level| device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("bloom pyramid"), size: wgpu::Extent3d { width: (size[0] >> level).max(1), height: (size[1] >> level).max(1), depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
-            dimension: wgpu::TextureDimension::D2, format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
-        })).collect();
-        let bloom_levels: Vec<_> = bloom_textures.iter().map(|t| t.create_view(&Default::default())).collect();
-        let bloom_view = bloom_levels[0].clone();
-        let bloom_bright_capture = std::env::var_os("RUSTUDIO_DUMP_HDR").map(|_| device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("diagnostic bloom extraction"),
-            size: wgpu::Extent3d { width: (size[0] >> 1).max(1), height: (size[1] >> 1).max(1), depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST, view_formats: &[],
-        }));
-        // Native CheapBokeh far path retains full-resolution color/CoC.
-        // Downsampling here imposes blur even as FarIntensity approaches zero.
-        let dof_tex = |label: &str| device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label), size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format: HDR_FORMAT, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        }).create_view(&Default::default());
-        let dof_views = [dof_tex("dof across"), dof_tex("dof down")];
-        let pair = |label: &str, a: &wgpu::TextureView, b: &wgpu::TextureView| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &self.tex_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(a),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sky_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(b),
-                    },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.black_view) },
-                ],
-            })
-        };
-        let bloom_down_bgs = (0..5).map(|i| pair("bloom pyramid down", if i == 0 { &hdr_view } else { &bloom_levels[i-1] }, &hdr_view)).collect();
-        let bloom_up_bgs = (1..5).map(|i| pair("bloom pyramid up", &bloom_levels[i], &hdr_view)).collect();
-        let blur_tex = |label: &str| device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d { width: (size[0] >> 2).max(1), height: (size[1] >> 2).max(1), depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format: HDR_FORMAT, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        }).create_view(&Default::default());
-        let blur_views = [blur_tex("blur a"), blur_tex("blur b")];
-        let blur_bgs = [
-            pair("blur down", &hdr_view, &self.black_view),
-            pair("blur across", &blur_views[1], &self.black_view),
-            pair("blur down", &blur_views[0], &self.black_view),
-        ];
-        let near_views: Vec<_> = (0..11).map(|i| device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("dof near quarter"), size: wgpu::Extent3d { width: (size[0]/4).max(1), height: if i == 0 {size[1]} else {(size[1]/4).max(1)}, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
-        }).create_view(&Default::default())).collect();
-        let near_bgs = (0..11).map(|i| pair("dof near", if i == 0 { &dof_views[1] } else if i == 8 { &near_views[1] } else { &near_views[i-1] }, if i == 8 || i == 9 { &near_views[7] } else { &self.black_view })).collect();
-        let dof_bgs = [pair("dof across", &hdr_view, &self.black_view), pair("dof down", &dof_views[0], &near_views[10])];
-        let hdr_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("post inputs"), layout: &self.tex_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sky_sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&bloom_view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dof_views[1]) },
-            ],
-        });
         let half_float = |label: &str, format: wgpu::TextureFormat| {
             device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -4857,15 +4948,6 @@ impl Renderer {
                 ],
             })
         };
-        let post_depth_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("post depth, near and blur"),
-            layout: &viewport.ssao_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&depth_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&near_views[10]) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&blur_views[1]) },
-            ],
-        });
         // down (input unused) → a … occlusion reads the depth → a, blur
         // across a → b, blur down b → a, apply reads a.
         let ssao_bgs = [
@@ -4883,6 +4965,7 @@ impl Renderer {
                 | wgpu::TextureUsages::COPY_SRC,
         );
         let display_view = display.create_view(&Default::default());
+        self.postfx.rebuild_targets(device, size, samples, &hdr_view, &depth_view);
         let mut egui_renderer = rs.renderer.write();
         match self.texture_id {
             Some(id) => egui_renderer.update_egui_texture_from_wgpu_texture(
@@ -4909,26 +4992,11 @@ impl Renderer {
             depth: depth_view,
             hdr,
             hdr_view,
-            scene_copy_view: scene_copy.create_view(&Default::default()),
             scene_copy,
             water_bg,
             water_depth,
             glass_bg,
             glass_depth,
-            hdr_bg,
-            post_depth_bg,
-            dof_views,
-            dof_bgs,
-            near_bgs,
-            near_views,
-            bloom_view,
-            bloom_bright_capture,
-            bloom_textures,
-            bloom_levels,
-            bloom_down_bgs,
-            bloom_up_bgs,
-            blur_views,
-            blur_bgs,
             ssao_depth_view,
             ssao_views,
             ssao_bgs,
@@ -4938,9 +5006,8 @@ impl Renderer {
     }
 
     /// World GUIs and effects enter the HDR scene before bloom, DoF and
-    /// colour correction (UILitFogFS / ParticleCustomFS), recorded for
-    /// `finish_frame`, which then draws the post chain once over them.
-    /// AlwaysOnTop and screen GUIs are composed separately by egui.
+    /// colour correction (UILitFogFS / ParticleCustomFS). AlwaysOnTop and
+    /// screen GUIs are composed separately by egui.
     pub fn draw_world_gui(
         &mut self,
         rs: &egui_wgpu::RenderState,
@@ -4949,7 +5016,7 @@ impl Renderer {
         fx: Option<&crate::world_gui::FxFrame>,
         tone_curve: Option<[f32; 5]>,
     ) {
-        let Some(t) = self.target.as_ref().filter(|_| self.post_due) else { return };
+        let Some(t) = self.target.as_ref() else { return };
         let pass = self.world_gui[sample_slot(t.samples)]
             .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, t.samples));
         pass.font_texture_update = Some(font_texture_update);
@@ -4961,29 +5028,9 @@ impl Renderer {
         // (effects light themselves from the frame's local lights)
         pass.lights = self.lights_buf.clone();
         pass.n_lights = self.gui_n_lights;
-        let encoder = self
-            .post_encoder
-            .get_or_insert_with(|| rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport post") }));
-        pass.effects(rs, encoder, &t.hdr_view, t.size, &t.depth, batches, fx, tone_curve, self.gui_fog.0, self.gui_fog.1);
-    }
-
-    /// Records the post chain of the frame `render` recorded (bloom, blur,
-    /// DoF, the display image), over the HDR image as the world GUIs and
-    /// effects left it, and hands it to the render thread. Every `render`
-    /// is followed by one, before anything draws on the display image
-    /// (highlights, adornments).
-    pub fn finish_frame(&mut self, rs: &egui_wgpu::RenderState) {
-        if !std::mem::take(&mut self.post_due) {
-            return;
+        if pass.effects(rs, &t.hdr_view, t.size, &t.depth, batches, fx, tone_curve, self.gui_fog.0, self.gui_fog.1, self.gui_exposure) {
+            self.finish_again(rs);
         }
-        let mut encoder = self
-            .post_encoder
-            .take()
-            .unwrap_or_else(|| rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport post") }));
-        if let Some(target) = self.target.as_ref() {
-            self.encode_post(&mut encoder, target);
-        }
-        crate::render_thread::perform(&rs.queue, vec![encoder], None);
     }
 
     /// Highlights over the finished image (highlight.rs): each one's parts
@@ -5032,105 +5079,20 @@ impl Renderer {
         pass.draw(&rs.device, &rs.queue, &t.depth, &t.display_view, self.last_view_proj, list);
     }
 
-    /// The bloom and the final image again, from the HDR image as it is now
-    /// (effects drawn into it after `render`; the frame's globals still
-    /// bound).
-    fn encode_bloom(&self, encoder: &mut wgpu::CommandEncoder, target: &Target, size: f32) {
-        if size < 0.0 { return; }
-        let scale = ((target.size[0] as f32 * target.size[1] as f32) / 2073600.0).sqrt();
-        let levels = (3.0 + (scale.log2() + (size / 7.0).log2().max(0.0)).max(-1.0)).min(5.999) as usize;
-        for i in 0..levels {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("bloom pyramid down"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &target.bloom_levels[i], depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
-            });
-            pass.set_pipeline(if i == 0 { &self.bloom_bright } else { &self.bloom_down });
-            pass.set_bind_group(0, &self.globals_bg, &[]); pass.set_bind_group(1, &target.bloom_down_bgs[i], &[]); pass.draw(0..3, 0..1);
-            drop(pass);
-            if i == 0 {
-                if let Some(texture) = &target.bloom_bright_capture {
-                    encoder.copy_texture_to_texture(target.bloom_textures[0].as_image_copy(), texture.as_image_copy(), texture.size());
-                }
-            }
-        }
-        for i in (1..levels).rev() {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("bloom pyramid up"), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &target.bloom_levels[i-1], depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
-            });
-            pass.set_pipeline(&self.bloom_up); pass.set_bind_group(0, &self.globals_bg, &[]); pass.set_bind_group(1, &target.bloom_up_bgs[i-1], &[]); pass.draw(0..3, 0..1);
-        }
-    }
-
-    fn encode_blur(&self, encoder: &mut wgpu::CommandEncoder, target: &Target, size: f32) {
-        if size <= 0.0 { return; }
-        let passes: [(&str, &wgpu::RenderPipeline, &wgpu::BindGroup, &wgpu::TextureView); 3] = [
-            ("blur down", &self.blur_down, &target.blur_bgs[0], &target.blur_views[1]),
-            ("blur across", &self.blur_h, &target.blur_bgs[1], &target.blur_views[0]),
-            ("blur vertical", &self.blur_v, &target.blur_bgs[2], &target.blur_views[1]),
-        ];
-        for (label, pipeline, bg, view) in passes {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(label),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, bg, &[]);
-            pass.draw(0..3, 0..1);
-        }
-    }
-
-    /// Bloom, blur, DoF and the display image from the HDR image (the
-    /// frame's globals bound).
-    fn encode_post(&self, encoder: &mut wgpu::CommandEncoder, target: &Target) {
-        let viewport = self.pipelines(target.samples);
-        self.encode_bloom(encoder, target, self.post_bloom_size);
-        self.encode_blur(encoder, target, self.post_blur_size);
-        crate::gpu_timing::mark(encoder, "gpu: bloom");
-        let fullscreen = |encoder: &mut wgpu::CommandEncoder, label: &str, pipeline: &wgpu::RenderPipeline, bg: &wgpu::BindGroup, view: &wgpu::TextureView| {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(label),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, bg, &[]);
-            if label == "post" {
-                pass.set_bind_group(2, &target.post_depth_bg, &[]);
-            } else if label == "dof across" || label == "dof near" {
-                pass.set_bind_group(2, &target.ssao_bgs[0], &[]);
-            }
-            pass.draw(0..3, 0..1);
-        };
-        if self.post_dof {
-            fullscreen(encoder, "dof across", &viewport.dof_h, &target.dof_bgs[0], &target.dof_views[0]);
-            fullscreen(encoder, "dof down", &self.dof_v, &target.dof_bgs[1], &target.dof_views[1]);
-            if self.post_dof_near {
-                for i in 0..11 {
-                    fullscreen(encoder, "dof near", &viewport.near_pipelines[i], &target.near_bgs[i], &target.near_views[i]);
-                }
-            }
-        }
-        crate::gpu_timing::mark(encoder, "gpu: dof");
-        fullscreen(encoder, "post", &viewport.post, &target.hdr_bg, &target.display_view);
-        crate::gpu_timing::mark(encoder, "gpu: post");
+    /// Re-run post-processing after world GUIs and effects are drawn into HDR.
+    fn finish_again(&mut self, rs: &egui_wgpu::RenderState) {
+        let _b = rustudio_core::bench::scope("fx_post_again");
+        let Some(target) = self.target.as_ref() else { return };
+        let mut encoder = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("effects post") });
+        self.postfx.encode(
+            &rs.device,
+            &rs.queue,
+            &mut encoder,
+            &target.display_view,
+            &self.last_postfx,
+            false,
+        );
+        rs.queue.submit([encoder.finish()]);
     }
 
     /// The last frame's fog (`Globals::fog`) and its linear colour, as
@@ -5157,8 +5119,6 @@ impl Renderer {
         frame: &Frame,
     ) -> Option<egui::TextureId> {
         let svc_t0 = Instant::now();
-        // (the last frame's post chain, had nobody recorded it)
-        self.finish_frame(rs);
         self.pool.flush();
         let size = [size[0].clamp(1, 8192), size[1].clamp(1, 8192)];
         crate::gpu_timing::set_automatic(frame.quality.is_some());
@@ -5187,8 +5147,7 @@ impl Renderer {
         }
         self.ensure_target(rs, size, samples);
         if frame.probe.as_ref().is_some_and(|pf| pf.tasks.iter().any(|t| matches!(t, env_probe_gpu::Task::Face(_)))) {
-            let probe_samples = self.probe_samples;
-            self.ensure_pipelines(rs, probe_samples);
+            self.ensure_pipelines(rs, self.probe_samples);
         }
         let device = &rs.device;
         let queue = &rs.queue;
@@ -5215,12 +5174,8 @@ impl Renderer {
             }
             globals.env_spec[3] = pf.blend;
         }
-        self.post_bloom_size = globals.bloom[1];
-        self.post_blur_size = globals.sky_rot[1];
-        // NearIntensity below 0.22 takes the cheap full-resolution pass
-        // (fs_dof_v), not the near chain (shader.wgsl DOF_CHEAP_BELOW).
-        self.post_dof_near = globals.dof[2] >= DOF_CHEAP_BELOW;
-        self.post_dof = globals.dof[2] > 0.0 || globals.dof[3] > 0.0;
+        self.last_postfx = frame.postfx;
+        self.last_postfx.terrain_capture_id = std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_ID").is_some();
         globals.cam_pos[3] = self.material_epoch.elapsed().as_secs_f32();
         // Deterministic isolated render probes (no effect in ordinary runs).
         if let Ok(t) = std::env::var("RUSTUDIO_MATERIAL_TIME") {
@@ -5233,9 +5188,11 @@ impl Renderer {
             let mut f=std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}/frames.jsonl")).unwrap();
             writeln!(f,"{}",serde_json::json!({"frame":n,"shader_time":globals.cam_pos[3],"camera":globals.cam_pos,"spheres":globals.sun_sphere,"matrices":globals.sun_casc,"rects":globals.sun_rect,"viewport":size,"wall":self.material_epoch.elapsed().as_secs_f64()})).unwrap();
         }
+        self.update_sky_env(queue, &mut globals);
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
         self.vf.base = Some(globals);
         self.gui_fog = Self::gui_fog(&frame.globals);
+        self.gui_exposure = frame.globals.params[1];
         self.gui_lightgrid = frame.globals.lightgrid;
         self.gui_sun_params = [if frame.globals.sun_color[3] < 0.5 { 1.0 } else { 0.0 }, rustudio_core::mech::SUN_DIST, rustudio_core::mech::HYBRID_LERP_SLOPE, if frame.shadows { 1.0 } else { 0.0 }];
         self.gui_sun = crate::world_gui::SunCascades { local: frame.globals.sun_casc, sphere: frame.globals.sun_sphere, rect: frame.globals.sun_rect };
@@ -5364,7 +5321,7 @@ impl Renderer {
             if n == 0 {
                 continue;
             }
-            if b.pass == Pass::Decal {
+            if b.pass == Pass::Decal || b.pass == Pass::Cutout {
                 see_bounds.add_box(b.lo, b.hi);
             }
             let straddles_frustum = !box_inside(&planes, b.lo, b.hi);
@@ -5418,8 +5375,8 @@ impl Renderer {
         drop(r_scope);
         let r_scope = rustudio_core::bench::scope("r_per_frame_cull");
         // Per-frame items: moving, new and see-through parts.
-        // (with each instance's bounding radius: the sun cascades cull by it)
-        let mut dyn_opaque: Vec<((usize, usize), InstanceRaw, f32)> = Vec::new();
+        let mut dyn_opaque: Vec<((usize, usize), InstanceRaw)> = Vec::new();
+        let mut dyn_cutout: Vec<((usize, usize), InstanceRaw)> = Vec::new();
         let mut dyn_decal: Vec<((usize, usize), InstanceRaw)> = Vec::new();
         let mut blended: Vec<(f32, (usize, usize), InstanceRaw)> = Vec::new();
         // Decals / Textures on a solid (or invisible) host: part of the
@@ -5477,7 +5434,11 @@ impl Renderer {
                     b.add_sphere(d.xf.pos, rad);
                 };
                 match pass_of(d) {
-                    Some(Pass::Opaque) => dyn_opaque.push((draw_key(d), raw, rad)),
+                    Some(Pass::Opaque) => dyn_opaque.push((draw_key(d), raw)),
+                    Some(Pass::Cutout) => {
+                        see_bound(&mut see_bounds);
+                        dyn_cutout.push((draw_key(d), raw))
+                    }
                     Some(Pass::Decal) => {
                         see_bound(&mut see_bounds);
                         dyn_decal.push((draw_key(d), raw))
@@ -5515,6 +5476,7 @@ impl Renderer {
         // (stable sorts of indices: the same order as sorting the 144-byte
         // instances in place, without moving them around)
         sort_stable_by(&mut dyn_opaque, |a, b| a.0.cmp(&b.0));
+        sort_stable_by(&mut dyn_cutout, |a, b| a.0.cmp(&b.0));
         sort_stable_by(&mut dyn_decal, |a, b| a.0.cmp(&b.0));
         // Glass samples the opaque scene and must precede other transparents.
         // Preserve the existing back-to-front distance order within each group.
@@ -5537,6 +5499,7 @@ impl Renderer {
         let raw: Vec<InstanceRaw> = dyn_opaque
             .iter()
             .map(|e| e.1)
+            .chain(dyn_cutout.iter().map(|e| e.1))
             .chain(dyn_decal.iter().map(|e| e.1))
             .chain(surface_decals.iter().map(|e| e.2))
             .chain(blended.iter().map(|e| e.2))
@@ -5571,6 +5534,8 @@ impl Renderer {
         let mut base = 0u32;
         let opaque_runs = runs(&mut dyn_opaque.iter().map(|e| e.0), base);
         base += dyn_opaque.len() as u32;
+        let cutout_runs = runs(&mut dyn_cutout.iter().map(|e| e.0), base);
+        base += dyn_cutout.len() as u32;
         let decal_runs = runs(&mut dyn_decal.iter().map(|e| e.0), base);
         base += dyn_decal.len() as u32;
         let surface_decal_runs = runs(&mut surface_decals.iter().map(|e| e.1), base);
@@ -5622,7 +5587,7 @@ impl Renderer {
         let grass_shadows = *GRASS_SHADOWS.get_or_init(|| std::env::var_os("RUSTUDIO_NO_GRASS_SHADOW").is_none());
         let sun_due = if frame.shadows {
             self.sun.upload(queue, &frame.sun_cascades);
-            self.sun.plan(&frame.sun_cascades, scene_gen, !opaque_runs.is_empty() || !self.terrain_grass.is_empty())
+            self.sun.plan(&frame.sun_cascades, scene_gen, !opaque_runs.is_empty() || !cutout_runs.is_empty() || !self.terrain_grass.is_empty())
         } else {
             self.sun.forget();
             [false; crate::sun_shadow::CASCADES]
@@ -5630,18 +5595,13 @@ impl Renderer {
 
         let target = self.target.as_ref()?;
         let viewport = self.pipelines[sample_slot(samples)].as_ref()?;
-        // (the probe's faces draw with the `probe_samples` set: below)
+        // (the probe's faces draw with the probe_samples set: below)
         let probe_viewport = self.pipelines[sample_slot(self.probe_samples)].as_ref();
         let cloud_slot = sample_slot(samples);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("viewport"),
         });
         crate::gpu_timing::begin(device, queue, &mut encoder);
-        // The light grid's new voxels (written off this thread), before
-        // anything samples the grid.
-        for up in self.grid_uploads.drain(..) {
-            up.encode(&mut encoder, &self.lightgrid_tex, &self.localgrid_tex);
-        }
         // Skinned parts' vertices for this frame, before anything draws them.
         self.skin.encode(&mut encoder);
         crate::gpu_timing::mark(&mut encoder, "gpu: skinning");
@@ -5652,7 +5612,7 @@ impl Renderer {
                     None => (&self.globals_layout, &self.globals_bg),
                 };
                 let clouds = self.clouds[cloud_slot].get_or_insert_with(|| {
-                    crate::clouds::CloudsGpu::new(device, queue, globals_layout, &shader_source(self.reduced), HDR_FORMAT, samples)
+                    crate::clouds::CloudsGpu::new(device, queue, globals_layout, &shader_source(self.reduced), HDR_FORMAT, DEPTH_FORMAT, samples)
                 });
                 clouds.encode(device, queue, &mut encoder, globals_bg, look, -frame.globals.sun_dir[1], target.size);
             }
@@ -5671,30 +5631,15 @@ impl Renderer {
             // Casters: static opaque cells that can reach the cascade's box
             // (trimmed like the view), plus this frame's moving opaque parts.
             let sp = frustum(cascade.caster_view_proj());
-            // This frame's moving casters that can reach the cascade's box
-            // (a skinned mesh's vertices can leave its box: kept). Each box
-            // holds only part of the view, cascade 0 the nearest studs, so
-            // a crowd of moving characters drew far more shadows than it cast.
-            let mut moving_ranges: Vec<((usize, usize), u32, u32)> = Vec::new();
-            for (i, (key, raw, rad)) in dyn_opaque.iter().enumerate() {
-                let (centre, rad) = raw_sphere(raw, *rad);
-                if !sphere_visible(&sp, centre, rad) && !self.meshes.get(key.0).is_some_and(|m| m.storage) {
-                    continue;
-                }
-                let at = i as u32;
-                match moving_ranges.last_mut() {
-                    Some(l) if l.0 == *key && l.2 == at => l.2 = at + 1,
-                    _ => moving_ranges.push((*key, at, at + 1)),
-                }
-            }
             let mut shadow_ranges: Vec<((usize, usize), u32, u32)> = Vec::new();
+            let mut shadow_cutout_ranges: Vec<((usize, usize), u32, u32)> = Vec::new();
             // Small casters are trimmed by their distance from the camera. At
             // Shading detail Low, cascades 1..3 measure it from their own
             // (snapped) centre instead, so their static casters stay the same
             // while the camera moves inside a snap step and SunCache keeps
             // them; at High and Medium the camera, as before.
             let trim_from = if ci > 0 && low_detail { cascade.centre } else { cam };
-            for b in self.st.batches.iter().filter(|b| b.pass == Pass::Opaque) {
+            for b in self.st.batches.iter().filter(|b| b.pass == Pass::Opaque || b.pass == Pass::Cutout) {
                 if !box_visible(&sp, b.lo, b.hi) {
                     continue;
                 }
@@ -5704,9 +5649,10 @@ impl Renderer {
                 if n == 0 {
                     continue;
                 }
-                match shadow_ranges.last_mut() {
+                let dst = if b.pass == Pass::Cutout { &mut shadow_cutout_ranges } else { &mut shadow_ranges };
+                match dst.last_mut() {
                     Some(last) if last.0 == b.key && last.2 == b.start => last.2 = b.start + n,
-                    _ => shadow_ranges.push((b.key, b.start, b.start + n)),
+                    _ => dst.push((b.key, b.start, b.start + n)),
                 }
             }
             let side = cascade.tile.min(SHADOW_SIZE);
@@ -5781,6 +5727,33 @@ impl Renderer {
             // (skinned meshes are rewritten by the compute pass in place:
             // they cast with the moving parts)
             let skinned = |key: (usize, usize)| self.meshes.get(key.0).is_some_and(|m| m.storage);
+            let cast_cutout_list = |pass: &mut wgpu::RenderPass, ranges: &[((usize, usize), u32, u32)], want_skinned: Option<bool>| {
+                let mut bound_t = usize::MAX;
+                let mut started = false;
+                for r in ranges {
+                    if let Some(w) = want_skinned {
+                        if skinned(r.0) != w {
+                            continue;
+                        }
+                    }
+                    if !started {
+                        cast_bound.set(UNBOUND);
+                        pass.set_pipeline(&self.shadow_cutout);
+                        pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
+                        self.sun.bind(pass, ci);
+                        started = true;
+                    }
+                    if bound_t != r.0.1 {
+                        if let Some(bg) = self.textures.get(r.0.1) {
+                            pass.set_bind_group(2, bg, &[]);
+                            bound_t = r.0.1;
+                        } else {
+                            continue;
+                        }
+                    }
+                    cast(pass, r.0, r.1..r.2);
+                }
+            };
             let draw_static = |pass: &mut wgpu::RenderPass, all: bool| {
                 cast_bound.set(UNBOUND);
                 pass.set_pipeline(&self.shadow);
@@ -5789,6 +5762,10 @@ impl Renderer {
                 pass.set_vertex_buffer(1, self.static_buf.slice(..));
                 for r in shadow_ranges.iter().filter(|r| all || !skinned(r.0)) {
                     cast(pass, r.0, r.1..r.2);
+                }
+                if !shadow_cutout_ranges.is_empty() {
+                    pass.set_vertex_buffer(1, self.static_buf.slice(..));
+                    cast_cutout_list(pass, &shadow_cutout_ranges, if all { None } else { Some(false) });
                 }
                 terrain(pass, true);
             };
@@ -5806,8 +5783,16 @@ impl Renderer {
                     }
                 }
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
-                for r in &moving_ranges {
+                for r in &opaque_runs {
                     cast(pass, r.0, r.1..r.2);
+                }
+                if ci > 0 && SunCache::on() && !shadow_cutout_ranges.is_empty() {
+                    pass.set_vertex_buffer(1, self.static_buf.slice(..));
+                    cast_cutout_list(pass, &shadow_cutout_ranges, Some(true));
+                }
+                if !cutout_runs.is_empty() {
+                    pass.set_vertex_buffer(1, self.instance_buf.slice(..));
+                    cast_cutout_list(pass, &cutout_runs, None);
                 }
                 terrain(pass, false);
             };
@@ -5819,7 +5804,7 @@ impl Renderer {
                     let mut h = std::collections::hash_map::DefaultHasher::new();
                     // (in-place caster writes are handled by their spheres)
                     let global = scene_gen.wrapping_sub(self.caster_flushes);
-                    (global, side, &shadow_ranges, self.mesh_gen).hash(&mut h);
+                    (global, side, &shadow_ranges, &shadow_cutout_ranges, self.mesh_gen).hash(&mut h);
                     cascade.view_proj().to_cols_array().map(f32::to_bits).hash(&mut h);
                     cascade.caster_view_proj().to_cols_array().map(f32::to_bits).hash(&mut h);
                     cascade.centre.to_array().map(f32::to_bits).hash(&mut h);
@@ -5854,23 +5839,26 @@ impl Renderer {
         drop(r_scope);
         let r_scope = rustudio_core::bench::scope("r_scene_encode");
         // Local light shadow maps (Studio's Future path): the lights the
-        // light list gave a slot (LightRaw.extra.w), each a cube of EVSM
+        // light list gave a slot (LightRaw.extra.w), each storing EVSM
         // moments; redrawn only when those lights or the static scene change.
         {
-            let slots: Vec<(usize, Vec3, f32)> = frame.lights[..n_lights]
+            let slots: Vec<_> = frame.lights[..n_lights]
                 .iter()
                 .filter(|l| l.extra[3] >= 0.0)
-                .map(|l| (l.extra[3] as usize, Vec3::new(l.pos_range[0], l.pos_range[1], l.pos_range[2]), l.pos_range[3]))
-                .filter(|s| s.0 < rustudio_core::mech::LSHADOW_MAX_LIGHTS)
+                .map(|light| (light.extra[3] as usize, light))
+                .filter(|(slot, _)| *slot < rustudio_core::mech::LSHADOW_MAX_LIGHTS)
                 .collect();
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 self.caster_gen.hash(&mut h);
-                for (i, p, r) in &slots {
-                    i.hash(&mut h);
-                    p.to_array().map(f32::to_bits).hash(&mut h);
-                    r.to_bits().hash(&mut h);
+                for (slot, light) in &slots {
+                    slot.hash(&mut h);
+                    light.pos_range.map(f32::to_bits).hash(&mut h);
+                    light.color[3].to_bits().hash(&mut h);
+                    light.dir.map(f32::to_bits).hash(&mut h);
+                    light.surface_u[3].to_bits().hash(&mut h);
+                    light.surface_v.map(f32::to_bits).hash(&mut h);
                 }
                 h.finish()
             };
@@ -5880,18 +5868,29 @@ impl Renderer {
                 let n = rustudio_core::mech::LSHADOW_MAX_LIGHTS;
                 let mut slot_data = vec![0f32; n * 100];
                 let mut face_data = vec![0u8; n * 6 * LSHADOW_FACE_STRIDE as usize];
-                for (slot, pos, range) in &slots {
-                    let inv = 1.0 / range.max(1e-3);
-                    for (f, (vp, axis)) in LightShadows::faces(*pos, *range).iter().enumerate() {
+                let mut slot_faces = Vec::with_capacity(slots.len());
+                for (slot, light) in &slots {
+                    let pos = Vec3::from_slice(&light.pos_range[..3]);
+                    let range = light.pos_range[3];
+                    let (faces, origin, inv, count) =
+                        if let Some((vp, axis, origin, inv)) = LightShadows::surface_face(light, pos, range) {
+                            ([(vp, axis); 6], origin, inv, 1)
+                        } else {
+                            (LightShadows::faces(pos, range), pos, range.max(1e-3).recip(), 6)
+                        };
+                    for (f, (vp, axis)) in faces[..count].iter().enumerate() {
                         slot_data[slot * 100 + f * 16..slot * 100 + f * 16 + 16].copy_from_slice(&vp.to_cols_array());
                         let mut u = [0f32; 24];
                         u[..16].copy_from_slice(&vp.to_cols_array());
-                        u[16..20].copy_from_slice(&[pos.x, pos.y, pos.z, inv]);
+                        u[16..20].copy_from_slice(&[origin.x, origin.y, origin.z, inv]);
                         u[20..24].copy_from_slice(&[axis.x, axis.y, axis.z, 0.0]);
                         let o = (slot * 6 + f) * LSHADOW_FACE_STRIDE as usize;
                         face_data[o..o + 96].copy_from_slice(bytemuck::cast_slice(&u));
                     }
-                    slot_data[slot * 100 + 96..slot * 100 + 100].copy_from_slice(&[pos.x, pos.y, pos.z, inv]);
+                    let signed_inv = if count == 1 { -inv } else { inv };
+                    slot_data[slot * 100 + 96..slot * 100 + 100]
+                        .copy_from_slice(&[origin.x, origin.y, origin.z, signed_inv]);
+                    slot_faces.push((faces, count));
                 }
                 queue.write_buffer(&self.lshadow.slots_buf, 0, bytemuck::cast_slice(&slot_data));
                 queue.write_buffer(&self.lshadow.face_buf, 0, &face_data);
@@ -5927,25 +5926,62 @@ impl Renderer {
                 let lbound: Bound = std::cell::Cell::new(UNBOUND);
                 let cols = rustudio_core::mech::LSHADOW_ATLAS / rustudio_core::mech::LSHADOW_FACE;
                 let face_px = rustudio_core::mech::LSHADOW_FACE;
-                for (slot, pos, range) in &slots {
+                for ((slot, light), (faces, count)) in slots.iter().zip(slot_faces.iter()) {
+                    // Include the range around the whole emitting rectangle.
+                    let pos = Vec3::from_slice(&light.pos_range[..3]);
+                    let range = light.pos_range[3] + light.extra[0].hypot(light.extra[1]);
                     // The static cells the light reaches.
                     let near: Vec<&Batch> = self
                         .st
                         .batches
                         .iter()
                         .filter(|b| b.pass == Pass::Opaque)
-                        .filter(|b| (pos.clamp(b.lo, b.hi) - *pos).length_squared() <= range * range)
+                        .filter(|b| (pos.clamp(b.lo, b.hi) - pos).length_squared() <= range * range)
                         .collect();
-                    for f in 0..6u32 {
+                    let near_cutout: Vec<&Batch> = self
+                        .st
+                        .batches
+                        .iter()
+                        .filter(|b| b.pass == Pass::Cutout)
+                        .filter(|b| (pos.clamp(b.lo, b.hi) - pos).length_squared() <= range * range)
+                        .collect();
+                    for f in 0..*count as u32 {
+                        let face_planes = frustum(faces[f as usize].0);
                         let k = *slot as u32 * 6 + f;
                         let (x, y) = ((k % cols) * face_px, (k / cols) * face_px);
                         pass.set_viewport(x as f32, y as f32, face_px as f32, face_px as f32, 0.0, 1.0);
                         pass.set_scissor_rect(x, y, face_px, face_px);
+                        pass.set_pipeline(&self.lshadow_pipe);
                         pass.set_bind_group(1, &self.lshadow.face_bg, &[k * LSHADOW_FACE_STRIDE as u32]);
                         for b in &near {
+                            if !box_visible(&face_planes, b.lo, b.hi) {
+                                continue;
+                            }
                             if let Some(mesh) = self.meshes.get(b.key.0) {
                                 rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SHADOW, 1, (mesh.count / 3) as u64 * b.count as u64);
                                 mesh.draw_bound(&mut pass, b.start..b.start + b.count, &lbound);
+                            }
+                        }
+                        if !near_cutout.is_empty() {
+                            pass.set_pipeline(&self.lshadow_cutout_pipe);
+                            pass.set_bind_group(1, &self.lshadow.face_bg, &[k * LSHADOW_FACE_STRIDE as u32]);
+                            let mut bound_t = usize::MAX;
+                            for b in &near_cutout {
+                                if !box_visible(&face_planes, b.lo, b.hi) {
+                                    continue;
+                                }
+                                if bound_t != b.key.1 {
+                                    if let Some(bg) = self.textures.get(b.key.1) {
+                                        pass.set_bind_group(2, bg, &[]);
+                                        bound_t = b.key.1;
+                                    } else {
+                                        continue;
+                                    }
+                                }
+                                if let Some(mesh) = self.meshes.get(b.key.0) {
+                                    rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SHADOW, 1, (mesh.count / 3) as u64 * b.count as u64);
+                                    mesh.draw_bound(&mut pass, b.start..b.start + b.count, &lbound);
+                                }
                             }
                         }
                     }
@@ -6026,7 +6062,7 @@ impl Renderer {
         if let Some(pf) = frame.probe.as_ref() {
             for task in &pf.tasks {
                 if let env_probe_gpu::Task::Face(f) = *task {
-                    // (a face draws with the `probe_samples` set, made above for this frame)
+                    // (a face draws with the probe_samples set, made above for this frame)
                     let Some(pv) = probe_viewport else {
                         self.probe.store_face(device, &mut encoder, f);
                         continue;
@@ -6069,9 +6105,20 @@ impl Renderer {
                             pass.set_pipeline(if self.culls_back(b.key.0) { &pv.opaque } else { &pv.opaque_two_sided });
                             draw_uncounted(&mut pass, b.key, b.start..b.start + b.count, 0);
                         }
+                        for b in self.st.batches.iter().filter(|b| b.pass == Pass::Cutout) {
+                            if !box_visible(&face_planes, b.lo, b.hi) {
+                                continue;
+                            }
+                            pass.set_pipeline(if self.culls_back(b.key.0) { &pv.cutout } else { &pv.cutout_two_sided });
+                            draw_uncounted(&mut pass, b.key, b.start..b.start + b.count, 0);
+                        }
                         pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                         for r in &opaque_runs {
                             pass.set_pipeline(if self.culls_back(r.0.0) { &pv.opaque } else { &pv.opaque_two_sided });
+                            draw_uncounted(&mut pass, r.0, r.1..r.2, 0);
+                        }
+                        for r in &cutout_runs {
+                            pass.set_pipeline(if self.culls_back(r.0.0) { &pv.cutout } else { &pv.cutout_two_sided });
                             draw_uncounted(&mut pass, r.0, r.1..r.2, 0);
                         }
                         if !self.terrain_chunks.is_empty() {
@@ -6101,8 +6148,11 @@ impl Renderer {
             overlay: viewport.overlay.clone(),
         };
         // Studio's encoded blend (SeeThrough), when anything blends this frame.
+        let has_cutout = !cutout_runs.is_empty()
+            || static_ranges.iter().any(|r| r.0 == Pass::Cutout);
+        let has_pre_split_see = !surface_decal_runs.is_empty() || has_cutout;
         let encoded = !viewport.see.linear
-            && (!surface_decal_runs.is_empty()
+            && (has_pre_split_see
                 || !decal_runs.is_empty()
                 || !blend_runs.is_empty()
                 || !overlay_runs.is_empty()
@@ -6114,6 +6164,34 @@ impl Renderer {
                 pass.set_pipeline(&pipes.transparent);
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                 for r in &surface_decal_runs {
+                    draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
+                }
+                pass.set_bind_group(1, &self.textures[0], &[]);
+                unbind();
+            }
+            if has_cutout {
+                // Opaque SurfaceAppearance AlphaMode=Transparency (Cutout) parts:
+                // opaque texels (>= 0.5) wrote scene depth in decal_depth; color
+                // blends in Studio's sqrt-encoded pass (before split water/glass
+                // copy so foliage shows through glass and water).
+                unbind();
+                pass.set_bind_group(2, &target.glass_bg, &[]);
+                pass.set_vertex_buffer(1, self.static_buf.slice(..));
+                for r in static_ranges.iter().filter(|r| r.0 == Pass::Cutout) {
+                    pass.set_pipeline(if self.culls_back(r.1 .0) {
+                        &pipes.transparent_culled
+                    } else {
+                        &pipes.transparent
+                    });
+                    draw(pass, r.1, r.2..r.3, r.4, calls);
+                }
+                pass.set_vertex_buffer(1, self.instance_buf.slice(..));
+                for r in &cutout_runs {
+                    pass.set_pipeline(if self.culls_back(r.0 .0) {
+                        &pipes.transparent_culled
+                    } else {
+                        &pipes.transparent
+                    });
                     draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
                 }
                 pass.set_bind_group(1, &self.textures[0], &[]);
@@ -6149,13 +6227,13 @@ impl Renderer {
                 }
             }
         };
-        let scene_pass = |encoder: &mut wgpu::CommandEncoder, label: &str, first: bool, last: bool| {
+        let scene_pass = |encoder: &mut wgpu::CommandEncoder, label: &str, first: bool, last: bool, resolve: bool| {
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &target.msaa,
                     depth_slice: None,
-                    resolve_target: (samples > 1).then_some(&target.hdr_view),
+                    resolve_target: (resolve && samples > 1).then_some(&target.hdr_view),
                     ops: wgpu::Operations {
                         load: if first { wgpu::LoadOp::Clear(wgpu::Color::BLACK) } else { wgpu::LoadOp::Load },
                         store: if last && samples > 1 { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store },
@@ -6230,7 +6308,7 @@ impl Renderer {
         // ... and the covered pixels decoded back into the scene (resolved);
         // the pass stays open for the editor's lines.
         let see_end = |encoder: &mut wgpu::CommandEncoder, last: bool| {
-            let mut pass = scene_pass(encoder, "see-through decode", false, last);
+            let mut pass = scene_pass(encoder, "see-through decode", false, last, true);
             pass.set_pipeline(&viewport.see.decode);
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_bind_group(1, &target.see_decode_bg, &[]);
@@ -6253,14 +6331,13 @@ impl Renderer {
             }
         };
         {
-            let mut pass = scene_pass(&mut encoder, "viewport", true, !split && !encoded);
+            // The encoded blends read MSAA directly. Resolve here only
+            // when a later pass already needs the single-sample snapshot.
+            let resolve = !encoded || (split && !has_pre_split_see);
+            let mut pass = scene_pass(&mut encoder, "viewport", true, !split && !encoded, resolve);
             pass.set_bind_group(2, &target.glass_bg, &[]);
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_bind_group(1, &self.textures[0], &[]);
-            if frame.sky {
-                pass.set_pipeline(&viewport.sky);
-                pass.draw(0..3, 0..1);
-            }
 
             // Loaded meshes are two-sided unless mesh_cull_slot culls them
             // (file meshes, unless a MeshPart is DoubleSided: as Studio).
@@ -6308,26 +6385,14 @@ impl Renderer {
                 pass.set_pipeline(opaque_pipe(r.0, &raw[r.1 as usize..r.2 as usize]));
                 draw_scene_dynamic(&mut pass, r.0, r.1..r.2, &mut calls);
             }
-            // Only opaque authored decal texels contribute scene depth. The
-            // shader rejects other blended materials and fractional coverage;
-            // the invisible host never enters this pass. Keep the ordinary
-            // sorted color pass for layer order and semitransparent edges.
-            pass.set_pipeline(&viewport.decal_depth);
-            for r in &surface_decal_runs {
-                draw_dynamic_uncounted(&mut pass, r.0, r.1..r.2);
-            }
-            for r in &blend_runs {
-                // fs_decal_depth discards every mode except Decal.
-                if raw[r.1 as usize..r.2 as usize]
-                    .iter()
-                    .any(|part| part.extra[3] == DECAL_TEX_MODE)
-                {
-                    draw_dynamic_uncounted(&mut pass, r.0, r.1..r.2);
-                }
-            }
             // Terrain chunks in view.
             if !self.terrain_chunks.is_empty() {
-                pass.set_pipeline(&viewport.terrain);
+                let terrain = if globals.perf[3] > 0.5 && globals.perf[0] < 1.5 {
+                    viewport.terrain_low.as_ref().unwrap_or(&viewport.terrain)
+                } else {
+                    &viewport.terrain
+                };
+                pass.set_pipeline(terrain);
                 pass.set_bind_group(1, &self.terrain_bg, &[]);
                 for c in self.terrain_chunks.values().chain(self.terrain_grass.values()) {
                     if box_visible(&planes, c.lo, c.hi)
@@ -6347,6 +6412,62 @@ impl Renderer {
                 pass.set_bind_group(1, &self.textures[0], &[]);
                 unbind();
             }
+            if frame.sky {
+                // Depth-test sky and clouds against reversed-Z clear depth (0.0)
+                // after opaque and terrain geometry so only uncovered sky samples
+                // are shaded (0a108737), while cutout edges blend over sky + clouds.
+                pass.set_bind_group(0, &self.globals_bg, &[]);
+                pass.set_bind_group(1, &self.textures[0], &[]);
+                pass.set_bind_group(2, &target.glass_bg, &[]);
+                pass.set_pipeline(&viewport.sky);
+                pass.draw(0..3, 0..1);
+                if let Some(c) = self.clouds[cloud_slot].as_ref().filter(|_| frame.clouds.is_some()) {
+                    let globals_bg = self.sky_globals.as_ref().map_or(&self.globals_bg, |(_, bg)| bg);
+                    c.draw_over_sky(device, &mut pass, globals_bg);
+                    pass.set_bind_group(0, &self.globals_bg, &[]);
+                    pass.set_bind_group(1, &self.textures[0], &[]);
+                    pass.set_bind_group(2, &target.glass_bg, &[]);
+                }
+                unbind();
+            }
+            // Opaque authored decal texels and opaque cutout SurfaceAppearance
+            // texels (>= 0.5) contribute scene depth while keeping the encoded
+            // color pass for Studio-accurate blending on fractional edges.
+            if has_cutout {
+                pass.set_vertex_buffer(1, self.static_buf.slice(..));
+                for r in static_ranges.iter().filter(|r| r.0 == Pass::Cutout) {
+                    pass.set_pipeline(if self.culls_back(r.1 .0) {
+                        &viewport.decal_depth_culled
+                    } else {
+                        &viewport.decal_depth
+                    });
+                    draw_uncounted(&mut pass, r.1, r.2..r.3, r.4);
+                }
+                pass.set_vertex_buffer(1, self.instance_buf.slice(..));
+                for r in &cutout_runs {
+                    pass.set_pipeline(if self.culls_back(r.0 .0) {
+                        &viewport.decal_depth_culled
+                    } else {
+                        &viewport.decal_depth
+                    });
+                    draw_dynamic_uncounted(&mut pass, r.0, r.1..r.2);
+                }
+            }
+            pass.set_vertex_buffer(1, self.instance_buf.slice(..));
+            pass.set_pipeline(&viewport.decal_depth);
+            for r in &surface_decal_runs {
+                draw_dynamic_uncounted(&mut pass, r.0, r.1..r.2);
+            }
+            for r in &blend_runs {
+                if raw[r.1 as usize..r.2 as usize].iter().any(|part| part.extra[3] == DECAL_TEX_MODE) {
+                    pass.set_pipeline(if self.culls_back(r.0.0) {
+                        &viewport.decal_depth_culled
+                    } else {
+                        &viewport.decal_depth
+                    });
+                    draw_dynamic_uncounted(&mut pass, r.0, r.1..r.2);
+                }
+            }
             if !encoded {
                 surface_decals(&mut pass, &mut calls);
                 lines(&mut pass);
@@ -6357,9 +6478,9 @@ impl Renderer {
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: scene (opaque, terrain, unencoded blends)");
         drop(r_scope);
-        // Decals on solid hosts belong to the surface: before terrain water
-        // and glass read the scene.
-        if encoded && split && !surface_decal_runs.is_empty() {
+        // Decals on solid hosts and opaque cutout SurfaceAppearances belong to
+        // the opaque scene: draw before terrain water and glass read it.
+        if encoded && split && has_pre_split_see {
             let mut pass = see_begin(&mut encoder);
             surface_decals(&mut pass, &mut calls);
             drop(pass);
@@ -6386,7 +6507,7 @@ impl Renderer {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &target.msaa,
                         depth_slice: None,
-                        resolve_target: (samples > 1).then_some(&target.hdr_view),
+                        resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
@@ -6431,7 +6552,7 @@ impl Renderer {
                 pass.draw(0..3, 0..1);
             }
             if !encoded {
-                let mut pass = scene_pass(&mut encoder, "see-through", false, true);
+                let mut pass = scene_pass(&mut encoder, "see-through", false, true, true);
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 see_through(&mut pass, &mut calls);
             }
@@ -6455,11 +6576,6 @@ impl Renderer {
             crate::gpu_timing::mark(&mut encoder, "gpu: water, glass, split see-through");
         }
         stats.draw_calls = calls;
-        // Scene colour snapshot (water/glass reads are complete).
-        encoder.copy_texture_to_texture(target.hdr.as_image_copy(), target.scene_copy.as_image_copy(),
-            wgpu::Extent3d { width: target.size[0], height: target.size[1], depth_or_array_layers: 1 });
-        crate::gpu_timing::mark(&mut encoder, "gpu: scene copy");
-        // Bloom: bright pass, blur across, blur down (half resolution).
         // SSAO, then its multiply into the scene.
         // Performance > Ambient occlusion Off skips both (a full-resolution
         // pass on a weak chip).
@@ -6467,6 +6583,10 @@ impl Renderer {
             || rustudio_core::rustudio_settings::performance_value("ssao") != "off",
             |profile| profile.ssao(),
         ) {
+            // The apply pass is the only reader of this snapshot.
+            encoder.copy_texture_to_texture(target.hdr.as_image_copy(), target.scene_copy.as_image_copy(),
+                wgpu::Extent3d { width: target.size[0], height: target.size[1], depth_or_array_layers: 1 });
+            crate::gpu_timing::mark(&mut encoder, "gpu: scene copy");
             let steps: [(&str, &wgpu::RenderPipeline, usize, &wgpu::TextureView, bool); 5] = [
                 ("ssao depth", &viewport.ssao_down, 0, &target.ssao_depth_view, true),
                 ("ssao", &viewport.ssao_main, 1, &target.ssao_views[0], true),
@@ -6499,23 +6619,24 @@ impl Renderer {
             }
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: ssao");
-        // Terrain.Clouds over the sky (Studio composes them after SSAO).
-        if let Some(c) = self.clouds[cloud_slot].as_mut().filter(|_| frame.clouds.is_some() && frame.sky) {
-            encoder.copy_texture_to_texture(target.hdr.as_image_copy(), target.scene_copy.as_image_copy(),
-                wgpu::Extent3d { width: target.size[0], height: target.size[1], depth_or_array_layers: 1 });
-            let globals_bg = self.sky_globals.as_ref().map_or(&self.globals_bg, |(_, bg)| bg);
-            c.composite(device, &mut encoder, globals_bg, &target.hdr_view, &target.scene_copy_view, &target.depth);
-        }
-        crate::gpu_timing::mark(&mut encoder, "gpu: clouds composite");
-        // The post chain waits for the world GUIs and effects
-        // (`draw_world_gui`): `finish_frame` records it once, after them.
-        self.post_due = true;
+        self.postfx.encode(
+            device,
+            queue,
+            &mut encoder,
+            &target.display_view,
+            &self.last_postfx,
+            true,
+        );
         self.probe.flush(queue);
-        // Prepare ends here: the render thread finishes (encodes) these
-        // passes while this thread goes on with the frame, and submits them
-        // with the post chain (RenderView::renderPerform, render_thread.rs).
-        let after = self.clouds[cloud_slot].as_mut().and_then(|c| c.after_submit());
-        crate::render_thread::finish(queue, vec![encoder], after);
+        let r_scope = rustudio_core::bench::scope("r_finish");
+        let commands = encoder.finish();
+        drop(r_scope);
+        let r_scope = rustudio_core::bench::scope("r_submit");
+        queue.submit([commands]);
+        drop(r_scope);
+        if let Some(c) = self.clouds[cloud_slot].as_mut() {
+            c.after_submit();
+        }
         self.stats = stats;
         rustudio_core::bench::perf::end_frame(svc_t0.elapsed().as_secs_f64(), 0.0);
         draw_top::end_frame();
@@ -7032,6 +7153,7 @@ fn draw_key(p: &PartDraw) -> (usize, usize) {
 }
 
 const DECAL_TEX_MODE: f32 = 2.0;
+const CUTOUT_TEX_MODE: f32 = 4.0;
 
 fn tex_mode(p: &PartDraw) -> f32 {
     match (p.tex_mode, p.texture) {
@@ -7039,7 +7161,7 @@ fn tex_mode(p: &PartDraw) -> f32 {
         (TexMode::Over, Some(_)) => 1.0,
         (TexMode::Decal, Some(_)) => DECAL_TEX_MODE,
         (TexMode::Opaque, Some(_)) => 3.0,
-        (TexMode::Cutout, Some(_)) => 4.0,
+        (TexMode::Cutout, Some(_)) => CUTOUT_TEX_MODE,
         (TexMode::OpaqueTinted, Some(_)) => 5.0,
         (TexMode::TintMask, Some(_)) => 6.0,
     }
@@ -7336,10 +7458,6 @@ impl Renderer {
             if item.state == ItemState::Dynamic || (!vf.layer_of.is_empty() && vf.layer_of.contains_key(r)) {
                 continue;
             }
-            if !item.draws.iter().all(|d| !shows(d) || pass_of(d).is_some()) {
-                item.state = ItemState::Dynamic;
-                continue;
-            }
             let rank = owners.len() as u32;
             match &item.state {
                 ItemState::Static(slots) => {
@@ -7355,6 +7473,13 @@ impl Renderer {
                     }
                 }
                 _ => {
+                    // Updates keep an existing static slot only while its
+                    // draw is still eligible. Validate draws arriving here
+                    // from the pending list before giving them a slot.
+                    if !item.draws.iter().all(|d| !shows(d) || pass_of(d).is_some()) {
+                        item.state = ItemState::Dynamic;
+                        continue;
+                    }
                     item.state = ItemState::Static(vec![u32::MAX; item.draws.len()]);
                     for (i, d) in item.draws.iter().enumerate() {
                         let Some(pass) = pass_of(d).filter(|_| shows(d)) else { continue };
@@ -7381,44 +7506,42 @@ impl Renderer {
             let (rank, draw) = slot_owner[slot];
             (pass, key, morton([c.x as i32, c.y as i32, c.z as i32]), !total_order_bits(self.st.radii[slot]), rank, draw)
         };
-        let mut old: Vec<(u32, (Pass, (usize, usize), u64, u32, u32, u32))> = Vec::with_capacity(n_old);
-        for slot in 0..n_old {
-            if slot_owner[slot].0 == u32::MAX {
-                continue;
-            }
-            let k = key_of(slot, &self.st.raw[slot]);
-            if old.last().is_some_and(|l| l.1 >= k) {
-                return None;
-            }
-            old.push((slot as u32, k));
-        }
+        let mut old = slot_owner.iter().enumerate().filter_map(|(slot, &(rank, _))| {
+            (rank != u32::MAX).then(|| (slot, key_of(slot, &self.st.raw[slot])))
+        }).peekable();
         fresh.sort_unstable_by(|a, b| a.key.cmp(&b.key));
         rustudio_core::bench::add("rs_merge_new", 0.0, fresh.len() as u64);
+        let capacity = n_old.saturating_sub(self.st.hidden) + fresh.len();
         let mut st = StaticLayout {
-            raw: Vec::with_capacity(old.len() + fresh.len()),
-            keys: Vec::with_capacity(old.len() + fresh.len()),
-            radii: Vec::with_capacity(old.len() + fresh.len()),
+            raw: Vec::with_capacity(capacity),
+            keys: Vec::with_capacity(capacity),
+            radii: Vec::with_capacity(capacity),
             ..Default::default()
         };
-        let (mut i, mut j) = (0, 0);
+        let mut fresh = fresh.into_iter().peekable();
+        let mut previous = None;
         let mut cell_of_batch = u64::MAX;
-        while i < old.len() || j < fresh.len() {
-            let take_old = j >= fresh.len() || (i < old.len() && old[i].1 < fresh[j].key);
-            let (key, raw, radius) = if take_old {
-                let (s, k) = (old[i].0 as usize, old[i].1);
-                i += 1;
-                (k, self.st.raw[s], self.st.radii[s])
-            } else {
-                j += 1;
-                (fresh[j - 1].key, fresh[j - 1].raw, fresh[j - 1].radius)
+        loop {
+            let (key, raw, radius) = match (old.peek(), fresh.peek()) {
+                (Some((_, key)), next) if next.is_none_or(|entry| *key < entry.key) => {
+                    let (slot, key) = old.next().expect("peeked old slot");
+                    if previous.is_some_and(|p| p >= key) {
+                        // The full rebuild resets every item's slots, including
+                        // ones already assigned by this merge.
+                        return None;
+                    }
+                    previous = Some(key);
+                    (key, self.st.raw[slot], self.st.radii[slot])
+                }
+                (_, Some(_)) => {
+                    let entry = fresh.next().expect("peeked new slot");
+                    (entry.key, entry.raw, entry.radius)
+                }
+                (None, None) => break,
+                (Some(_), None) => unreachable!("the old slot wins when no new slot remains"),
             };
             let slot = st.raw.len() as u32;
-            // (the box aabb_of gives, from the same axes and size)
-            let axis = |r: [f32; 4]| Vec3::new(r[0], r[1], r[2]);
-            let h = Vec3::new(raw.size[0], raw.size[1], raw.size[2]) * 0.5;
-            let ext = axis(raw.r0).abs() * h.x + axis(raw.r1).abs() * h.y + axis(raw.r2).abs() * h.z;
-            let pos = Vec3::new(raw.r0[3], raw.r1[3], raw.r2[3]);
-            let (lo, hi) = (pos - ext, pos + ext);
+            let (lo, hi) = raw_aabb(&raw);
             st.raw.push(raw);
             st.keys.push((key.0, key.1));
             st.radii.push(radius);
@@ -7575,7 +7698,8 @@ impl Renderer {
     /// Uploads a new static layout and makes it current.
     fn finish_static(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mut st: StaticLayout) {
         let scope = rustudio_core::bench::scope("rs_upload");
-        if st.raw.len() > self.static_cap {
+        let resized = st.raw.len() > self.static_cap;
+        if resized {
             self.static_cap = st.raw.len().next_power_of_two();
             self.static_buf = Self::make_buf(
                 device,
@@ -7583,8 +7707,11 @@ impl Renderer {
                 self.static_cap * std::mem::size_of::<InstanceRaw>(),
             );
         }
-        if !st.raw.is_empty() {
-            queue.write_buffer(&self.static_buf, 0, bytemuck::cast_slice(&st.raw));
+        let start = if resized { 0 } else { static_upload_start(&self.st, &st.raw) };
+        if start < st.raw.len() {
+            let bytes = bytemuck::cast_slice(&st.raw[start..]);
+            rustudio_core::bench::add("rs_upload_bytes", 0.0, bytes.len() as u64);
+            queue.write_buffer(&self.static_buf, (start * std::mem::size_of::<InstanceRaw>()) as u64, bytes);
         }
         drop(scope);
         let scope = rustudio_core::bench::scope("rs_swap");
@@ -7854,12 +7981,276 @@ fn mip_levels(w: u32, h: u32) -> u32 {
     32 - w.max(h).leading_zeros()
 }
 
-/// PBR maps hold linear data: their mips average the stored values (a
-/// gamma-correct colour mip would distort normals and roughness).
+/// An RGBA8 sRGB image followed by its mip levels (each half the size,
+/// 2×2 texels averaged in linear light; alpha averaged as is).
+/// PBR maps contain linear data; gamma-correct colour mips distort normals
+/// and roughness. Keep the channels in their encoded data space.
+fn data_mip_chain(mut w: u32, mut h: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    let mut prev = rgba.to_vec();
+    while w > 1 || h > 1 {
+        let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+        let mut next = vec![0; (nw * nh * 4) as usize];
+        for y in 0..nh { for x in 0..nw { for c in 0..4 {
+            let mut sum = 0u16;
+            for (dx, dy) in [(0,0), (1,0), (0,1), (1,1)] {
+                sum += prev[(((y*2+dy).min(h-1)*w + (x*2+dx).min(w-1))*4) as usize + c] as u16;
+            }
+            next[((y*nw+x)*4) as usize+c] = ((sum+2)/4) as u8;
+        }}}
+        out.extend_from_slice(&next);
+        prev = next;
+        w = nw; h = nh;
+    }
+    out
+}
+
 #[test]
 fn pbr_mips_preserve_linear_channels() {
     let px = [0,0,0,0, 255,255,255,255, 0,0,0,0, 255,255,255,255];
-    assert_eq!(&rustudio_core::texture::data_mip_chain(2,2,&px)[16..], &[128;4]);
+    assert_eq!(&data_mip_chain(2,2,&px)[16..], &[128;4]);
+}
+
+/// Cache key for the Atmosphere-baked `PrefilteredEnvTexture` mips of `sky_tex`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SkyEnvKey(u64, u64);
+
+impl SkyEnvKey {
+    fn from_globals(sky_gen: u64, g: &Globals) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for c in &g.atmos_cube {
+            for ch in 0..3 {
+                c[ch].to_bits().hash(&mut h);
+            }
+        }
+        for ch in 0..3 {
+            g.atmos_sky[ch].to_bits().hash(&mut h);
+        }
+        for ch in 0..3 {
+            g.atmos_glare[ch].to_bits().hash(&mut h);
+        }
+        for ch in 0..4 {
+            g.sun_dir[ch].to_bits().hash(&mut h);
+        }
+        for ch in 0..3 {
+            g.sun_color[ch].to_bits().hash(&mut h);
+        }
+        for ch in 0..4 {
+            g.sky_tint[ch].to_bits().hash(&mut h);
+        }
+        Self(sky_gen, h.finish())
+    }
+}
+
+/// Evaluates Studio's `AdvSkyLinearEnvFS` (when `atmos` is `Some`) at `base_size`
+/// (128px), filters its environment mips, and
+/// encodes each mip level as 6 contiguous RGBA8 cube faces.
+fn prefilter_env_mips(base_raw: &[u8], base_size: u32, atmos: Option<&Globals>) -> Vec<(u32, Vec<u8>)> {
+    use rustudio_core::mech as m;
+    let bw = base_size as usize;
+    let levels = mip_levels(base_size, base_size) as usize;
+    let to_lin_srgb: [f32; 256] = std::array::from_fn(|i| (i as f32 / 255.0).powf(2.2));
+    let th_srgb: [f32; 255] = std::array::from_fn(|i| ((i as f32 + 0.5) / 255.0).powf(2.2));
+    let encode_px = |lin: [f32; 3]| -> [u8; 4] {
+        [
+            th_srgb.partition_point(|&t| t <= lin[0]) as u8,
+            th_srgb.partition_point(|&t| t <= lin[1]) as u8,
+            th_srgb.partition_point(|&t| t <= lin[2]) as u8,
+            255,
+        ]
+    };
+    let mut mip0 = Vec::with_capacity(6 * bw * bw);
+    if let Some(g) = atmos {
+        let tint = if g.sky_tint[3] > 0.5 {
+            [g.sky_tint[0], g.sky_tint[1], g.sky_tint[2]]
+        } else {
+            [1.0; 3]
+        };
+        let sun_dir = Vec3::new(g.sun_dir[0], g.sun_dir[1], g.sun_dir[2]).normalize_or_zero();
+        let sun_col = [
+            g.sun_color[0] * g.sun_dir[3],
+            g.sun_color[1] * g.sun_dir[3],
+            g.sun_color[2] * g.sun_dir[3],
+        ];
+        let fog_off_x = g.atmos_sky[0];
+        let fog_off_y = g.atmos_sky[1];
+        let glare_k = g.atmos_sky[2];
+        let glare_exp = [g.atmos_glare[0], g.atmos_glare[1], g.atmos_glare[2]];
+        let cube = g.atmos_cube;
+        for f in 0..6 {
+            for ty in 0..bw {
+                for tx in 0..bw {
+                    let dir = cube_face_dir(f, (tx as f32 + 0.5) / bw as f32, (ty as f32 + 0.5) / bw as f32);
+                    let p = &base_raw[(f * bw * bw + ty * bw + tx) * 4..];
+                    let c = [
+                        (p[0] as f32 / 255.0).powi(2) * tint[0],
+                        (p[1] as f32 / 255.0).powi(2) * tint[1],
+                        (p[2] as f32 / 255.0).powi(2) * tint[2],
+                    ];
+                    let y = dir.y.max(1e-5);
+                    let t = (fog_off_x / (m::ATMOS_T_EPS + y.powf(fog_off_y))).exp2().clamp(0.0, 1.0);
+                    let px = dir.x.max(0.0);
+                    let nx = (-dir.x).max(0.0);
+                    let py = dir.y.max(0.0);
+                    let ny = (-dir.y).max(0.0);
+                    let pz = dir.z.max(0.0);
+                    let nz = (-dir.z).max(0.0);
+                    let (px2, nx2, py2, ny2, pz2, nz2) = (px * px, nx * nx, py * py, ny * ny, pz * pz, nz * nz);
+                    let sun_u = (0.5 + 0.5 * dir.dot(sun_dir)).max(0.0);
+                    let mut lin = [0.0f32; 3];
+                    for ch in 0..3 {
+                        let haze = cube[0][ch] * px2 + cube[1][ch] * nx2
+                            + cube[2][ch] * py2 + cube[3][ch] * ny2
+                            + cube[4][ch] * pz2 + cube[5][ch] * nz2;
+                        let gl = (sun_u.powf(glare_exp[ch]) * (1.0 - t)).clamp(0.0, 1.0) * glare_k;
+                        let h = haze + sun_col[ch] * gl;
+                        lin[ch] = (h + (c[ch] - h) * t) * (p[3] as f32 / 255.0);
+                    }
+                    mip0.push(lin);
+                }
+            }
+        }
+        return sky_env_filter::filter(mip0, base_size, levels);
+    } else {
+        for p in base_raw.chunks_exact(4) {
+            mip0.push([to_lin_srgb[p[0] as usize], to_lin_srgb[p[1] as usize], to_lin_srgb[p[2] as usize]]);
+        }
+    }
+
+    let mut src: Vec<(usize, Vec<[f32; 3]>)> = Vec::with_capacity(levels);
+    src.push((bw, mip0));
+    for l in 1..levels {
+        let (pw, prev) = &src[l - 1];
+        let pw = *pw;
+        let w = (pw >> 1).max(1);
+        let mut next = Vec::with_capacity(6 * w * w);
+        for f in 0..6 {
+            let base = f * pw * pw;
+            for ty in 0..w {
+                for tx in 0..w {
+                    let (x0, y0) = (tx * 2, ty * 2);
+                    let (x1, y1) = ((x0 + 1).min(pw - 1), (y0 + 1).min(pw - 1));
+                    let s00 = prev[base + y0 * pw + x0];
+                    let s10 = prev[base + y0 * pw + x1];
+                    let s01 = prev[base + y1 * pw + x0];
+                    let s11 = prev[base + y1 * pw + x1];
+                    next.push([
+                        (s00[0] + s10[0] + s01[0] + s11[0]) * 0.25,
+                        (s00[1] + s10[1] + s01[1] + s11[1]) * 0.25,
+                        (s00[2] + s10[2] + s01[2] + s11[2]) * 0.25,
+                    ]);
+                }
+            }
+        }
+        src.push((w, next));
+    }
+    let fetch = |level: usize, d: Vec3| -> [f32; 3] {
+        let (w, px) = &src[level.min(src.len() - 1)];
+        let w = *w;
+        let (f, sc, tc) = cube_face_st(d);
+        let x = ((sc * w as f32 - 0.5).max(0.0)).min(w as f32 - 1.0);
+        let y = ((tc * w as f32 - 0.5).max(0.0)).min(w as f32 - 1.0);
+        let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+        let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(w - 1));
+        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        let at = |xx: usize, yy: usize| px[f * w * w + yy * w + xx];
+        let mut c = [0f32; 3];
+        for (xx, yy, wt) in [
+            (x0, y0, (1.0 - fx) * (1.0 - fy)),
+            (x1, y0, fx * (1.0 - fy)),
+            (x0, y1, (1.0 - fx) * fy),
+            (x1, y1, fx * fy),
+        ] {
+            let s = at(xx, yy);
+            for ch in 0..3 {
+                c[ch] += s[ch] * wt;
+            }
+        }
+        c
+    };
+    let n_samples = m::ENV_PREFILTER_SAMPLES;
+    let texel_sa = 4.0 * std::f32::consts::PI / (6.0 * (bw as f32) * (bw as f32));
+    let mut out: Vec<(u32, Vec<u8>)> = (0..levels)
+        .map(|l| {
+            let w = (base_size >> l).max(1);
+            (w, vec![255u8; 6 * (w as usize) * (w as usize) * 4])
+        })
+        .collect();
+    // Mip 0: the unfiltered clear sky.
+    for (i, lin) in src[0].1.iter().enumerate() {
+        out[0].1[i * 4..i * 4 + 4].copy_from_slice(&encode_px(*lin));
+    }
+    // Mips 1..levels: GGX-prefiltered in parallel across the 6 faces.
+    let face_mips: Vec<Vec<Vec<u8>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..6)
+            .map(|f| {
+                let fetch = &fetch;
+                let encode_px = &encode_px;
+                scope.spawn(move || {
+                    let mut per_level = Vec::with_capacity(levels - 1);
+                    for l in 1..levels {
+                        let w = (base_size >> l).max(1) as usize;
+                        let rough = (l as f32 / m::ENV_SPEC_MIP_PER_ROUGHNESS).min(1.0);
+                        let a = rough * rough;
+                        let a2 = a * a;
+                        let mut bytes = vec![255u8; w * w * 4];
+                        for ty in 0..w {
+                            for tx in 0..w {
+                                let n = cube_face_dir(f, (tx as f32 + 0.5) / w as f32, (ty as f32 + 0.5) / w as f32);
+                                let up = if n.z.abs() < 0.999 { Vec3::Z } else { Vec3::X };
+                                let tx_ = up.cross(n).normalize();
+                                let ty_ = n.cross(tx_);
+                                let mut acc = [0f32; 3];
+                                let mut wsum = 0f32;
+                                for i in 0..n_samples {
+                                    let u = (i as f32 + 0.5) / n_samples as f32;
+                                    let v = (i as u32).reverse_bits() as f32 / 4294967296.0;
+                                    let phi = 2.0 * std::f32::consts::PI * v;
+                                    let cos_t = ((1.0 - u) / (1.0 + (a2 - 1.0) * u)).sqrt();
+                                    let sin_t = (1.0 - cos_t * cos_t).max(0.0).sqrt();
+                                    let h = tx_ * (sin_t * phi.cos()) + ty_ * (sin_t * phi.sin()) + n * cos_t;
+                                    let lv = h * (2.0 * cos_t) - n;
+                                    let nl = n.dot(lv);
+                                    if nl <= 0.0 {
+                                        continue;
+                                    }
+                                    let dd = cos_t * cos_t * (a2 - 1.0) + 1.0;
+                                    let d = a2 / (std::f32::consts::PI * dd * dd);
+                                    let sample_sa = 1.0 / (n_samples as f32 * d * 0.25 + 1e-4);
+                                    let mip = (0.5 * (sample_sa / texel_sa).log2() + 1.0).max(0.0);
+                                    let m0 = mip.floor() as usize;
+                                    let t = mip - m0 as f32;
+                                    let c0 = fetch(m0, lv);
+                                    let c1 = fetch(m0 + 1, lv);
+                                    for ch in 0..3 {
+                                        acc[ch] += (c0[ch] * (1.0 - t) + c1[ch] * t) * nl;
+                                    }
+                                    wsum += nl;
+                                }
+                                let inv = 1.0 / wsum.max(1e-6);
+                                let p = (ty * w + tx) * 4;
+                                bytes[p..p + 4].copy_from_slice(&encode_px(
+                                    [acc[0] * inv, acc[1] * inv, acc[2] * inv],
+                                ));
+                            }
+                        }
+                        per_level.push(bytes);
+                    }
+                    per_level
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for l in 1..levels {
+        let w = out[l].0 as usize;
+        let face_bytes = w * w * 4;
+        for f in 0..6 {
+            out[l].1[f * face_bytes..(f + 1) * face_bytes].copy_from_slice(&face_mips[f][l - 1]);
+        }
+    }
+    out
 }
 
 /// Six square faces, each with its mip chain, layer-major (a cube upload).

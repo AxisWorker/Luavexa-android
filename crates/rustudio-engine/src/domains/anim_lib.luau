@@ -512,15 +512,8 @@ function ACP.GetAnimationClipAsync(self, id)
         task.wait()
         state = __rs_asset_ready(n)
     end
-    local ok, model, decoding = false, nil, false
-    if state == true then
-        ok, model, decoding = pcall(__rs_anim_asset, n)
-        -- (decoded on a worker: yields until it is in)
-        while ok and decoding do
-            task.wait()
-            ok, model, decoding = pcall(__rs_anim_asset, n)
-        end
-    end
+    local ok, model = false, nil
+    if state == true then ok, model = pcall(__rs_anim_asset, n) end
     if ok and model then
         local c = if model:IsA("AnimationClip") then model else model:FindFirstChildWhichIsA("AnimationClip", true)
         if c then c.Parent = nil; return c end
@@ -558,8 +551,6 @@ local ANIM = {}
 function ANIM.GetTrackByAnimationId(self, id)
     return __rs_track_by_id(self, tostring(id))
 end
-function ANIM.StepAnimations() return nil end
-function ANIM.ApplyJointVelocities() return nil end
 function ANIM.RegisterEvaluationParallelCallback() error("RegisterEvaluationParallelCallback is not enabled!", 0) end
 -- AnimationController:GetPlayingAnimationTracks (deprecated): its Animator's.
 local AC = {}

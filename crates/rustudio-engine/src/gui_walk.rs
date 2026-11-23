@@ -8,13 +8,25 @@ use std::time::{Duration, Instant};
 use super::*;
 use rustudio_core::mech;
 
+fn safe_font_size(size: f32) -> f32 {
+    if size.is_finite() {
+        size.max(mech::GUI_MIN_FONT_SIZE)
+    } else {
+        mech::GUI_MIN_FONT_SIZE
+    }
+}
+
+fn constrain_font_size(size: f32, min: f32, max: f32) -> f32 {
+    let min = safe_font_size(min);
+    size.clamp(min, safe_font_size(max).max(min))
+}
 
 /// Measures TextScaled against a canvas without laying out the same
 /// single-line text again at every projected BillboardGui width.
 #[derive(Default)]
 pub(super) struct TextFitCache {
     sizes: TextMemo<(LayoutJob, FitSearch), 4096>,
-    wrapped: TextMemo<(LayoutJob, egui::Vec2), 4096>,
+    wrapped: TextMemo<(LayoutJob, egui::Vec2, bool), 4096>,
     unwrapped: rustc_hash::FxHashMap<u64, UnwrappedProbes>,
     probe_fonts: Option<Fonts>,
     /// The probe fonts being made on another thread (live runs: parsing every
@@ -77,6 +89,23 @@ fn single_line_ascii(text: &str) -> bool {
     text.bytes().all(|byte| byte == b' ' || byte.is_ascii_graphic())
 }
 
+/// Whether epaint had to split a single word across rows because it exceeded
+/// `max_width` (Roblox `TextScaled` shrinks the font size rather than breaking
+/// a word mid-word).
+pub(super) fn has_mid_word_break(galley: &egui::Galley) -> bool {
+    galley.rows.windows(2).any(|w| {
+        if w[0].ends_with_newline {
+            return false;
+        }
+        let last = w[0].row.glyphs.last().map(|g| g.chr);
+        let first = w[1].row.glyphs.first().map(|g| g.chr);
+        match (last, first) {
+            (Some(a), Some(b)) => !a.is_whitespace() && !b.is_whitespace() && !matches!(a, '-' | '/'),
+            _ => false,
+        }
+    })
+}
+
 /// Trial text sizes do not use the displayed atlas. Reuse the identical
 /// Roblox fallback faces so an atlas reset only parses each file once.
 fn probe_font_definitions(mut definitions: egui::FontDefinitions) -> egui::FontDefinitions {
@@ -134,8 +163,7 @@ impl TextFitCache {
         self.spent[usize::from(self.screen)] += start.elapsed();
     }
 
-    fn probe(&mut self, ctx: &egui::Context, mut job: LayoutJob) -> Option<Arc<egui::Galley>> {
-        sane_font_sizes(&mut job);
+    fn probe(&mut self, ctx: &egui::Context, job: LayoutJob) -> Option<Arc<egui::Galley>> {
         let start = self.can_start_work().then(Instant::now)?;
         // TextScaled tries fractional sizes that never get painted. Keep
         // their glyphs away from the uploaded atlas and its world-GUI mips.
@@ -197,7 +225,6 @@ impl TextFitCache {
     fn layout(&mut self, ctx: &egui::Context, mut job: LayoutJob) -> Option<Arc<egui::Galley>> {
         // epaint normalizes the wrapping width before it stores the layout.
         job.wrap.max_width = job.wrap.max_width.round();
-        sane_font_sizes(&mut job);
         let key = text_job_hash(&job, ());
         if let Some(galley) = self.galleys.get(key).filter(|g| *g.job == job) {
             return Some(galley.clone());
@@ -240,7 +267,7 @@ impl TextFitCache {
         let (mut lo, mut hi, mut step) = match self.sizes.get(key).filter(|(job, _)| *job == style) {
             Some((_, FitSearch::Ready(size))) => return Some(*size),
             Some((_, FitSearch::Pending { lo, hi, step })) => (*lo, *hi, *step),
-            None => (1.0, max.max(1.0), 0),
+            None => (1.0, max.floor().max(1.0) + 1.0, 0),
         };
         if !self.can_start_work() {
             return None;
@@ -265,8 +292,8 @@ impl TextFitCache {
         // Resume this search at the first unmeasured size next frame.
         // A probe is the smallest unit of atlas work.
         let mut search = || {
-            while step < 10 && lo.floor() != hi.floor() {
-                let mid = (lo + hi) * 0.5;
+            while step < 10 && lo + 1.0 < hi {
+                let mid = ((lo + hi) * 0.5).floor();
                 if line_height.is_some_and(|height| mid * height > height_limit) {
                     hi = mid;
                     step += 1;
@@ -283,34 +310,35 @@ impl TextFitCache {
                     // epaint skips the wrapping loop when the paragraph advance
                     // fits the rounded wrap width. No wrap fits a shorter height
                     // than the single row for this uniform text.
-                    (advance <= bounds.x.max(1.0).round() || single.y > bounds.y + 0.5).then_some(single)
+                    (advance <= bounds.x.max(1.0).round() || single.y > bounds.y + 0.5).then_some((single, false))
                 } else {
                     None
                 };
-                let measured = if let Some(measured) = measured {
+                let (measured, mid_break) = if let Some(measured) = measured {
                     measured
                 } else {
                     let mut job = build(mid, true);
                     job.wrap.max_width = job.wrap.max_width.round();
                     let key = text_job_hash(&job, ());
-                    if let Some((_, measure)) = self.wrapped.get(key).filter(|(cached, _)| *cached == job) {
-                        *measure
+                    if let Some((_, measure, broken)) = self.wrapped.get(key).filter(|(cached, _, _)| *cached == job) {
+                        (*measure, *broken)
                     } else {
                         let _p = rustudio_core::bench::scope("gui_text_fit_wrapped");
                         let galley = self.probe(ctx, job)?;
                         let measure = galley.size();
-                        self.wrapped.insert(key, ((*galley.job).clone(), measure));
-                        measure
+                        let broken = has_mid_word_break(&galley);
+                        self.wrapped.insert(key, ((*galley.job).clone(), measure, broken));
+                        (measure, broken)
                     }
                 };
-                if measured.x <= bounds.x + 0.5 && measured.y <= bounds.y + 0.5 {
+                if !mid_break && measured.x <= bounds.x + 0.5 && measured.y <= bounds.y + 0.5 {
                     lo = mid;
                 } else {
                     hi = mid;
                 }
                 step += 1;
             }
-            Some(lo.floor().max(1.0))
+            Some(lo.clamp(1.0, max.max(1.0)))
         };
         let size = search();
         if simple {
@@ -327,7 +355,7 @@ impl TextFitCache {
 
 /// `rect` inside the UIPadding of `r` (a GuiObject or a LayerCollector:
 /// Studio pads a ScreenGui's children too, e.g. Laser Tag's 20 px HUD margin).
-pub(super) fn padded(d: &Document, r: Ref, rect: Rect, scale: f32) -> Rect {
+pub(crate) fn padded(d: &Document, r: Ref, rect: Rect, scale: f32) -> Rect {
     let Some(p) = child_of_class(d, r, "UIPadding") else {
         return rect;
     };
@@ -335,7 +363,7 @@ pub(super) fn padded(d: &Document, r: Ref, rect: Rect, scale: f32) -> Rect {
     let rr = udim(d, p, "PaddingRight");
     let t = udim(d, p, "PaddingTop");
     let b = udim(d, p, "PaddingBottom");
-    Rect::from_min_max(
+    Rect::from_two_pos(
         Pos2::new(
             rect.left() + l[0] * rect.width() + l[1] * scale,
             rect.top() + t[0] * rect.height() + t[1] * scale,
@@ -345,6 +373,66 @@ pub(super) fn padded(d: &Document, r: Ref, rect: Rect, scale: f32) -> Rect {
             rect.bottom() - b[0] * rect.height() - b[1] * scale,
         ),
     )
+}
+
+/// Roblox multiline text height: `LineHeight` scales the spacing between lines
+/// only, not the final line's height (`(rows - 1) * size * line_height + size`).
+pub(super) fn text_rows_height(rows: usize, size: f32, line_height: f32) -> f32 {
+    if rows <= 1 {
+        size
+    } else {
+        (rows - 1) as f32 * size * line_height + size
+    }
+}
+
+/// Applies `UISizeConstraint` and `UIAspectRatioConstraint` children of a
+/// `UIGridLayout` to its computed cell size `(cw, ch)`.
+fn apply_cell_constraints(d: &Document, lay: Ref, mut cw: f32, mut ch: f32, scale: f32) -> (f32, f32) {
+    if let Some(c) = child_of_class(d, lay, "UISizeConstraint") {
+        let min = vec2(d, c, "MinSize", [0.0, 0.0]);
+        let max = vec2(d, c, "MaxSize", [f32::INFINITY, f32::INFINITY]);
+        if min[0] <= max[0] {
+            cw = cw.clamp(min[0] * scale, max[0] * scale);
+        }
+        if min[1] <= max[1] {
+            ch = ch.clamp(min[1] * scale, max[1] * scale);
+        }
+    }
+    if let Some(c) = child_of_class(d, lay, "UIAspectRatioConstraint") {
+        let ratio = num(d, c, "AspectRatio", 1.0).max(1e-3);
+        if enum_u32(d.prop(c, "AspectType")) == Some(1) {
+            if enum_u32(d.prop(c, "DominantAxis")) == Some(1) {
+                cw = ch * ratio;
+            } else {
+                ch = cw / ratio;
+            }
+        } else if cw / ch.max(1e-3) > ratio {
+            cw = ch * ratio;
+        } else {
+            ch = cw / ratio;
+        }
+    }
+    (cw, ch)
+}
+
+/// Signed slot offset of page `i` relative to `cur` in a `Circular` `UIPageLayout`
+/// of `n` pages. Moving forward (`dir > 0`) keeps `n/2` positive (`0,1,2,-1` for
+/// `n=4`); initial or backward (`dir <= 0`) wraps `(n+1)/2` negative (`0,1,-2,-1`).
+fn wrap_page_slot(i: usize, cur: usize, n: usize, dir: i8) -> i32 {
+    if n == 0 {
+        return 0;
+    }
+    let d = ((i as i32 - cur as i32).rem_euclid(n as i32)) as usize;
+    let wrap_neg = if dir > 0 {
+        d > n / 2
+    } else {
+        d >= (n + 1) / 2
+    };
+    if wrap_neg {
+        d as i32 - n as i32
+    } else {
+        d as i32
+    }
 }
 
 /// 2D affine map (turns of rotated GuiObjects).
@@ -417,8 +505,12 @@ pub(super) struct LocalHit {
     pub button: bool,
     pub textbox: bool,
     pub sink: bool,
+    /// GuiObject.Active (buttons default to true): a finger on it is the
+    /// GUI's (`gameProcessedEvent`); a button with it off still clicks but
+    /// lets the finger through, as Roblox's thumbstick frame relies on.
     pub active: bool,
     pub scrolling: bool,
+    pub page_layout: Option<Ref>,
     /// Draggable, or holds an enabled UIDragDetector.
     pub drag: bool,
     /// Drew something of its own (background, image, text, stroke…); an
@@ -476,6 +568,9 @@ pub(super) struct Walk<'a, 'b> {
     /// Memos being written, innermost last; and replay depth.
     pub rec: Vec<Rec>,
     pub replaying: u32,
+    /// Pre-computed cell rects from a parent `UITableLayout`, consumed when
+    /// walking each row/column strip's direct children.
+    pub table_cells: HashMap<Ref, Rect>,
 }
 
 /// Inherited while walking down the tree.
@@ -493,6 +588,33 @@ pub(super) struct Down {
 }
 
 impl Walk<'_, '_> {
+    /// rustudio extension (not Studio): Roblox's chat input bar only takes
+    /// clicks on its one-line TextBox, a thin strip inside the pill's
+    /// padding. A press anywhere on the pill (ExperienceChat's InputGroup)
+    /// focuses that TextBox here. The send button is drawn later, so its own
+    /// hit stays on top.
+    fn chat_pill_hit(&mut self, d: &Document, tb: Ref) {
+        let parent = |r: Ref| d.dom.get_by_ref(r).map(|i| i.parent()).filter(|p| p.is_some());
+        let named = |r: Ref, n: &str| name_of(d, r) == n;
+        let Some(tbc) = parent(tb).filter(|r| named(*r, "TextBoxContainer")) else { return };
+        let Some(tc) = parent(tbc).filter(|r| named(*r, "TextContainer")) else { return };
+        let Some(group) = parent(tc).filter(|r| named(*r, "InputGroup")) else { return };
+        let mut a = Some(group);
+        let mut in_chat = false;
+        while let Some(r) = a {
+            if named(r, "ExperienceChat") {
+                in_chat = true;
+                break;
+            }
+            a = parent(r);
+        }
+        if !in_chat {
+            return;
+        }
+        let Some(pill) = self.hits.iter().rev().find(|h| h.r == group).cloned() else { return };
+        self.hits.push(LocalHit { r: tb, button: false, textbox: true, sink: true, drag: false, painted: false, ..pill });
+    }
+
     fn push(&mut self, shape: Shape, dn: &Down) {
         self.seq += 1;
         self.items.push(Item {
@@ -506,38 +628,99 @@ impl Walk<'_, '_> {
         });
     }
 
-    /// Places the GuiObjects of `group` (the GuiObject children of `owner`:
-    /// the parent, or a Folder under it) by the UIListLayout / UIGridLayout /
-    /// UIPageLayout among `owner`'s children, inside `content`. Without a
-    /// layout nothing is placed: the objects sit at their own Position.
-    fn layout_group(&mut self, owner: Ref, group: &[Ref], content: Rect, dn: Down, placed: &mut HashMap<Ref, Rect>) {
+    /// Lays out and draws the GuiObject children of `parent` inside `content`.
+    pub(super) fn children(&mut self, parent: Ref, content: Rect, dn: Down) {
         let d = self.input.doc;
-        let list_layout = child_of_class(d, owner, "UIListLayout");
-        let list = list_layout.or_else(|| child_of_class(d, owner, "UIPageLayout"));
-        let grid = child_of_class(d, owner, "UIGridLayout");
-        if let Some(lay) = grid.or(list) {
-            let mut order: Vec<Ref> = group
-                .iter()
-                .copied()
-                .filter(|k| boolp(d, *k, "Visible", true))
-                .collect();
+        // Folders organize GUI descendants without introducing a layout box.
+        // A UIListLayout / UIGridLayout inside a Folder lays out the Folder's
+        // GuiObjects within the parent's content, as Roblox does (a Folder of
+        // buttons with its own UIListLayout: LBG's skill bar), while a layout
+        // under the parent arranges the parent's direct children only.
+        // (what was read is kept for the GUI cache: gui_input.rs cache_marks)
+        fn gui_children(d: &Document, parent: Ref, out: &mut Vec<Ref>, folders: &mut Vec<Ref>, gui: &mut Gui, by: Ref) {
+            gui.walk_kids.push(parent);
+            for child in children(d, parent) {
+                gui.walk_reads.push((child, by));
+                match d.class_of(child).as_deref() {
+                    Some("Folder") => {
+                        folders.push(child);
+                        gui_children(d, child, out, folders, gui, by)
+                    }
+                    Some(class) if doc::is_a(class, "GuiObject") => out.push(child),
+                    _ => {}
+                }
+            }
+        }
+        let mut kids = Vec::new();
+        let mut folders = Vec::new();
+        gui_children(d, parent, &mut kids, &mut folders, self.gui, self.cur);
+        let mut placed = self.place_children(parent, content, dn.scale, false);
+        for folder in folders {
+            placed.extend(self.place_children(folder, content, dn.scale, false));
+        }
+        // Sibling order: ZIndex, then child order.
+        let mut sorted = kids;
+        sorted.sort_by_key(|k| num(d, *k, "ZIndex", 1.0) as i32);
+        for k in sorted {
+            self.object_memo(k, content, placed.get(&k).copied(), dn);
+        }
+    }
+
+    /// Computes layout slots and their content extent without visiting or painting the slots.
+    pub(super) fn place_children(&mut self, parent: Ref, content: Rect, scale: f32, reading: bool) -> HashMap<Ref, Rect> {
+        let d = self.input.doc;
+        // UIGridStyleLayouts lay out only direct visible GuiObject children of
+        // `parent` (not GuiObjects nested inside a Folder child, though those
+        // are still rendered via `kids`).
+        let direct_kids: Vec<Ref> = children(d, parent)
+            .into_iter()
+            .filter(|k| {
+                d.class_of(*k).is_some_and(|c| doc::is_a(&c, "GuiObject"))
+                    && boolp(d, *k, "Visible", true)
+            })
+            .collect();
+        let list_layout = child_of_class(d, parent, "UIListLayout");
+        let page_layout = child_of_class(d, parent, "UIPageLayout");
+        let grid_layout = child_of_class(d, parent, "UIGridLayout");
+        let table_layout = child_of_class(d, parent, "UITableLayout");
+        let mut placed: HashMap<Ref, Rect> = HashMap::new();
+        let mut from_table = false;
+        if !self.table_cells.is_empty() {
+            for k in &direct_kids {
+                if let Some(rc) = self.table_cells.remove(k) {
+                    placed.insert(*k, rc);
+                    from_table = true;
+                }
+            }
+        }
+        if !from_table {
+        if let Some(lay) = grid_layout.or(table_layout).or(page_layout).or(list_layout) {
+            let mut order: Vec<Ref> = direct_kids;
             // SortOrder: Name 0, Custom 1, LayoutOrder 2.
-            match enum_u32(d.prop(lay, "SortOrder")).unwrap_or(2) {
+            let sort_order = enum_u32(d.prop(lay, "SortOrder")).unwrap_or(2);
+            match sort_order {
                 0 => order.sort_by_key(|k| name_of(d, *k)),
                 2 => order.sort_by_key(|k| num(d, *k, "LayoutOrder", 0.0) as i64),
                 _ => {}
             }
             let halign = enum_u32(d.prop(lay, "HorizontalAlignment")).unwrap_or(1); // Center 0, Left 1, Right 2
             let valign = enum_u32(d.prop(lay, "VerticalAlignment")).unwrap_or(1); // Center 0, Top 1, Bottom 2
-            let vertical = enum_u32(d.prop(lay, "FillDirection")).unwrap_or(1) == 1;
-            if Some(lay) == grid {
+            let default_dir = if Some(lay) == page_layout { 0 } else { 1 };
+            let vertical = enum_u32(d.prop(lay, "FillDirection")).unwrap_or(default_dir) == 1;
+            if Some(lay) == grid_layout {
                 let cell = udim2(d, lay, "CellSize");
                 let pad = udim2(d, lay, "CellPadding");
-                let cw = cell[0] * content.width() + cell[1] * dn.scale;
-                let ch = cell[2] * content.height() + cell[3] * dn.scale;
-                let px = pad[0] * content.width() + pad[1] * dn.scale;
-                let py = pad[2] * content.height() + pad[3] * dn.scale;
+                let (cw, ch) = apply_cell_constraints(
+                    d,
+                    lay,
+                    cell[0] * content.width() + cell[1] * scale,
+                    cell[2] * content.height() + cell[3] * scale,
+                    scale,
+                );
+                let px = pad[0] * content.width() + pad[1] * scale;
+                let py = pad[2] * content.height() + pad[3] * scale;
                 let max_cells = num(d, lay, "FillDirectionMaxCells", 0.0) as usize;
+                let start_corner = enum_u32(d.prop(lay, "StartCorner")).unwrap_or(0); // TL 0, TR 1, BL 2, BR 3
                 let fit = if vertical {
                     ((content.height() + py) / (ch + py).max(1e-3)).floor()
                 } else {
@@ -568,12 +751,20 @@ impl Walk<'_, '_> {
                         2 => content.height() - total_h,
                         _ => 0.0,
                     };
+                let flip_x = matches!(start_corner, 1 | 3);
+                let flip_y = matches!(start_corner, 2 | 3);
                 for (i, k) in order.iter().enumerate() {
-                    let (c, r) = if vertical {
+                    let (mut c, mut r) = if vertical {
                         (i / per_line, i % per_line)
                     } else {
                         (i % per_line, i / per_line)
                     };
+                    if flip_x {
+                        c = cols - 1 - c;
+                    }
+                    if flip_y {
+                        r = rows - 1 - r;
+                    }
                     placed.insert(
                         *k,
                         Rect::from_min_size(
@@ -582,6 +773,245 @@ impl Walk<'_, '_> {
                         ),
                     );
                 }
+                let lay_box = GuiBox {
+                    size: if n > 0 { [total_w, total_h] } else { [0.0, 0.0] },
+                    canvas: Some(if n > 0 { [cols as f32, rows as f32] } else { [0.0, 0.0] }),
+                    window: Some([cw / scale.max(1e-6), ch / scale.max(1e-6)]),
+                    ..Default::default()
+                };
+                self.gui.layout.insert(lay, lay_box);
+                self.boxes.push((lay, lay_box));
+            } else if Some(lay) == table_layout {
+                // MajorAxis: RowMajor 0, ColumnMajor 1.
+                // FillEmptySpaceRows fills along the major (strip) axis;
+                // FillEmptySpaceColumns fills along the minor (within-strip) axis.
+                let major_col = enum_u32(d.prop(lay, "MajorAxis")).unwrap_or(0) == 1;
+                let fill_cols = boolp(d, lay, "FillEmptySpaceColumns", false);
+                let fill_rows = boolp(d, lay, "FillEmptySpaceRows", false);
+                let pad = udim2(d, lay, "Padding");
+                let pad_x = pad[0] * content.width() + pad[1] * scale;
+                let pad_y = pad[2] * content.height() + pad[3] * scale;
+                let mut strip_cells: Vec<(Ref, Vec<(Ref, egui::Vec2)>)> = Vec::with_capacity(order.len());
+                let mut max_minor = 0usize;
+                for &strip in &order {
+                    self.gui.walk_kids.push(strip);
+                    let mut cells: Vec<Ref> = children(d, strip)
+                        .into_iter()
+                        .filter(|c| {
+                            d.class_of(*c).is_some_and(|k| doc::is_a(&k, "GuiObject"))
+                                && boolp(d, *c, "Visible", true)
+                        })
+                        .collect();
+                    match sort_order {
+                        0 => cells.sort_by_key(|k| name_of(d, *k)),
+                        2 => cells.sort_by_key(|k| num(d, *k, "LayoutOrder", 0.0) as i64),
+                        _ => {}
+                    }
+                    let measured: Vec<(Ref, egui::Vec2)> = cells
+                        .into_iter()
+                        .map(|c| {
+                            self.gui.walk_reads.push((c, self.cur));
+                            (c, self.own_size(c, content, scale, 0))
+                        })
+                        .collect();
+                    max_minor = max_minor.max(measured.len());
+                    strip_cells.push((strip, measured));
+                }
+                let n_strips = strip_cells.len();
+                let (mut col_w, mut row_h) = if major_col {
+                    let mut cw = vec![0.0f32; n_strips];
+                    let mut rh = vec![0.0f32; max_minor];
+                    for (si, (_, cells)) in strip_cells.iter().enumerate() {
+                        for (ci, (_, sz)) in cells.iter().enumerate() {
+                            cw[si] = cw[si].max(sz.x);
+                            rh[ci] = rh[ci].max(sz.y);
+                        }
+                    }
+                    if fill_rows && n_strips > 0 {
+                        let avail = content.width() - pad_x * n_strips.saturating_sub(1) as f32;
+                        let sum: f32 = cw.iter().sum();
+                        if sum > 0.0 && sum < avail {
+                            let f = avail / sum;
+                            for w in &mut cw { *w *= f; }
+                        }
+                    }
+                    if fill_cols && max_minor > 0 {
+                        let avail = content.height() - pad_y * max_minor.saturating_sub(1) as f32;
+                        let sum: f32 = rh.iter().sum();
+                        if sum > 0.0 && sum < avail {
+                            let f = avail / sum;
+                            for h in &mut rh { *h *= f; }
+                        }
+                    }
+                    (cw, rh)
+                } else {
+                    let mut cw = vec![0.0f32; max_minor];
+                    let mut rh = vec![0.0f32; n_strips];
+                    for (si, (_, cells)) in strip_cells.iter().enumerate() {
+                        for (ci, (_, sz)) in cells.iter().enumerate() {
+                            cw[ci] = cw[ci].max(sz.x);
+                            rh[si] = rh[si].max(sz.y);
+                        }
+                    }
+                    if fill_cols && max_minor > 0 {
+                        let avail = content.width() - pad_x * max_minor.saturating_sub(1) as f32;
+                        let sum: f32 = cw.iter().sum();
+                        if sum > 0.0 && sum < avail {
+                            let f = avail / sum;
+                            for w in &mut cw { *w *= f; }
+                        }
+                    }
+                    if fill_rows && n_strips > 0 {
+                        let avail = content.height() - pad_y * n_strips.saturating_sub(1) as f32;
+                        let sum: f32 = rh.iter().sum();
+                        if sum > 0.0 && sum < avail {
+                            let f = avail / sum;
+                            for h in &mut rh { *h *= f; }
+                        }
+                    }
+                    (cw, rh)
+                };
+                let _ = (&mut col_w, &mut row_h);
+                let total_w = col_w.iter().sum::<f32>() + pad_x * col_w.len().saturating_sub(1) as f32;
+                let total_h = row_h.iter().sum::<f32>() + pad_y * row_h.len().saturating_sub(1) as f32;
+                let x0 = content.left()
+                    + match halign {
+                        0 => (content.width() - total_w) * 0.5,
+                        2 => content.width() - total_w,
+                        _ => 0.0,
+                    };
+                let y0 = content.top()
+                    + match valign {
+                        0 => (content.height() - total_h) * 0.5,
+                        2 => content.height() - total_h,
+                        _ => 0.0,
+                    };
+                let mut col_x = Vec::with_capacity(col_w.len());
+                let mut cx = x0;
+                for &w in &col_w {
+                    col_x.push(cx);
+                    cx += w + pad_x;
+                }
+                let mut row_y = Vec::with_capacity(row_h.len());
+                let mut ry = y0;
+                for &h in &row_h {
+                    row_y.push(ry);
+                    ry += h + pad_y;
+                }
+                for (si, (strip, cells)) in strip_cells.iter().enumerate() {
+                    let strip_rect = if major_col {
+                        Rect::from_min_size(Pos2::new(col_x[si], y0), egui::vec2(col_w[si], total_h))
+                    } else {
+                        Rect::from_min_size(Pos2::new(x0, row_y[si]), egui::vec2(total_w, row_h[si]))
+                    };
+                    placed.insert(*strip, strip_rect);
+                    if self.replaying == 0 {
+                        self.gui.memo.remove(strip);
+                    }
+                    for (ci, (cell, _)) in cells.iter().enumerate() {
+                        let cell_rect = if major_col {
+                            Rect::from_min_size(Pos2::new(col_x[si], row_y[ci]), egui::vec2(col_w[si], row_h[ci]))
+                        } else {
+                            Rect::from_min_size(Pos2::new(col_x[ci], row_y[si]), egui::vec2(col_w[ci], row_h[si]))
+                        };
+                        self.table_cells.insert(*cell, cell_rect);
+                    }
+                }
+                let lay_box = GuiBox {
+                    size: if n_strips > 0 { [total_w, total_h] } else { [0.0, 0.0] },
+                    ..Default::default()
+                };
+                self.gui.layout.insert(lay, lay_box);
+                self.boxes.push((lay, lay_box));
+            } else if Some(lay) == page_layout {
+                let pad = udim(d, lay, "Padding");
+                let gap = pad[0]
+                    * if vertical {
+                        content.height()
+                    } else {
+                        content.width()
+                    }
+                    + pad[1] * scale;
+                let circular = boolp(d, lay, "Circular", false);
+                let n = order.len();
+                let (slot_w, slot_h) = (content.width(), content.height());
+                let slot_main = if vertical { slot_h } else { slot_w };
+                let stride = slot_main + gap;
+                let page_state = super::share().pages.get(&lay).copied();
+                let (from_idx, to_idx, alpha, dir) = match page_state {
+                    Some((from, to, a, dir)) if n > 0 => {
+                        let ti = order.iter().position(|&r| r == to).unwrap_or(0);
+                        let fi = order.iter().position(|&r| r == from).unwrap_or(ti);
+                        if a < 1.0 && fi != ti {
+                            self.gui.no_cache = Some("page sliding");
+                        }
+                        (fi, ti, a, dir)
+                    }
+                    _ => (0, 0, 1.0, 0),
+                };
+                let cur_pos = if from_idx == to_idx || alpha >= 1.0 {
+                    to_idx as f32
+                } else if circular && n > 0 {
+                    let step = if dir > 0 {
+                        ((to_idx + n - from_idx) % n) as i32
+                    } else if dir < 0 {
+                        -(((from_idx + n - to_idx) % n) as i32)
+                    } else {
+                        wrap_page_slot(to_idx, from_idx, n, 0)
+                    };
+                    from_idx as f32 + step as f32 * alpha
+                } else {
+                    from_idx as f32 + (to_idx as f32 - from_idx as f32) * alpha
+                };
+                for (i, k) in order.iter().enumerate() {
+                    let slot_off = if circular && n > 0 {
+                        if alpha >= 1.0 || from_idx == to_idx {
+                            wrap_page_slot(i, to_idx, n, dir) as f32
+                        } else {
+                            let mut delta = (i as f32 - cur_pos).rem_euclid(n as f32);
+                            if dir > 0 {
+                                if delta > (n / 2) as f32 {
+                                    delta -= n as f32;
+                                }
+                            } else if delta >= ((n + 1) / 2) as f32 {
+                                delta -= n as f32;
+                            }
+                            delta
+                        }
+                    } else {
+                        i as f32 - cur_pos
+                    };
+                    let s = self.layout_item_size(*k, content, scale, reading);
+                    let (sx, sy) = if vertical {
+                        (content.left(), content.top() + slot_off * stride)
+                    } else {
+                        (content.left() + slot_off * stride, content.top())
+                    };
+                    let ax = match halign {
+                        0 => (slot_w - s.x) * 0.5,
+                        2 => slot_w - s.x,
+                        _ => 0.0,
+                    };
+                    let ay = match valign {
+                        0 => (slot_h - s.y) * 0.5,
+                        2 => slot_h - s.y,
+                        _ => 0.0,
+                    };
+                    placed.insert(*k, Rect::from_min_size(Pos2::new(sx + ax, sy + ay), s));
+                }
+                let acs = if n == 0 {
+                    [0.0, 0.0]
+                } else {
+                    let total_main = n as f32 * slot_main + (n - 1) as f32 * gap;
+                    if vertical {
+                        [slot_w, total_main]
+                    } else {
+                        [total_main, slot_h]
+                    }
+                };
+                let lay_box = GuiBox { size: acs, ..Default::default() };
+                self.gui.layout.insert(lay, lay_box);
+                self.boxes.push((lay, lay_box));
             } else {
                 let pad = udim(d, lay, "Padding");
                 let gap = pad[0]
@@ -590,21 +1020,22 @@ impl Walk<'_, '_> {
                     } else {
                         content.width()
                     }
-                    + pad[1] * dn.scale;
+                    + pad[1] * scale;
                 // The flex settings (list-flex-layouts): Wraps breaks the
                 // list into lines at the fill axis' extent; HorizontalFlex /
                 // VerticalFlex (UIFlexAlignment: None 0, Fill 1, SpaceAround
-                // 2, SpaceBetween 3, SpaceEvenly 4) grow the items or spread
-                // them along the fill axis, and spread the lines across it;
-                // ItemLineAlignment (Automatic 0, Start 1, Center 2, End 3,
+                // 2, SpaceBetween 3, SpaceEvenly 4) grow/shrink the items or
+                // spread them along the fill axis, and spread the lines across
+                // it; ItemLineAlignment (Automatic 0, Start 1, Center 2, End 3,
                 // Stretch 4) sets the items within their line.
-                let wraps = boolp(d, lay, "Wraps", false);
-                let hflex = enum_u32(d.prop(lay, "HorizontalFlex")).unwrap_or(0);
-                let vflex = enum_u32(d.prop(lay, "VerticalFlex")).unwrap_or(0);
+                let is_list = Some(lay) == list_layout;
+                let wraps = is_list && boolp(d, lay, "Wraps", false);
+                let hflex = if is_list { enum_u32(d.prop(lay, "HorizontalFlex")).unwrap_or(0) } else { 0 };
+                let vflex = if is_list { enum_u32(d.prop(lay, "VerticalFlex")).unwrap_or(0) } else { 0 };
                 let (main_flex, cross_flex) = if vertical { (vflex, hflex) } else { (hflex, vflex) };
                 // Center 0, Left / Top 1, Right / Bottom 2 on each axis.
                 let (main_align, cross_align) = if vertical { (valign, halign) } else { (halign, valign) };
-                let line_align = match enum_u32(d.prop(lay, "ItemLineAlignment")).unwrap_or(0) {
+                let line_align = match if is_list { enum_u32(d.prop(lay, "ItemLineAlignment")).unwrap_or(0) } else { 0 } {
                     // Automatic: the alignment across the fill axis — and
                     // Fill across stretches the items to their line.
                     0 if cross_flex == 1 => 4,
@@ -622,35 +1053,65 @@ impl Walk<'_, '_> {
                 };
                 let mut sizes: Vec<egui::Vec2> = order
                     .iter()
-                    .map(|k| self.own_size(*k, content, dn.scale, 0))
+                    .map(|k| self.layout_item_size(*k, content, scale, reading))
                     .collect();
-                // Fill lets each item grow by default. A UIFlexItem can
-                // override how much its own item grows (read again when it
-                // changes: walk_reads).
-                let ratios: Vec<f32> = order.iter().map(|k| {
+                // Per-item flex metadata: (grow_ratio, shrink_ratio, item_line_align, min_main, max_main).
+                let flex_items: Vec<(f32, f32, u32, f32, f32)> = order.iter().map(|k| {
                     self.gui.walk_kids.push(*k);
-                    match child_of_class(d, *k, "UIFlexItem") {
+                    let (gr, sr, ila) = match child_of_class(d, *k, "UIFlexItem") {
                         Some(item) => {
                             self.gui.walk_reads.push((item, self.cur));
-                            flex_grow(d, item)
+                            let (g, s) = flex_ratios(d, item);
+                            let a = enum_u32(d.prop(item, "ItemLineAlignment")).unwrap_or(0);
+                            (g, s, a)
                         }
-                        None => if main_flex == 1 { 1.0 } else { 0.0 },
-                    }
+                        None => if main_flex == 1 { (1.0, 1.0, 0) } else { (0.0, 0.0, 0) },
+                    };
+                    let own_scale = child_of_class(d, *k, "UIScale")
+                        .map(|s| num(d, s, "Scale", 1.0))
+                        .unwrap_or(1.0);
+                    let sc_factor = scale * own_scale;
+                    let (mn, mx) = match child_of_class(d, *k, "UISizeConstraint") {
+                        Some(sc) => {
+                            self.gui.walk_reads.push((sc, self.cur));
+                            let min_v = vec2(d, sc, "MinSize", [0.0, 0.0]);
+                            let max_v = vec2(d, sc, "MaxSize", [f32::INFINITY, f32::INFINITY]);
+                            let axis = usize::from(vertical);
+                            if min_v[axis] <= max_v[axis] {
+                                ((min_v[axis] * sc_factor).max(0.0), max_v[axis] * sc_factor)
+                            } else {
+                                (0.0, f32::INFINITY)
+                            }
+                        }
+                        None => (0.0, f32::INFINITY),
+                    };
+                    (gr, sr, ila, mn, mx)
                 }).collect();
                 let lines = list_lines(&sizes, vertical, wraps, room_main, gap);
                 // Across the fill axis: the lines, their gaps and the room
                 // left, shared by the lines (Fill), spread between them, or
                 // put before / after the block (the alignment).
                 let n_lines = lines.len() as f32;
-                let cross_total: f32 = lines.iter().map(|l| l.across).sum::<f32>()
-                    + gap * lines.len().saturating_sub(1) as f32;
+                let lines_sum: f32 = lines.iter().map(|l| l.across).sum();
+                let cross_gaps = gap * lines.len().saturating_sub(1) as f32;
+                let cross_total = lines_sum + cross_gaps;
                 let cross_room = room_cross - cross_total;
+                let cross_raw = room_cross - lines_sum;
                 let (mut cross_at, cross_gap, line_grow) = match cross_flex {
-                    1 if cross_room > 0.0 => (0.0, gap, cross_room / n_lines),
-                    2 if cross_room > 0.0 => (cross_room / n_lines * 0.5, gap + cross_room / n_lines, 0.0),
-                    3 if cross_room > 0.0 && lines.len() > 1 => (0.0, gap + cross_room / (n_lines - 1.0), 0.0),
-                    4 if cross_room > 0.0 => (cross_room / (n_lines + 1.0), gap + cross_room / (n_lines + 1.0), 0.0),
-                    1..=4 => (0.0, gap, 0.0),
+                    1 if cross_room > 0.0 && n_lines > 0.0 => (0.0, gap, cross_room / n_lines),
+                    1 => (0.0, gap, 0.0),
+                    2 if cross_room > 0.0 && n_lines > 0.0 => {
+                        let each = cross_raw / n_lines;
+                        if each >= gap { (each * 0.5, each, 0.0) } else { (cross_room * 0.5, gap, 0.0) }
+                    }
+                    2 => (cross_room * 0.5, gap, 0.0),
+                    3 if cross_room > 0.0 && lines.len() > 1 => (0.0, cross_raw / (n_lines - 1.0), 0.0),
+                    3 => (0.0, gap, 0.0),
+                    4 if cross_room > 0.0 && n_lines > 0.0 => {
+                        let each = cross_raw / (n_lines + 1.0);
+                        if each >= gap { (each, each, 0.0) } else { (cross_room * 0.5, gap, 0.0) }
+                    }
+                    4 => (cross_room * 0.5, gap, 0.0),
                     _ => (
                         match cross_align {
                             0 => cross_room * 0.5,
@@ -661,56 +1122,158 @@ impl Walk<'_, '_> {
                         0.0,
                     ),
                 };
-                for line in &lines {
+                let mut acs_main = 0.0f32;
+                let mut acs_cross = 0.0f32;
+                for (li, line) in lines.iter().enumerate() {
                     let line_across = line.across + line_grow;
+                    if li > 0 {
+                        acs_cross += gap;
+                    }
+                    acs_cross += line_across;
                     let idx = line.items.clone();
-                    let count = idx.len() as f32;
-                    // Along the fill axis: the room this line leaves goes to
-                    // the growing items (UIFlexItem Grow / Fill / Custom by
-                    // their ratio; with Fill, every item: Model Reflect's
-                    // title label is Size (0, 28) and grows to the rest of
-                    // its header row), or is spread as spacing.
+                    let line_len = idx.len();
+                    let count = line_len as f32;
+                    let line_gaps = gap * line_len.saturating_sub(1) as f32;
+                    let mut main_sizes: Vec<f32> = idx
+                        .clone()
+                        .map(|i| if vertical { sizes[i].y } else { sizes[i].x })
+                        .collect();
+                    let base_main = main_sizes.clone();
                     let room = room_main - line.along;
-                    let sum: f32 = idx.clone().map(|i| ratios[i]).sum();
-                    let (main_at, main_gap) = if room > 0.0 && (main_flex == 1 || sum > 0.0) {
-                        let r: Vec<f32> = idx.clone().map(|i| if sum > 0.0 { ratios[i] } else { 1.0 }).collect();
-                        let rsum: f32 = r.iter().sum();
-                        for (j, i) in idx.clone().enumerate() {
-                            let add = room * r[j] / rsum;
-                            if vertical {
-                                sizes[i].y += add;
-                            } else {
-                                sizes[i].x += add;
-                                // (as tall as it is at its new width:
-                                // Sizer::flex_heights)
-                                let k = order[i];
-                                if add > 0.0 && enum_u32(d.prop(k, "AutomaticSize")).unwrap_or(0) & 2 != 0 {
-                                    sizes[i].y = Sizer { d, m: &mut *self }.height_at_width(k, sizes[i].x, content, dn.scale, 0);
+                    let grow_sum: f32 = idx.clone().map(|i| flex_items[i].0).sum();
+                    let shrink_sum: f32 = idx.clone().map(|i| flex_items[i].1).sum();
+                    if room > 0.0 && grow_sum > 0.0 {
+                        let mut frozen = vec![false; line_len];
+                        for _ in 0..line_len {
+                            let cur_sum: f32 = main_sizes.iter().sum();
+                            let rem = room_main - line_gaps - cur_sum;
+                            if rem <= 1e-4 {
+                                break;
+                            }
+                            let gsum: f32 = (0..line_len)
+                                .filter(|&j| !frozen[j])
+                                .map(|j| flex_items[idx.start + j].0)
+                                .sum();
+                            if gsum <= 0.0 {
+                                break;
+                            }
+                            let mut any_clamped = false;
+                            for j in 0..line_len {
+                                if frozen[j] {
+                                    continue;
+                                }
+                                let (gr, _, _, _, mx) = flex_items[idx.start + j];
+                                if gr > 0.0 {
+                                    let want = main_sizes[j] + rem * gr / gsum;
+                                    if want > mx {
+                                        main_sizes[j] = mx;
+                                        frozen[j] = true;
+                                        any_clamped = true;
+                                    }
                                 }
                             }
+                            if !any_clamped {
+                                for j in 0..line_len {
+                                    if frozen[j] {
+                                        continue;
+                                    }
+                                    let gr = flex_items[idx.start + j].0;
+                                    if gr > 0.0 {
+                                        main_sizes[j] += rem * gr / gsum;
+                                    }
+                                }
+                                break;
+                            }
                         }
-                        (0.0, gap)
-                    } else {
-                        match main_flex {
-                            2 if room > 0.0 => (room / count * 0.5, gap + room / count),
-                            3 if room > 0.0 && count > 1.0 => (0.0, gap + room / (count - 1.0)),
-                            4 if room > 0.0 => (room / (count + 1.0), gap + room / (count + 1.0)),
-                            1..=4 => (0.0, gap),
-                            _ => (
-                                match main_align {
-                                    0 => room * 0.5,
-                                    2 => room,
-                                    _ => 0.0,
-                                },
-                                gap,
-                            ),
+                    } else if room < 0.0 && shrink_sum > 0.0 {
+                        let mut frozen = vec![false; line_len];
+                        for _ in 0..line_len {
+                            let cur_sum: f32 = main_sizes.iter().sum();
+                            let overflow = cur_sum + line_gaps - room_main;
+                            if overflow <= 1e-4 {
+                                break;
+                            }
+                            let wsum: f32 = (0..line_len)
+                                .filter(|&j| !frozen[j])
+                                .map(|j| base_main[j] * flex_items[idx.start + j].1)
+                                .sum();
+                            if wsum <= 0.0 {
+                                break;
+                            }
+                            let mut any_clamped = false;
+                            for j in 0..line_len {
+                                if frozen[j] {
+                                    continue;
+                                }
+                                let (_, sr, _, mn, _) = flex_items[idx.start + j];
+                                let w = base_main[j] * sr;
+                                if w > 0.0 {
+                                    let want = main_sizes[j] - overflow * w / wsum;
+                                    if want < mn {
+                                        main_sizes[j] = mn;
+                                        frozen[j] = true;
+                                        any_clamped = true;
+                                    }
+                                }
+                            }
+                            if !any_clamped {
+                                for j in 0..line_len {
+                                    if frozen[j] {
+                                        continue;
+                                    }
+                                    let w = base_main[j] * flex_items[idx.start + j].1;
+                                    if w > 0.0 {
+                                        main_sizes[j] -= overflow * w / wsum;
+                                    }
+                                }
+                                break;
+                            }
                         }
+                    }
+                    for (j, i) in idx.clone().enumerate() {
+                        if vertical {
+                            sizes[i].y = main_sizes[j];
+                        } else {
+                            sizes[i].x = main_sizes[j];
+                        }
+                    }
+                    let final_items_sum: f32 = main_sizes.iter().sum();
+                    let final_along = final_items_sum + line_gaps;
+                    acs_main = acs_main.max(final_along);
+                    let final_room = room_main - final_along;
+                    let raw_free = room_main - final_items_sum;
+                    let (main_at, main_gap) = match main_flex {
+                        1 => (0.0, gap),
+                        2 if final_room > 0.0 && count > 0.0 => {
+                            let each = raw_free / count;
+                            if each >= gap { (each * 0.5, each) } else { (final_room * 0.5, gap) }
+                        }
+                        2 => (final_room * 0.5, gap),
+                        3 if final_room > 0.0 && count > 1.0 => (0.0, raw_free / (count - 1.0)),
+                        3 => (0.0, gap),
+                        4 if final_room > 0.0 && count > 0.0 => {
+                            let each = raw_free / (count + 1.0);
+                            if each >= gap { (each, each) } else { (final_room * 0.5, gap) }
+                        }
+                        4 => (final_room * 0.5, gap),
+                        _ => (
+                            match main_align {
+                                0 => final_room * 0.5,
+                                2 => final_room,
+                                _ => 0.0,
+                            },
+                            gap,
+                        ),
                     };
                     let mut at = main_at;
                     for i in idx {
                         let s = sizes[i];
                         let (along, across) = if vertical { (s.y, s.x) } else { (s.x, s.y) };
-                        let (off, size) = match line_align {
+                        let item_la = match flex_items[i].2 {
+                            0 => line_align,
+                            a => a,
+                        };
+                        let (off, size) = match item_la {
                             4 => (0.0, line_across),
                             2 => ((line_across - across) * 0.5, across),
                             3 => (line_across - across, across),
@@ -732,67 +1295,27 @@ impl Walk<'_, '_> {
                     }
                     cross_at += line_across + cross_gap;
                 }
+                let acs = if lines.is_empty() {
+                    [0.0, 0.0]
+                } else if vertical {
+                    [acs_cross, acs_main]
+                } else {
+                    [acs_main, acs_cross]
+                };
+                let lay_box = GuiBox { size: acs, ..Default::default() };
+                self.gui.layout.insert(lay, lay_box);
+                self.boxes.push((lay, lay_box));
             }
         }
-        // A UIPageLayout shows its current page where the row starts, sliding
-        // between pages while it tweens (crates/rustudio-engine/src/domains/gui_input.luau).
-        if let Some(lay) = list.filter(|l| d.class_of(*l).is_some_and(|c| c == "UIPageLayout")) {
-            let page = super::share().pages.get(&lay).copied();
-            if let Some((from, to, alpha)) = page {
-                // (sliding: the page moves without a document mark)
-                self.gui.no_cache = Some("page sliding");
-                let off = |r: Ref| placed.get(&r).map(|p| p.min - content.min);
-                if let (Some(a), Some(b)) = (off(from).or(off(to)), off(to)) {
-                    let o = a + (b - a) * alpha;
-                    for k in group {
-                        if let Some(p) = placed.get_mut(k) {
-                            *p = p.translate(-o);
-                        }
-                    }
-                }
-            }
         }
+        placed
     }
 
-    /// Lays out and draws the GuiObject children of `parent` inside `content`.
-    pub(super) fn children(&mut self, parent: Ref, content: Rect, dn: Down) {
-        let d = self.input.doc;
-        // The parent's own GuiObject children, and each Folder's (a Folder
-        // organizes GUI descendants without a layout box of its own; a
-        // UIListLayout / UIGridLayout inside the Folder lays out the
-        // Folder's GuiObjects within the parent's content, as Roblox does —
-        // a Folder of buttons with its own UIListLayout — while a layout
-        // under the parent arranges the parent's direct children only).
-        // `kids` keeps the drawing order (a Folder's children where it is).
-        // (what was read is kept for the GUI cache: gui_input.rs cache_marks)
-        fn gui_children(d: &Document, parent: Ref, out: &mut Vec<Ref>, groups: &mut Vec<(Ref, Vec<Ref>)>, gui: &mut Gui, by: Ref) {
-            gui.walk_kids.push(parent);
-            let mut own = Vec::new();
-            for child in children(d, parent) {
-                gui.walk_reads.push((child, by));
-                match d.class_of(child).as_deref() {
-                    Some("Folder") => gui_children(d, child, out, groups, gui, by),
-                    Some(class) if doc::is_a(class, "GuiObject") => {
-                        out.push(child);
-                        own.push(child);
-                    }
-                    _ => {}
-                }
-            }
-            groups.push((parent, own));
-        }
-        let mut kids = Vec::new();
-        let mut groups = Vec::new();
-        gui_children(d, parent, &mut kids, &mut groups, self.gui, self.cur);
-        let mut placed: HashMap<Ref, Rect> = HashMap::new();
-        for (owner, group) in &groups {
-            self.layout_group(*owner, group, content, dn, &mut placed);
-        }
-        // Sibling order: ZIndex, then child order.
-        let mut sorted = kids;
-        sorted.sort_by_key(|k| num(d, *k, "ZIndex", 1.0) as i32);
-        for k in sorted {
-            self.object_memo(k, content, placed.get(&k).copied(), dn);
+    fn layout_item_size(&mut self, r: Ref, parent: Rect, scale: f32, reading: bool) -> egui::Vec2 {
+        if reading {
+            Sizer { d: self.input.doc, m: super::FaceText }.own_size(r, parent, scale, 0)
+        } else {
+            self.own_size(r, parent, scale, 0)
         }
     }
 
@@ -820,30 +1343,110 @@ impl Walk<'_, '_> {
         if text.is_empty() && d.class_of(r).is_some_and(|c| c == "TextBox") {
             text = text_prop(d, r, "PlaceholderText");
         }
-        if boolp(d, r, "RichText", false) {
-            text = rich_runs(&text).into_iter().map(|run| run.text).collect();
-        }
-        if text.is_empty() {
-            return egui::Vec2::ZERO;
-        }
+        let rich = boolp(d, r, "RichText", false);
         let font = font_of(d, r);
+        let legacy_scale = legacy_text_scale(&font);
+        let mut size = num(d, r, "TextSize", 14.0) * scale * legacy_scale;
+        if let Some(c) = child_of_class(d, r, "UITextSizeConstraint") {
+            size = constrain_font_size(
+                size,
+                num(d, c, "MinTextSize", 1.0) * scale,
+                num(d, c, "MaxTextSize", 100.0) * scale,
+            );
+        }
+        let size = safe_font_size(size);
+        if text.is_empty() {
+            return egui::vec2(0.0, size);
+        }
         let family = self.gui.family(self.ctx, self.input.store, &font);
-        let text = super::ligatures::apply(&family, text);
-        let size = num(d, r, "TextSize", 14.0) * scale * legacy_text_scale(&font);
         let k = self.em_per_size(&family);
-        let mut f = TextFormat::simple(FontId::new(size * k, family), Color32::WHITE);
-        f.line_height = Some(size * num(d, r, "LineHeight", 1.0));
+        note_text_face(self.ctx, &font, &family, k);
+        let lh = num(d, r, "LineHeight", 1.0);
         let mut job = LayoutJob::default();
-        job.append(&text, 0.0, f);
+        let mut has_custom_size = false;
+        if rich {
+            let runs = rich_runs(&text);
+            if runs.iter().all(|run| run.text.is_empty()) {
+                return egui::vec2(0.0, size);
+            }
+            let bold_face = font.1 >= 600;
+            let italic_face = font.2;
+            let bold_family = if !bold_face && runs.iter().any(|r| r.bold && !r.italic) {
+                let bf = (font.0.clone(), 700, font.2);
+                let fam = self.gui.family(self.ctx, self.input.store, &bf);
+                let em = self.em_per_size(&fam);
+                note_text_face(self.ctx, &bf, &fam, em);
+                Some((fam, em))
+            } else {
+                None
+            };
+            let italic_family = if !italic_face && runs.iter().any(|r| r.italic && !r.bold) {
+                let itf = (font.0.clone(), font.1, true);
+                let fam = self.gui.family(self.ctx, self.input.store, &itf);
+                let em = self.em_per_size(&fam);
+                note_text_face(self.ctx, &itf, &fam, em);
+                Some((fam, em))
+            } else {
+                None
+            };
+            let bold_italic_family = if !(bold_face && italic_face) && runs.iter().any(|r| r.bold && r.italic) {
+                let bif = (font.0.clone(), 700, true);
+                let fam = self.gui.family(self.ctx, self.input.store, &bif);
+                let em = self.em_per_size(&fam);
+                note_text_face(self.ctx, &bif, &fam, em);
+                Some((fam, em))
+            } else {
+                None
+            };
+            for run in &runs {
+                if run.size.is_some() {
+                    has_custom_size = true;
+                }
+                let rs = safe_font_size(run.size.map(|s| s * scale * legacy_scale).unwrap_or(size));
+                let (fam, em) = match (run.bold, run.italic) {
+                    (true, true) => bold_italic_family
+                        .as_ref()
+                        .or(bold_family.as_ref())
+                        .or(italic_family.as_ref())
+                        .cloned()
+                        .unwrap_or_else(|| (family.clone(), k)),
+                    (true, false) => bold_family.clone().unwrap_or_else(|| (family.clone(), k)),
+                    (false, true) => italic_family.clone().unwrap_or_else(|| (family.clone(), k)),
+                    (false, false) => (family.clone(), k),
+                };
+                let shaped = apply_font_ligatures(&fam, &run.text);
+                let mut f = TextFormat::simple(FontId::new(safe_font_size(rs * em), fam), Color32::WHITE);
+                f.studio_text_size = Some(rs);
+                f.line_height = Some(rs * lh);
+                job.append(shaped.as_ref(), 0.0, f);
+            }
+        } else {
+            let shaped = apply_font_ligatures(&family, &text);
+            let mut f = TextFormat::simple(FontId::new(safe_font_size(size * k), family), Color32::WHITE);
+            f.studio_text_size = Some(size);
+            f.line_height = Some(size * lh);
+            job.append(shaped.as_ref(), 0.0, f);
+        }
         job.wrap.max_width = wrap.max(1.0);
+        job.keep_trailing_whitespace = true;
         job.round_output_to_gui = false;
         let g = self.gui.text_fit.layout_now(self.ctx, job);
-        egui::vec2(g.rect.width(), g.rect.height().max(size))
+        let h = if has_custom_size && (lh - 1.0).abs() < 1e-4 {
+            g.rect.height().ceil()
+        } else {
+            text_rows_height(g.rows.len(), size, lh)
+        };
+        egui::vec2(g.rect.width().ceil(), h)
     }
 
     fn content_size(&mut self, r: Ref, size: egui::Vec2, scale: f32, auto: u32, depth: usize) -> egui::Vec2 {
         let d = self.input.doc;
         Sizer { d, m: self }.content_size(r, size, scale, auto, depth)
+    }
+
+    fn content_size_in(&mut self, r: Ref, size: egui::Vec2, scale: f32, auto: u32, depth: usize, room: f32) -> egui::Vec2 {
+        let d = self.input.doc;
+        Sizer { d, m: self }.content_size_in(r, size, scale, auto, depth, room)
     }
 
     fn own_size(&mut self, r: Ref, parent: Rect, scale: f32, depth: usize) -> egui::Vec2 {
@@ -918,15 +1521,6 @@ impl<M: AutoText> Sizer<'_, M> {
             Pos2::ZERO,
             egui::vec2((size.x - pl - pr).max(0.0), (size.y - pt - pb).max(0.0)),
         );
-        // Growing on X, its children measure with the room it can grow
-        // into, not its own (often 0) width: Roblox's Help tab nests
-        // AutomaticSize XY frames 0 wide around wrapped "Up arrow", which
-        // wrapped a letter per line.
-        let room_inner = if auto & 1 != 0 && room.is_finite() {
-            Rect::from_min_size(Pos2::ZERO, egui::vec2(inner.width().max(room - pl - pr), inner.height()))
-        } else {
-            inner
-        };
         let mut ext = egui::Vec2::ZERO;
         if d.class_of(r)
             .is_some_and(|c| matches!(c.as_str(), "TextLabel" | "TextButton" | "TextBox"))
@@ -936,10 +1530,16 @@ impl<M: AutoText> Sizer<'_, M> {
             // AutomaticSize XY TextWrapped label in a ScrollingFrame, wraps in
             // three lines in its 302 px window,
             // checks/plugins/ref/corpus/screens/argon-load-popup.jpg).
+            let sz = udim2(d, r, "Size");
             let wrap = if !boolp(d, r, "TextWrapped", false) {
                 f32::INFINITY
             } else if auto & 1 != 0 {
-                (room - pl - pr).max(inner.width())
+                if sz[0] > 0.0 && inner.width() > 0.0 {
+                    let avail = (room - pl - pr).max(0.0);
+                    if avail.is_finite() { inner.width().min(avail) } else { inner.width() }
+                } else {
+                    (room - pl - pr).max(inner.width())
+                }
             } else {
                 inner.width()
             };
@@ -961,16 +1561,10 @@ impl<M: AutoText> Sizer<'_, M> {
                 } else {
                     inner.width()
                 } + p[1] * scale;
-            let mut sizes: Vec<egui::Vec2> =
-                kids.iter().map(|k| self.auto_child_size(*k, inner, room_inner, scale, auto, depth + 1)).collect();
-            // A row that isn't growing on X fills its width as `children`
-            // lays it out: the items that flex wider are as tall as they
-            // are at their new width.
-            if !vertical && auto & 1 == 0 && depth < 8 {
-                let used = sizes.iter().map(|s| s.x).sum::<f32>() + gap * kids.len().saturating_sub(1) as f32;
-                let fill = enum_u32(d.prop(lay, "HorizontalFlex")) == Some(1);
-                self.flex_heights(&kids, &mut sizes, inner, inner.width() - used, fill, scale, depth + 1);
-            }
+            let sizes: Vec<egui::Vec2> = kids
+                .iter()
+                .map(|k| self.auto_child_size(*k, inner, scale, auto, depth + 1))
+                .collect();
             // A wrapping list breaks at the fill axis' extent — unless that
             // axis is the one growing (nothing to wrap at: one line).
             let main_auto = if vertical { auto & 2 != 0 } else { auto & 1 != 0 };
@@ -990,8 +1584,13 @@ impl<M: AutoText> Sizer<'_, M> {
             let vertical = enum_u32(d.prop(lay, "FillDirection")).unwrap_or(1) == 1;
             let cell = udim2(d, lay, "CellSize");
             let cp = udim2(d, lay, "CellPadding");
-            let cw = cell[0] * inner.width() + cell[1] * scale;
-            let ch = cell[2] * inner.height() + cell[3] * scale;
+            let (cw, ch) = apply_cell_constraints(
+                d,
+                lay,
+                cell[0] * inner.width() + cell[1] * scale,
+                cell[2] * inner.height() + cell[3] * scale,
+                scale,
+            );
             let px = cp[0] * inner.width() + cp[1] * scale;
             let py = cp[2] * inner.height() + cp[3] * scale;
             let n = kids.len();
@@ -1026,9 +1625,70 @@ impl<M: AutoText> Sizer<'_, M> {
                     rows as f32 * ch + rows.saturating_sub(1) as f32 * py,
                 ));
             }
+        } else if let Some(lay) = child_of_class(d, r, "UITableLayout") {
+            let major_col = enum_u32(d.prop(lay, "MajorAxis")).unwrap_or(0) == 1;
+            let sort_order = enum_u32(d.prop(lay, "SortOrder")).unwrap_or(2);
+            let pad = udim2(d, lay, "Padding");
+            let pad_x = pad[0] * inner.width() + pad[1] * scale;
+            let pad_y = pad[2] * inner.height() + pad[3] * scale;
+            let mut strips = kids;
+            match sort_order {
+                0 => strips.sort_by_key(|k| name_of(d, *k)),
+                2 => strips.sort_by_key(|k| num(d, *k, "LayoutOrder", 0.0) as i64),
+                _ => {}
+            }
+            let mut max_minor = 0usize;
+            let mut rows_cells: Vec<Vec<egui::Vec2>> = Vec::with_capacity(strips.len());
+            for strip in &strips {
+                let mut cells: Vec<Ref> = children(d, *strip)
+                    .into_iter()
+                    .filter(|c| {
+                        d.class_of(*c).is_some_and(|k| doc::is_a(&k, "GuiObject"))
+                            && boolp(d, *c, "Visible", true)
+                    })
+                    .collect();
+                match sort_order {
+                    0 => cells.sort_by_key(|k| name_of(d, *k)),
+                    2 => cells.sort_by_key(|k| num(d, *k, "LayoutOrder", 0.0) as i64),
+                    _ => {}
+                }
+                let szs: Vec<egui::Vec2> = cells
+                    .iter()
+                    .map(|c| self.auto_child_size(*c, inner, scale, auto, depth + 1))
+                    .collect();
+                max_minor = max_minor.max(szs.len());
+                rows_cells.push(szs);
+            }
+            let (col_w, row_h) = if major_col {
+                let mut cw = vec![0.0f32; rows_cells.len()];
+                let mut rh = vec![0.0f32; max_minor];
+                for (si, cells) in rows_cells.iter().enumerate() {
+                    for (ci, sz) in cells.iter().enumerate() {
+                        cw[si] = cw[si].max(sz.x);
+                        rh[ci] = rh[ci].max(sz.y);
+                    }
+                }
+                (cw, rh)
+            } else {
+                let mut cw = vec![0.0f32; max_minor];
+                let mut rh = vec![0.0f32; rows_cells.len()];
+                for (si, cells) in rows_cells.iter().enumerate() {
+                    for (ci, sz) in cells.iter().enumerate() {
+                        cw[ci] = cw[ci].max(sz.x);
+                        rh[si] = rh[si].max(sz.y);
+                    }
+                }
+                (cw, rh)
+            };
+            if !rows_cells.is_empty() {
+                ext = ext.max(egui::vec2(
+                    col_w.iter().sum::<f32>() + pad_x * col_w.len().saturating_sub(1) as f32,
+                    row_h.iter().sum::<f32>() + pad_y * row_h.len().saturating_sub(1) as f32,
+                ));
+            }
         } else {
             for k in kids {
-                let s = self.auto_child_size(k, inner, room_inner, scale, auto, depth + 1);
+                let s = self.auto_child_size(k, inner, scale, auto, depth + 1);
                 let p = udim2(d, k, "Position");
                 let anchor = vec2(d, k, "AnchorPoint", [0.0, 0.0]);
                 let at = egui::vec2(
@@ -1048,20 +1708,9 @@ impl<M: AutoText> Sizer<'_, M> {
     /// Archimedes' window (an AutomaticSize Y button whose content sits in a
     /// `UDim2.new(1, 0, 1, -20)` frame: Studio shows the whole panel,
     /// checks/plugins/ref/corpus/screens/archimedes-click-main.jpg).
-    /// `room_inner`: `inner` as wide as the parent can grow (children sized
-    /// by Scale on X still take `inner`).
-    pub(super) fn auto_child_size(
-        &mut self,
-        k: Ref,
-        inner: Rect,
-        room_inner: Rect,
-        scale: f32,
-        auto: u32,
-        depth: usize,
-    ) -> egui::Vec2 {
-        let base = if udim2(self.d, k, "Size")[0] != 0.0 { inner } else { room_inner };
-        let mut s = self.own_size(k, base, scale, depth);
-        if depth >= 8 {
+    pub(super) fn auto_child_size(&mut self, k: Ref, inner: Rect, scale: f32, auto: u32, depth: usize) -> egui::Vec2 {
+        let mut s = self.own_size_in_auto(k, inner, scale, depth, auto).max(egui::Vec2::ZERO);
+        if depth >= 24 {
             return s;
         }
         let sz = udim2(self.d, k, "Size");
@@ -1069,7 +1718,7 @@ impl<M: AutoText> Sizer<'_, M> {
         let (gx, gy) = (grows(1, sz[0]), grows(2, sz[2]));
         if gx || gy {
             let axes = (gx as u32) | ((gy as u32) << 1);
-            let c = self.content_size(k, s, scale, axes, depth);
+            let c = self.content_size_in(k, s, scale, axes, depth, inner.width());
             if gx {
                 s.x = s.x.max(c.x);
             }
@@ -1078,62 +1727,6 @@ impl<M: AutoText> Sizer<'_, M> {
             }
         }
         s
-    }
-
-    /// A horizontal row's items grown by `room` (UIFlexItem FlexMode Grow,
-    /// or every item when the layout's HorizontalFlex is Fill), and those
-    /// growing on Y made as tall as their content is at the new width (an
-    /// item sized 0 wide measured first at 0: ExpChat's TextContainer wrapped
-    /// the typed text a word per line, the chat input 182 px tall).
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn flex_heights(
-        &mut self,
-        kids: &[Ref],
-        sizes: &mut [egui::Vec2],
-        parent: Rect,
-        room: f32,
-        fill: bool,
-        scale: f32,
-        depth: usize,
-    ) {
-        let d = self.d;
-        if !room.is_finite() || room <= 0.0 || kids.is_empty() {
-            return;
-        }
-        let ratios: Vec<f32> = kids
-            .iter()
-            .map(|k| match child_of_class(d, *k, "UIFlexItem") {
-                Some(item) => flex_grow(d, item),
-                None => if fill { 1.0 } else { 0.0 },
-            })
-            .collect();
-        let sum: f32 = ratios.iter().sum();
-        if sum <= 0.0 {
-            return;
-        }
-        for ((k, s), r) in kids.iter().zip(sizes.iter_mut()).zip(&ratios) {
-            if *r > 0.0 {
-                s.x += room * r / sum;
-                if enum_u32(d.prop(*k, "AutomaticSize")).unwrap_or(0) & 2 != 0 {
-                    s.y = self.height_at_width(*k, s.x, parent, scale, depth);
-                }
-            }
-        }
-    }
-
-    /// An AutomaticSize Y object's height when it is `width` wide.
-    pub(super) fn height_at_width(&mut self, r: Ref, width: f32, parent: Rect, scale: f32, depth: usize) -> f32 {
-        let d = self.d;
-        let s = udim2(d, r, "Size");
-        let base = s[2] * parent.height() + s[3] * scale;
-        let c = self.content_size_in(r, egui::vec2(width, base), scale, 2, depth, width);
-        let mut y = base.max(c.y);
-        if let Some(c) = child_of_class(d, r, "UISizeConstraint") {
-            let min = vec2(d, c, "MinSize", [0.0, 0.0]);
-            let max = vec2(d, c, "MaxSize", [f32::INFINITY, f32::INFINITY]);
-            y = y.clamp(min[1], max[1].max(min[1]));
-        }
-        y
     }
 
     /// A GuiObject's size from Size, AutomaticSize and its constraints (and UIScale).
@@ -1145,6 +1738,10 @@ impl<M: AutoText> Sizer<'_, M> {
     /// (AbsoluteSize -1, -1 for a Size of -1 px offset, the box placed with
     /// it; Emitter2D's jitter fix makes them for particles near their end).
     pub(super) fn own_size_signed(&mut self, r: Ref, parent: Rect, scale: f32, depth: usize) -> egui::Vec2 {
+        self.own_size_in_auto(r, parent, scale, depth, 0)
+    }
+
+    fn own_size_in_auto(&mut self, r: Ref, parent: Rect, scale: f32, depth: usize, parent_auto: u32) -> egui::Vec2 {
         let d = self.d;
         let s = udim2(d, r, "Size");
         // SizeConstraint (RelativeXY 0, RelativeXX 1, RelativeYY 2): the
@@ -1156,53 +1753,71 @@ impl<M: AutoText> Sizer<'_, M> {
             _ => (parent.width(), parent.height()),
         };
         let mut size = egui::vec2(s[0] * sw + s[1] * scale, s[2] * sh + s[3] * scale);
-        // AutomaticSize: None 0, X 1, Y 2, XY 3.
-        let auto = enum_u32(d.prop(r, "AutomaticSize")).unwrap_or(0);
-        if auto != 0 && depth < 8 {
-            let px = udim2(d, r, "Position");
-            let room = parent.width() - (px[0] * parent.width() + px[1] * scale);
-            let c = self.content_size_in(r, size, scale, auto, depth, room);
-            if auto & 1 != 0 {
-                size.x = size.x.max(c.x);
-            }
-            if auto == 3 {
-                // Growing on both axes, the content is laid out again at the
-                // width it settled on (within a UISizeConstraint's MaxSize):
-                // children sized by Scale on X and wrapped text take that
-                // width, and the height is what they need there. (Measured
-                // at the old width, ExpChat's translation notice, a
-                // 300 px-max XY frame of two wrapped labels, wrapped a
-                // character per line and filled its 400 px MaxSize height.)
-                if let Some(c) = child_of_class(d, r, "UISizeConstraint") {
-                    let min = vec2(d, c, "MinSize", [0.0, 0.0]);
-                    let max = vec2(d, c, "MaxSize", [f32::INFINITY, f32::INFINITY]);
-                    size.x = size.x.clamp(min[0], max[0].max(min[0]));
-                }
-                let c = self.content_size_in(r, size, scale, auto, depth, room);
-                size.y = size.y.max(c.y);
-            } else if auto & 2 != 0 {
-                size.y = size.y.max(c.y);
-            }
-        }
+        // Evaluation order verified against Studio:
+        // Base Size (with SizeConstraint) -> UISizeConstraint -> UIAspectRatioConstraint
+        // -> AutomaticSize -> own UIScale.
         if let Some(c) = child_of_class(d, r, "UISizeConstraint") {
             let min = vec2(d, c, "MinSize", [0.0, 0.0]);
             let max = vec2(d, c, "MaxSize", [f32::INFINITY, f32::INFINITY]);
-            size.x = size.x.clamp(min[0], max[0].max(min[0]));
-            size.y = size.y.clamp(min[1], max[1].max(min[1]));
+            if min[0] <= max[0] {
+                size.x = size.x.clamp(min[0] * scale, max[0] * scale);
+            }
+            if min[1] <= max[1] {
+                size.y = size.y.clamp(min[1] * scale, max[1] * scale);
+            }
         }
         if let Some(c) = child_of_class(d, r, "UIAspectRatioConstraint") {
             let ratio = num(d, c, "AspectRatio", 1.0).max(1e-3);
             // AspectType: FitWithinMaxSize 0, ScaleWithParentSize 1; DominantAxis: Width 0, Height 1.
+            // When measuring inside an AutomaticSize parent, a Scale on the parent's
+            // auto-growing axis isn't constrained yet (e.g. a 1:1 square thumbnail
+            // with Size {1,0},{1,0} in an AutomaticSize.Y card), so derive that axis
+            // from the known fixed axis instead of collapsing to 0.
+            let auto_gx = parent_auto & 1 != 0 && s[0] != 0.0;
+            let auto_gy = parent_auto & 2 != 0 && s[2] != 0.0;
             if enum_u32(d.prop(c, "AspectType")) == Some(1) {
                 if enum_u32(d.prop(c, "DominantAxis")) == Some(1) {
                     size.x = size.y * ratio;
                 } else {
                     size.y = size.x / ratio;
                 }
+                if parent.width() > 0.0 && parent_auto & 1 == 0 && size.x > parent.width() {
+                    size.x = parent.width();
+                    size.y = size.x / ratio;
+                }
+                if parent.height() > 0.0 && parent_auto & 2 == 0 && size.y > parent.height() {
+                    size.y = parent.height();
+                    size.x = size.y * ratio;
+                }
+            } else if auto_gy && !auto_gx {
+                size.y = size.x / ratio;
+            } else if auto_gx && !auto_gy {
+                size.x = size.y * ratio;
             } else if size.x / size.y.max(1e-3) > ratio {
                 size.x = size.y * ratio;
             } else {
                 size.y = size.x / ratio;
+            }
+        }
+        // AutomaticSize: None 0, X 1, Y 2, XY 3.
+        let auto = enum_u32(d.prop(r, "AutomaticSize")).unwrap_or(0);
+        if auto != 0 && depth < 24 {
+            let px = udim2(d, r, "Position");
+            let anchor = vec2(d, r, "AnchorPoint", [0.0, 0.0]);
+            let pos_x = px[0] * parent.width() + px[1] * scale;
+            let room = if anchor[0] > 0.5 {
+                pos_x / anchor[0]
+            } else {
+                (parent.width() - pos_x) / (1.0 - anchor[0]).max(1e-3)
+            }
+            .min(parent.width())
+            .max(0.0);
+            let c = self.content_size_in(r, size, scale, auto, depth, room);
+            if auto & 1 != 0 {
+                size.x = size.x.max(c.x);
+            }
+            if auto & 2 != 0 {
+                size.y = size.y.max(c.y);
             }
         }
         if let Some(sc) = child_of_class(d, r, "UIScale") {
@@ -1387,9 +2002,7 @@ impl Walk<'_, '_> {
             ],
             size: [abs_size.x, abs_size.y],
             rot: dn.turn + rot,
-            text: None,
-            canvas: None,
-            canvas_fit: None,
+            ..Default::default()
         };
 
         let items_before = self.items.len();
@@ -1443,10 +2056,36 @@ impl Walk<'_, '_> {
         if class == "ViewportFrame" {
             bg_t = 1.0;
         }
+        let text_class = matches!(class.as_str(), "TextLabel" | "TextButton" | "TextBox");
+        // UIStroke: around the box (Border), or around the text (Contextual, on text objects).
+        let stroke = child_of_class(d, r, "UIStroke");
+        let stroke_on_text = stroke.is_some_and(|s| {
+            text_class && enum_u32(d.prop(s, "ApplyStrokeMode")).unwrap_or(0) == 0
+        });
+        let border_stroke = stroke.filter(|_| !stroke_on_text).and_then(|s| {
+            let th = num(d, s, "Thickness", 1.0) * me.scale;
+            let st = num(d, s, "Transparency", 0.0);
+            (th > 0.0 && st < 1.0).then_some((s, th, st))
+        });
+        let feather = 1.0 / self.ctx.pixels_per_point().max(1e-3);
+        let has_corner = corner.is_some_and(|c| c >= 0.5);
         if bg_t < 1.0 && rect.width() > 0.0 && rect.height() > 0.0 {
             let a = (1.0 - bg_t) * me.alpha;
             let tint = me.tint;
-            let pts = rounded(rect, corner.unwrap_or(0.0));
+            // When an opaque outer UIStroke borders the fill, extend the fill under the stroke's
+            // inner AA edge by half a pixel so the backdrop never bleeds through the seam.
+            let seam_overlap = match border_stroke {
+                Some((_, th, st)) if st <= 0.01 && (has_corner || !me.aff.is_id()) => {
+                    (0.5 * feather).min(th * 0.5)
+                }
+                _ => 0.0,
+            };
+            let fill_rect = if seam_overlap > 0.0 { rect.expand(seam_overlap) } else { rect };
+            let fill_r = corner.map(|c| {
+                let base = c.min(rect.width() * 0.5).min(rect.height() * 0.5).max(0.0);
+                if base >= 0.5 { base + seam_overlap } else { 0.0 }
+            }).unwrap_or(0.0);
+            let fill_feather = if has_corner || !me.aff.is_id() { feather } else { 0.0 };
             let mesh = match gradient {
                 Some(g) => {
                     let gr = Grad::new(d, g, rect);
@@ -1461,8 +2100,16 @@ impl Walk<'_, '_> {
                             a * (1.0 - t),
                         )
                     };
-                    if corner.is_some() {
-                        fill_mesh(&pts, &f)
+                    if has_corner {
+                        fill_rounded_aa_mesh(
+                            fill_rect,
+                            fill_r,
+                            fill_feather,
+                            None,
+                            egui::TextureId::default(),
+                            &f,
+                            true,
+                        )
                     } else {
                         quad_mesh(
                             rect,
@@ -1475,7 +2122,15 @@ impl Walk<'_, '_> {
                 }
                 None => {
                     let c = rgba([bg[0] * tint[0], bg[1] * tint[1], bg[2] * tint[2]], a);
-                    fill_mesh(&pts, &|_| c)
+                    fill_rounded_aa_mesh(
+                        fill_rect,
+                        fill_r,
+                        fill_feather,
+                        None,
+                        egui::TextureId::default(),
+                        &|_| c,
+                        false,
+                    )
                 }
             };
             self.push(Shape::Mesh(mesh.into()), &me);
@@ -1514,31 +2169,17 @@ impl Walk<'_, '_> {
                 }
             }
         }
-        let text_class = matches!(class.as_str(), "TextLabel" | "TextButton" | "TextBox");
-        // UIStroke: around the box (Border), or around the text (Contextual, on text objects).
-        let stroke = child_of_class(d, r, "UIStroke");
-        let stroke_on_text = stroke.is_some_and(|s| {
-            text_class && enum_u32(d.prop(s, "ApplyStrokeMode")).unwrap_or(0) == 0
-        });
-        if let Some(s) = stroke.filter(|_| !stroke_on_text) {
-            let th = num(d, s, "Thickness", 1.0) * me.scale;
-            let st = num(d, s, "Transparency", 0.0);
-            if th > 0.0 && st < 1.0 {
-                let c = rgba(color(d, s, "Color", [0.0, 0.0, 0.0]), (1.0 - st) * me.alpha);
-                let outer = rounded(
-                    rect.expand(th * 0.5),
-                    corner.map(|c| c + th * 0.5).unwrap_or(0.0),
-                );
-                // A UIGradient under the UIStroke colours the stroke.
-                match child_of_class(d, s, "UIGradient") {
-                    Some(g) => {
-                        let gl = GradLut::new(d, g, rect);
-                        let ps = egui::epaint::PathStroke::new_uv(th, move |_, p| gl.tint(p, c));
-                        self.push(Shape::closed_line(outer, ps), &me);
-                    }
-                    None => self.push(Shape::closed_line(outer, Stroke::new(th, c)), &me),
+        if let Some((s, th, st)) = border_stroke {
+            let c = rgba(color(d, s, "Color", [0.0, 0.0, 0.0]), (1.0 - st) * me.alpha);
+            let stroke_feather = if has_corner || !me.aff.is_id() || th < 1.0 { feather } else { 0.0 };
+            let mesh = match child_of_class(d, s, "UIGradient") {
+                Some(g) => {
+                    let gl = GradLut::new(d, g, rect);
+                    stroke_rounded_aa_mesh(rect, corner, th, stroke_feather, &|p| gl.tint(p, c))
                 }
-            }
+                None => stroke_rounded_aa_mesh(rect, corner, th, stroke_feather, &|_| c),
+            };
+            self.push(Shape::Mesh(mesh.into()), &me);
         }
         if matches!(class.as_str(), "ImageLabel" | "ImageButton") {
             self.image(r, rect, &me, gradient, corner);
@@ -1558,39 +2199,52 @@ impl Walk<'_, '_> {
             // object's box (its Contextual UIStroke keeps its own colour,
             // or its own UIGradient's).
             let fill_grad = gradient.map(|g| GradLut::new(d, g, rect));
-            gb.text = self.text(r, &class, text_rect, &me, stroke.filter(|_| stroke_on_text), fill_grad, rect);
+            let (tb, fits) = self.text(r, &class, text_rect, &me, stroke.filter(|_| stroke_on_text), fill_grad, rect);
+            gb.text = tb;
+            gb.text_fits = fits;
         }
         // ParticleEmitter2D children, over the object, under its children.
         self.particles(r, rect, &me);
-        // GuiService.SelectedObject (keyboard / gamepad selection).
-        if self.selected_object() == Some(r) {
-            let [cr, cg, cb] = mech::GUI_SELECTION_RGB;
-            self.push(
-                Shape::closed_line(
-                    rounded(rect.expand(3.0), corner.unwrap_or(0.0) + 3.0),
-                    Stroke::new(2.0, Color32::from_rgb(cr, cg, cb)),
-                ),
-                &me,
-            );
+        // GuiService.SelectedCoreObject / SelectedObject (keyboard / gamepad selection).
+        if let Some((sel, is_core)) = self.selected_object() {
+            if sel == r {
+                self.draw_selection_cursor(r, is_core, rect, corner, feather, &me);
+            }
         }
 
-        let textbox = class == "TextBox";
+        let interactable = boolp(d, r, "Interactable", true);
+        let textbox = interactable && class == "TextBox";
         let scrolling = class == "ScrollingFrame";
-        self.hits.push(LocalHit {
-            r,
-            rect,
-            aff: me.aff,
-            clip: (dn.clip != Rect::EVERYTHING).then_some(dn.clip),
-            button: is_button,
-            textbox,
-            sink: is_button || textbox || boolp(d, r, "Active", false),
-            active: boolp(d, r, "Active", is_button),
-            // (the wheel and a finger scroll it only while ScrollingEnabled)
-            scrolling: scrolling && boolp(d, r, "ScrollingEnabled", true),
-            drag: boolp(d, r, "Draggable", false)
-                || child_of_class(d, r, "UIDragDetector").is_some_and(|dd| boolp(d, dd, "Enabled", true)),
-            painted: self.items.len() > items_before,
-        });
+        let scrolling_enabled = interactable && scrolling && boolp(d, r, "ScrollingEnabled", true);
+        let page_layout = interactable
+            .then(|| {
+                child_of_class(d, r, "UIPageLayout")
+                    .filter(|pl| boolp(d, *pl, "ScrollWheelInputEnabled", true))
+            })
+            .flatten();
+        let active = boolp(d, r, "Active", false);
+        if !self.input.playing || interactable || active {
+            self.hits.push(LocalHit {
+                r,
+                rect,
+                aff: me.aff,
+                clip: (dn.clip != Rect::EVERYTHING).then_some(dn.clip),
+                button: interactable && is_button,
+                textbox,
+                sink: (interactable && (is_button || textbox)) || active,
+                active: boolp(d, r, "Active", interactable && is_button),
+                scrolling: scrolling_enabled,
+                page_layout,
+                drag: interactable
+                    && (boolp(d, r, "Draggable", false)
+                        || child_of_class(d, r, "UIDragDetector")
+                            .is_some_and(|dd| boolp(d, dd, "Enabled", true))),
+                painted: self.items.len() > items_before,
+            });
+        }
+        if textbox {
+            self.chat_pill_hit(d, r);
+        }
         self.gui.layout.insert(r, gb);
         self.boxes.push((r, gb));
 
@@ -1605,78 +2259,126 @@ impl Walk<'_, '_> {
             me.clip = me.clip.intersect(rect);
         }
         if scrolling {
-            let cs = udim2(d, r, "CanvasSize");
-            let cp = vec2(d, r, "CanvasPosition", [0.0, 0.0]);
-            let mut canvas = egui::vec2(
-                cs[0] * content.width() + cs[1] * me.scale,
-                cs[2] * content.height() + cs[3] * me.scale,
+            // CanvasSize.Scale multiplies the ScrollingFrame's parent content size.
+            let cs = match d.prop(r, "CanvasSize") {
+                Some(Variant::UDim2(u)) => [u.x.scale, u.x.offset as f32, u.y.scale, u.y.offset as f32],
+                _ => [0.0, 0.0, 2.0, 0.0],
+            };
+            let mut raw = egui::vec2(
+                cs[0] * parent.width() + cs[1] * me.scale,
+                cs[2] * parent.height() + cs[3] * me.scale,
             );
-            // AutomaticCanvasSize (None 0, X 1, Y 2, XY 3) grows the canvas
-            // to hold the children (Place A's admin panel: CanvasSize 0).
+            // AutomaticCanvasSize (None 0, X 1, Y 2, XY 3) grows the canvas to hold
+            // its children + UIPadding.
             let acs = enum_u32(d.prop(r, "AutomaticCanvasSize")).unwrap_or(0);
-            // The least canvas: the content area, and what an automatic axis holds.
-            let mut floor = content.size();
-            if acs != 0 {
-                let held = self.content_size(r, rect.size(), me.scale, acs, 0)
-                    - (rect.size() - content.size());
-                if acs & 1 != 0 {
-                    canvas.x = canvas.x.max(held.x);
-                    floor.x = floor.x.max(held.x);
-                }
-                if acs & 2 != 0 {
-                    canvas.y = canvas.y.max(held.y);
-                    floor.y = floor.y.max(held.y);
-                }
+            let held = if acs != 0 {
+                self.content_size_in(r, rect.size(), me.scale, acs, 0, rect.width())
+            } else {
+                egui::Vec2::ZERO
+            };
+            if acs & 1 != 0 {
+                raw.x = raw.x.max(held.x);
             }
-            let canvas = canvas.max(content.size());
-            // Recorded with the padding around it (the scroll range is this
-            // less the frame's size).
-            let pad = rect.size() - content.size();
-            let whole = canvas + pad;
-            let fit = crate::gui::CanvasFit { pad: [pad.x, pad.y], floor: [floor.x, floor.y], scale: me.scale };
+            if acs & 2 != 0 {
+                raw.y = raw.y.max(held.y);
+            }
+            let th = num(d, r, "ScrollBarThickness", 12.0) * me.scale;
+            // Studio reserves a 1 px separator beside a non-zero scrollbar.
+            let gutter = if th > 0.0 { th + 1.0 * me.scale } else { 0.0 };
+            // ScrollingDirection: X 1, Y 2, XY 4 (default).
+            let sd = enum_u32(d.prop(r, "ScrollingDirection")).unwrap_or(4);
+            let can_x = sd != 2;
+            let can_y = sd != 1;
+            let show_v = can_y && raw.y > rect.height() + 0.5;
+            let show_h = can_x && raw.x > rect.width() + 0.5;
+            // ScrollBarInset: None 0, ScrollBar 1, Always 2.
+            let vi = enum_u32(d.prop(r, "VerticalScrollBarInset")).unwrap_or(0);
+            let hi = enum_u32(d.prop(r, "HorizontalScrollBarInset")).unwrap_or(0);
+            let vpos = enum_u32(d.prop(r, "VerticalScrollBarPosition")).unwrap_or(0); // Right 0, Left 1
+            let inset_v = if vi == 2 || (vi == 1 && show_v) { gutter } else { 0.0 };
+            let inset_h = if hi == 2 || (hi == 1 && show_h) { gutter } else { 0.0 };
+            let auto_x = if acs & 1 != 0 { held.x + if inset_v > 0.0 { th } else { 0.0 } } else { 0.0 };
+            let auto_y = if acs & 2 != 0 { held.y + if inset_h > 0.0 { th } else { 0.0 } } else { 0.0 };
+            if acs & 1 != 0 {
+                raw.x = raw.x.max(auto_x);
+            }
+            if acs & 2 != 0 {
+                raw.y = raw.y.max(auto_y);
+            }
+            let floor = egui::vec2(
+                (rect.width() - inset_v).max(0.0).max(auto_x),
+                (rect.height() - inset_h).max(0.0).max(auto_y),
+            );
+            let canvas = raw.max(floor);
+            // AbsoluteWindowSize subtracts the gutter whenever a scrollbar shows,
+            // independent of VerticalScrollBarInset / HorizontalScrollBarInset.
+            let window = egui::vec2(
+                (rect.width() - if show_v { gutter } else { 0.0 }).max(0.0),
+                (rect.height() - if show_h { gutter } else { 0.0 }).max(0.0),
+            );
+            let max_scroll = (canvas - window).max(egui::Vec2::ZERO);
+            let cp = vec2(d, r, "CanvasPosition", [0.0, 0.0]);
+            let cp = [cp[0].clamp(0.0, max_scroll.x), cp[1].clamp(0.0, max_scroll.y)];
+            let fit = crate::gui::CanvasFit {
+                basis: [parent.width(), parent.height()],
+                floor: [floor.x, floor.y],
+                scale: me.scale,
+            };
             if let Some(b) = self.gui.layout.get_mut(&r) {
-                b.canvas = Some([whole.x, whole.y]);
+                b.canvas = Some([canvas.x, canvas.y]);
+                b.window = Some([window.x, window.y]);
                 b.canvas_fit = Some(fit);
             }
             if let Some((_, b)) = self.boxes.iter_mut().rev().find(|(k, _)| *k == r) {
-                b.canvas = Some([whole.x, whole.y]);
+                b.canvas = Some([canvas.x, canvas.y]);
+                b.window = Some([window.x, window.y]);
                 b.canvas_fit = Some(fit);
             }
-            self.children(
-                r,
-                Rect::from_min_size(
-                    Pos2::new(content.left() - cp[0], content.top() - cp[1]),
-                    canvas,
-                ),
-                me,
+            let origin = Pos2::new(
+                rect.left() + if vpos == 1 { inset_v } else { 0.0 } - cp[0],
+                rect.top() - cp[1],
             );
-            let th = num(d, r, "ScrollBarThickness", 12.0) * me.scale;
+            let canvas_rect = Rect::from_min_size(origin, canvas);
+            // UIPadding pads inside the canvas (not added on top of CanvasSize).
+            let mut inner_canvas = padded(d, r, canvas_rect, me.scale);
+            if chat_style {
+                inner_canvas = inner_canvas.shrink(17.0 * me.scale);
+            }
+            self.children(r, inner_canvas, me);
             let st = num(d, r, "ScrollBarImageTransparency", 0.0);
-            if th > 0.0 && st < 1.0 && canvas.y > content.height() + 0.5 {
-                self.scroll_bar(r, rect, content, canvas.y, cp[1], th, st, &me);
+            if th > 0.0 && st < 1.0 {
+                if show_v {
+                    let bar_x = if vpos == 1 { rect.left() } else { rect.right() - th };
+                    let track = Rect::from_min_size(Pos2::new(bar_x, rect.top()), egui::vec2(th, window.y));
+                    self.scroll_bar(r, track, canvas.y, cp[1], th, st, &me, true);
+                }
+                if show_h {
+                    let bar_x = rect.left() + if vpos == 1 && show_v { gutter } else { 0.0 };
+                    let track = Rect::from_min_size(Pos2::new(bar_x, rect.bottom() - th), egui::vec2(window.x, th));
+                    self.scroll_bar(r, track, canvas.x, cp[0], th, st, &me, false);
+                }
             }
         } else {
             self.children(r, content, me);
         }
     }
 
-    /// A ScrollingFrame's vertical thumb as Studio draws it: TopImage,
-    /// MidImage and BottomImage (default the content's
-    /// textures/ui/Scroll/scroll-{top,middle,bottom}.png: white at half
-    /// alpha, rounded ends) tinted ScrollBarImageColor3, at the frame's right
-    /// edge, ScrollBarThickness wide. The ends are thickness-square images;
-    /// the thumb is the view's share of the canvas long and never shorter
-    /// than its two ends (Studio's WPixel capture: a 60 px view of a 300 px
-    /// canvas draws a 16 px thumb whose round caps meet at its middle,
-    /// checks/plugins/widgets/captures/studio-wleft.png).
+    /// A ScrollingFrame's vertical or horizontal thumb as Studio draws it.
     #[allow(clippy::too_many_arguments)]
-    fn scroll_bar(&mut self, r: Ref, rect: Rect, content: Rect, canvas_h: f32, cp_y: f32, th: f32, st: f32, me: &Down) {
+    fn scroll_bar(&mut self, r: Ref, track: Rect, canvas_len: f32, cp: f32, th: f32, st: f32, me: &Down, vertical: bool) {
         let d = self.input.doc;
-        let h = content.height();
-        let len = (h * h / canvas_h).max(2.0 * th).min(h);
-        let travel = (canvas_h - h).max(1e-3);
-        let top = content.top() + (cp_y / travel).clamp(0.0, 1.0) * (h - len);
-        let bar = Rect::from_min_size(Pos2::new(rect.right() - th, top), egui::vec2(th, len));
+        let view = if vertical { track.height() } else { track.width() };
+        if view <= 0.0 || canvas_len <= view {
+            return;
+        }
+        let len = (view * view / canvas_len).max(2.0 * th).min(view);
+        let travel = (canvas_len - view).max(1e-3);
+        let off = (cp / travel).clamp(0.0, 1.0) * (view - len);
+        let bar = if vertical {
+            Rect::from_min_size(Pos2::new(track.left(), track.top() + off), egui::vec2(th, len))
+        } else {
+            Rect::from_min_size(Pos2::new(track.left() + off, track.top()), egui::vec2(len, th))
+        };
         let ic = color(d, r, "ScrollBarImageColor3", [1.0, 1.0, 1.0]);
         let tint = me.tint;
         let c = rgba([ic[0] * tint[0], ic[1] * tint[1], ic[2] * tint[2]], (1.0 - st) * me.alpha);
@@ -1684,23 +2386,37 @@ impl Walk<'_, '_> {
             let has = d.dom.get_by_ref(r).is_some_and(|i| i.properties.contains_key(&rbx_dom_weak::ustr(prop)));
             if has { text_prop(d, r, prop) } else { dflt.to_string() }
         };
-        let parts = [
-            (image("TopImage", "rbxasset://textures/ui/Scroll/scroll-top.png"), Rect::from_min_size(bar.min, egui::vec2(th, th))),
-            (
-                image("MidImage", "rbxasset://textures/ui/Scroll/scroll-middle.png"),
-                Rect::from_min_max(Pos2::new(bar.left(), bar.top() + th), Pos2::new(bar.right(), bar.bottom() - th)),
-            ),
-            (
-                image("BottomImage", "rbxasset://textures/ui/Scroll/scroll-bottom.png"),
-                Rect::from_min_max(Pos2::new(bar.left(), bar.bottom() - th), bar.max),
-            ),
-        ];
+        let parts = if vertical {
+            [
+                (image("TopImage", "rbxasset://textures/ui/Scroll/scroll-top.png"), Rect::from_min_size(bar.min, egui::vec2(th, th))),
+                (
+                    image("MidImage", "rbxasset://textures/ui/Scroll/scroll-middle.png"),
+                    Rect::from_min_max(Pos2::new(bar.left(), bar.top() + th), Pos2::new(bar.right(), bar.bottom() - th)),
+                ),
+                (
+                    image("BottomImage", "rbxasset://textures/ui/Scroll/scroll-bottom.png"),
+                    Rect::from_min_max(Pos2::new(bar.left(), bar.bottom() - th), bar.max),
+                ),
+            ]
+        } else {
+            [
+                (image("TopImage", "rbxasset://textures/ui/Scroll/scroll-top.png"), Rect::from_min_size(bar.min, egui::vec2(th, th))),
+                (
+                    image("MidImage", "rbxasset://textures/ui/Scroll/scroll-middle.png"),
+                    Rect::from_min_max(Pos2::new(bar.left() + th, bar.top()), Pos2::new(bar.right() - th, bar.bottom())),
+                ),
+                (
+                    image("BottomImage", "rbxasset://textures/ui/Scroll/scroll-bottom.png"),
+                    Rect::from_min_max(Pos2::new(bar.right() - th, bar.top()), bar.max),
+                ),
+            ]
+        };
         if parts.iter().all(|(id, _)| id.is_empty()) {
             return;
         }
         let mut drew = false;
         for (id, dst) in parts {
-            if id.is_empty() || dst.height() <= 0.0 {
+            if id.is_empty() || dst.width() <= 0.0 || dst.height() <= 0.0 {
                 continue;
             }
             let Some((tex, _)) = self.gui.texture(self.ctx, self.input.store, self.input.doc_dir, &id) else {
@@ -1717,13 +2433,99 @@ impl Walk<'_, '_> {
         }
     }
 
-    fn selected_object(&self) -> Option<Ref> {
+    fn selected_object(&self) -> Option<(Ref, bool)> {
+        if !super::share().selection_visible {
+            return None;
+        }
         let d = self.input.doc;
         let gs = d.find_child(d.dom.root_ref(), "GuiService")?;
+        if let Some(Variant::Ref(r)) = d.prop(gs, "SelectedCoreObject") {
+            if d.exists(r) {
+                return Some((r, true));
+            }
+        }
         match d.prop(gs, "SelectedObject") {
-            Some(Variant::Ref(r)) if d.exists(r) => Some(r),
+            Some(Variant::Ref(r)) if d.exists(r) => Some((r, false)),
             _ => None,
         }
+    }
+
+    /// Draws the keyboard / gamepad selection cursor around `r`, honoring
+    /// `GuiObject.SelectionImageObject` (e.g. CoreScripts' transparent
+    /// `noSelectionObject` suppresses the outline; a custom `UIStroke` cursor
+    /// styles it).
+    fn draw_selection_cursor(
+        &mut self,
+        r: Ref,
+        is_core: bool,
+        rect: Rect,
+        corner: Option<f32>,
+        feather: f32,
+        me: &Down,
+    ) {
+        let d = self.input.doc;
+        if let Some(Variant::Ref(img)) = d.prop(r, "SelectionImageObject") {
+            if d.exists(img) {
+                let stroke = child_of_class(d, img, "UIStroke")
+                    .or_else(|| {
+                        d.dom.get_by_ref(img)?.children().iter().copied().find_map(|c| {
+                            if d.class_of(c).is_some_and(|k| doc::is_a(&k, "GuiObject"))
+                                && boolp(d, c, "Visible", true)
+                            {
+                                child_of_class(d, c, "UIStroke")
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .filter(|s| {
+                        boolp(d, *s, "Enabled", true)
+                            && num(d, *s, "Transparency", 0.0) < 1.0
+                            && num(d, *s, "Thickness", 1.0) > 0.0
+                    });
+                if let Some(s) = stroke {
+                    let th = num(d, s, "Thickness", 2.0) * me.scale;
+                    let st = num(d, s, "Transparency", 0.0).clamp(0.0, 1.0);
+                    let c = rgba(color(d, s, "Color", [1.0, 1.0, 1.0]), (1.0 - st) * me.alpha);
+                    let expand = th;
+                    let sel_rect = rect.expand(expand);
+                    let sel_corner = corner.map(|rad| rad + expand);
+                    self.push(
+                        Shape::Mesh(stroke_rounded_aa_mesh(sel_rect, sel_corner, th, feather, &|_| c).into()),
+                        me,
+                    );
+                    return;
+                }
+                let bg_vis = num(d, img, "BackgroundTransparency", 0.0) < 1.0;
+                let img_vis = d
+                    .class_of(img)
+                    .is_some_and(|k| matches!(k.as_str(), "ImageLabel" | "ImageButton"))
+                    && !text_prop(d, img, "Image").is_empty()
+                    && num(d, img, "ImageTransparency", 0.0) < 1.0;
+                let child_vis = d.dom.get_by_ref(img).is_some_and(|inst| {
+                    inst.children().iter().any(|&c| {
+                        d.class_of(c).is_some_and(|k| doc::is_a(&k, "GuiObject"))
+                            && boolp(d, c, "Visible", true)
+                    })
+                });
+                if !bg_vis && !img_vis && !child_vis {
+                    // Explicit transparent placeholder (e.g. SettingsHub's noSelectionObject).
+                    return;
+                }
+            }
+        }
+        let (c, th, expand) = if is_core {
+            (Color32::WHITE, 2.5 * me.scale, 2.5 * me.scale)
+        } else {
+            let [cr, cg, cb] = mech::GUI_SELECTION_RGB;
+            (Color32::from_rgb(cr, cg, cb), 2.0, 2.0)
+        };
+        let sel_rect = rect.expand(expand);
+        let sel_corner = corner.map(|rad| rad + expand);
+        self.push(
+            Shape::Mesh(stroke_rounded_aa_mesh(sel_rect, sel_corner, th, feather, &|_| c).into()),
+            me,
+        );
     }
 
     /// ImageLabel / ImageButton with ImageRect*, ScaleType and UIGradient.
@@ -1791,8 +2593,9 @@ impl Walk<'_, '_> {
             tex
         };
         // UICorner rounds the image too (Stretch, Fit, Crop).
+        let feather = 1.0 / self.ctx.pixels_per_point().max(1e-3);
         let quad = |dst: Rect, uv: Rect| match corner.filter(|c| *c >= 0.5) {
-            Some(c) => rounded_quad_mesh(dst, uv, tex, &col, c),
+            Some(c) => rounded_quad_mesh(dst, uv, tex, &col, c, feather),
             None => quad_mesh(dst, uv, tex, &col, steps),
         };
         match scale_type {
@@ -1915,7 +2718,7 @@ impl Walk<'_, '_> {
     }
 
     /// Text with its font, size (TextScaled, UITextSizeConstraint), wrapping,
-    /// truncation, alignment, rich text and outline. Returns TextBounds.
+    /// truncation, alignment, rich text and outline. Returns `(TextBounds, TextFits)`.
     fn text(
         &mut self,
         r: Ref,
@@ -1925,20 +2728,29 @@ impl Walk<'_, '_> {
         ui_stroke: Option<Ref>,
         fill_grad: Option<GradLut>,
         box_rect: Rect,
-    ) -> Option<[f32; 2]> {
+    ) -> (Option<[f32; 2]>, bool) {
         let d = self.input.doc;
         let _text = rustudio_core::bench::scope("gui_text");
-        let mut text = text_prop(d, r, "Text");
-        let mut col = color(d, r, "TextColor3", [0.0, 0.0, 0.0]);
+        let raw_text = text_prop(d, r, "Text");
+        let text_col = color(d, r, "TextColor3", [0.0, 0.0, 0.0]);
+        let mut col = text_col;
         let tt = num(d, r, "TextTransparency", 0.0);
         let focused = self.gui.focus == Some(r);
-        if class == "TextBox" && text.is_empty() && !focused {
-            text = text_prop(d, r, "PlaceholderText");
-            col = color(d, r, "PlaceholderColor3", [0.7, 0.7, 0.7]);
+        let is_textbox = class == "TextBox";
+        let is_placeholder = is_textbox && raw_text.is_empty();
+        // Roblox shows PlaceholderText whenever Text is empty, even while focused.
+        let mut text = if is_placeholder {
+            col = color(d, r, "PlaceholderColor3", [0.5, 0.5, 0.5]);
+            text_prop(d, r, "PlaceholderText")
+        } else {
+            raw_text.clone()
+        };
+        let max_vis = num(d, r, "MaxVisibleGraphemes", -1.0) as i32;
+        if !is_placeholder && max_vis >= 0 {
+            text = textbox::limit_visible_graphemes(&text, max_vis).to_string();
         }
         let font = font_of(d, r);
         let family = self.gui.family(self.ctx, self.input.store, &font);
-        let text = super::ligatures::apply(&family, text);
         let bold_face = font.1 >= 600;
         let rich = boolp(d, r, "RichText", false);
         let wrapped = boolp(d, r, "TextWrapped", false);
@@ -1956,21 +2768,11 @@ impl Walk<'_, '_> {
         // egui sizes by the em. This family's line height per em, measured once.
         let em_per_size = self.em_per_size(&family);
         note_text_face(self.ctx, &font, &family, em_per_size);
-        // RichText <b>: the family's bold face (Studio draws SourceSans <b>
-        // with SourceSansPro 700: checks/plugins/widgets sheet probe-wpixel).
-        let bold_family = if rich && !bold_face && text.contains("<b") {
-            let bf = (font.0.clone(), 700, font.2);
-            let fam = self.gui.family(self.ctx, self.input.store, &bf);
-            let em = self.em_per_size(&fam);
-            Some((fam, em))
-        } else {
-            None
-        };
-        let runs = if rich {
+        let mut runs = if rich {
             rich_runs(&text)
         } else {
             vec![Run {
-                text: text.clone(),
+                text: apply_font_ligatures(&family, &text).into_owned(),
                 bold: false,
                 italic: font.2,
                 underline: false,
@@ -1978,44 +2780,100 @@ impl Walk<'_, '_> {
                 color: None,
                 size: None,
                 transparency: None,
+                stroke_transparency: None,
             }]
         };
+        if rich {
+            for run in &mut runs {
+                if let Cow::Owned(s) = apply_font_ligatures(&family, &run.text) {
+                    run.text = s;
+                }
+            }
+        }
+        // RichText <b>, <i>, <b><i>: load the family's bold / italic / bold-italic faces.
+        let italic_face = font.2;
+        let base_is_italic_file = matches!(&family, FontFamily::Name(n) if n.contains("Italic") || n.contains("Oblique"));
+        let bold_family = if rich && !bold_face && runs.iter().any(|r| r.bold && !r.italic) {
+            let bf = (font.0.clone(), 700, font.2);
+            let fam = self.gui.family(self.ctx, self.input.store, &bf);
+            let em = self.em_per_size(&fam);
+            note_text_face(self.ctx, &bf, &fam, em);
+            Some((fam, em))
+        } else {
+            None
+        };
+        let italic_family = if rich && !italic_face && runs.iter().any(|r| r.italic && !r.bold) {
+            let itf = (font.0.clone(), font.1, true);
+            let fam = self.gui.family(self.ctx, self.input.store, &itf);
+            let em = self.em_per_size(&fam);
+            note_text_face(self.ctx, &itf, &fam, em);
+            Some((fam, em))
+        } else {
+            None
+        };
+        let bold_italic_family = if rich && !(bold_face && italic_face) && runs.iter().any(|r| r.bold && r.italic) {
+            let bif = (font.0.clone(), 700, true);
+            let fam = self.gui.family(self.ctx, self.input.store, &bif);
+            let em = self.em_per_size(&fam);
+            note_text_face(self.ctx, &bif, &fam, em);
+            Some((fam, em))
+        } else {
+            None
+        };
+        let legacy_scale = legacy_text_scale(&font);
         let build = |size: f32, wrap: bool| -> LayoutJob {
             let mut job = LayoutJob::default();
             for run in &runs {
-                let rs = run.size.map(|s| s * ui_scale).unwrap_or(size);
+                let rs = safe_font_size(run.size.map(|s| s * ui_scale * legacy_scale).unwrap_or(size));
                 let c = run.color.unwrap_or(col);
                 let color = rgba(
                     [c[0] * tint[0], c[1] * tint[1], c[2] * tint[2]],
                     (1.0 - run.transparency.unwrap_or(tt)) * alpha,
                 );
-                let (fam, em) = match (&bold_family, run.bold) {
-                    (Some((bf, be)), true) => (bf.clone(), *be),
-                    _ => (family.clone(), em_per_size),
+                let (fam, em, real_italic, has_bold) = match (run.bold, run.italic) {
+                    (true, true) => match &bold_italic_family {
+                        Some((bf, be)) => (bf.clone(), *be, *bf != family, true),
+                        None => match (&bold_family, &italic_family) {
+                            (Some((bf, be)), _) => (bf.clone(), *be, base_is_italic_file, true),
+                            (_, Some((itf, ite))) => (itf.clone(), *ite, *itf != family, bold_face),
+                            _ => (family.clone(), em_per_size, base_is_italic_file, bold_face),
+                        },
+                    },
+                    (true, false) => match &bold_family {
+                        Some((bf, be)) => (bf.clone(), *be, base_is_italic_file, true),
+                        None => (family.clone(), em_per_size, base_is_italic_file, bold_face),
+                    },
+                    (false, true) => match &italic_family {
+                        Some((itf, ite)) => (itf.clone(), *ite, *itf != family, bold_face),
+                        None => (family.clone(), em_per_size, base_is_italic_file, bold_face),
+                    },
+                    (false, false) => (family.clone(), em_per_size, base_is_italic_file, bold_face),
                 };
-                let mut f = TextFormat::simple(FontId::new(rs * em, fam), color);
+                let mut f = TextFormat::simple(FontId::new(safe_font_size(rs * em), fam), color);
+                f.studio_text_size = Some(rs);
                 f.line_height = Some(rs * line_height);
-                f.italics = run.italic;
+                f.italics = run.italic && !real_italic;
                 if run.underline {
                     f.underline = Stroke::new((rs / 14.0).max(1.0), color);
                 }
                 if run.strike {
                     f.strikethrough = Stroke::new((rs / 14.0).max(1.0), color);
                 }
-                if run.bold && !bold_face && bold_family.is_none() {
+                if run.bold && !has_bold {
                     // Faux bold: egui has no synthetic bold, so a little extra spacing.
                     f.extra_letter_spacing = rs * 0.04;
                 }
-                super::color_glyphs::append(&mut job, &run.text, f);
+                job.append(&run.text, 0.0, f);
             }
             job.wrap.max_width = if wrap || truncate {
-                rect.width().max(1.0)
+                rect.width().max(1.0) + if truncate && !wrap { 0.5 } else { 0.0 }
             } else {
                 f32::INFINITY
             };
             if truncate {
                 if !wrap {
                     job.wrap.max_rows = 1;
+                    job.wrap.break_anywhere = true;
                 }
                 job.wrap.overflow_character = Some('…');
             }
@@ -2031,10 +2889,20 @@ impl Walk<'_, '_> {
             job
         };
         let ctx = self.ctx;
-        if text.is_empty() && !focused {
-            return Some([0.0, 0.0]);
-        }
         let mut size = num(d, r, "TextSize", 14.0) * me.scale * legacy_text_scale(&font);
+        if !scaled {
+            if let Some(c) = tsc {
+                size = constrain_font_size(
+                    size,
+                    num(d, c, "MinTextSize", 1.0) * me.scale,
+                    num(d, c, "MaxTextSize", 100.0) * me.scale,
+                );
+            }
+        }
+        size = safe_font_size(size);
+        if text.is_empty() && !focused {
+            return (Some([0.0, size]), size <= rect.height() + 0.5);
+        }
         let simple = !rich && !truncate && single_line_ascii(&text);
         if scaled {
             let max = tsc
@@ -2044,18 +2912,14 @@ impl Walk<'_, '_> {
                 * me.scale.max(1.0);
             let Some(fitted) = self.gui.text_fit.size(ctx, rect.size(), max, simple, &build) else {
                 self.gui.no_cache = Some("text deferred");
-                return None;
+                return (None, false);
             };
             size = fitted;
             if let Some(c) = tsc {
                 size = size.max(num(d, c, "MinTextSize", 1.0) * me.scale);
             }
-        } else if let Some(c) = tsc {
-            size = size.clamp(
-                num(d, c, "MinTextSize", 1.0) * me.scale,
-                num(d, c, "MaxTextSize", 100.0) * me.scale,
-            );
         }
+        size = safe_font_size(size);
         let galley = {
             let _p = rustudio_core::bench::scope("gui_text_layout");
             if scaled && simple {
@@ -2072,7 +2936,7 @@ impl Walk<'_, '_> {
         };
         let Some(galley) = galley else {
             self.gui.no_cache = Some("text deferred");
-            return None;
+            return (None, false);
         };
         let gs = galley.size();
         // The galley's rows are aligned around x by its halign.
@@ -2086,7 +2950,112 @@ impl Walk<'_, '_> {
             2 => rect.bottom() - gs.y,
             _ => rect.center().y - gs.y * 0.5,
         };
-        let pos = Pos2::new(x, y);
+        // Sync script cursor/selection writes so drawing reflects live CursorPosition/SelectionStart.
+        let (tb_cur, tb_sel) = if focused {
+            let sh = super::share();
+            let c = sh.tb_cursor.get(&r).copied().unwrap_or(self.gui.tb_cursor);
+            let s = sh.tb_sel.get(&r).copied().unwrap_or(self.gui.tb_sel);
+            (c, s)
+        } else {
+            (-1, -1)
+        };
+        let char_idx_for_byte = |b: i32| -> usize {
+            if b < 1 || is_placeholder {
+                return 0;
+            }
+            let clamped = textbox::clamp_byte_pos(&text, (b - 1) as usize);
+            text[..clamped].chars().count()
+        };
+        // Caret position in galley-local coordinates (for horizontal scrolling & drawing).
+        let caret_local_rect = if focused {
+            if is_placeholder || text.is_empty() {
+                let cx = 0.0;
+                Rect::from_min_max(Pos2::new(cx, 0.0), Pos2::new(cx, size * line_height))
+            } else {
+                let cc = egui::text::CCursor::new(char_idx_for_byte(tb_cur));
+                galley.pos_from_cursor(cc)
+            }
+        } else {
+            Rect::NOTHING
+        };
+        // Horizontal scrolling for non-wrapped, non-scaled TextBoxes when text overflows.
+        let mut scroll_x = 0.0f32;
+        let mut text_down = *me;
+        if is_textbox && !wrapped && !scaled && rect.width() > 0.0 {
+            let view_w = rect.width();
+            let content_w = galley.rect.width();
+            if focused && !is_placeholder && content_w > view_w {
+                let mut sx = self.gui.tb_scroll.get(&r).copied().unwrap_or(0.0);
+                let caret_rel_x = (x + caret_local_rect.min.x) - rect.left();
+                let margin = 2.0f32.min(view_w * 0.25);
+                if caret_rel_x - sx > view_w - margin {
+                    sx = caret_rel_x - (view_w - margin);
+                } else if caret_rel_x - sx < 0.0 {
+                    sx = caret_rel_x;
+                }
+                let max_scroll = ((x + galley.rect.right()) - rect.left() - (view_w - margin)).max(0.0);
+                sx = sx.clamp(0.0, max_scroll);
+                self.gui.tb_scroll.insert(r, sx);
+                scroll_x = sx;
+            } else {
+                self.gui.tb_scroll.remove(&r);
+            }
+            // Clip overflowing TextBox text/selection/caret to the TextBox bounds.
+            if me.aff.is_id() && (focused || scroll_x > 0.0 || boolp(d, r, "ClipsDescendants", false)) {
+                text_down.clip = me.clip.intersect(rect);
+            }
+        }
+        let pos = Pos2::new(x - scroll_x, y);
+        if is_textbox {
+            self.gui.tb_layouts.insert(
+                r,
+                TextBoxLayout {
+                    galley: galley.clone(),
+                    text_origin: pos,
+                    screen_origin: self.screen,
+                    aff: me.aff,
+                    is_placeholder,
+                    text: raw_text.clone(),
+                },
+            );
+        }
+        // Selection highlight (drawn BEHIND text, Roblox cornflower blue rgb(107, 161, 249)).
+        if focused && !is_placeholder && tb_sel >= 1 && tb_cur >= 1 && tb_sel != tb_cur {
+            let lo_b = textbox::clamp_byte_pos(&text, (tb_cur.min(tb_sel) - 1) as usize);
+            let hi_b = textbox::clamp_byte_pos(&text, (tb_cur.max(tb_sel) - 1) as usize);
+            if lo_b < hi_b {
+                let lo_c = text[..lo_b].chars().count();
+                let hi_c = text[..hi_b].chars().count();
+                let lc_lo = galley.layout_from_cursor(egui::text::CCursor::new(lo_c));
+                let lc_hi = galley.layout_from_cursor(egui::text::CCursor::new(hi_c));
+                let sel_col = Color32::from_rgba_unmultiplied(
+                    107,
+                    161,
+                    249,
+                    (255.0 * me.alpha).round().clamp(0.0, 255.0) as u8,
+                );
+                for row_idx in lc_lo.row..=lc_hi.row.min(galley.rows.len().saturating_sub(1)) {
+                    let row = &galley.rows[row_idx];
+                    let x0 = if row_idx == lc_lo.row {
+                        row.pos.x + row.x_offset(lc_lo.column)
+                    } else {
+                        row.rect().left()
+                    };
+                    let x1 = if row_idx == lc_hi.row {
+                        row.pos.x + row.x_offset(lc_hi.column)
+                    } else {
+                        row.rect().right().max(row.rect().left() + size * 0.35)
+                    };
+                    if x1 > x0 {
+                        let srect = Rect::from_min_max(
+                            Pos2::new(pos.x + x0, pos.y + row.min_y()),
+                            Pos2::new(pos.x + x1, pos.y + row.max_y()),
+                        );
+                        self.push(Shape::rect_filled(srect, 0.0, sel_col), &text_down);
+                    }
+                }
+            }
+        }
         let mut outline: Option<(f32, Color32)> = None;
         let mut outline_grad: Option<GradLut> = None;
         let stroke_t = num(d, r, "TextStrokeTransparency", 1.0);
@@ -2114,26 +3083,27 @@ impl Walk<'_, '_> {
             }
         }
         if let Some((th, c)) = outline {
-            // Roblox strokes the outline once at its transparency; the eight
-            // copies here overlap, so each takes a share of the alpha.
-            let a = c.a() as f32 / 255.0;
-            let per = 1.0 - (1.0 - a).powf(1.0 / mech::GUI_TEXT_STROKE_OVERLAP);
-            let c = if a > 0.0 { c.gamma_multiply(per / a) } else { c };
-            // A rich text run's own transparency fades its outline too
-            // (ExpChat's message body holds the name again as an invisible
-            // run to make room for it: it drew a black outline of the name).
-            let fill_a = (1.0 - tt) * me.alpha;
-            let fades = rich && fill_a > 0.0 && runs.iter().any(|run| run.transparency.is_some());
-            let tinted = (outline_grad.is_some() || fades).then(|| {
-                recolor_galley(&galley, pos, |p, v| {
-                    let base = outline_grad.as_ref().map_or(c, |gl| gl.tint(p, c));
-                    if fades {
-                        base.gamma_multiply((v.a() as f32 / 255.0 / fill_a).min(1.0))
+            let skip_transparent = rich
+                && runs
+                    .iter()
+                    .any(|r| r.transparency.is_some_and(|t| t >= 1.0) || r.stroke_transparency.is_some_and(|t| t >= 1.0));
+            let has_color_glyphs = galley
+                .rows
+                .iter()
+                .any(|pr| !pr.row.visuals.color_glyph_vertex_starts.is_empty());
+            let tinted = if outline_grad.is_some() || skip_transparent || has_color_glyphs {
+                Some(recolor_galley(&galley, pos, Some(Color32::TRANSPARENT), |p, orig| {
+                    if skip_transparent && orig.a() == 0 {
+                        Color32::TRANSPARENT
+                    } else if let Some(gl) = &outline_grad {
+                        gl.tint(p, c)
                     } else {
-                        base
+                        c
                     }
-                })
-            });
+                }))
+            } else {
+                None
+            };
             for k in 0..8 {
                 let a = std::f32::consts::TAU * k as f32 / 8.0;
                 let at = pos + egui::vec2(a.cos(), a.sin()) * th;
@@ -2145,30 +3115,70 @@ impl Walk<'_, '_> {
                         ts
                     }
                 };
-                self.push(Shape::Text(ts), me);
+                self.push(Shape::Text(ts), &text_down);
             }
         }
         let fill = match &fill_grad {
-            Some(gl) => recolor_galley(&galley, pos, |p, c| gl.tint(p, c)),
+            Some(gl) => recolor_galley(&galley, pos, None, |p, c| gl.tint(p, c)),
             None => galley.clone(),
         };
-        self.push(Shape::Text(TextShape::new(pos, fill, rgba(col, (1.0 - tt) * me.alpha))), me);
-        // Caret in the focused TextBox (blinking).
-        if focused { self.gui.no_cache = Some("focused textbox"); }
-        if focused && (self.ctx.input(|i| i.time) * 2.0) as i64 % 2 == 0 {
-            let cx = pos.x + galley.rect.right() + 1.0;
-            self.push(
-                Shape::line_segment(
-                    [
-                        Pos2::new(cx, rect.center().y - size * 0.5),
-                        Pos2::new(cx, rect.center().y + size * 0.5),
-                    ],
-                    Stroke::new(1.0, rgba(col, me.alpha)),
-                ),
-                me,
-            );
+        self.push(Shape::Text(TextShape::new(pos, fill, rgba(col, (1.0 - tt) * me.alpha))), &text_down);
+        // Blinking caret in the focused TextBox (1 physical pixel wide, TextColor3,
+        // solid for 0.53s after any input so it stays visible while moving/typing).
+        if focused {
+            self.gui.no_cache = Some("focused textbox");
+            let now_s = ui_time(self.ctx);
+            let elapsed = (now_s - self.gui.tb_blink).max(0.0);
+            let blink_on = ((elapsed / 0.53) as u64) % 2 == 0;
+            if blink_on {
+                let ppp = self.ctx.pixels_per_point().max(1.0);
+                let caret_w = 1.0 / ppp;
+                let cx = ((pos.x + caret_local_rect.min.x) * ppp).round() / ppp;
+                let (cy0, cy1) = if caret_local_rect.height() > 1.0 {
+                    (pos.y + caret_local_rect.min.y, pos.y + caret_local_rect.max.y)
+                } else {
+                    (pos.y, pos.y + size * line_height)
+                };
+                let caret_rect = Rect::from_min_max(Pos2::new(cx, cy0), Pos2::new(cx + caret_w, cy1));
+                self.push(
+                    Shape::rect_filled(caret_rect, 0.0, rgba(text_col, (1.0 - tt) * me.alpha)),
+                    &text_down,
+                );
+            }
         }
-        Some([galley.rect.width(), galley.rect.height()])
+        let full_w = galley.rect.width().ceil();
+        let has_custom_size = rich && runs.iter().any(|r| r.size.is_some());
+        let full_h = if has_custom_size && (line_height - 1.0).abs() < 1e-4 {
+            galley.rect.height().ceil()
+        } else {
+            text_rows_height(galley.rows.len(), size, line_height)
+        };
+        let fits = full_w <= rect.width() + 0.5 && full_h <= rect.height() + 0.5;
+        let (tb_w, tb_h) = if wrapped && !scaled && galley.rows.len() > 1 && full_h > rect.height() + 0.5 {
+            // Studio's TextBounds on overflowing wrapped text measures only the
+            // rows that fit vertically inside the box while TextFits is false.
+            let mut fit_rows = 0usize;
+            for k in 1..=galley.rows.len() {
+                if text_rows_height(k, size, line_height) <= rect.height() + 0.5 {
+                    fit_rows = k;
+                } else {
+                    break;
+                }
+            }
+            if fit_rows > 0 {
+                let vis_w = galley.rows[..fit_rows]
+                    .iter()
+                    .map(|pr| pr.rect().width())
+                    .fold(0.0f32, f32::max)
+                    .ceil();
+                (vis_w, text_rows_height(fit_rows, size, line_height))
+            } else {
+                (full_w, full_h)
+            }
+        } else {
+            (full_w, full_h)
+        };
+        (Some([tb_w, tb_h]), fits)
     }
 
     /// A ViewportFrame: the renderer draws its parts (vf_render.rs, through
@@ -2221,13 +3231,19 @@ impl Walk<'_, '_> {
     }
 }
 
-/// UIFlexItem grow ratio: FlexMode Grow (1) and Fill (3)
-/// grow by 1, Custom (4) by its GrowRatio; None (0) and Shrink (2) don't.
-fn flex_grow(d: &Document, f: Ref) -> f32 {
+/// UIFlexItem (grow, shrink) ratios:
+/// None (0) -> (0, 0), Grow (1) -> (1, 0), Shrink (2) -> (0, 1),
+/// Fill (3) -> (1, 1), Custom (4) -> (GrowRatio, ShrinkRatio).
+fn flex_ratios(d: &Document, f: Ref) -> (f32, f32) {
     match enum_u32(d.prop(f, "FlexMode")).unwrap_or(0) {
-        1 | 3 => 1.0,
-        4 => num(d, f, "GrowRatio", 0.0).max(0.0),
-        _ => 0.0,
+        1 => (1.0, 0.0),
+        2 => (0.0, 1.0),
+        3 => (1.0, 1.0),
+        4 => (
+            num(d, f, "GrowRatio", 0.0).max(0.0),
+            num(d, f, "ShrinkRatio", 0.0).max(0.0),
+        ),
+        _ => (0.0, 0.0),
     }
 }
 
@@ -2269,6 +3285,15 @@ pub(super) fn list_lines(sizes: &[egui::Vec2], vertical: bool, wraps: bool, room
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn font_sizes_are_valid_after_scaling() {
+        for size in [0.0, f32::NAN, f32::INFINITY, f32::from_bits(1)] {
+            assert_eq!(safe_font_size(size), mech::GUI_MIN_FONT_SIZE);
+        }
+        assert_eq!(safe_font_size(14.0), 14.0);
+        assert_eq!(safe_font_size(constrain_font_size(f32::NAN, 0.0, 0.0)), mech::GUI_MIN_FONT_SIZE);
+    }
+
     use super::*;
 
     #[test]
@@ -2279,7 +3304,7 @@ mod tests {
             for text in ["Temple Guardian", "longwordwithoutbreaks", "é W", "title\nsecond line", "Lv. 100", "jjjj W"] {
                 for width in [6.0, 39.4, 70.3, 70.8, 198.0] {
                     for height in [3.5, 11.3, 31.7, 49.0] {
-                        for max in [20.0, 100.0] {
+                        for max in [20.0f32, 100.0] {
                             let build = |size: f32, wrap: bool| {
                                 let mut job = LayoutJob::simple(
                                     text.into(), FontId::proportional(size), egui::Color32::WHITE,
@@ -2289,22 +3314,49 @@ mod tests {
                                 job.round_output_to_gui = false;
                                 job
                             };
-                            let mut lo = 1.0f32;
-                            let mut hi = max;
-                            for _ in 0..10 {
-                                let mid = (lo + hi) * 0.5;
-                                let actual = ctx.fonts_mut(|fonts| fonts.layout_job(build(mid, true))).size();
-                                if actual.x <= width + 0.5 && actual.y <= height + 0.5 {
+                            let mut lo = 1i32;
+                            let mut hi = (max.floor().max(1.0) as i32) + 1;
+                            while lo + 1 < hi {
+                                let mid = (lo + hi) / 2;
+                                let g = ctx.fonts_mut(|fonts| fonts.layout_job(build(mid as f32, true)));
+                                let actual = g.size();
+                                if !has_mid_word_break(&g) && actual.x <= width + 0.5 && actual.y <= height + 0.5 {
                                     lo = mid;
                                 } else {
                                     hi = mid;
                                 }
                             }
                             let fitted = cache.size(&ctx, egui::vec2(width, height), max, single_line_ascii(text), build);
-                            assert_eq!(fitted, Some(lo.floor()), "{text:?} {width}×{height} max {max}");
+                            assert_eq!(fitted, Some(lo as f32), "{text:?} {width}×{height} max {max}");
                         }
                     }
                 }
+            }
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn text_scaled_does_not_split_single_word_mid_word() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+            let mut cache = TextFitCache::default();
+            for word in ["Random", "Spectate"] {
+                let width = 70.0;
+                let height = 180.0;
+                let build = |size: f32, wrap: bool| {
+                    let mut job = LayoutJob::simple(
+                        word.into(), FontId::proportional(size), egui::Color32::WHITE,
+                        if wrap { width } else { f32::INFINITY },
+                    );
+                    job.sections[0].format.line_height = Some(size);
+                    job.round_output_to_gui = false;
+                    job
+                };
+                let fitted = cache.size(&ctx, egui::vec2(width, height), 100.0, true, build).unwrap();
+                let g = ctx.fonts_mut(|fonts| fonts.layout_job(build(fitted, true)));
+                assert_eq!(g.rows.len(), 1, "{word} at size {fitted} wrapped into {} rows", g.rows.len());
+                assert!(!has_mid_word_break(&g), "{word} broke mid-word");
             }
         });
         output.textures_delta.clear();
@@ -2464,7 +3516,7 @@ mod layout_tests {
         let rect = Rect::from_min_size(Pos2::new(20.0, 0.0), egui::vec2(309.7, 30.0));
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
-            let mut walk = Walk { gui: &mut gui, ctx: ui.ctx(), input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
+            let mut walk = Walk { gui: &mut gui, ctx: ui.ctx(), input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let reply_box = &walk.boxes.iter().find(|(r, _)| *r == reply).unwrap().1;
             assert!((reply_box.size[0] - rect.width()).abs() < 0.01);
@@ -2474,97 +3526,12 @@ mod layout_tests {
         out.textures_delta.clear();
     }
 
-    #[test]
-    fn grid_overrides_authored_tab_width() {
-        let mut doc = Document::new_place();
-        let root = doc.dom.root_ref();
-        let parent = doc.dom.insert(root, InstanceBuilder::new("Frame"));
-        let folder = doc.dom.insert(parent, InstanceBuilder::new("Folder"));
-        let nested = doc.dom.insert(folder, InstanceBuilder::new("Folder"));
-        let control = doc.dom.insert(nested, InstanceBuilder::new("TextButton").with_name("Travel").with_property("LayoutOrder", 100i32));
-        let mut tabs = Vec::new();
-        for name in ["Sound", "Titles"] {
-            tabs.push(doc.dom.insert(parent, InstanceBuilder::new("Frame").with_name(name)
-                .with_property("Size", UDim2::new(UDim::new(0.326, 0), UDim::new(1.0, 0)))));
-        }
-        doc.dom.insert(parent, InstanceBuilder::new("UIGridLayout")
-            .with_property("CellSize", UDim2::new(UDim::new(0.49, 0), UDim::new(1.0, 0)))
-            .with_property("CellPadding", UDim2::new(UDim::new(0.01, 0), UDim::new(0.0, 0)))
-            .with_property("FillDirection", Enum::from_u32(1))
-            .with_property("HorizontalAlignment", Enum::from_u32(0)));
-        let ctx = egui::Context::default();
-        let mut gui = Gui::default();
-        let cam = Camera::default();
-        let mut store = AssetStore::default();
-        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1000.0, 40.0));
-        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
-        let mut out = ctx.run_ui(Default::default(), |ui| {
-            let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
-            walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
-            assert!(walk.boxes.iter().any(|(r, _)| *r == control), "nested Folder control was skipped");
-            let boxes: Vec<_> = tabs.iter().map(|r| &walk.boxes.iter().find(|(k, _)| k == r).unwrap().1).collect();
-            assert!((boxes[0].size[0] - 490.0).abs() < 0.01);
-            assert!((boxes[1].pos[0] - boxes[0].pos[0] - 500.0).abs() < 0.01);
-        });
-        // (No renderer here: epaint asserts undelivered font-atlas updates.)
-        out.textures_delta.clear();
-    }
-
-    /// UIFlexItem in a horizontal UIListLayout: a Grow child takes the room
-    /// the others leave (Model Reflect's header: a 16 px button, a 28 px
-    /// logo and a Size (0, 28) title that grows); Custom grows by GrowRatio.
-    /// A wrapped AutomaticSize X label grows up to its parent's width and
-    /// wraps there (Argon's error message).
-    #[test]
-    fn flex_grow_and_wrapped_automatic_x() {
-        let mut doc = Document::new_place();
-        let root = doc.dom.root_ref();
-        let parent = doc.dom.insert(root, InstanceBuilder::new("Frame"));
-        doc.dom.insert(parent, InstanceBuilder::new("UIListLayout").with_property("FillDirection", Enum::from_u32(0)));
-        let fixed = doc.dom.insert(parent, InstanceBuilder::new("Frame").with_property("LayoutOrder", 0i32)
-            .with_property("Size", UDim2::new(UDim::new(0.0, 40), UDim::new(0.0, 28))));
-        let grow = doc.dom.insert(parent, InstanceBuilder::new("Frame").with_property("LayoutOrder", 1i32)
-            .with_property("Size", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 28))));
-        doc.dom.insert(grow, InstanceBuilder::new("UIFlexItem").with_property("FlexMode", Enum::from_u32(1)));
-        let custom = doc.dom.insert(parent, InstanceBuilder::new("Frame").with_property("LayoutOrder", 2i32)
-            .with_property("Size", UDim2::new(UDim::new(0.0, 10), UDim::new(0.0, 28))));
-        doc.dom.insert(custom, InstanceBuilder::new("UIFlexItem").with_property("FlexMode", Enum::from_u32(4)).with_property("GrowRatio", 3.0f32));
-        let holder = doc.dom.insert(root, InstanceBuilder::new("Frame"));
-        let label = doc.dom.insert(holder, InstanceBuilder::new("TextLabel")
-            .with_property("Text", "word ".repeat(60))
-            .with_property("TextWrapped", true)
-            .with_property("AutomaticSize", Enum::from_u32(3)));
-        let ctx = egui::Context::default();
-        let mut gui = Gui::default();
-        let cam = Camera::default();
-        let mut store = AssetStore::default();
-        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(250.0, 30.0));
-        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
-        let mut out = ctx.run_ui(Default::default(), |ui| {
-            let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
-            let dn = Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 };
-            walk.children(parent, rect, dn);
-            walk.children(holder, rect, dn);
-            let b = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1.clone();
-            // room 250 - 40 - 0 - 10 = 200: Grow 1 part (50), Custom 3 parts (150)
-            assert!((b(fixed).size[0] - 40.0).abs() < 0.01);
-            assert!((b(grow).size[0] - 50.0).abs() < 0.01 && (b(grow).pos[0] - 40.0).abs() < 0.01, "{:?}", b(grow).size);
-            assert!((b(custom).size[0] - 160.0).abs() < 0.01 && (b(custom).pos[0] - 90.0).abs() < 0.01, "{:?}", b(custom).size);
-            let l = b(label);
-            assert!(l.size[0] <= 250.0 && l.size[0] > 200.0 && l.size[1] > 40.0, "wrapped at the parent's width: {:?}", l.size);
-        });
-        out.textures_delta.clear();
-    }
-
     /// UIListLayout.Wraps: a horizontal list breaks into lines at its
     /// parent's width (five 40 px tiles, 5 px apart, in 100 px: two, two,
     /// one), the lines stacked by the same Padding; HorizontalFlex
     /// SpaceBetween spreads each line's items to its ends and
     /// ItemLineAlignment Stretch gives a short item its line's height. An
-    /// AutomaticSize Y holder of such a list is as tall as its lines
-    /// (LBG's 90 wrapping lists: shop rows and the player list).
+    /// AutomaticSize Y holder of such a list is as tall as its lines.
     #[test]
     fn list_wraps_and_flexes() {
         let mut doc = Document::new_place();
@@ -2608,7 +3575,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             let dn = Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 };
             walk.children(wrap, rect, dn);
             walk.children(spread, rect, dn);
@@ -2661,7 +3628,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             let dn = Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 };
             walk.children(container, rect, dn);
             walk.children(listed, rect, dn);
@@ -2677,8 +3644,7 @@ mod layout_tests {
 
     /// UIShadow: a drop shadow of the box — soft over BlurRadius (10 px:
     /// from 5 px inside the box's edge to 5 px out), in its Color at
-    /// 1 - Transparency — drawn under the box's background (LBG's 138:
-    /// glows on its result frames and buttons).
+    /// 1 - Transparency — drawn under the box's background.
     #[test]
     fn ui_shadow_under_the_box() {
         use rbx_dom_weak::types::Color3;
@@ -2700,7 +3666,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(page, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let bounds = |it: &Item| it.shape.visual_bounding_rect();
             let shadow = walk.items.iter().find(|it| bounds(it).min.x < 46.0).expect("a shadow item");
@@ -2713,6 +3679,90 @@ mod layout_tests {
             let a = m.vertices.iter().map(|v| v.color.a()).max().unwrap();
             assert!((a as i32 - 128).abs() <= 2, "half transparent at the fullest: {a}");
             assert!(m.vertices.iter().any(|v| v.color.a() == 0), "faded out at the edge");
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn grid_overrides_authored_tab_width() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let parent = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let folder = doc.dom.insert(parent, InstanceBuilder::new("Folder"));
+        let nested = doc.dom.insert(folder, InstanceBuilder::new("Folder"));
+        let control = doc.dom.insert(nested, InstanceBuilder::new("TextButton").with_name("Travel").with_property("LayoutOrder", 100i32));
+        let mut tabs = Vec::new();
+        for name in ["Sound", "Titles"] {
+            tabs.push(doc.dom.insert(parent, InstanceBuilder::new("Frame").with_name(name)
+                .with_property("Size", UDim2::new(UDim::new(0.326, 0), UDim::new(1.0, 0)))));
+        }
+        doc.dom.insert(parent, InstanceBuilder::new("UIGridLayout")
+            .with_property("CellSize", UDim2::new(UDim::new(0.49, 0), UDim::new(1.0, 0)))
+            .with_property("CellPadding", UDim2::new(UDim::new(0.01, 0), UDim::new(0.0, 0)))
+            .with_property("FillDirection", Enum::from_u32(1))
+            .with_property("HorizontalAlignment", Enum::from_u32(0)));
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1000.0, 40.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            assert!(walk.boxes.iter().any(|(r, _)| *r == control), "nested Folder control was skipped");
+            let boxes: Vec<_> = tabs.iter().map(|r| &walk.boxes.iter().find(|(k, _)| k == r).unwrap().1).collect();
+            assert!((boxes[0].size[0] - 490.0).abs() < 0.01);
+            assert!((boxes[1].pos[0] - boxes[0].pos[0] - 500.0).abs() < 0.01);
+        });
+        // (No renderer here: epaint asserts undelivered font-atlas updates.)
+        out.textures_delta.clear();
+    }
+
+    /// UIFlexItem in a horizontal UIListLayout: a Grow child takes the room
+    /// the others leave (Model Reflect's header: a 16 px button, a 28 px
+    /// logo and a Size (0, 28) title that grows); Custom grows by GrowRatio.
+    /// A wrapped AutomaticSize X label grows up to its parent's width and
+    /// wraps there (Argon's error message).
+    #[test]
+    fn flex_grow_and_wrapped_automatic_x() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let parent = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        doc.dom.insert(parent, InstanceBuilder::new("UIListLayout").with_property("FillDirection", Enum::from_u32(0)));
+        let fixed = doc.dom.insert(parent, InstanceBuilder::new("Frame").with_property("LayoutOrder", 0i32)
+            .with_property("Size", UDim2::new(UDim::new(0.0, 40), UDim::new(0.0, 28))));
+        let grow = doc.dom.insert(parent, InstanceBuilder::new("Frame").with_property("LayoutOrder", 1i32)
+            .with_property("Size", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 28))));
+        doc.dom.insert(grow, InstanceBuilder::new("UIFlexItem").with_property("FlexMode", Enum::from_u32(1)));
+        let custom = doc.dom.insert(parent, InstanceBuilder::new("Frame").with_property("LayoutOrder", 2i32)
+            .with_property("Size", UDim2::new(UDim::new(0.0, 10), UDim::new(0.0, 28))));
+        doc.dom.insert(custom, InstanceBuilder::new("UIFlexItem").with_property("FlexMode", Enum::from_u32(4)).with_property("GrowRatio", 3.0f32));
+        let holder = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let label = doc.dom.insert(holder, InstanceBuilder::new("TextLabel")
+            .with_property("Text", "word ".repeat(60))
+            .with_property("TextWrapped", true)
+            .with_property("AutomaticSize", Enum::from_u32(3)));
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(250.0, 30.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let dn = Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 };
+            walk.children(parent, rect, dn);
+            walk.children(holder, rect, dn);
+            let b = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1.clone();
+            // room 250 - 40 - 0 - 10 = 200: Grow 1 part (50), Custom 3 parts (150)
+            assert!((b(fixed).size[0] - 40.0).abs() < 0.01);
+            assert!((b(grow).size[0] - 50.0).abs() < 0.01 && (b(grow).pos[0] - 40.0).abs() < 0.01, "{:?}", b(grow).size);
+            assert!((b(custom).size[0] - 160.0).abs() < 0.01 && (b(custom).pos[0] - 90.0).abs() < 0.01, "{:?}", b(custom).size);
+            let l = b(label);
+            assert!(l.size[0] <= 250.0 && l.size[0] > 200.0 && l.size[1] > 40.0, "wrapped at the parent's width: {:?}", l.size);
         });
         out.textures_delta.clear();
     }
@@ -2738,7 +3788,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let size = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1.size;
             let a = size(yy);
@@ -2779,14 +3829,14 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let b = walk.boxes.iter().find(|(k, _)| *k == sf).unwrap().1;
             let laid = b.canvas.unwrap();
             assert_eq!(b.canvas_for([0.0, 0.0, 0.0, 400.0]), Some(laid), "same CanvasSize");
-            assert!((laid[1] - 410.0).abs() < 0.01, "400 + the padding: {laid:?}");
+            assert!((laid[1] - 400.0).abs() < 0.01, "UIPadding is inside the canvas: {laid:?}");
             let small = b.canvas_for([0.0, 0.0, 0.0, 160.0]).unwrap();
-            assert!((small[1] - 170.0).abs() < 0.01, "shrunk: {small:?}");
+            assert!((small[1] - 160.0).abs() < 0.01, "shrunk: {small:?}");
             let tiny = b.canvas_for([0.0, 0.0, 0.0, 10.0]).unwrap();
             assert!((tiny[1] - 100.0).abs() < 0.01, "never below the frame: {tiny:?}");
             let a = walk.boxes.iter().find(|(k, _)| *k == auto).unwrap().1;
@@ -2796,20 +3846,252 @@ mod layout_tests {
         out.textures_delta.clear();
     }
 
-}
-
-/// A TextSize of 0 (or a TextScaled label in a box with no height, or a NaN
-/// from a 0/0 scale) reaches here as a 0 or non-finite font size, which
-/// epaint's glyph cache rejects (debug assertion "Bad px_scale_factor: 0",
-/// a crash in gui_walk layout). Roblox draws such text as nothing; a tiny
-/// size draws nothing visible and keeps the layout's geometry (estimate).
-fn sane_font_sizes(job: &mut LayoutJob) {
-    for s in &mut job.sections {
-        let size = &mut s.format.font_id.size;
-        // (A tiny positive size, e.g. TextScaled in a box a hair tall,
-        // scales to a 0 px factor in epaint, which refuses it too.)
-        if !(size.is_finite() && *size >= rustudio_core::mech::GUI_MIN_FONT_SIZE) {
-            *size = rustudio_core::mech::GUI_MIN_FONT_SIZE;
-        }
+    #[test]
+    fn table_layout_row_and_col_major_fill_empty() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let make_table = |doc: &mut Document, major_axis: u32, fc: bool, fr: bool| {
+            let tbl = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+            let lay = doc.dom.insert(tbl, InstanceBuilder::new("UITableLayout")
+                .with_property("MajorAxis", Enum::from_u32(major_axis))
+                .with_property("FillEmptySpaceColumns", fc)
+                .with_property("FillEmptySpaceRows", fr)
+                .with_property("Padding", UDim2::new(UDim::new(0.0, 4), UDim::new(0.0, 6)))
+                .with_property("SortOrder", Enum::from_u32(2)));
+            let r1 = doc.dom.insert(tbl, InstanceBuilder::new("Frame").with_property("LayoutOrder", 1i32));
+            let c11 = doc.dom.insert(r1, InstanceBuilder::new("Frame").with_property("LayoutOrder", 1i32)
+                .with_property("Size", UDim2::new(UDim::new(0.0, 50), UDim::new(0.0, 35))));
+            let c12 = doc.dom.insert(r1, InstanceBuilder::new("Frame").with_property("LayoutOrder", 2i32)
+                .with_property("Size", UDim2::new(UDim::new(0.0, 60), UDim::new(0.0, 20))));
+            let r2 = doc.dom.insert(tbl, InstanceBuilder::new("Frame").with_property("LayoutOrder", 2i32));
+            let c21 = doc.dom.insert(r2, InstanceBuilder::new("Frame").with_property("LayoutOrder", 1i32)
+                .with_property("Size", UDim2::new(UDim::new(0.0, 30), UDim::new(0.0, 40))));
+            (tbl, lay, r1, c11, c12, r2, c21)
+        };
+        let (t_row, l_row, _, rc11, rc12, _, rc21) = make_table(&mut doc, 0, true, false);
+        let (t_col, l_col, _, cc11, _, cc2, cc21) = make_table(&mut doc, 1, false, true);
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(220.0, 140.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let dn = Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 };
+            walk.children(t_row, rect, dn);
+            walk.children(t_col, rect, dn);
+            let b = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1;
+            // RowMajor FC=true: avail_w = 220 - 4 = 216, col_w = [50, 60] scaled by 216/110.
+            assert!((b(l_row).size[0] - 220.0).abs() < 0.01 && (b(l_row).size[1] - 81.0).abs() < 0.01);
+            assert!((b(rc11).size[0] - 50.0 * 216.0 / 110.0).abs() < 0.02);
+            assert!((b(rc12).size[0] - 60.0 * 216.0 / 110.0).abs() < 0.02);
+            assert!((b(rc21).size[1] - 40.0).abs() < 0.01);
+            // ColumnMajor FR=true scales the major (strip/column) axis: [60, 30] -> avail 216.
+            assert!((b(l_col).size[0] - 220.0).abs() < 0.01);
+            assert!((b(cc11).size[0] - 60.0 * 216.0 / 90.0).abs() < 0.02);
+            assert!((b(cc2).size[0] - 30.0 * 216.0 / 90.0).abs() < 0.02);
+            assert!((b(cc21).size[0] - 30.0 * 216.0 / 90.0).abs() < 0.02);
+        });
+        out.textures_delta.clear();
     }
+
+    #[test]
+    fn grid_start_corners_and_constraints() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let parent = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let lay = doc.dom.insert(parent, InstanceBuilder::new("UIGridLayout")
+            .with_property("CellSize", UDim2::new(UDim::new(0.4, 0), UDim::new(0.8, 0)))
+            .with_property("CellPadding", UDim2::new(UDim::new(0.0, 5), UDim::new(0.0, 5)))
+            .with_property("StartCorner", Enum::from_u32(3)) // BottomRight
+            .with_property("SortOrder", Enum::from_u32(2)));
+        doc.dom.insert(lay, InstanceBuilder::new("UIAspectRatioConstraint")
+            .with_property("AspectRatio", 2.0f32)
+            .with_property("AspectType", Enum::from_u32(0)));
+        let i1 = doc.dom.insert(parent, InstanceBuilder::new("Frame").with_property("LayoutOrder", 1i32));
+        let i2 = doc.dom.insert(parent, InstanceBuilder::new("Frame").with_property("LayoutOrder", 2i32));
+        let i3 = doc.dom.insert(parent, InstanceBuilder::new("Frame").with_property("LayoutOrder", 3i32));
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 140.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let b = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1;
+            // Cell 80x112 aspect-fit 2:1 -> 80x40; 2x2 grid; BottomRight puts i1 at (85,45), i2 at (0,45), i3 at (85,0).
+            assert_eq!(b(lay).window, Some([80.0, 40.0]));
+            assert_eq!(b(lay).canvas, Some([2.0, 2.0]));
+            assert!((b(i1).pos[0] - 85.0).abs() < 0.01 && (b(i1).pos[1] - 45.0).abs() < 0.01);
+            assert!((b(i2).pos[0] - 0.0).abs() < 0.01 && (b(i2).pos[1] - 45.0).abs() < 0.01);
+            assert!((b(i3).pos[0] - 85.0).abs() < 0.01 && (b(i3).pos[1] - 0.0).abs() < 0.01);
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn constraints_order_and_padding_overflow() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let page = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        // MinSize > MaxSize ignored.
+        let min_gt_max = doc.dom.insert(page, InstanceBuilder::new("Frame")
+            .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100))));
+        doc.dom.insert(min_gt_max, InstanceBuilder::new("UISizeConstraint")
+            .with_property("MinSize", Vector2::new(120.0, 90.0))
+            .with_property("MaxSize", Vector2::new(60.0, 50.0)));
+        // ScaleWithParentSize clamped to parent (200x120) preserving 0.5 ratio -> 60x120.
+        let scale_ar = doc.dom.insert(page, InstanceBuilder::new("Frame")
+            .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100))));
+        doc.dom.insert(scale_ar, InstanceBuilder::new("UIAspectRatioConstraint")
+            .with_property("AspectRatio", 0.5f32)
+            .with_property("AspectType", Enum::from_u32(1))
+            .with_property("DominantAxis", Enum::from_u32(0)));
+        // AutomaticSize runs after UISizeConstraint: grows to child 150x80 despite MaxSize 90x50.
+        let auto_sc = doc.dom.insert(page, InstanceBuilder::new("Frame")
+            .with_property("AutomaticSize", Enum::from_u32(3)));
+        doc.dom.insert(auto_sc, InstanceBuilder::new("UISizeConstraint")
+            .with_property("MinSize", Vector2::new(40.0, 30.0))
+            .with_property("MaxSize", Vector2::new(90.0, 50.0)));
+        doc.dom.insert(auto_sc, InstanceBuilder::new("Frame")
+            .with_property("Size", UDim2::new(UDim::new(0.0, 150), UDim::new(0.0, 80))));
+        // UIPadding overflow flips rect cleanly: 100x60 with L=70,R=70,T=40,B=40 -> pos(30,20) size(40,20).
+        let pad_box = doc.dom.insert(page, InstanceBuilder::new("Frame")
+            .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 60))));
+        doc.dom.insert(pad_box, InstanceBuilder::new("UIPadding")
+            .with_property("PaddingLeft", UDim::new(0.0, 70))
+            .with_property("PaddingRight", UDim::new(0.0, 70))
+            .with_property("PaddingTop", UDim::new(0.0, 40))
+            .with_property("PaddingBottom", UDim::new(0.0, 40)));
+        let inside = doc.dom.insert(pad_box, InstanceBuilder::new("Frame")
+            .with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(1.0, 0))));
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 120.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(page, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let b = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1;
+            assert_eq!(b(min_gt_max).size, [100.0, 100.0]);
+            assert!((b(scale_ar).size[0] - 60.0).abs() < 0.01 && (b(scale_ar).size[1] - 120.0).abs() < 0.01);
+            assert_eq!(b(auto_sc).size, [150.0, 80.0]);
+            assert_eq!(b(inside).pos, [30.0, 20.0]);
+            assert_eq!(b(inside).size, [40.0, 20.0]);
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn scrolling_frame_insets_gutter_and_direction() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let parent = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let sf = doc.dom.insert(parent, InstanceBuilder::new("ScrollingFrame")
+            .with_property("Size", UDim2::new(UDim::new(0.0, 180), UDim::new(0.0, 100)))
+            .with_property("CanvasSize", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 300)))
+            .with_property("ScrollBarThickness", 16i32)
+            .with_property("VerticalScrollBarInset", Enum::from_u32(2))
+            .with_property("VerticalScrollBarPosition", Enum::from_u32(1)));
+        let child = doc.dom.insert(sf, InstanceBuilder::new("Frame")
+            .with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(0.5, 0))));
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 120.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let b = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1;
+            // gutter = 16 + 1 = 17 -> acs = (163, 300), aws = (163, 100), child shifted right by 17.
+            assert_eq!(b(sf).canvas, Some([163.0, 300.0]));
+            assert_eq!(b(sf).window, Some([163.0, 100.0]));
+            assert_eq!(b(child).pos, [17.0, 0.0]);
+            assert_eq!(b(child).size, [163.0, 150.0]);
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn page_layout_slots_and_circular_wrap() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let parent = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let lay = doc.dom.insert(parent, InstanceBuilder::new("UIPageLayout")
+            .with_property("Padding", UDim::new(0.0, 10))
+            .with_property("Circular", true)
+            .with_property("SortOrder", Enum::from_u32(2)));
+        let p: Vec<Ref> = (1..=4).map(|i| {
+            doc.dom.insert(parent, InstanceBuilder::new("Frame")
+                .with_property("LayoutOrder", i)
+                .with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(1.0, 0))))
+        }).collect();
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 120.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let b = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1;
+            // Default Horizontal, stride = 210, acs = (4*200 + 3*10, 120) = (830, 120).
+            // Circular initial (dir=0): slots [0, +1, -2, -1].
+            assert_eq!(b(lay).size, [830.0, 120.0]);
+            assert_eq!(b(p[0]).pos[0], 0.0);
+            assert_eq!(b(p[1]).pos[0], 210.0);
+            assert_eq!(b(p[2]).pos[0], -420.0);
+            assert_eq!(b(p[3]).pos[0], -210.0);
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn list_flex_shrink_and_size_constraint_clamp() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let parent = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        doc.dom.insert(parent, InstanceBuilder::new("UIListLayout")
+            .with_property("FillDirection", Enum::from_u32(0))
+            .with_property("SortOrder", Enum::from_u32(2)));
+        let a = doc.dom.insert(parent, InstanceBuilder::new("Frame").with_property("LayoutOrder", 1i32)
+            .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 20))));
+        doc.dom.insert(a, InstanceBuilder::new("UIFlexItem").with_property("FlexMode", Enum::from_u32(2)));
+        doc.dom.insert(a, InstanceBuilder::new("UISizeConstraint")
+            .with_property("MinSize", Vector2::new(80.0, 0.0))
+            .with_property("MaxSize", Vector2::new(200.0, 200.0)));
+        let b_ref = doc.dom.insert(parent, InstanceBuilder::new("Frame").with_property("LayoutOrder", 2i32)
+            .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 20))));
+        doc.dom.insert(b_ref, InstanceBuilder::new("UIFlexItem").with_property("FlexMode", Enum::from_u32(2)));
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(140.0, 40.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let bx = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1;
+            // Overflow = 60: `a` hits MinSize 80 (shrinks 20), `b` absorbs remaining 40 -> 60.
+            assert!((bx(a).size[0] - 80.0).abs() < 0.01);
+            assert!((bx(b_ref).size[0] - 60.0).abs() < 0.01);
+        });
+        out.textures_delta.clear();
+    }
+
 }

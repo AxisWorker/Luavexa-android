@@ -673,6 +673,17 @@ impl Session {
         self.get_with_timeout(url, None)
     }
 
+    /// GET with the session and extra request headers.
+    pub fn get_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<(u16, String)> {
+        let mut req = self.agent.get(url).header("Cookie", &self.held().header());
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let r = req.call()?;
+        self.apply_rotation(&r);
+        text_of(r)
+    }
+
     pub(crate) fn get_with_timeout(&self, url: &str, timeout: Option<Duration>) -> Result<(u16, String)> {
         let mut req = self.agent.get(url).header("Cookie", &self.held().header());
         if let Some(timeout) = timeout {
@@ -779,6 +790,85 @@ impl Session {
     /// The CSRF token held now (tests).
     pub fn csrf_token_held(&self) -> bool {
         self.csrf.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    /// General authenticated HTTP request for Studio built-in plugins
+    /// (`HttpService:RequestInternal`, `HttpRbxApiService`). Sends the session
+    /// cookie only to `*.roblox.com`, forwards caller headers, handles
+    /// X-CSRF-TOKEN retries on 403 for non-GET/HEAD methods, and returns
+    /// `(status, reason, headers, body_bytes)`.
+    pub fn raw_request(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&[u8]>,
+    ) -> Result<(u16, String, Vec<(String, String)>, Vec<u8>)> {
+        let send_cookie = {
+            let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+            let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+            let host = host.rsplit_once('@').map(|(_, h)| h).unwrap_or(host);
+            let host = host.split(':').next().unwrap_or("").to_ascii_lowercase();
+            host == "roblox.com" || host.ends_with(".roblox.com")
+        };
+        let is_read = matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE");
+        for _ in 0..=CSRF_MAX_RETRIES {
+            let token = self.csrf.lock().ok().and_then(|g| g.clone());
+            let mut req = ureq::http::Request::builder().method(method).uri(url);
+            if send_cookie {
+                req = req.header("Cookie", self.held().header());
+            }
+            for (k, v) in headers {
+                if k.eq_ignore_ascii_case("cookie")
+                    || k.eq_ignore_ascii_case("host")
+                    || k.eq_ignore_ascii_case("content-length")
+                {
+                    continue;
+                }
+                req = req.header(k.as_str(), v.as_str());
+            }
+            if !is_read && send_cookie {
+                if let Some(t) = &token {
+                    req = req.header("X-CSRF-TOKEN", t);
+                }
+            }
+            let req = match body {
+                Some(b) => req.body(b).map_err(|_| Error::new("invalid HTTP request"))?,
+                None => req.body(&[][..]).map_err(|_| Error::new("invalid HTTP request"))?,
+            };
+            let mut resp = self.agent.run(req)?;
+            if send_cookie {
+                self.apply_rotation(&resp);
+            }
+            let fresh = resp
+                .headers()
+                .get("x-csrf-token")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let status = resp.status();
+            let status_code = status.as_u16();
+            let reason = status.canonical_reason().unwrap_or("").to_string();
+            let resp_headers: Vec<(String, String)> = resp
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
+                .collect();
+            let resp_body = resp
+                .body_mut()
+                .with_config()
+                .limit(1 << 28)
+                .read_to_vec()?;
+            if !is_read && send_cookie && status_code == 403 {
+                if let Some(t) = fresh.filter(|t| !t.is_empty() && token.as_deref() != Some(t.as_str())) {
+                    if let Ok(mut g) = self.csrf.lock() {
+                        *g = Some(t);
+                    }
+                    continue;
+                }
+            }
+            return Ok((status_code, reason, resp_headers, resp_body));
+        }
+        Err(Error::new("Roblox kept refusing the CSRF token"))
     }
 
     /// A state-changing POST with the X-CSRF-TOKEN dance, Studio's rule

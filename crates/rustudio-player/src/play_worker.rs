@@ -169,6 +169,27 @@ mod tests {
     }
 
     #[test]
+    fn datamodel_shutdown_returns_to_the_edit_document() {
+        use rustudio_engine::runtime::security;
+        let mut game = Game::new(None);
+        let original = game.doc.dom.root_ref();
+        let mut host = ();
+        game.start_play(RunMode::Run, &mut host, false, None);
+        game.with_side(Side::Server, |rt, _, _| {
+            security::with_main_identity(&rt.lua, security::CORE, || rt.lua.load(r#"
+                local part = Instance.new("Part", workspace)
+                part.Name = "PlayOnly"
+                game:Shutdown()
+            "#).exec())
+        }).unwrap().unwrap();
+        let ctx = egui::Context::default();
+        game.play_tick(&ctx, 1.0 / 60.0, &mut host, true, false);
+        assert!(!game.is_playing());
+        assert_eq!(game.doc.dom.root_ref(), original);
+        assert!(game.doc.find_named(game.doc.workspace().unwrap(), "PlayOnly").is_none());
+    }
+
+    #[test]
     fn worker_mutates_the_live_world_and_publishes_to_the_view_in_order() {
         let mut game = Game::new(None);
         game.start_play_threaded(RunMode::Run, &mut (), false, Some((731, 419)));
@@ -224,6 +245,178 @@ mod tests {
         assert!(find(&game.doc).is_none());
         game.stop_play(&mut ());
     }
+
+    /// With the Play worker on, the main thread has no client VM of its own:
+    /// the in-game menu's Settings page reads UserGameSettings published in
+    /// PlayView.settings so toggling CameraYInverted On then Off (even after
+    /// the 1 s `shown` window expires), changing MouseSensitivity, and
+    /// changing MasterVolume all round-trip cleanly.
+    #[test]
+    fn game_menu_settings_round_trip_with_play_worker() {
+        use crate::play::game::game_menu::MenuPage;
+
+        let mut game = Game::new(None);
+        game.keep_game_settings = false;
+        game.fixed_dt = Some(1.0 / 60.0);
+        game.start_play_threaded(RunMode::Play, &mut (), false, None);
+        assert!(game.has_play_worker());
+        assert!(game.play_side_lua(Side::Client).is_none(), "client VM lives on the worker");
+
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        if let Some(prop) = fonts.families.get(&egui::FontFamily::Proportional).cloned() {
+            for fam in ["medium", "bold", "tabler", "tabler-filled", "mono-bold"] {
+                fonts.families.insert(egui::FontFamily::Name(fam.into()), prop.clone());
+            }
+        }
+        ctx.set_fonts(fonts);
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 800.0));
+        let mut time = 10.0f64;
+
+        let step_worker = |game: &mut Game, ctx: &egui::Context| {
+            for _ in 0..3 {
+                game.play_tick(ctx, 1.0 / 60.0, &mut (), false, false);
+                game.play_thread.as_ref().unwrap().worker.submit(|_, _| ()).unwrap().recv().unwrap();
+            }
+        };
+
+        let draw_menu = |game: &mut Game, ctx: &egui::Context, t: f64, click: Option<egui::Pos2>| {
+            let mut run_frame = |events: Vec<egui::Event>, ft: f64| {
+                let raw = egui::RawInput {
+                    screen_rect: Some(rect),
+                    time: Some(ft),
+                    events,
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(raw, |ui| {
+                    game.game_menu(ui, rect);
+                });
+                out.textures_delta.clear();
+            };
+            if let Some(pos) = click {
+                run_frame(
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    t,
+                );
+                run_frame(
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    t + 0.02,
+                );
+            } else {
+                run_frame(Vec::new(), t);
+            }
+        };
+
+        let read_client_ugs = |game: &Game| {
+            game.play_thread
+                .as_ref()
+                .unwrap()
+                .worker
+                .submit(|g, _| {
+                    g.with_play_side(Side::Client, |rt, _, _| {
+                        crate::play::game::game_menu::user_game_settings(&rt.lua)
+                    })
+                    .flatten()
+                })
+                .unwrap()
+                .recv()
+                .unwrap()
+                .expect("client UserGameSettings")
+        };
+
+        step_worker(&mut game, &ctx);
+        let initial = game
+            .play
+            .as_ref()
+            .and_then(|s| s.presentation.as_ref())
+            .and_then(|v| v.settings)
+            .expect("PlayView publishes initial UserGameSettings");
+        assert!(!initial.inverted);
+
+        // Open the menu directly onto the Settings page with the open tween
+        // complete so the controls are on-screen and interactive.
+        game.toggle_game_menu();
+        {
+            let m = &mut game.play.as_mut().unwrap().game.menu;
+            m.page = MenuPage::Settings;
+            m.changed_at = None;
+        }
+        draw_menu(&mut game, &ctx, time, None);
+
+        let view = game.play.as_ref().unwrap().game.menu.rects["page"];
+        let w = view.width();
+        let top = view.min + egui::vec2(0.0, 5.0);
+        let sens_more = egui::pos2(view.max.x - 96.0, top.y + 25.0);
+        let vol_less = egui::pos2(view.max.x - 0.6 * w + 16.0, top.y + 75.0);
+        let inv_arrow = egui::pos2(view.max.x - 16.0, top.y + 125.0);
+
+        // 1. Toggle CameraYInverted Off -> On.
+        time += 0.1;
+        draw_menu(&mut game, &ctx, time, Some(inv_arrow));
+        step_worker(&mut game, &ctx);
+        let after_on = read_client_ugs(&game);
+        assert!(after_on.inverted, "CameraYInverted should become true: {after_on:?}");
+        let published_on = game.play.as_ref().unwrap().presentation.as_ref().unwrap().settings.unwrap();
+        assert!(published_on.inverted, "PlayView.settings should publish inverted=true: {published_on:?}");
+
+        // 2. Advance past the 1 s `shown` hold so the menu must read
+        // PlayView.settings, then toggle CameraYInverted On -> Off.
+        time += 2.0;
+        draw_menu(&mut game, &ctx, time, None);
+        time += 0.1;
+        draw_menu(&mut game, &ctx, time, Some(inv_arrow));
+        step_worker(&mut game, &ctx);
+        let after_off = read_client_ugs(&game);
+        assert!(!after_off.inverted, "CameraYInverted should toggle back to false: {after_off:?}");
+        let published_off = game.play.as_ref().unwrap().presentation.as_ref().unwrap().settings.unwrap();
+        assert!(!published_off.inverted, "PlayView.settings should publish inverted=false: {published_off:?}");
+
+        // 3. Increment Camera Sensitivity and decrement Volume, then verify
+        // both update on the client VM and publish back in PlayView.settings.
+        time += 2.0;
+        draw_menu(&mut game, &ctx, time, Some(sens_more));
+        step_worker(&mut game, &ctx);
+        let after_sens = read_client_ugs(&game);
+        assert!(
+            after_sens.sensitivity > initial.sensitivity + 0.01,
+            "MouseSensitivity should increase: {} -> {}",
+            initial.sensitivity,
+            after_sens.sensitivity
+        );
+        let published_sens = game.play.as_ref().unwrap().presentation.as_ref().unwrap().settings.unwrap();
+        assert!((published_sens.sensitivity - after_sens.sensitivity).abs() < 1e-4);
+
+        time += 2.0;
+        draw_menu(&mut game, &ctx, time, Some(vol_less));
+        step_worker(&mut game, &ctx);
+        let after_vol = read_client_ugs(&game);
+        assert!(
+            after_vol.volume < initial.volume - 0.05,
+            "MasterVolume should decrease: {} -> {}",
+            initial.volume,
+            after_vol.volume
+        );
+        let published_vol = game.play.as_ref().unwrap().presentation.as_ref().unwrap().settings.unwrap();
+        assert!((published_vol.volume - after_vol.volume).abs() < 1e-4);
+
+        game.stop_play(&mut ());
+    }
 }
 
 use egui::Rect;
@@ -231,7 +424,7 @@ use rbx_dom_weak::{Instance, InstanceBuilder, Ustr, types::{Ref, Variant}};
 use rustudio_core::{doc::{Document, Mark, Marks, Reader}, log::LogLine};
 use rustudio_engine::{
     gui::{GuiBox, GuiEvent},
-    runtime::{RunMode, Side, domains::players_chat::ChatView},
+    runtime::{RunMode, Side},
 };
 use rustudio_render::{
     camera::Camera,
@@ -249,14 +442,9 @@ use crate::{
 pub(super) struct PlayView {
     pub(crate) has_character: bool,
     pub(crate) skip: rustc_hash::FxHashSet<Ref>,
-    pub(crate) chat: Option<ChatView>,
     pub(crate) chat_on: bool,
+    pub(crate) topbar_inset: Option<rustudio_engine::ltypes::LRect>,
     pub(crate) backpack_on: bool,
-    /// GuiService.TopbarEnabled (Roblox's top bar over the game).
-    pub(crate) topbar_on: bool,
-    /// The CoreScripts' GuiService:SetTopbarInset (World::topbar_inset):
-    /// where TopbarSafeInsets ScreenGuis go while Roblox's own run.
-    pub(crate) topbar_inset: Option<[f32; 4]>,
     pub(crate) hotbar: Vec<(String, String, bool)>,
     status: String,
     /// The client's UserGameSettings (the in-game menu's Settings page
@@ -267,9 +455,6 @@ pub(super) struct PlayView {
 struct Presentation {
     snapshot: RenderSnapshot,
     view: PlayView,
-    /// StarterGui:SetCore("ChatActive") this step (the worker's client):
-    /// the presentation opens or closes its chat box.
-    chat_active: Option<bool>,
     time: f64,
     showing: Side,
     mouse_behavior: u32,
@@ -278,6 +463,9 @@ struct Presentation {
     clickable: bool,
     kicked: Option<String>,
     flashes: Vec<Flash>,
+    /// Roblox's CoreScripts started on the worker's client (Escape and the
+    /// Play chrome then belong to them, not rustudio's own menu).
+    core_scripts_active: bool,
 }
 
 enum PublishedFrame {
@@ -344,8 +532,10 @@ struct Input {
     gui_layout: Option<std::collections::HashMap<Ref, GuiBox>>,
     mouse_delta: glam::Vec2,
     mouse_moved: bool,
+    mouse_move_processed: bool,
     mouse_buttons: Vec<(u8, bool, bool)>,
     wheel: f32,
+    wheel_processed: bool,
     menu_open: bool,
     menu_events: Vec<bool>,
     settings: Vec<String>,
@@ -380,8 +570,10 @@ impl Input {
             gui_layout,
             mouse_delta: std::mem::take(&mut s.mouse_delta),
             mouse_moved: std::mem::take(&mut s.mouse_moved),
+            mouse_move_processed: std::mem::take(&mut s.mouse_move_processed),
             mouse_buttons: std::mem::take(&mut p.uis_mouse),
             wheel: std::mem::take(&mut s.wheel),
+            wheel_processed: std::mem::take(&mut s.wheel_processed),
             menu_open: p.menu_open,
             menu_events: std::mem::take(&mut p.menu_events),
             settings: std::mem::take(&mut p.menu.lua),
@@ -423,8 +615,10 @@ impl Input {
             }
             s.mouse_delta += self.mouse_delta;
             s.mouse_moved |= self.mouse_moved;
+            s.mouse_move_processed |= self.mouse_move_processed;
             p.uis_mouse.extend(self.mouse_buttons);
             s.wheel += self.wheel;
+            s.wheel_processed |= self.wheel_processed;
             p.menu_open = self.menu_open;
             p.menu_events.extend(self.menu_events);
             p.menu.lua.extend(self.settings);
@@ -567,16 +761,13 @@ impl Publication {
         } else if !updated {
             PublishedFrame::Reuse
         } else {
-            let (chat, chat_on, backpack_on, topbar_on, topbar_inset, settings) = game.with_play_side(Side::Client, |rt, _, _| {
-                let (chat_on, backpack_on, topbar_on, topbar_inset) = rt.world_mut().map_or((true, true, true, None), |w| {
-                    (!w.core_gui_off.contains("Chat"), !w.core_gui_off.contains("Backpack"), !w.topbar_off, w.topbar_inset)
-                });
-                let view = rustudio_engine::runtime::domains::players_chat::chat_view(&rt.lua);
+            let (chat_on, topbar_inset) = game.play_topbar();
+            let (backpack_on, settings) = game.with_play_side(Side::Client, |rt, _, _| {
+                let backpack_on = rt.world_mut().is_none_or(|w| !w.core_gui_off.contains("Backpack"));
                 let settings = crate::play::game::game_menu::user_game_settings(&rt.lua);
-                (view, chat_on, backpack_on, topbar_on, topbar_inset, settings)
-            }).unwrap_or((None, true, true, true, None, None));
+                (backpack_on, settings)
+            }).unwrap_or((true, None));
             let status = game.play_status().unwrap_or_default();
-            let chat_active = game.play.as_mut().and_then(|s| s.game.chat_active.take());
             let s = game.play.as_ref().expect("live Play publication");
             let skip = s.physics_skip();
             let skip = match s.showing {
@@ -586,11 +777,9 @@ impl Publication {
             let view = PlayView {
                 has_character: game.play_has_character(),
                 skip,
-                chat,
                 chat_on,
-                backpack_on,
-                topbar_on,
                 topbar_inset,
+                backpack_on,
                 hotbar: game.play_hotbar(),
                 status,
                 settings,
@@ -602,7 +791,6 @@ impl Publication {
             PublishedFrame::Updated(Presentation {
                 snapshot,
                 view,
-                chat_active,
                 time: s.time,
                 showing: s.showing,
                 mouse_behavior: s.mouse_behavior,
@@ -610,6 +798,7 @@ impl Publication {
                 cursor_image: s.cursor_image.clone(),
                 clickable: s.game.clickable,
                 kicked: s.game.kicked.clone(),
+                core_scripts_active: s.game.core_scripts_active,
                 flashes: s.game.flashes.clone(),
             })
         };
@@ -658,11 +847,8 @@ impl Publication {
         s.cursor_image = frame.cursor_image;
         s.game.clickable = frame.clickable;
         s.game.kicked = frame.kicked;
+        s.game.core_scripts_active = frame.core_scripts_active;
         s.game.flashes = frame.flashes;
-        if let Some(on) = frame.chat_active {
-            s.game.chat_open = on;
-            s.game.chat_focus = on;
-        }
         s.presentation = Some(frame.view);
         if replaced {
             game.scene = Default::default();
@@ -689,9 +875,9 @@ impl Game {
         if self.play.is_some() {
             return;
         }
-        let avatar = self.character_auto_loads();
+        self.edit_audio.stop_playback();
         if mode == RunMode::Play {
-            for (level, text) in self.account.settle_for_play(std::time::Duration::from_secs(20), avatar) {
+            for (level, text) in self.account.settle_for_play(std::time::Duration::from_secs(20), true) {
                 self.push_log(level, text);
             }
         }
@@ -763,8 +949,14 @@ impl Game {
     pub(crate) fn threaded_step(&mut self, keyboard: PlayKeyboard, dt: f32, host: &mut dyn GameHost) {
         let Some(mut threaded) = self.play_thread.take() else { return };
         threaded.queue_edits(EditorEdits::take(self));
-        // (a fixed-step replay joins every step: no frame reuses the last)
-        match threaded.receive(self, host, if self.fixed_dt.is_some() { Join::Block } else { Join::Poll }) {
+        // The viewport applies TextBox edits using the mirrored Text and its
+        // local caret. Publish a queued edit before the viewport edits again
+        // so it cannot apply that caret to the preceding Text.
+        let textbox_edit = self.play.as_ref().is_some_and(|play| {
+            play.game.gui_events.iter().any(|event| matches!(event, GuiEvent::TextBoxUpdate { .. }))
+        });
+        // A fixed-step replay also joins every preceding step.
+        match threaded.receive(self, host, textbox_edit || self.fixed_dt.is_some()) {
             Receive::Available => {}
             Receive::Pending => {
                 threaded.deferred_dt = (threaded.deferred_dt + dt).min(rustudio_core::mech::MAX_FRAME_DT);
@@ -775,7 +967,7 @@ impl Game {
             Receive::Stopped => return,
         }
         let dt = (dt + std::mem::take(&mut threaded.deferred_dt)).min(rustudio_core::mech::MAX_FRAME_DT);
-        let wait_for_input_pose = std::mem::take(&mut threaded.follow_local_input);
+        let wait_for_publication = std::mem::take(&mut threaded.follow_local_input) || textbox_edit;
         let edits = threaded.queued_edits.take().expect("edits scanned at this boundary");
         let input = Input::take(self, keyboard, edits);
         let mut source = threaded.source.take().expect("last snapshot was applied");
@@ -797,11 +989,8 @@ impl Game {
                 threaded.pending = Some(pending);
                 // InputBegan was delivered while the last viewport drew.
                 // Give the following RenderStepped's pose and camera the
-                // next presentation slot instead of queueing it one deeper,
-                // but never hold the display longer than a small budget: a
-                // slow step presents the last frame and lands next frame.
-                let budget = std::time::Duration::from_secs_f32(rustudio_core::mech::PLAY_INPUT_POSE_WAIT_MS / 1000.0);
-                if !wait_for_input_pose || !matches!(threaded.receive(self, host, Join::Upto(budget)), Receive::Stopped) {
+                // next presentation slot instead of queueing it one deeper.
+                if !wait_for_publication || matches!(threaded.receive(self, host, true), Receive::Available) {
                     self.play_thread = Some(threaded);
                 }
             }
@@ -852,13 +1041,6 @@ enum Receive {
     Stopped,
 }
 
-/// How long `ThreadedPlay::receive` waits for the step in flight.
-enum Join {
-    Poll,
-    Upto(std::time::Duration),
-    Block,
-}
-
 impl ThreadedPlay {
     fn queue_edits(&mut self, edits: EditorEdits) {
         if let Some(queued) = &mut self.queued_edits {
@@ -869,29 +1051,17 @@ impl ThreadedPlay {
         }
     }
 
-    fn receive(&mut self, main: &mut Game, host: &mut dyn GameHost, wait: Join) -> Receive {
+    fn receive(&mut self, main: &mut Game, host: &mut dyn GameHost, wait: bool) -> Receive {
         if let Some(pending) = self.pending.as_ref() {
-            let result = match wait {
-                Join::Block => {
-                    let _join = rustudio_core::bench::scope("gameplay_publish_wait");
-                    pending.recv().ok()
-                }
-                Join::Upto(budget) => {
-                    let _join = rustudio_core::bench::scope("gameplay_publish_wait");
-                    match pending.recv_timeout(budget) {
-                        Ok(frame) => Some(frame),
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            rustudio_core::bench::add("gameplay_input_wait_timeouts", 0.0, 1);
-                            return Receive::Pending;
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => None,
-                    }
-                }
-                Join::Poll => match pending.try_recv() {
+            let result = if wait {
+                let _join = rustudio_core::bench::scope("gameplay_publish_wait");
+                pending.recv().ok()
+            } else {
+                match pending.try_recv() {
                     Ok(frame) => Some(frame),
                     Err(mpsc::TryRecvError::Empty) => return Receive::Pending,
                     Err(mpsc::TryRecvError::Disconnected) => None,
-                },
+                }
             };
             self.pending = None;
             let Some((frame, source)) = result else {
@@ -911,7 +1081,7 @@ impl Game {
     pub(super) fn show_worker_side(&mut self, side: Side, host: &mut dyn GameHost) {
         let Some(mut threaded) = self.play_thread.take() else { return };
         threaded.queue_edits(EditorEdits::take(self));
-        if !matches!(threaded.receive(self, host, Join::Block), Receive::Available) {
+        if !matches!(threaded.receive(self, host, true), Receive::Available) {
             return;
         }
         let edits = threaded.queued_edits.take().expect("edits scanned before side change");
@@ -927,7 +1097,7 @@ impl Game {
             return;
         };
         threaded.pending = Some(reply);
-        if matches!(threaded.receive(self, host, Join::Block), Receive::Available) {
+        if matches!(threaded.receive(self, host, true), Receive::Available) {
             self.play_thread = Some(threaded);
         }
     }

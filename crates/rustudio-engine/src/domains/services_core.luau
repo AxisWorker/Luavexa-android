@@ -141,434 +141,242 @@ M["LocalStorageService.WhenLoaded"] = function(self, fn)
 	task.spawn(fn)
 end
 
------------------------------------------------------------- StarterGui
--- SetCore / GetCore run what the CoreScripts registered (RobloxScriptSecurity
--- RegisterSetCore / RegisterGetCore). Once any is registered, an unknown
--- name fails with Roblox's message ("SetCore: SendNotification has not been
--- registered by the CoreScripts"); with no CoreScripts running they keep
--- rustudio's old answers (nothing / nil).
--- A registered function runs at its registrant's identity (a game
--- LocalScript's SetCore reaches a CoreScript's handler with the CoreScript's
--- capabilities, as in Roblox), on its own thread; its error comes back as
--- "Error calling SetCore <name>: <message>".
-local set_core, get_core = {}, {}
+------------------------------------------------------------ StarterGui SetCore/GetCore registry
+local set_core_handlers = {}
+local get_core_handlers = {}
+
 M["StarterGui.RegisterSetCore"] = function(self, name, fn)
-	if type(fn) ~= "function" then fail("Argument 2 missing or nil") end
-	set_core[str_arg(name, 1)] = { fn = fn, ident = rs.identity() }
+	local k = str_arg(name, 1)
+	if type(fn) ~= "function" and typeof(fn) ~= "Instance" then
+		fail("RegisterSetCore: Argument 2 must be a function or BindableEvent")
+	end
+	set_core_handlers[k] = fn
 end
 M["StarterGui.RegisterGetCore"] = function(self, name, fn)
-	if type(fn) ~= "function" then fail("Argument 2 missing or nil") end
-	get_core[str_arg(name, 1)] = { fn = fn, ident = rs.identity() }
-end
-local function run_as(kind, name, h, ...)
-	local res = table.pack(rs.call_as(h.ident, h.fn, ...))
-	if not res[1] then fail(string.format("Error calling %s %s: %s", kind, name, tostring(res[2]))) end
-	return table.unpack(res, 2, res.n)
-end
-M["StarterGui.SetCore"] = function(self, name, ...)
-	local h = set_core[str_arg(name, 1)]
-	if h then
-		run_as("SetCore", name, h, ...)
-	elseif next(set_core) ~= nil then
-		fail(string.format("SetCore: %s has not been registered by the CoreScripts", name))
+	local k = str_arg(name, 1)
+	if type(fn) ~= "function" and typeof(fn) ~= "Instance" then
+		fail("RegisterGetCore: Argument 2 must be a function or BindableFunction")
 	end
+	get_core_handlers[k] = fn
 end
-M["StarterGui.GetCore"] = function(self, name)
-	local h = get_core[str_arg(name, 1)]
-	if h then return run_as("GetCore", name, h) end
-	if next(get_core) ~= nil then
-		fail(string.format("GetCore: %s has not been registered by the CoreScripts", name))
+
+function __rs_core_set_core(name, val)
+	local h = set_core_handlers[name]
+	if h == nil then return false end
+	if type(h) == "function" then
+		h(val)
+	elseif typeof(h) == "Instance" and h:IsA("BindableEvent") then
+		h:Fire(val)
 	end
-	return nil
-end
--- Whether a CoreScript registered `name` (services_core.rs: a SetCore /
--- GetCore nobody registered is the engine's own — TopbarEnabled over
--- rustudio's drawn bar, ChatActive, ResetButtonCallback… — not this
--- module's, which would take it quietly with Roblox's CoreScripts off).
-M["StarterGui.core_registered"] = function(kind, name)
-	local t = if kind == "SetCore" then set_core else get_core
-	return type(name) == "string" and t[name] ~= nil
-end
-
------------------------------------------------------------- RunService
--- The client build the CoreScripts report in telemetry and version checks.
--- rustudio is no Roblox build: empty strings (estimate), no Team Create
--- viewer or team test, and the Roblox GUI focus kept as set.
-local gui_focused = false
-M["RunService.GetRobloxVersion"] = function() return "" end
-M["RunService.GetCoreScriptVersion"] = function() return "" end
-M["RunService.GetRobloxClientChannel"] = function() return "" end
-M["RunService.IsTeamCreateViewer"] = function() return false end
-M["RunService.IsTeamTest"] = function() return false end
-M["RunService.GetRobloxGuiFocused"] = function() return gui_focused end
-M["RunService.SetRobloxGuiFocused"] = function(self, on)
-	on = on == true
-	if on ~= gui_focused then
-		gui_focused = on
-		rs.fire(self, "RobloxGuiFocusedChanged", on)
-	end
-end
-
------------------------------------------------------------- UserInputService
--- A desktop at the top device level (estimate: rustudio runs on desktops).
-M["UserInputService.GetDeviceType"] = function() return Enum.DeviceType.Desktop end
-M["UserInputService.GetDeviceLevel"] = function() return Enum.DeviceLevel.High end
-
------------------------------------------------------------- Player
--- The block list the CoreScripts keep on the local player (the web block
--- list isn't fetched: it starts empty, estimate), and friend status
--- (no friends web call here: NotFriend, estimate).
-local blocked, block_ready = {}, false
-M["Player.GetBlockListInitialized"] = function() return block_ready end
-M["Player.SetBlockListInitialized"] = function(self)
-	block_ready = true
-	rs.fire(self, "BlockListChanged")
-end
-M["Player.AddToBlockList"] = function(self, ids)
-	if type(ids) ~= "table" then fail("Argument 1 missing or nil") end
-	for _, id in ids do blocked[tonumber(id)] = true end
-	rs.fire(self, "BlockListChanged")
-end
-M["Player.UpdatePlayerBlocked"] = function(self, id, on)
-	blocked[tonumber(id)] = if on then true else nil
-	rs.fire(self, "BlockListChanged")
-end
-M["Player.HasBlockedPlayer"] = function(self, id) return blocked[tonumber(id)] == true end
-M["Player.GetFriendStatus"] = function(self, other)
-	if other == self then return Enum.FriendStatus.Unknown end
-	return Enum.FriendStatus.NotFriend
-end
-M["Player.GetUnder13"] = function() return false end
-
------------------------------------------------------------- RbxAnalyticsService
--- Roblox's telemetry: a Play session has no analytics backend, so the
--- reports go nowhere and the ids are empty (stubs, as for AnalyticsService).
-for _, n in { "AddGlobalPointsField", "AddGlobalPointsTag", "RemoveGlobalPointsField", "RemoveGlobalPointsTag",
-	"ReleaseRBXEventStream", "ReportCounter", "ReportInfluxSeries", "ReportStats", "ReportToDiagByCountryCode",
-	"SendEventDeferred", "SendEventImmediately", "SetRBXEvent", "SetRBXEventStream", "TrackEvent", "TrackEventWithArgs",
-	"UpdateHeartbeatObject" } do
-	M["RbxAnalyticsService." .. n] = function() end
-end
-for _, n in { "GetClientId", "GetSessionId", "GetPlaySessionId" } do
-	M["RbxAnalyticsService." .. n] = function() return "" end
-end
-
------------------------------------------------------------- IXPService
--- Roblox's experiment layers. No experiment backend in a Play session: every
--- layer reads as loaded with no variables, so callers take their defaults
--- (estimate; the real service fetches assignments for the user).
-local ixp_layers = { User = {}, Creator = {}, BrowserTracker = {} }
-for kind, layers in ixp_layers do
-	M["IXPService.Get" .. kind .. "LayerLoadingStatus"] = function() return Enum.IXPLoadingStatus.Initialized end
-	M["IXPService.Get" .. kind .. "LayerVariables"] = function(self, name) str_arg(name, 1) return {} end
-	M["IXPService.Get" .. kind .. "StatusForLayer"] = function(self, name)
-		str_arg(name, 1)
-		return Enum.IXPLoadingStatus.Initialized
-	end
-	M["IXPService.Log" .. kind .. "LayerExposure"] = function(self, name) str_arg(name, 1) end
-	if kind ~= "BrowserTracker" then
-		M["IXPService.Register" .. kind .. "Layers"] = function(self, list)
-			if type(list) == "table" then
-				for _, name in list do layers[tostring(name)] = true end
-			end
-		end
-		M["IXPService.GetRegistered" .. kind .. "LayersToStatus"] = function()
-			local out = {}
-			for name in layers do out[name] = Enum.IXPLoadingStatus.Initialized end
-			return out
-		end
-		M["IXPService.Initialize" .. kind .. "Layers"] = function(self)
-			rs.fire(self, "On" .. kind .. "LayerLoadingStatusChanged", Enum.IXPLoadingStatus.Initialized)
-		end
-		M["IXPService.Clear" .. kind .. "Layers"] = function() table.clear(layers) end
-	end
-end
-M["IXPService.LogFlagLinkedUserLayerExposure"] = function(self, name) str_arg(name, 1) end
-
------------------------------------------------------------- MemStorageService
--- The app's in-memory key / value store with change callbacks: Bind(key, fn)
--- runs fn(value) on each SetItem / Fire of that key; BindAndFire also runs it
--- now with the current value.
-local mem, mem_binds, mem_owner = {}, {}, {}
-local function mem_fire(key, value)
-	for conn, fn in mem_binds[key] or {} do task.spawn(fn, value) end
-end
-local function mem_bind(key, fn)
-	if type(fn) ~= "function" then fail("Argument 2 missing or nil") end
-	local conn = rs.new_object("MemStorageConnection")
-	mem_binds[key] = mem_binds[key] or {}
-	mem_binds[key][conn] = fn
-	mem_owner[conn] = key
-	return conn
-end
-M["MemStorageService.GetItem"] = function(self, key, default)
-	local v = mem[str_arg(key, 1)]
-	if v == nil then return default end
-	return v
-end
-M["MemStorageService.SetItem"] = function(self, key, value)
-	str_arg(key, 1)
-	mem[key] = tostring(value)
-	mem_fire(key, mem[key])
-end
-M["MemStorageService.HasItem"] = function(self, key) return mem[str_arg(key, 1)] ~= nil end
-M["MemStorageService.RemoveItem"] = function(self, key)
-	local had = mem[str_arg(key, 1)] ~= nil
-	mem[key] = nil
-	return had
-end
-M["MemStorageService.Fire"] = function(self, key, value) mem_fire(str_arg(key, 1), value) end
-M["MemStorageService.Bind"] = function(self, key, fn) return mem_bind(str_arg(key, 1), fn) end
-M["MemStorageService.BindAndFire"] = function(self, key, fn)
-	local conn = mem_bind(str_arg(key, 1), fn)
-	task.spawn(fn, mem[key])
-	return conn
-end
-M["MemStorageService.Call"] = function(self, key) str_arg(key, 1) return nil end
-M["MemStorageConnection.Disconnect"] = function(self)
-	local key = mem_owner[self]
-	if key and mem_binds[key] then mem_binds[key][self] = nil end
-	mem_owner[self] = nil
-end
-
------------------------------------------------------------- NotificationService
--- Roblox's real-time push channel: a Play session isn't connected to it, so
--- subscriptions take nothing and its events never fire (stubs).
-for _, n in { "ActionEnabled", "ActionTaken", "SubscribeToRccEventNamespace", "SubscribeToTopic",
-	"UnsubscribeFromTopic", "SwitchedToAppShellFeature" } do
-	M["NotificationService." .. n] = function() end
-end
-
------------------------------------------------------------- ThirdPartyUserService
--- Console / third-party sign-in: a desktop Play session has none.
-M["ThirdPartyUserService.IsSingleSignOnSupported"] = function() return false end
-M["ThirdPartyUserService.IsAccountSwitchingSupported"] = function() return false end
-M["ThirdPartyUserService.IsChatRestrictionSupported"] = function() return false end
-M["ThirdPartyUserService.HaveActiveUser"] = function() return false end
-M["ThirdPartyUserService.GetUserPlatformName"] = function() return "" end
-M["ThirdPartyUserService.ShowAccountPicker"] = function() end
-
------------------------------------------------------------- AdService
--- No ad network in a Play session: no ad teleport, nothing to report, no
--- ads loaded (stubs).
--- (source universe, destination universe): 0, 0 for no ad teleport, as
--- BackButtonController compares them with numbers.
-M["AdService.GetAdTeleportInfo"] = function() return 0, 0 end
-M["AdService.GetReportAdInfo"] = function() return {} end
-M["AdService.GetUniversalAppAdsEligibility"] = function() return {} end
-M["AdService.IsAdLoaded"] = function() return false end
-M["AdService.SetAdGuiInteractivityHandlerInitialized"] = function() end
-M["AdService.HideEudsaDisclosure"] = function() end
-
------------------------------------------------------------- VRService / AvatarChatService
--- No VR app build, and none of the avatar-chat (face tracking, voice)
--- features in a Play session: the CoreScripts skip them (estimates).
-M["VRService.IsVRAppBuild"] = function() return false end
-M["AvatarChatService.deviceMeetsRequirementsForFeature"] = function() return false end
-M["AvatarChatService.IsEnabled"] = function() return false end
-M["AvatarChatService.IsPlaceEnabled"] = function() return false end
-M["AvatarChatService.IsUniverseEnabled"] = function() return false end
-M["AvatarChatService.EnableVoice"] = function() return false end
-M["AvatarChatService.PollClientFeatures"] = function() return 0 end
-M["AvatarChatService.PollServerFeatures"] = function() return 0 end
-M["AvatarChatService.GetClientFeaturesAsync"] = function() return 0 end
-M["AvatarChatService.GetServerFeaturesAsync"] = function() return 0 end
-
------------------------------------------------------------- the rest
--- Platform achievements (consoles): none here.
-M["AchievementService.IsAvailable"] = function() return false end
-M["AchievementService.HasAchieved"] = function() return false end
-M["AchievementService.GrantAchievement"] = function() return false end
--- The CoreScripts' own view of an Animator's playing tracks: the same list
--- games get.
-M["Animator.GetPlayingAnimationTracksCoreScript"] = function(self) return self:GetPlayingAnimationTracks() end
--- Event ingestion (telemetry): no backend in a Play session (stubs).
-for _, n in { "SendEventDeferred", "SendEventImmediately", "SetRBXEvent", "SetRBXEventStream" } do
-	M["EventIngestService." .. n] = function() end
-end
-
------------------------------------------------------------- HttpService:RequestInternal
--- The CoreScripts' web requests (an HttpRequest; Start(callback) answers
--- callback(success, { StatusCode, Body, ... })). Roblox's web APIs answer
--- as the signed-in player through rustudio's login session; any other host
--- fails as a connection error. GET and POST only.
-local requests = {}
-M["HttpService.RequestInternal"] = function(self, options)
-	if type(options) ~= "table" then fail("Argument 1 missing or nil") end
-	local req = rs.new_object("HttpRequest")
-	requests[req] = options
-	return req
-end
-M["HttpRequest.Start"] = function(self, callback)
-	local o = requests[self]
-	requests[self] = nil
-	if not o then fail("HttpRequest already started") end
-	task.spawn(function()
-		local id = rs.web_start(string.upper(tostring(o.Method or "GET")), tostring(o.Url), o.Body)
-		if not id then
-			if type(callback) == "function" then callback(false, { StatusCode = 0, Body = "", StatusMessage = "HttpError: ConnectFail" }) end
-			return
-		end
-		local status, body
-		repeat
-			task.wait()
-			status, body = rs.web_poll(id)
-		until status ~= nil
-		if type(callback) ~= "function" then return end
-		if status == 0 then
-			callback(false, { StatusCode = 0, Body = body, StatusMessage = body })
-		else
-			callback(true, { StatusCode = status, Body = body, Headers = {}, StatusMessage = tostring(status) })
-		end
-	end)
-end
-M["HttpRequest.Cancel"] = function(self) requests[self] = nil end
-
------------------------------------------------------------- CaptureService
--- Screenshots and videos the app saved: none in a Play session, and no
--- video capture (stubs; CaptureScreenshot and friends live in assets_cloud).
-M["CaptureService.RetrieveCaptures"] = function() return {} end
-M["CaptureService.CanCaptureVideo"] = function() return false end
-M["CaptureService.IsCapturingVideo"] = function() return false end
-for _, n in { "OnCaptureBegan", "OnCaptureEnded", "OnCaptureShared", "OnCaptureObjectShared", "OnVideoCaptureShared",
-	"OnSavePromptFinished", "OnSharePromptFinished", "OnCapturePermissionsPromptFinished", "DeleteCapture",
-	"SaveCaptureToExternalStorage", "SaveScreenshotCapture", "StopVideoCaptureInternal" } do
-	M["CaptureService." .. n] = function() end
-end
-
------------------------------------------------------------- LinkingService
--- Deep links into the app: a Play session gets none. The CoreScripts'
--- registered url patterns are kept (IsUrlRegistered); nothing is pending
--- and no url arrives (OnLuaUrl never fires).
-local lua_urls = {}
-M["LinkingService.RegisterLuaUrl"] = function(self, url) lua_urls[str_arg(url, 1)] = true end
-M["LinkingService.IsUrlRegistered"] = function(self, url) return lua_urls[str_arg(url, 1)] == true end
-M["LinkingService.GetLastLuaUrl"] = function() return nil end
-M["LinkingService.GetAndClearLastPendingUrl"] = function() return {} end
-M["LinkingService.StartLuaUrlDelivery"] = function() return nil end
-M["LinkingService.StopLuaUrlDelivery"] = function() end
-M["LinkingService.DetectUrl"] = function() end
-M["LinkingService.DetectDlic"] = function() end
-M["LinkingService.CreateInternalDlic"] = function() return nil end
-M["LinkingService.OpenUrl"] = function() return false end
-M["LinkingService.SupportsSwitchToSettingsApp"] = function() return false end
-M["LinkingService.SwitchToSettingsApp"] = function() end
--- The user agent the client's web requests send: rustudio's own (its
--- RequestInternal goes through rustudio's session).
-M["HttpService.GetUserAgent"] = function() return rs.user_agent end
-
------------------------------------------------------------- AudioFocusService
--- Which registered audio context (voice, the app's media) has the focus:
--- RequestFocus grants it to the highest priority asking, AcquireFocus takes
--- it. -1 while none has it (estimate).
-local audio_contexts, audio_focus, audio_priority = {}, -1, -math.huge
-M["AudioFocusService.RegisterContextIdFromLua"] = function(self, id)
-	if not table.find(audio_contexts, id) then
-		table.insert(audio_contexts, id)
-		rs.fire(self, "OnContextRegistered", id)
-	end
-end
-M["AudioFocusService.GetRegisteredContexts"] = function() return table.clone(audio_contexts) end
-M["AudioFocusService.GetFocusedContextId"] = function() return audio_focus end
-M["AudioFocusService.RequestFocus"] = function(self, id, priority)
-	priority = tonumber(priority) or 0
-	if audio_focus == id or priority >= audio_priority then
-		audio_focus, audio_priority = id, priority
-		return true
-	end
-	return false
-end
-M["AudioFocusService.AcquireFocus"] = function(self, id)
-	audio_focus = id
 	return true
 end
 
------------------------------------------------------------- SessionService
--- The app's session tree for telemetry: sessions by id with a parent, a tag,
--- metadata and a creation time, and the contexts that hold focus. A Play
--- client starts with one root session.
-local sessions = {}
-local root_sid
-local function now_ms() return math.floor(os.time() * 1000) end
--- (made on first use: no DataModel yet when this chunk loads)
-local function root()
-	if not root_sid then
-		root_sid = game:GetService("HttpService"):GenerateGUID(false)
-		sessions[root_sid] = { tag = "Root", meta = {}, created = now_ms() }
+function __rs_core_get_core(name)
+	local h = get_core_handlers[name]
+	if h == nil then return false, nil end
+	if type(h) == "function" then
+		return true, h()
+	elseif typeof(h) == "Instance" and h:IsA("BindableFunction") then
+		return true, h:Invoke()
 	end
-	return root_sid
+	return true, nil
 end
-local focused_contexts = {}
-M["SessionService.GetRootSID"] = function() return root() end
-M["SessionService.SessionExists"] = function(self, sid)
-	root()
-	return sessions[str_arg(sid, 1)] ~= nil
+
+------------------------------------------------------------ RunService CoreScript members
+local roblox_gui_focused = false
+M["RunService.GetRobloxVersion"] = function() return "0.747.0.7470000" end
+M["RunService.GetCoreScriptVersion"] = function() return "0.747.0.7470000" end
+M["RunService.SetRobloxGuiFocused"] = function(_, on) roblox_gui_focused = on == true end
+M["RunService.GetRobloxGuiFocused"] = function() return roblox_gui_focused end
+
+------------------------------------------------------------ IXPService
+local ixp_user_layers = {}
+local ixp_creator_layers = {}
+local function ixp_init_enum()
+	local ok, v = pcall(function() return Enum.IXPLoadingStatus.Initialized end)
+	return ok and v or nil
 end
-M["SessionService.SetSession"] = function(self, parent, child, tag)
-	sessions[str_arg(child, 2)] = { parent = parent, tag = tostring(tag or ""), meta = {}, created = now_ms() }
+M["IXPService.GetUserLayerLoadingStatus"] = function() return ixp_init_enum() end
+M["IXPService.GetBrowserTrackerLayerLoadingStatus"] = function() return ixp_init_enum() end
+M["IXPService.GetCreatorLayerLoadingStatus"] = function() return ixp_init_enum() end
+M["IXPService.GetUserStatusForLayer"] = function() return ixp_init_enum() end
+M["IXPService.GetBrowserTrackerStatusForLayer"] = function() return ixp_init_enum() end
+M["IXPService.GetCreatorStatusForLayer"] = function() return ixp_init_enum() end
+M["IXPService.GetUserLayerVariables"] = function() return {} end
+M["IXPService.GetBrowserTrackerLayerVariables"] = function() return {} end
+M["IXPService.GetCreatorLayerVariables"] = function() return {} end
+M["IXPService.GetRegisteredUserLayersToStatus"] = function()
+	local out, st = {}, ixp_init_enum()
+	for k in pairs(ixp_user_layers) do out[k] = st end
+	return out
 end
-M["SessionService.ReplaceSession"] = function(self, sid, tag)
-	local s = sessions[str_arg(sid, 1)]
-	if s then s.tag = tostring(tag or "") end
+M["IXPService.GetRegisteredCreatorLayersToStatus"] = function()
+	local out, st = {}, ixp_init_enum()
+	for k in pairs(ixp_creator_layers) do out[k] = st end
+	return out
+end
+M["IXPService.RegisterUserLayers"] = function(_, layers)
+	if type(layers) == "table" then
+		for k, v in pairs(layers) do ixp_user_layers[type(v) == "string" and v or tostring(k)] = true end
+	end
+end
+M["IXPService.RegisterCreatorLayers"] = function(_, layers)
+	if type(layers) == "table" then
+		for k, v in pairs(layers) do ixp_creator_layers[type(v) == "string" and v or tostring(k)] = true end
+	end
+end
+M["IXPService.ClearUserLayers"] = function() table.clear(ixp_user_layers) end
+M["IXPService.ClearCreatorLayers"] = function() table.clear(ixp_creator_layers) end
+M["IXPService.InitializeUserLayers"] = function(self)
+	rs.fire(self, "OnUserLayerLoadingStatusChanged", ixp_init_enum())
+end
+M["IXPService.InitializeCreatorLayers"] = function(self)
+	rs.fire(self, "OnCreatorLayerLoadingStatusChanged", ixp_init_enum())
+end
+for _, n in { "LogUserLayerExposure", "LogBrowserTrackerLayerExposure", "LogCreatorLayerExposure", "LogFlagLinkedUserLayerExposure" } do
+	M["IXPService." .. n] = function() end
+end
+
+------------------------------------------------------------ MemStorageService
+-- Default GUAC app policy JSON so CapturesPolicy enables the Gallery tab in
+-- SettingsHub (fromMemStorageService reads "GUAC:<UserId>:app-policy").
+local DEFAULT_APP_POLICY = '{"EligibleForCapturesFeature":true,"EnableCapturesBulkManagement":true,"EnableShareCaptureCTA":true}'
+local mem_items = {
+	["app-policy"] = DEFAULT_APP_POLICY,
+}
+local function mem_get(key)
+	local v = mem_items[key]
+	if v ~= nil then return v end
+	if key:match("^GUAC:.*:app%-policy$") then
+		return DEFAULT_APP_POLICY
+	end
+	return nil
+end
+local mem_subs = {}
+local mem_owner = {}
+M["MemStorageService.SetItem"] = function(_, key, val)
+	key = str_arg(key, 1)
+	local s = tostring(val)
+	mem_items[key] = s
+	local list = mem_subs[key]
+	if list then
+		for _, fn in pairs(list) do task.spawn(fn, s) end
+	end
+end
+M["MemStorageService.GetItem"] = function(_, key)
+	return mem_get(str_arg(key, 1)) or ""
+end
+M["MemStorageService.HasItem"] = function(_, key)
+	return mem_get(str_arg(key, 1)) ~= nil
+end
+M["MemStorageService.RemoveItem"] = function(_, key)
+	key = str_arg(key, 1)
+	local had = mem_items[key] ~= nil
+	mem_items[key] = nil
+	return had
+end
+M["MemStorageService.Fire"] = function(_, key, ...)
+	key = str_arg(key, 1)
+	local list = mem_subs[key]
+	if list then
+		for _, fn in pairs(list) do task.spawn(fn, ...) end
+	end
+end
+M["MemStorageService.Call"] = function(_, key)
+	str_arg(key, 1)
+	return nil
+end
+local function mem_bind(key, fn, fire_now)
+	key = str_arg(key, 1)
+	if type(fn) ~= "function" then fail("Argument 2 missing or nil") end
+	local conn = rs.new_object("MemStorageConnection")
+	mem_subs[key] = mem_subs[key] or {}
+	mem_subs[key][conn] = fn
+	mem_owner[conn] = key
+	local cur = fire_now and mem_get(key) or nil
+	if cur ~= nil then
+		task.spawn(fn, cur)
+	end
+	return conn
+end
+M["MemStorageService.Bind"] = function(_, key, fn) return mem_bind(key, fn, false) end
+M["MemStorageService.BindAndFire"] = function(_, key, fn) return mem_bind(key, fn, true) end
+M["MemStorageConnection.Disconnect"] = function(self)
+	local k = mem_owner[self]
+	if k and mem_subs[k] then mem_subs[k][self] = nil end
+	mem_owner[self] = nil
+end
+
+------------------------------------------------------------ RbxAnalyticsService
+M["RbxAnalyticsService.GetSessionId"] = function() return "00000000-0000-0000-0000-000000000000" end
+M["RbxAnalyticsService.GetClientId"] = function() return "00000000-0000-0000-0000-000000000000" end
+M["RbxAnalyticsService.GetPlaySessionId"] = function() return "" end
+for _, n in {
+	"AddGlobalPointsField", "AddGlobalPointsTag", "DEPRECATED_TrackEvent", "DEPRECATED_TrackEventWithArgs",
+	"ReleaseRBXEventStream", "RemoveGlobalPointsField", "RemoveGlobalPointsTag", "ReportCounter",
+	"ReportInfluxSeries", "ReportStats", "ReportToDiagByCountryCode", "SendEventDeferred",
+	"SendEventImmediately", "SetRBXEvent", "SetRBXEventStream", "TrackEvent", "TrackEventWithArgs",
+	"UpdateHeartbeatObject",
+} do
+	M["RbxAnalyticsService." .. n] = function() end
+end
+
+------------------------------------------------------------ SessionService
+local sess_map = {} -- sid -> { tag = ..., parent = ..., meta = {}, created = ms }
+local sess_root = "root"
+sess_map[sess_root] = { tag = "root", parent = nil, meta = {}, created = math.floor(os.time() * 1000) }
+local sess_focus = {}
+local function sess_find(sid) return sess_map[sid] end
+M["SessionService.SetSession"] = function(self, parentSid, sid, tag)
+	sid = tostring(sid or "")
+	sess_map[sid] = { tag = tostring(tag or sid), parent = parentSid, meta = {}, created = math.floor(os.time() * 1000) }
+	rs.fire(self, "SessionChanged", sid)
+end
+M["SessionService.ReplaceSession"] = function(self, sid, newSid)
+	local old = sess_map[sid]
+	sess_map[sid] = nil
+	sess_map[tostring(newSid or "")] = old or { tag = tostring(newSid or ""), meta = {}, created = math.floor(os.time() * 1000) }
+	rs.fire(self, "SessionChanged", newSid)
 end
 M["SessionService.RemoveSession"] = function(self, sid)
-	sid = str_arg(sid, 1)
-	if sid == root_sid then return end
-	sessions[sid] = nil
-	for k, s in sessions do
-		if s.parent == sid then sessions[k] = nil end
+	sess_map[sid] = nil
+	rs.fire(self, "SessionChanged", sid)
+end
+M["SessionService.SessionExists"] = function(_, sid) return sess_map[sid] ~= nil end
+M["SessionService.GetSessionID"] = function(_, sid) return sess_map[sid] and tostring(sid) or "" end
+M["SessionService.GetSessionTag"] = function(_, sid) local s = sess_find(sid) return s and s.tag or "" end
+M["SessionService.SetMetadata"] = function(_, sid, k, v)
+	local s = sess_find(sid)
+	if s then s.meta[k] = v end
+end
+M["SessionService.GetMetadata"] = function(_, sid, k)
+	local s = sess_find(sid)
+	return s and s.meta[k] or nil
+end
+M["SessionService.RemoveMetadata"] = function(_, sid, k)
+	local s = sess_find(sid)
+	if s then s.meta[k] = nil end
+end
+M["SessionService.RemoveSessionsWithMetadataKey"] = function(_, k)
+	for sid, s in pairs(sess_map) do
+		if s.meta[k] ~= nil then sess_map[sid] = nil end
 	end
 end
-M["SessionService.GetSessionTag"] = function(self, sid)
-	local s = sessions[str_arg(sid, 1)]
-	return s and s.tag or ""
-end
-M["SessionService.GetCreatedTimestampUtcMs"] = function(self, sid)
-	local s = sessions[str_arg(sid, 1)]
+M["SessionService.GetCreatedTimestampUtcMs"] = function(_, sid)
+	local s = sess_find(sid)
 	return s and s.created or 0
 end
-M["SessionService.SetMetadata"] = function(self, sid, key, value)
-	local s = sessions[str_arg(sid, 1)]
-	if s then s.meta[str_arg(key, 2)] = value end
-end
-M["SessionService.GetMetadata"] = function(self, sid, key)
-	local s = sessions[str_arg(sid, 1)]
-	return s and s.meta[str_arg(key, 2)]
-end
-M["SessionService.RemoveMetadata"] = function(self, sid, key)
-	local s = sessions[str_arg(sid, 1)]
-	if s then s.meta[str_arg(key, 2)] = nil end
-end
-M["SessionService.RemoveSessionsWithMetadataKey"] = function(self, key)
-	str_arg(key, 1)
-	for k, s in sessions do
-		if k ~= root_sid and s.meta[key] ~= nil then sessions[k] = nil end
-	end
-end
-M["SessionService.GetSessionID"] = function(self, structural) str_arg(structural, 1) return "" end
-M["SessionService.GenerateSessionInfoString"] = function() return "" end
+M["SessionService.GetRootSID"] = function() return sess_root end
 M["SessionService.GetBreadcrumbs"] = function() return {} end
 M["SessionService.GetHistory"] = function() return {} end
-M["SessionService.AcquireContextFocus"] = function(self, c) focused_contexts[str_arg(c, 1)] = true end
-M["SessionService.ReleaseContextFocus"] = function(self, c) focused_contexts[str_arg(c, 1)] = nil end
-M["SessionService.IsContextFocused"] = function(self, c) return focused_contexts[str_arg(c, 1)] == true end
+M["SessionService.GenerateSessionInfoString"] = function() return "" end
+M["SessionService.AcquireContextFocus"] = function(_, ctx) sess_focus[ctx] = true end
+M["SessionService.ReleaseContextFocus"] = function(_, ctx) sess_focus[ctx] = nil end
+M["SessionService.IsContextFocused"] = function(_, ctx) return sess_focus[ctx] == true end
 
 ------------------------------------------------------------ ExperienceService
--- The app's experience launcher. A Play session is in its experience and
--- launches no other: join / leave callbacks are held on real connections
--- (fired by nothing here), launches and cross-experience calls do nothing.
-local experience_events = {}
-local function experience_event(kind)
-	experience_events[kind] = experience_events[kind] or Instance.new("BindableEvent")
-	return experience_events[kind].Event
-end
-M["ExperienceService.RegisterForExperienceJoin"] = function(self, fn)
-	if type(fn) ~= "function" then fail("Argument 1 missing or nil") end
-	return experience_event("join"):Connect(fn)
-end
-M["ExperienceService.RegisterForExperienceLeave"] = function(self, fn)
-	if type(fn) ~= "function" then fail("Argument 1 missing or nil") end
-	return experience_event("leave"):Connect(fn)
+local function dummy_conn()
+	return { Connected = true, Disconnect = function(c) c.Connected = false end }
 end
 M["ExperienceService.IsInExperience"] = function() return true end
 M["ExperienceService.GetPlaceJoinState"] = function() return "" end
@@ -576,26 +384,406 @@ M["ExperienceService.GetQueuePosition"] = function() return 0 end
 M["ExperienceService.GetFollowUserId"] = function() return 0 end
 M["ExperienceService.GetPendingJoinAttempt"] = function() return {} end
 M["ExperienceService.ConsumePendingExperienceLeaveWithReason"] = function() return {} end
-for _, n in { "LaunchExperience", "LaunchExperienceFromSource" } do
-	M["ExperienceService." .. n] = function() return "" end
+M["ExperienceService.LaunchExperience"] = function() return "" end
+M["ExperienceService.LaunchExperienceFromSource"] = function() return "" end
+M["ExperienceService.LaunchExperienceFromSourceWithCallback"] = function() end
+M["ExperienceService.LeaveExperienceWithReason"] = function() end
+M["ExperienceService.ExecuteCrossExperienceCall"] = function() end
+M["ExperienceService.StartCrossExperience"] = function() end
+M["ExperienceService.StopCrossExperience"] = function() end
+M["ExperienceService.RegisterForExperienceJoin"] = function() return dummy_conn() end
+M["ExperienceService.RegisterForExperienceLeave"] = function() return dummy_conn() end
+
+------------------------------------------------------------ PolicyService / SafetyService / PermissionsService / UserGameSettings
+M["PolicyService.GetPolicyInfoForServerRobloxOnlyAsync"] = function()
+	return { ArePaidRandomItemsRestricted = false, IsSubjectToChinaPolicies = false }
 end
-for _, n in { "LaunchExperienceFromSourceWithCallback", "LeaveExperienceWithReason", "StartCrossExperience", "StopCrossExperience", "ExecuteCrossExperienceCall" } do
-	M["ExperienceService." .. n] = function() end
+M["SafetyService.DecodeAvatarMovementProto"] = function() return {} end
+M["SafetyService.TakeScreenshot"] = function() return 0 end
+for _, n in {
+	"ReportBuildUIClose", "ReportBuildUIOpen", "ReportCapturesUIClose", "ReportCapturesUIOpen",
+	"ReportChatLineReportingClose", "ReportChatLineReportingOpen",
+	"ReportChatSuspensionDialogClose", "ReportChatSuspensionDialogOpen",
+	"ReportMenuTabClose", "ReportMenuTabOpen",
+	"ReportPartyChatWindowClose", "ReportPartyChatWindowOpen",
+} do
+	M["SafetyService." .. n] = function() end
+end
+M["PermissionsService.GetIsThirdPartyAssetAllowed"] = function() return true end
+M["PermissionsService.GetIsThirdPartyPurchaseAllowed"] = function() return true end
+M["PermissionsService.GetIsThirdPartyTeleportAllowed"] = function() return true end
+M["PermissionsService.GetPermissions"] = function() return {} end
+M["PermissionsService.SetPermissions"] = function() end
+
+local tutorials = {}
+M["UserGameSettings.GetDefaultFramerateCap"] = function() return 60 end
+M["UserGameSettings.GetTutorialState"] = function(_, id) return tutorials[tostring(id)] == true end
+M["UserGameSettings.SetTutorialState"] = function(_, id, v) tutorials[tostring(id)] = v == true end
+M["UserGameSettings.ResetOnboardingCompleted"] = function() end
+
+------------------------------------------------------------ ThirdPartyUserService
+local function chat_not_restricted()
+	local ok, v = pcall(function() return Enum.ChatRestrictionStatus.NotRestricted end)
+	return ok and v or nil
+end
+M["ThirdPartyUserService.GetUserPlatformName"] = function() return "" end
+M["ThirdPartyUserService.GetVoiceChatRestrictionStatus"] = function() return chat_not_restricted() end
+M["ThirdPartyUserService.HaveActiveUser"] = function() return false end
+M["ThirdPartyUserService.IsAccountSwitchingSupported"] = function() return false end
+M["ThirdPartyUserService.IsChatRestrictionSupported"] = function() return false end
+M["ThirdPartyUserService.IsSingleSignOnSupported"] = function() return false end
+M["ThirdPartyUserService.ShowAccountPicker"] = function() end
+
+------------------------------------------------------------ NotificationService
+M["NotificationService.GetScheduledNotifications"] = function() return {} end
+for _, n in {
+	"ActionEnabled", "ActionTaken", "CancelAllNotification", "CancelNotification",
+	"ScheduleNotification", "SubscribeToRccEventNamespace", "SubscribeToTopic",
+	"SwitchedToAppShellFeature", "UnsubscribeFromTopic",
+} do
+	M["NotificationService." .. n] = function() end
 end
 
------------------------------------------------------------- TelemetryService
--- Roblox's client telemetry: no backend in a Play session (stubs).
-for _, n in { "LogEvent", "LogCounter", "LogStat", "LogDurationEvent", "LogDurationEventWithTimestamp" } do
+------------------------------------------------------------ AdService
+M["AdService.GetAdTeleportInfo"] = function() return 0, 0 end
+M["AdService.GetReportAdInfo"] = function() return {} end
+M["AdService.GetUniversalAppAdsEligibility"] = function() return {} end
+M["AdService.GetAdAvailabilityNowForUniverseAsync"] = function() return {} end
+M["AdService.IsAdLoaded"] = function() return false end
+for _, n in {
+	"HandleWhyThisAdClicked", "HideEudsaDisclosure", "OnDemandVideoCompleteFromUI",
+	"ReturnToPublisherExperience", "SetAdGuiInteractivityHandlerInitialized", "SubmitAdNotification",
+} do
+	M["AdService." .. n] = function() end
+end
+
+------------------------------------------------------------ AchievementService
+M["AchievementService.IsAvailable"] = function() return false end
+M["AchievementService.GrantAchievement"] = function() return false end
+M["AchievementService.HasAchieved"] = function() return false end
+
+------------------------------------------------------------ CaptureService (CoreScript members)
+M["CaptureService.CanCaptureVideo"] = function() return false end
+M["CaptureService.IsCapturingVideo"] = function() return false end
+M["CaptureService.RetrieveCaptures"] = function() return {} end
+M["CaptureService.GetScreenshotCaptureObject"] = function() return nil end
+M["CaptureService.PreCaptureShared"] = function() return "" end
+M["CaptureService.PreVideoCaptureShared"] = function() return "" end
+M["CaptureService.CreatePostAsync"] = function() return {} end
+M["CaptureService.DeleteCapturesAsync"] = function() return 0 end
+M["CaptureService.DeleteVideoCaptureAsync"] = function() return false end
+M["CaptureService.GetCaptureFilePathAsync"] = function() return "" end
+M["CaptureService.GetCaptureSizeAsync"] = function() return Vector2.new(0, 0) end
+M["CaptureService.GetCaptureStorageSizeAsync"] = function() return 0 end
+M["CaptureService.GetCaptureUploadDataAsync"] = function() return {} end
+M["CaptureService.SaveCapturesToExternalStorageAsync"] = function() return 0 end
+M["CaptureService.UploadPostAsync"] = function() return {} end
+M["CaptureService.StartVideoCaptureForMCPAsync"] = function() return Enum.VideoCaptureStartedResult.OtherError end
+M["CaptureService.StartVideoCaptureInternalAsync"] = function() return Enum.VideoCaptureStartedResult.OtherError end
+for _, n in {
+	"DeleteCapture", "DeleteVideoCapture", "OnCaptureBegan", "OnCaptureEnded",
+	"OnCaptureObjectShared", "OnCapturePermissionsPromptFinished", "OnCaptureShared",
+	"OnSavePromptFinished", "OnSharePromptFinished", "OnVideoCaptureShared",
+	"SaveCaptureObjectToExternalStorage", "SaveCaptureToExternalStorage",
+	"SaveScreenshotCapture", "SaveVideoCaptureToExternalStorage",
+	"StopVideoCaptureForMCP", "StopVideoCaptureInternal", "UploadCaptureAndPostMoment",
+	"CheckMomentTextStatusAsync", "CheckUploadCaptureStatusForSupportTicketAsync",
+	"GenerateMomentTextAsync", "StartUploadCaptureForSupportTicketAsync",
+} do
+	M["CaptureService." .. n] = function() end
+end
+
+------------------------------------------------------------ HttpService / HttpRequest (CoreScript internal)
+local http_req_cancelled = setmetatable({}, { __mode = "k" })
+local http_req_opts = setmetatable({}, { __mode = "k" })
+M["HttpService.RequestInternal"] = function(_, options)
+	local req = rs.new_object("HttpRequest")
+	if type(options) == "table" then
+		http_req_opts[req] = {
+			Url = options.Url,
+			Method = options.Method or "GET",
+			Headers = options.Headers,
+			Body = options.Body,
+		}
+	end
+	return req
+end
+M["HttpService.GetHttpEnabled"] = function(self) return self.HttpEnabled end
+M["HttpService.SetHttpEnabled"] = function(self, on) self.HttpEnabled = on == true end
+M["HttpService.GetUserAgent"] = function() return "Roblox/WinInet" end
+M["HttpService.JSONDecodeAsync"] = function(self, input) return self:JSONDecode(input) end
+M["HttpService.JSONEncodeAsync"] = function(self, obj) return self:JSONEncode(obj) end
+M["HttpRbxApiService.GetDocumentationUrl"] = function(_, partial)
+	return "https://create.roblox.com/docs/" .. tostring(partial or "")
+end
+M["HttpRequest.Cancel"] = function(self) http_req_cancelled[self] = true end
+M["HttpRequest.Start"] = function(self, cb)
+	if type(cb) ~= "function" then fail("Argument 1 missing or nil") end
+	local opts = http_req_opts[self]
+	if not opts or type(opts.Url) ~= "string" then
+		task.defer(function()
+			if http_req_cancelled[self] then return end
+			cb(false, {
+				StatusCode = 0,
+				StatusMessage = "InvalidUrl",
+				Body = "",
+				Headers = {},
+				HttpError = Enum.HttpError.InvalidUrl,
+			})
+		end)
+		return
+	end
+	local id, err = rs.http_internal_start(tostring(opts.Method or "GET"), opts.Url, opts.Headers, opts.Body)
+	if not id then
+		if rs.http_debug then
+			print(string.format("[HTTP-INT-ERR] %s %s -> %s",
+				tostring(opts.Method or "GET"), tostring(opts.Url), tostring(err)))
+		end
+		task.defer(function()
+			if http_req_cancelled[self] then return end
+			cb(false, {
+				StatusCode = 0,
+				StatusMessage = tostring(err or "ConnectFail"),
+				Body = "",
+				Headers = {},
+				HttpError = Enum.HttpError.ConnectFail,
+			})
+		end)
+		return
+	end
+	task.spawn(function()
+		while true do
+			task.wait()
+			if http_req_cancelled[self] then return end
+			local r = table.pack(rs.http_poll(id))
+			if r.n > 0 then
+				local okk, status, msg, headers, body = r[1], r[2], r[3], r[4], r[5]
+				if http_req_cancelled[self] then return end
+				if rs.http_debug then
+					print(string.format("[HTTP-INT] %s %s -> ok=%s status=%s len=%d",
+						tostring(opts.Method or "GET"), tostring(opts.Url), tostring(okk), tostring(status),
+						type(body) == "string" and #body or 0))
+				end
+				if okk then
+					cb(true, {
+						Success = status >= 200 and status < 300,
+						StatusCode = status,
+						StatusMessage = msg or "",
+						Body = body or "",
+						Headers = headers or {},
+						HttpError = Enum.HttpError.OK,
+						Stats = {
+							WasRequestRetried = false,
+							DurationInQueue = 0,
+							DurationNameLookup = 0,
+							DurationConnect = 0,
+							DurationSSLHandshake = 0,
+							DurationMakeRequest = 0,
+							DurationReceiveResponse = 0,
+						},
+					})
+				else
+					cb(false, {
+						Success = false,
+						StatusCode = 0,
+						StatusMessage = tostring(status or "ConnectFail"),
+						Body = "",
+						Headers = {},
+						HttpError = Enum.HttpError.ConnectFail,
+					})
+				end
+				return
+			end
+		end
+	end)
+end
+
+------------------------------------------------------------ AvatarEditorService / GenericChallengeService
+for _, n in {
+	"NoPromptApplyProfileConfiguration", "NoPromptCreateOutfit", "NoPromptDeleteOutfit",
+	"NoPromptRenameOutfit", "NoPromptSaveAvatar", "NoPromptSaveAvatarThumbnailCustomization",
+	"NoPromptSetFavorite", "NoPromptUpdateOutfit",
+} do
+	M["AvatarEditorService." .. n] = function() return false end
+end
+for _, n in {
+	"BustAvatarFetchCache", "PerformCreateOutfitWithDescription", "PerformDeleteOutfit",
+	"PerformRenameOutfit", "PerformSaveAvatarWithDescription", "PerformSetFavorite",
+	"PerformUpdateOutfit", "SetAllowInventoryReadAccess", "SignalCreateOutfitFailed",
+	"SignalCreateOutfitPermissionDenied", "SignalDeleteOutfitFailed",
+	"SignalDeleteOutfitPermissionDenied", "SignalRenameOutfitFailed",
+	"SignalRenameOutfitPermissionDenied", "SignalSaveAvatarFailed",
+	"SignalSaveAvatarPermissionDenied", "SignalSetFavoriteFailed",
+	"SignalSetFavoritePermissionDenied", "SignalUpdateOutfitFailed",
+	"SignalUpdateOutfitPermissionDenied", "refreshAvatarThumbnails",
+} do
+	M["AvatarEditorService." .. n] = function() end
+end
+for _, n in {
+	"SignalChallengeAbandoned", "SignalChallengeCompleted",
+	"SignalChallengeInvalidated", "SignalChallengeLoaded", "SignalChallengeRequired",
+} do
+	M["GenericChallengeService." .. n] = function() end
+end
+
+------------------------------------------------------------ AvatarChatService / VideoCaptureService / CoreGui / EventIngest / Social / Group / AvatarCreation / Marketplace
+M["AvatarChatService.DebugCounterGet"] = function() return 0 end
+M["AvatarChatService.EnableVoice"] = function() return false end
+M["AvatarChatService.IsEnabled"] = function() return false end
+M["AvatarChatService.IsPlaceEnabled"] = function() return false end
+M["AvatarChatService.IsUniverseEnabled"] = function() return false end
+M["AvatarChatService.PollClientFeatures"] = function() return 0 end
+M["AvatarChatService.PollServerFeatures"] = function() return 0 end
+M["AvatarChatService.deviceMeetsRequirementsForFeature"] = function() return false end
+M["AvatarChatService.GetClientFeaturesAsync"] = function() return 0 end
+M["AvatarChatService.GetServerFeaturesAsync"] = function() return 0 end
+
+M["VideoCaptureService.GetCameraDevices"] = function() return {} end
+M["CoreGui.SetUserGuiRendering"] = function() end
+M["CoreGui.TakeScreenshot"] = function() end
+M["CoreGui.ToggleRecording"] = function() end
+for _, n in { "SendEventDeferred", "SendEventImmediately", "SetRBXEvent", "SetRBXEventStream" } do
+	M["EventIngestService." .. n] = function() end
+end
+for _, n in {
+	"InvokeGameInvitePromptClosed", "InvokeIrisInvite", "InvokeIrisInvitePromptClosed",
+	"InvokeShareSheetClosed", "PromptRsvpToEventCompleted", "SignalFeedbackSubmissionCompleted",
+	"SignalFeedbackSubmissionPermissionDenied", "UpdatePlayerPartyData",
+} do
+	M["SocialService." .. n] = function() end
+end
+M["GroupService.PromptJoinCompleted"] = function() end
+M["AvatarCreationService.DeserializeAvatarModel"] = function() return nil end
+M["AvatarCreationService.HandleSelfieConsentResult"] = function() end
+M["AvatarCreationService.HandleSelfieQRResult"] = function() end
+M["AvatarCreationService.CreateCageMeshPartsWithScaleForExportAsync"] = function() return Instance.new("Folder") end
+
+M["MarketplaceService.IsPurchaseSimulated"] = function() return false end
+M["MarketplaceService.PlayerCanMakePurchases"] = function() return false end
+M["MarketplaceService.GetAvailableSubscriptionProductsAsync"] = function() return {} end
+M["MarketplaceService.GetRobuxBalance"] = function() return 0 end
+M["MarketplaceService.GetSubscriptionPurchaseInfoAsync"] = function() return {} end
+M["MarketplaceService.GetUserSubscriptionDetailsInternalAsync"] = function() return {} end
+M["MarketplaceService.PerformBulkPurchase"] = function() return {} end
+M["MarketplaceService.PerformPurchase"] = function() return {} end
+M["MarketplaceService.PerformPurchaseV2"] = function() return {} end
+M["MarketplaceService.PerformSubscriptionPurchase"] = function() return "" end
+for _, n in {
+	"ClearProductInfoCaches", "PrepareCollectiblesPurchase", "PromptCollectiblesPurchase",
+	"PromptNativePurchase", "PromptNativePurchaseWithLocalPlayer",
+	"PromptNativePurchaseWithLocalPlayerWithPaymentSessionId", "PromptNativePurchaseWithPaymentSessionId",
+	"PromptRobloxPurchase", "PromptThirdPartyPurchase", "RedeemGamePassFreeTrial",
+	"RefreshBulkPurchase", "ReportAssetSale", "ReportRobuxUpsellStarted",
+	"SignalAssetTypePurchased", "SignalCheckPlayerHasRobloxSubscription",
+	"SignalClientPurchaseSuccess", "SignalMockPurchasePremium", "SignalMockPurchaseRobloxSubscription",
+	"SignalPromptBulkPurchaseFinished", "SignalPromptBundlePurchaseFinished",
+	"SignalPromptGamePassPurchaseFinished", "SignalPromptPremiumPurchaseFinished",
+	"SignalPromptProductPurchaseFinished", "SignalPromptPurchaseFinished",
+	"SignalPromptRobloxSubscriptionPurchaseFinished", "SignalPromptSubscriptionPurchaseFinished",
+	"SignalRobuxTransferCompleted", "SignalServerLuaDialogClosed",
+	"SignalUserSubscriptionStatusChanged", "PerformCancelSubscription",
+	"PerformSubscriptionPurchaseV2", "PerformSubscriptionPurchaseV3Async",
+	"PerformSubscriptionPurchaseWithRobuxAsync",
+} do
+	M["MarketplaceService." .. n] = function() end
+end
+M["MarketplaceService.SignalPromptPurchaseFinished"] = function(self, player, assetId, isPurchased)
+	rs.fire(self, "PromptPurchaseFinished", player, assetId, isPurchased == true)
+end
+M["MarketplaceService.SignalPromptGamePassPurchaseFinished"] = function(self, player, gamePassId, isPurchased)
+	rs.fire(self, "PromptGamePassPurchaseFinished", player, gamePassId, isPurchased == true)
+end
+M["MarketplaceService.SignalPromptProductPurchaseFinished"] = function(self, userId, productId, isPurchased)
+	rs.fire(self, "PromptProductPurchaseFinished", userId, productId, isPurchased == true)
+end
+M["MarketplaceService.SignalPromptBundlePurchaseFinished"] = function(self, player, bundleId, isPurchased)
+	rs.fire(self, "PromptBundlePurchaseFinished", player, bundleId, isPurchased == true)
+end
+M["MarketplaceService.SignalPromptSubscriptionPurchaseFinished"] = function(self, player, subId, isPurchased)
+	rs.fire(self, "PromptSubscriptionPurchaseFinished", player, subId, isPurchased == true)
+end
+M["MarketplaceService.SignalPromptPremiumPurchaseFinished"] = function(self, player)
+	rs.fire(self, "PromptPremiumPurchaseFinished", player)
+end
+
+------------------------------------------------------------ PlayerScripts / TelemetryService / AudioFocusService
+local function copy_modes(bucket, default_list)
+	local src = __rs_ps_modes and __rs_ps_modes[bucket]
+	if src == nil then src = default_list end
+	if not src then return {} end
+	local out = {}
+	for i, v in ipairs(src) do out[i] = v end
+	return out
+end
+M["PlayerScripts.GetRegisteredComputerCameraMovementModes"] = function() return copy_modes("ComputerCamera") end
+M["PlayerScripts.GetRegisteredComputerMovementModes"] = function()
+	return copy_modes("ComputerMovement", {
+		Enum.ComputerMovementMode.Default,
+		Enum.ComputerMovementMode.KeyboardMouse,
+		Enum.ComputerMovementMode.ClickToMove,
+	})
+end
+M["PlayerScripts.GetRegisteredTouchCameraMovementModes"] = function() return copy_modes("TouchCamera") end
+M["PlayerScripts.GetRegisteredTouchMovementModes"] = function() return copy_modes("TouchMovement") end
+for _, n in { "LogCounter", "LogDurationEvent", "LogDurationEventWithTimestamp", "LogEvent", "LogStat" } do
 	M["TelemetryService." .. n] = function() end
 end
+M["AudioFocusService.AcquireFocus"] = function() return true end
+M["AudioFocusService.GetFocusedContextId"] = function() return 0 end
+M["AudioFocusService.GetRegisteredContexts"] = function() return {} end
+M["AudioFocusService.RegisterContextIdFromLua"] = function() return true end
+M["AudioFocusService.RequestFocus"] = function() return true end
+M["SoundService.GetInputDevice"] = function() return "", "" end
+M["SoundService.GetInputDevices"] = function() return {}, {}, 0 end
+M["SoundService.GetOutputDevice"] = function() return "System Default", "" end
+M["SoundService.GetOutputDevices"] = function() return { "System Default" }, { "" }, 1 end
+M["SoundService.SetOutputDevice"] = function() end
+M["SoundService.GetRecordingDevices"] = function() return {} end
+M["SoundService.SetRecordingDevice"] = function() end
+M["SoundService.SetSoundEnabled"] = function() end
+M["SoundService.GetAudioApiByDefault"] = function() return false end
+M["SoundService.SetAudioApiByDefault"] = function() end
+M["SoundService.GetPeakLevel"] = function() return 0 end
+M["SoundService.GetListenerWorldCFrame"] = function() return CFrame.new() end
+M["SoundService.GetAudioInstances"] = function() return {} end
+M["SoundService.GetSoundMemoryData"] = function() return {} end
 
------------------------------------------------------------- TextService
--- The TextSize offset the player's preferred text size adds (GuiService.
--- PreferredTextSize): rustudio's is Medium, which adds none (estimate: the
--- offsets of the larger sizes aren't measured).
-M["TextService.GetTextSizeOffsetAsync"] = function(self, size)
-	if tonumber(size) == nil then fail("Argument 1 missing or nil") end
-	return 0
+------------------------------------------------------------ MaterialService
+local mat_fill_tool_enabled = false
+local mat_override_signals = {}
+local function mat_key(m)
+	return typeof(m) == "EnumItem" and m.Name or tostring(m or "")
 end
+M["MaterialService.GetIsMaterialActionAsToolEnabled"] = function()
+	return mat_fill_tool_enabled
+end
+M["MaterialService.ToggleMaterialFillToolEnabled"] = function(self)
+	mat_fill_tool_enabled = not mat_fill_tool_enabled
+	rs.fire(self, "MaterialFillToolEnabledChanged")
+end
+M["MaterialService.GetOverrideStatus"] = function()
+	local ok, v = pcall(function() return Enum.PropertyStatus.Ok end)
+	return ok and v or nil
+end
+M["MaterialService.GetMaterialOverrideChanged"] = function(_, mat)
+	local k = mat_key(mat)
+	local be = mat_override_signals[k]
+	if not be then
+		be = Instance.new("BindableEvent")
+		mat_override_signals[k] = be
+	end
+	return be.Event
+end
+M["MaterialService.SetCurrentMaterial"] = function() end
+
+------------------------------------------------------------ Animator CoreScript members
+M["Animator.GetPlayingAnimationTracksCoreScript"] = function(self)
+	return self:GetPlayingAnimationTracks()
+end
+M["Animator.LoadAnimationCoreScript"] = function(self, anim)
+	return self:LoadAnimation(anim)
+end
+M["Animator.StepAnimationsInternal"] = function() end
+M["Animator.SynchronizeWith"] = function() end
 
 return M

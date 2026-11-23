@@ -37,7 +37,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::SystemTime;
 
 use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
@@ -47,14 +48,72 @@ use crate::doc::Document;
 /// The patch, relative to the Studio root.
 pub const PATCH: &str = "ExtraContent/models/DataModelPatch/DataModelPatch.rbxm";
 
+/// Studio's built-in plugins folder, relative to the Studio root.
+pub const BUILTIN_PLUGINS_DIR: &str = "BuiltInPlugins/Optimized_Embedded_Signature";
+
 /// Compiled Luau, as Roblox ships it.
 pub type Bytecode = Arc<[u8]>;
+
+/// Process-wide weak interner for compiled Luau bytecode blobs.
+/// Studio's 58 built-in plugins each bundle identical copies of React, Roact,
+/// DeveloperFramework, Foundation, Rodux, Cryo, etc. (~95% identical across
+/// plugins), so sharing `Arc<[u8]>` cuts ~677 MB of duplicate bytecode down
+/// to ~36 MB while freeing unused blobs automatically once dropped.
+type BytecodeInternMap = HashMap<(u64, usize), Vec<Weak<[u8]>>>;
+static BYTECODE_INTERN: Mutex<Option<BytecodeInternMap>> = Mutex::new(None);
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn intern_bytecode_in(map: &mut BytecodeInternMap, bytes: &[u8]) -> Bytecode {
+    let key = (fnv1a_64(bytes), bytes.len());
+    let bucket = map.entry(key).or_default();
+    let mut live: Option<Bytecode> = None;
+    bucket.retain(|w| match w.upgrade() {
+        Some(arc) => {
+            if live.is_none() && arc.as_ref() == bytes {
+                live = Some(arc);
+            }
+            true
+        }
+        None => false,
+    });
+    if let Some(arc) = live {
+        return arc;
+    }
+    let arc: Bytecode = Arc::from(bytes);
+    bucket.push(Arc::downgrade(&arc));
+    arc
+}
 
 /// The patch file of the Studio install default_scripts reads, when there.
 pub fn patch_path() -> Option<PathBuf> {
     crate::default_scripts::studio_dir()
         .map(|d| d.join(PATCH))
         .filter(|p| p.is_file())
+}
+
+/// Studio's BuiltInPlugins/Optimized_Embedded_Signature directory, when present
+/// (`RUSTUDIO_BUILTIN_PLUGINS_DIR` overrides `default_scripts::studio_dir()`).
+pub fn builtin_plugins_dir() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("RUSTUDIO_BUILTIN_PLUGINS_DIR") {
+        if !p.is_empty() {
+            let p = PathBuf::from(p);
+            return p.is_dir().then_some(p);
+        }
+    }
+    crate::default_scripts::studio_dir()
+        .into_iter()
+        .chain(crate::paths::installed_studio())
+        .chain(crate::paths::windows_studio_install())
+        .map(|d| d.join(BUILTIN_PLUGINS_DIR))
+        .find(|p| p.is_dir())
 }
 
 /// The patch's tree, with every script's bytecode taken out of `Source`.
@@ -73,26 +132,61 @@ pub struct Installed {
     pub scripts: HashMap<String, Bytecode>,
 }
 
+/// Cached decoded patch keyed by (path, mtime, file size) so repeated Play
+/// sessions skip reading and decoding the 17 MB DataModelPatch.rbxm.
+struct CachedPatch {
+    path: PathBuf,
+    mtime: Option<SystemTime>,
+    len: u64,
+    patch: Patch,
+}
+
+static PATCH_CACHE: Mutex<Option<CachedPatch>> = Mutex::new(None);
+
+/// Reads (or reuses the process-wide decoded cache of) `path` and installs it
+/// into `doc`. Returns `(installed, from_cache)`.
+pub fn install_cached(doc: &mut Document, path: &Path) -> Result<(Installed, bool), String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mtime = meta.modified().ok();
+    let len = meta.len();
+    let mut guard = PATCH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let hit = guard
+        .as_ref()
+        .is_some_and(|c| c.path == path && c.mtime == mtime && c.len == len);
+    if !hit {
+        let patch = read(path)?;
+        *guard = Some(CachedPatch {
+            path: path.to_path_buf(),
+            mtime,
+            len,
+            patch,
+        });
+    }
+    let cached = guard.as_ref().expect("just populated");
+    let installed = install_cloned(doc, &cached.patch)?;
+    Ok((installed, hit))
+}
+
 pub fn read(path: &Path) -> Result<Patch, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     decode(&bytes)
 }
 
-const SOURCE_MARK: &str = "\0rustudio-bytecode:";
 const PROTECTED_STRING: u8 = 0x1d;
-const STRING: u8 = 0x01;
+const INT32_PROP: u8 = 0x03;
+const BC_PROP: &str = "__rs_bc";
 
 /// Reads a binary model whose script sources are ProtectedStrings.
 pub fn decode(file: &[u8]) -> Result<Patch, String> {
     let (rewritten, sources) = protected_to_marks(file)?;
     let mut dom = rbx_binary::from_reader(&rewritten[..]).map_err(|e| e.to_string())?;
     let mut bytecode = HashMap::with_capacity(sources.len());
-    let key = rbx_dom_weak::ustr("Source");
+    let key = rbx_dom_weak::ustr(BC_PROP);
     let refs: Vec<Ref> = dom.descendants().map(|i| i.referent()).collect();
     for r in refs {
         let Some(i) = dom.get_by_ref_mut(r) else { continue };
         let index = match i.properties.get(&key) {
-            Some(Variant::String(s)) => s.strip_prefix(SOURCE_MARK).and_then(|n| n.parse::<usize>().ok()),
+            Some(Variant::Int32(n)) if *n >= 0 => Some(*n as usize),
             _ => None,
         };
         if let Some(n) = index {
@@ -153,7 +247,14 @@ fn protected_to_marks(file: &[u8]) -> Result<(Vec<u8>, Vec<Bytecode>), String> {
             }
         };
         let mut replaced = None;
+        let mut drop_chunk = false;
         match &name {
+            // Built-in plugin .rbxm files under Optimized_Embedded_Signature
+            // carry Roblox's script-hash (HASH) and embedded-signature (SIGN)
+            // chunks, which rbx_binary does not parse.
+            b"HASH" | b"SIGN" => {
+                drop_chunk = true;
+            }
             b"INST" => {
                 let data = data()?;
                 let mut b = Bytes(&data);
@@ -170,33 +271,48 @@ fn protected_to_marks(file: &[u8]) -> Result<(Vec<u8>, Vec<Bytecode>), String> {
                 if prop == b"Source" && b.0.first() == Some(&PROTECTED_STRING) {
                     b.take(1)?;
                     let n = counts.get(&type_id).copied().ok_or("PROP chunk before its INST chunk")?;
-                    let mut body = Vec::with_capacity(16 + n * 32);
+                    // Encode the source index as a Roblox Int32 array (zig-zag + byte-interleaved)
+                    // to avoid 49k heap String allocations and UTF-8 parsing in rbx_binary.
+                    let base = sources.len();
+                    sources.reserve(n);
+                    {
+                        let mut guard = BYTECODE_INTERN.lock().unwrap_or_else(|e| e.into_inner());
+                        let intern = guard.get_or_insert_with(HashMap::new);
+                        for _ in 0..n {
+                            sources.push(intern_bytecode_in(intern, b.string()?));
+                        }
+                    }
+                    let mark_prop = BC_PROP.as_bytes();
+                    let mut body = Vec::with_capacity(9 + mark_prop.len() + n * 4);
                     body.extend_from_slice(&type_id.to_le_bytes());
-                    body.extend_from_slice(&(prop.len() as u32).to_le_bytes());
-                    body.extend_from_slice(prop);
-                    body.push(STRING);
-                    for _ in 0..n {
-                        let mark = format!("{SOURCE_MARK}{}", sources.len());
-                        sources.push(Bytecode::from(b.string()?));
-                        body.extend_from_slice(&(mark.len() as u32).to_le_bytes());
-                        body.extend_from_slice(mark.as_bytes());
+                    body.extend_from_slice(&(mark_prop.len() as u32).to_le_bytes());
+                    body.extend_from_slice(mark_prop);
+                    body.push(INT32_PROP);
+                    for shift in [24u32, 16, 8, 0] {
+                        for k in 0..n {
+                            let v = (base + k) as i32;
+                            let zz = ((v << 1) ^ (v >> 31)) as u32;
+                            body.push(((zz >> shift) & 0xff) as u8);
+                        }
                     }
                     replaced = Some(body);
                 }
             }
             _ => {}
         }
-        match replaced {
-            Some(body) => {
-                out.extend_from_slice(&name);
-                out.extend_from_slice(&0u32.to_le_bytes());
-                out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-                out.extend_from_slice(&0u32.to_le_bytes());
-                out.extend_from_slice(&body);
-            }
-            None => {
-                out.extend_from_slice(header);
-                out.extend_from_slice(payload);
+        if !drop_chunk {
+            match replaced {
+                Some(body) => {
+                    out.extend_from_slice(&name);
+                    out.extend_from_slice(&0u32.to_le_bytes());
+                    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&0u32.to_le_bytes());
+                    out.extend_from_slice(&body);
+                }
+                None => {
+                    out.extend_from_slice(header);
+                    out.extend_from_slice(payload);
+                }
             }
         }
         if &name == b"END\0" {
@@ -229,10 +345,6 @@ pub fn install(doc: &mut Document, mut patch: Patch) -> Result<Installed, String
     };
     let core_gui = service(doc, "CoreGui");
     if named(&doc.dom, core_gui, "RobloxGui").is_none() {
-        // ZIndexBehavior Sibling: the settings menu's Leave / Respawn /
-        // Resume row (React-built at ZIndex 1 inside its ZIndex 2
-        // MenuContainer) draws over the menu's background in the real
-        // client; Global, Instance.new's default, drew it underneath.
         doc.dom.insert(
             core_gui,
             InstanceBuilder::new("ScreenGui")
@@ -250,7 +362,10 @@ pub fn install(doc: &mut Document, mut patch: Patch) -> Result<Installed, String
         }
         let target = service(doc, &name);
         merge(&mut patch.dom, top, doc, target);
-        touched.push(target);
+        // CorePackages holds ~45k pure ModuleScripts/Folders with no render/physics/GUI nodes.
+        if name != "CorePackages" {
+            touched.push(target);
+        }
     }
     let mut installed = Installed::default();
     if let Some(scripts) = named(&patch.dom, patch_root, "CoreScripts") {
@@ -269,6 +384,101 @@ pub fn install(doc: &mut Document, mut patch: Patch) -> Result<Installed, String
         doc.mark_tree(r);
     }
     Ok(installed)
+}
+
+/// Clones a cached [`Patch`] into `doc` without mutating the cached tree.
+fn install_cloned(doc: &mut Document, patch: &Patch) -> Result<Installed, String> {
+    let patch_root = named(&patch.dom, patch.dom.root_ref(), "PatchRoot").ok_or("the patch has no PatchRoot")?;
+    let instances = named(&patch.dom, patch_root, "DataModelInstances").unwrap_or(patch_root);
+    let root = doc.dom.root_ref();
+    let service = |doc: &mut Document, class: &str| {
+        doc.find_child(root, class)
+            .unwrap_or_else(|| doc.dom.insert(root, InstanceBuilder::new(class).with_name(class)))
+    };
+    let core_gui = service(doc, "CoreGui");
+    if named(&doc.dom, core_gui, "RobloxGui").is_none() {
+        doc.dom.insert(
+            core_gui,
+            InstanceBuilder::new("ScreenGui")
+                .with_name("RobloxGui")
+                .with_property("ResetOnSpawn", false)
+                .with_property("ZIndexBehavior", Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1))),
+        );
+    }
+    let mut installed = Installed {
+        modules: HashMap::with_capacity(patch.bytecode.len()),
+        scripts: HashMap::new(),
+    };
+    let mut touched = vec![core_gui];
+    if let Some(inst_node) = patch.dom.get_by_ref(instances) {
+        for &top in inst_node.children() {
+            let Some(ti) = patch.dom.get_by_ref(top) else { continue };
+            if !crate::doc::is_service(&ti.name) {
+                return Err(format!("DataModelInstances.{} is not a service", ti.name));
+            }
+            let target = service(doc, &ti.name);
+            merge_cloned(&patch.dom, &patch.bytecode, top, doc, target, &mut installed.modules);
+            if ti.name != "CorePackages" {
+                touched.push(target);
+            }
+        }
+    }
+    if let Some(scripts) = named(&patch.dom, patch_root, "CoreScripts") {
+        if let Some(sn) = patch.dom.get_by_ref(scripts) {
+            for &k in sn.children() {
+                let Some(i) = patch.dom.get_by_ref(k) else { continue };
+                if i.class == "LocalizationTable" {
+                    clone_subtree(&patch.dom, &patch.bytecode, k, doc, core_gui, &mut installed.modules);
+                } else if let Some(b) = patch.bytecode.get(&k) {
+                    installed.scripts.insert(i.name.clone(), b.clone());
+                }
+            }
+        }
+    }
+    for r in touched {
+        doc.mark_tree(r);
+    }
+    Ok(installed)
+}
+
+fn clone_subtree(
+    src_dom: &WeakDom,
+    src_bc: &HashMap<Ref, Bytecode>,
+    src: Ref,
+    doc: &mut Document,
+    dst_parent: Ref,
+    out_modules: &mut HashMap<Ref, Bytecode>,
+) {
+    let Some(i) = src_dom.get_by_ref(src) else { return };
+    let mut b = InstanceBuilder::new(i.class).with_name(i.name.as_str());
+    for (k, v) in &i.properties {
+        b = b.with_property(*k, v.clone());
+    }
+    let new_r = doc.dom.insert(dst_parent, b);
+    if let Some(bc) = src_bc.get(&src) {
+        out_modules.insert(new_r, bc.clone());
+    }
+    for &c in i.children() {
+        clone_subtree(src_dom, src_bc, c, doc, new_r, out_modules);
+    }
+}
+
+fn merge_cloned(
+    src_dom: &WeakDom,
+    src_bc: &HashMap<Ref, Bytecode>,
+    src: Ref,
+    doc: &mut Document,
+    dst: Ref,
+    out_modules: &mut HashMap<Ref, Bytecode>,
+) {
+    let Some(sn) = src_dom.get_by_ref(src) else { return };
+    for &k in sn.children() {
+        let Some(i) = src_dom.get_by_ref(k) else { continue };
+        match (i.class.as_str(), named(&doc.dom, dst, &i.name)) {
+            ("Folder", Some(existing)) => merge_cloned(src_dom, src_bc, k, doc, existing, out_modules),
+            _ => clone_subtree(src_dom, src_bc, k, doc, dst, out_modules),
+        }
+    }
 }
 
 /// Moves `src`'s children under `dst`: a Folder whose name is already a
@@ -413,5 +623,57 @@ mod tests {
             assert!(crate::default_scripts::child_named(&d, cp, name).is_some(), "CorePackages.{name}");
         }
         assert!(installed.modules.len() > 10_000);
+    }
+
+    #[test]
+    fn decode_strips_embedded_signature_and_hash_chunks() {
+        let base = tiny_patch();
+        // Splice synthetic HASH and SIGN chunks before END\0, like Studio's
+        // BuiltInPlugins/Optimized_Embedded_Signature/*.rbxm files.
+        let end_pos = base.len() - (16 + 9); // END\0 header (16) + "</roblox>" (9)
+        let mut signed = Vec::with_capacity(base.len() + 64);
+        signed.extend_from_slice(&base[..end_pos]);
+        for (tag, payload) in [(b"HASH", b"fake-hash-bytes".as_slice()), (b"SIGN", b"fake-signature-bytes".as_slice())] {
+            signed.extend_from_slice(tag);
+            signed.extend_from_slice(&0u32.to_le_bytes());
+            signed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            signed.extend_from_slice(&0u32.to_le_bytes());
+            signed.extend_from_slice(payload);
+        }
+        signed.extend_from_slice(&base[end_pos..]);
+        let patch = decode(&signed).unwrap();
+        assert_eq!(patch.bytecode.len(), 4);
+    }
+
+    #[test]
+    fn decode_interns_identical_protected_bytecode() {
+        let bin = tiny_patch();
+        let p1 = decode(&bin).unwrap();
+        let p2 = decode(&bin).unwrap();
+        assert_eq!(p1.bytecode.len(), 4);
+        assert_eq!(p2.bytecode.len(), 4);
+        for b1 in p1.bytecode.values() {
+            assert!(
+                p2.bytecode.values().any(|b2| Arc::ptr_eq(b1, b2)),
+                "expected identical bytecode to share one Arc allocation"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_install_reuses_decoded_patch() {
+        let Some(path) = patch_path() else { return };
+        let t0 = std::time::Instant::now();
+        let mut d1 = Document::empty();
+        let (i1, hit1) = install_cached(&mut d1, &path).unwrap();
+        let cold_ms = t0.elapsed().as_millis();
+        let t1 = std::time::Instant::now();
+        let mut d2 = Document::empty();
+        let (i2, hit2) = install_cached(&mut d2, &path).unwrap();
+        let warm_ms = t1.elapsed().as_millis();
+        eprintln!("core_scripts::install_cached: cold={cold_ms}ms (hit={hit1}), warm={warm_ms}ms (hit={hit2})");
+        assert!(hit2, "second install_cached must reuse cached decoded patch");
+        assert_eq!(i1.modules.len(), i2.modules.len());
+        assert_eq!(i1.scripts.len(), i2.scripts.len());
     }
 }

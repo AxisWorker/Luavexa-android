@@ -9,17 +9,13 @@
 //! - Voice: VoiceChatInternal answers as a client with no voice session
 //!   (GetVoiceChatAvailable -1, JoinByGroupId true, …); eligibility for
 //!   others raises Studio's error; GetChatGroupsAsync is disabled.
-//!   AvatarChatService answers no voice / camera features (ClientFeatures
-//!   0, initialized), which the CoreScripts' voice manager reads as a
-//!   place and user without voice.
 //! - Video: VideoPlayer / VideoFrame load the WebM (session download),
 //!   read its duration and frame size from the container, and keep time
 //!   (TimePosition, DidEnd / Ended, DidLoop) and their events. Frames are
 //!   not decoded (no VP8/VP9 decoder in rustudio), so VideoSampler can't be
 //!   made and VideoDisplay shows nothing.
 //! - VideoCaptureService mocks and VideoDeviceInput are InternalTest /
-//!   RobloxScript only in Studio: the same capability errors. Its camera
-//!   list is empty (a client with no camera; capture never starts).
+//!   RobloxScript only in Studio: the same capability errors.
 
 use std::collections::HashMap;
 
@@ -36,6 +32,10 @@ use super::video::{self as vid, Decoder, Stream, Track};
 use super::{one, pb, pd, pstr};
 
 pub const METHODS: &[(&str, &str)] = &[
+    ("play", "Sound"),
+    ("stop", "Sound"),
+    ("pause", "Sound"),
+    ("resume", "Sound"),
     ("Play", "AudioTextToSpeech"),
     ("Pause", "AudioTextToSpeech"),
     ("Unload", "AudioTextToSpeech"),
@@ -57,7 +57,6 @@ pub const METHODS: &[(&str, &str)] = &[
     ("GetSamplesAtTimesAsync", "VideoSampler"),
     ("ClearMockInput", "VideoCaptureService"),
     ("SetMockInputAsync", "VideoCaptureService"),
-    ("GetCameraDevices", "VideoCaptureService"),
     ("GetAudioProcessingSettings", "VoiceChatInternal"),
     ("GetMicDevices", "VoiceChatInternal"),
     ("GetParticipants", "VoiceChatInternal"),
@@ -75,16 +74,6 @@ pub const METHODS: &[(&str, &str)] = &[
     ("IsVoiceEnabledForUserIdAsync", "VoiceChatInternal"),
     ("IsVoiceEnabledForUserIdAsync", "VoiceChatService"),
     ("GetChatGroupsAsync", "VoiceChatService"),
-    ("DebugCounterGet", "AvatarChatService"),
-    ("EnableVoice", "AvatarChatService"),
-    ("GetClientFeaturesAsync", "AvatarChatService"),
-    ("GetServerFeaturesAsync", "AvatarChatService"),
-    ("IsEnabled", "AvatarChatService"),
-    ("IsPlaceEnabled", "AvatarChatService"),
-    ("IsUniverseEnabled", "AvatarChatService"),
-    ("PollClientFeatures", "AvatarChatService"),
-    ("PollServerFeatures", "AvatarChatService"),
-    ("deviceMeetsRequirementsForFeature", "AvatarChatService"),
 ];
 
 pub const EVENTS: &[(&str, &str)] = &[
@@ -99,10 +88,6 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("Paused", "VideoFrame"),
     ("Played", "VideoFrame"),
     ("StateChanged", "VoiceChatInternal"),
-    ("DevicesChanged", "VideoCaptureService"),
-    ("Error", "VideoCaptureService"),
-    ("Started", "VideoCaptureService"),
-    ("Stopped", "VideoCaptureService"),
 ];
 
 #[derive(Clone, Copy, Default)]
@@ -155,6 +140,16 @@ fn set_bool(lua: &Lua, r: Ref, k: &str, v: bool) -> mlua::Result<()> {
 pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) -> Option<mlua::Result<MultiValue>> {
     let none = || Ok(MultiValue::new());
     let r = match (class, name) {
+        ("Sound", "play" | "stop" | "pause" | "resume") => {
+            use crate::runtime::ext::{SoundCmd, sound};
+            let command = match name {
+                "play" => SoundCmd::Play,
+                "stop" => SoundCmd::Stop,
+                "pause" => SoundCmd::Pause,
+                _ => SoundCmd::Resume,
+            };
+            sound(lua, this, command).and_then(|_| none())
+        }
         // ------------------------------------------------ text to speech
         ("AudioTextToSpeech", "LoadAsync") => (|| {
             world(lua)?.output.push((Level::Error, "Failed to load text to speech".into()));
@@ -211,7 +206,6 @@ pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) ->
         ("VideoCaptureService", "ClearMockInput" | "SetMockInputAsync") => Err(rt_err(format!(
             "The current thread cannot call '{name}' (lacking capability InternalTest)"
         ))),
-        ("VideoCaptureService", "GetCameraDevices") => lua.create_table().map(|t| one(Value::Table(t))),
         // --------------------------------------------------------- voice
         ("VoiceChatInternal", "GetAudioProcessingSettings" | "GetMicDevices" | "Leave" | "SetMicDevice") => none(),
         ("VoiceChatInternal", "GetParticipants") => lua.create_table().map(|t| one(Value::Table(t))),
@@ -272,21 +266,6 @@ pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) ->
         })(),
         ("VideoSampler", "GetSamplesAtTimesAsync") => samples(lua, this, args),
         ("VoiceChatService", "GetChatGroupsAsync") => Err(rt_err("VoiceChatService:GetChatGroupsAsync is disabled.")),
-        // A client without voice or camera chat: no feature bits for the
-        // user, universe or place (Enum.AvatarChatServiceFeature is a bit
-        // mask; IsEnabled tests one bit of a mask), and the opt-in does
-        // nothing (estimate: a signed-out or ineligible account's answers).
-        ("AvatarChatService", "GetClientFeaturesAsync" | "GetServerFeaturesAsync" | "PollClientFeatures" | "PollServerFeatures" | "DebugCounterGet") => {
-            Ok(one(Value::Integer(0)))
-        }
-        ("AvatarChatService", "IsEnabled") => (|| {
-            let mask = crate::ltypes::num(&arg(args, 1)).unwrap_or(0.0) as i64;
-            let feature = crate::ltypes::enum_arg(Some(&arg(args, 2)), "AvatarChatServiceFeature", "None")?;
-            Ok(one(Value::Boolean(mask & i64::from(feature.value) != 0)))
-        })(),
-        ("AvatarChatService", "IsPlaceEnabled" | "IsUniverseEnabled" | "EnableVoice" | "deviceMeetsRequirementsForFeature") => {
-            Ok(one(Value::Boolean(false)))
-        }
         _ => return None,
     };
     Some(r)
@@ -349,10 +328,6 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
                 }
             })
         }
-        ("AvatarChatService", "ClientFeatures" | "ServerFeatures") => Some(Value::Integer(0)),
-        ("AvatarChatService", "ClientFeaturesInitialized") => Some(Value::Boolean(true)),
-        ("VideoCaptureService", "Active") => Some(Value::Boolean(false)),
-        ("VideoCaptureService", "CameraID") => Some(Value::String(lua.create_string("")?)),
         _ => None,
     })
 }

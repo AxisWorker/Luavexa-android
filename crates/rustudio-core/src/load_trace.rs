@@ -188,3 +188,21 @@ pub fn assets(meshes: usize, textures_pending: usize, textures: usize) {
         mark(&format!("assets: meshes {meshes}, textures {textures} (+{textures_pending} decoding)"));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compile_summary_accumulates_and_resets() {
+        let _ = compile_summary();
+        note_compile(4096, true, false, std::time::Duration::from_millis(5));
+        note_compile(2048, false, true, std::time::Duration::from_millis(7));
+        let summary = compile_summary();
+        assert_eq!(
+            summary,
+            "; 2 scripts compiled (6 KB, 1 from the bytecode cache, 1 --!native) in 12 ms"
+        );
+        assert!(compile_summary().is_empty());
+    }
+}

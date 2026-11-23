@@ -33,8 +33,7 @@ pub(crate) fn set_automatic(enabled: bool) {
     AUTOMATIC.store(enabled, Ordering::Relaxed);
 }
 
-/// Whether GPU spans are timed now (`end_frame` does nothing otherwise).
-pub fn on() -> bool {
+fn on() -> bool {
     benchmark_enabled() || AUTOMATIC.load(Ordering::Relaxed) || rustudio_core::profiler::gpu_wanted()
 }
 
@@ -180,6 +179,7 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
     if !on() {
         return;
     }
+    let _scope = rustudio_core::bench::scope("gpu_timing_end_frame");
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(st) = g.as_mut() else { return };
     if let Some(cur) = st.cur {
@@ -283,12 +283,18 @@ pub fn take() -> (Vec<(&'static str, f64)>, Vec<f64>) {
     }
 }
 
-/// The timestamp encoders around a submit timed as `label`: (before,
-/// after), None with the switch off. Doesn't disturb a `begin`/`mark` run
-/// being recorded in another encoder meanwhile.
-fn bracket(device: &wgpu::Device, queue: &wgpu::Queue, label: &'static str) -> Option<(wgpu::CommandEncoder, wgpu::CommandEncoder)> {
+/// `queue.submit(bufs)`, timed as `label` (a timestamp before and after,
+/// in their own command buffers) with the switch on. Doesn't disturb a
+/// `begin`/`mark` run being recorded in another encoder meanwhile.
+pub fn submit(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &'static str,
+    bufs: impl IntoIterator<Item = wgpu::CommandBuffer>,
+) {
     if !detailed() || UNSUPPORTED.get().is_some() {
-        return None;
+        queue.submit(bufs);
+        return;
     }
     let saved = STATE.lock().unwrap_or_else(|e| e.into_inner())
         .as_ref().map(|s| (s.last, s.encoder_start));
@@ -299,35 +305,5 @@ fn bracket(device: &wgpu::Device, queue: &wgpu::Queue, label: &'static str) -> O
     if let Some(st) = STATE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         (st.last, st.encoder_start) = saved.unwrap_or_default();
     }
-    Some((a, b))
-}
-
-/// `encoders` finished and submitted on the render thread (render_thread.rs),
-/// timed as `label` (a timestamp before and after, in their own command
-/// buffers) with the switch on.
-pub fn submit(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    label: &'static str,
-    encoders: impl IntoIterator<Item = wgpu::CommandEncoder>,
-) {
-    let all = match bracket(device, queue, label) {
-        Some((a, b)) => std::iter::once(a).chain(encoders).chain(std::iter::once(b)).collect(),
-        None => encoders.into_iter().collect(),
-    };
-    crate::render_thread::perform(queue, all, None);
-}
-
-/// `queue.submit(bufs)` here and now, timed as `label` (after
-/// `render_thread::wait`: egui's paint offscreen).
-pub fn submit_finished(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    label: &'static str,
-    bufs: impl IntoIterator<Item = wgpu::CommandBuffer>,
-) {
-    match bracket(device, queue, label) {
-        Some((a, b)) => queue.submit(std::iter::once(a.finish()).chain(bufs).chain(std::iter::once(b.finish()))),
-        None => queue.submit(bufs),
-    };
+    queue.submit(std::iter::once(a.finish()).chain(bufs).chain(std::iter::once(b.finish())));
 }

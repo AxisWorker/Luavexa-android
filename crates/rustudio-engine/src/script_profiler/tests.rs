@@ -183,8 +183,6 @@ fn native_directive() {
 
 #[test]
 fn native_functions_are_flagged() {
-    // The script's first run must already be native: no deferred build.
-    crate::runtime::native_at_load(true);
     start_recording(false);
     set_sample_hz(4000);
     let out = run(
@@ -196,12 +194,14 @@ local function crunch(n, ...)
     for i = 1, n do x = x + (i % 7) * 0.5 end
     return x
 end
+-- Deferred --!native codegen drains at the start of the first Runtime::step.
+task.wait()
 local t0 = os.clock()
 local n = 0
 while os.clock() - t0 < 0.05 and n < 400 do crunch(100000) n += 1 end
 print("NDONE")
 "#,
-        2,
+        3,
     );
     assert!(out.iter().any(|(_, s)| s.contains("NDONE")), "{out:?}");
     let snap = snapshot();

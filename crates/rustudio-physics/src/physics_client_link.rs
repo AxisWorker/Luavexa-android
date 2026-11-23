@@ -100,6 +100,9 @@ pub struct Link {
     /// Server parts the client took out of its Workspace → the client instance taken out
     /// (the part's own copy, or an ancestor's).
     hidden: HashMap<Ref, Ref>,
+    // Only the local character skips server colliders absent on its client.
+    unstreamed: rustc_hash::FxHashSet<Ref>,
+    streaming_revision: Option<u64>,
     /// Server parts that collide on the server but that the client made
     /// CanCollide=false (a LocalScript opening a door for its own player):
     /// the client simulates its character against its own copy, so the
@@ -138,7 +141,15 @@ impl Link {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.proxies.is_empty() && self.hidden.is_empty() && self.statics.is_empty() && self.nocollide.is_empty()
+        self.proxies.is_empty() && self.statics.is_empty() && self.all_server_parts_visible()
+    }
+
+    fn all_server_parts_visible(&self) -> bool {
+        self.hidden.is_empty() && self.nocollide.is_empty() && self.unstreamed.is_empty()
+    }
+
+    fn hides_part(&self, r: &Ref) -> bool {
+        self.hidden.contains_key(r) || self.nocollide.contains(r) || self.unstreamed.contains(r)
     }
 
     pub(super) fn body_of(&self, r: Ref) -> Option<rp::RigidBodyHandle> {
@@ -161,7 +172,7 @@ impl Link {
         }
         let player = self.player_root.is_some_and(|r| own.contains(&r));
         if player {
-            by_collider.get(&h).is_some_and(|r| self.hidden.contains_key(r) || self.nocollide.contains(r))
+            by_collider.get(&h).is_some_and(|r| self.hides_part(r))
         } else {
             self.proxy_colliders.contains(&h)
         }
@@ -178,9 +189,9 @@ impl Link {
             let ok = !(p1 && p2) && if p1 { me(c.rigid_body2) } else { me(c.rigid_body1) };
             return Some(ok.then_some(rp::SolverFlags::COMPUTE_RIGID_IMPULSES));
         }
-        if !(self.hidden.is_empty() && self.nocollide.is_empty()) && (me(c.rigid_body1) || me(c.rigid_body2)) {
+        if !self.all_server_parts_visible() && (me(c.rigid_body1) || me(c.rigid_body2)) {
             let other = if me(c.rigid_body1) { c.collider2 } else { c.collider1 };
-            if by_collider.get(&other).is_some_and(|r| self.hidden.contains_key(r) || self.nocollide.contains(r)) {
+            if by_collider.get(&other).is_some_and(|r| self.hides_part(r)) {
                 return Some(None);
             }
         }
@@ -189,6 +200,21 @@ impl Link {
 }
 
 impl Physics {
+    pub fn set_streaming_visibility(
+        &mut self,
+        revision: Option<u64>,
+        missing: impl Iterator<Item = Ref>,
+    ) {
+        if self.link.streaming_revision == revision {
+            return;
+        }
+        self.link.streaming_revision = revision;
+        self.link.unstreamed.clear();
+        if revision.is_some() {
+            self.link.unstreamed.extend(missing);
+        }
+    }
+
     /// A replicated part whose CanCollide the client changed: off on the client while
     /// the server's collides → the player's character passes through it (`nocollide`);
     /// the same on both sides again (the client turned it back on, or the server's

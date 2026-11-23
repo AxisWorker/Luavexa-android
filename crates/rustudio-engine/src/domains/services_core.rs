@@ -2,23 +2,21 @@
 //! Studio's data model patch): ScriptContext:AddCoreScriptLocal, the
 //! DataModel's fast-flag and engine-feature queries,
 //! UserInputService:GetPlatform, GuiService:GetNotificationTypeList, and
-//! MessageBusService / LocalStorageService and StarterGui's
-//! RegisterSetCore / RegisterGetCore behind SetCore / GetCore
-//! (services_core.luau). Each is in
+//! MessageBusService / LocalStorageService (services_core.luau). Each is in
 //! the API dump with RobloxScriptSecurity (or LocalUserSecurity: GetFast*,
 //! GetEngineFeature); the runtime's security check refuses game scripts
 //! before these run.
 //!
-//! Flag values: Roblox's served client flags when Play loaded them
-//! (rustudio_core::client_flags), else the default a CoreScript gives
-//! (`DefineFastFlag(name, default)`), else false / 0 / "" (estimate). Engine
-//! features answer false (`ENGINE_FEATURES` aside): they gate engine API
-//! newer than what rustudio has, and the CoreScripts take their older path
-//! without them (estimate).
+//! Flag values: rustudio has none of Roblox's served flag settings, so a
+//! defined flag keeps the default its CoreScript gives (`DefineFastFlag(name,
+//! default)`), and a flag nothing defined reads false / 0 / "" (estimate:
+//! the engine's own C++ flags are unknown here). Engine features answer
+//! false: they gate engine API newer than what rustudio has, and the
+//! CoreScripts take their older path without them (estimate).
 
 use std::collections::HashMap;
 
-use mlua::{Function, Lua, MultiValue, Table, Value};
+use mlua::{Function, Lua, MultiValue, ObjectLike, Table, Value};
 use rbx_dom_weak::types::Ref;
 use rbx_dom_weak::InstanceBuilder;
 
@@ -38,63 +36,6 @@ pub(super) fn install(lua: &Lua, rs: &Table) -> mlua::Result<()> {
                 r
             };
             inst_value(lua, r)
-        })?,
-    )?;
-    // HttpService:RequestInternal's requests: Roblox web APIs as the signed-in
-    // player (the CoreScripts' own web calls), through the login session.
-    rs.set(
-        "web_start",
-        lua.create_function(|_, (method, url, body): (String, String, Option<String>)| {
-            let host = url.strip_prefix("https://").and_then(|r| r.split('/').next()).unwrap_or("");
-            if !(host == "roblox.com" || host.ends_with(".roblox.com")) {
-                return Ok(None);
-            }
-            Ok(Some(super::super::avatar::web::start(&method, url, body)))
-        })?,
-    )?;
-    rs.set(
-        "web_poll",
-        lua.create_function(|lua, id: u64| {
-            Ok(match super::super::avatar::web::poll(id) {
-                None => MultiValue::new(),
-                Some(Ok((status, text))) => MultiValue::from_vec(vec![
-                    Value::Integer(status as i64),
-                    Value::String(lua.create_string(text)?),
-                ]),
-                Some(Err(e)) => MultiValue::from_vec(vec![Value::Integer(0), Value::String(lua.create_string(e)?)]),
-            })
-        })?,
-    )?;
-    rs.set("user_agent", concat!("rustudio/", env!("CARGO_PKG_VERSION")))?;
-    rs.set("identity", lua.create_function(|lua, ()| Ok(security::current(lua)))?)?;
-    // f(...) on a new thread at identity `ident`: (true, results…) when it
-    // finished, (false, message) when it failed, (true) when it yielded (it
-    // carries on by itself).
-    rs.set(
-        "call_as",
-        lua.create_function(|lua, mut args: MultiValue| {
-            let ident = match args.pop_front() {
-                Some(Value::Integer(i)) => i as u8,
-                Some(Value::Number(n)) => n as u8,
-                _ => security::current(lua),
-            };
-            let Some(Value::Function(f)) = args.pop_front() else { return Err(rt_err("call_as: function expected")) };
-            let th = crate::runtime::domains::assets_cloud::scene::create_thread(lua, f)?;
-            security::set(&th, ident);
-            let mut out = MultiValue::new();
-            match th.resume::<MultiValue>(args) {
-                Ok(r) => {
-                    out.push_back(Value::Boolean(true));
-                    if th.status() != mlua::thread::ThreadStatus::Resumable {
-                        out.extend(r);
-                    }
-                }
-                Err(e) => {
-                    out.push_back(Value::Boolean(false));
-                    out.push_back(Value::String(lua.create_string(describe_error(&e))?));
-                }
-            }
-            Ok(out)
         })?,
     )?;
     let m: Table = lua.load(include_str!("services_core.luau")).set_name("=rustudio.services.core").call(rs.clone())?;
@@ -127,214 +68,348 @@ fn one(lua: &Lua, f: Fast) -> mlua::Result<MultiValue> {
     }]))
 }
 
-/// settings():GetFFlag / GetFVariable for a CoreScript: a flag it defined,
-/// else false / "" (estimate, as GetFast*).
-pub(super) fn settings_flag(lua: &Lua, method: &str, flag: &str) -> mlua::Result<MultiValue> {
-    // The engine's own in-game GUI inset (the in-game menu's player page adds
-    // to it): the top bar height rustudio lays GUIs out under.
-    if flag == "InGameGlobalGuiInset" {
-        return one(lua, Fast::Str((rustudio_core::mech::GUI_TOP_INSET as i64).to_string()));
+fn studio_fast_flag(flag: &str) -> Option<bool> {
+    match flag {
+        // Measured live in Studio 0.747/0.748 (StudioAppSettings.json + StudioIxpSettings.json):
+        // Chrome Unibar TopBar, ChatInputBarV2, BubbleChatConfiguration children, channel tabs,
+        // SettingsHub Gallery tab, People grid view, and blue Resume button with focus nav.
+        "EnableInGameMenuChrome"
+        | "AddTopBarScrim"
+        | "ExpChatNewInputBar4"
+        | "SetUpBubbleChatConfigurationChildProperties"
+        | "ExpChatAlignSystemMessageStyling"
+        | "ExpChatChannelTabSizingUpdate2"
+        | "ExpChatChannelTabRefactor2"
+        | "ExpChatFixChannelTabsMidExperienceToggle"
+        | "ExpChatUseChannelTabsStore6"
+        // ChatInputBarV2: round custom send button, pill corners and truncation
+        | "ExpChatInputBarV2CustomSendButton"
+        | "ExpChatInputBarV2CornerAndTruncationFix"
+        | "ExpChatPresetButtonOldInputBarV2"
+        | "ExpChatPresetButtonGlobalTabFix"
+        // SettingsHub: Gallery tab (Captures -> Gallery)
+        | "IGMChangeCapturesToGallery"
+        | "IGMChangeGalleryHeaderIcon"
+        | "UpdateGalleryIcon"
+        | "GalleryStopGap"
+        | "EnableCapturesGalleryRetrievalCoreScript_v3"
+        | "EnableCapturesGalleryRetrieval2"
+        | "EnableSettingsHubUIDelegateRollout"
+        | "EnableSystemScrimInSettingsHub"
+        // SettingsHub: People tab grid/card layout
+        | "RefactorPeoplePage9"
+        | "AddPeoplePageCardLayout4"
+        | "EnableSettingsHubCreateReactPage2"
+        | "EnablePeoplePageButtonOnMount"
+        | "NewPeoplePageIcons5"
+        | "RenderPeoplePageOnTabSwitch"
+        | "PeoplePageCardMenuUseVisibleProperty"
+        | "FixPeoplePageCardTooltip"
+        | "PeoplePagePostponeInitialRender"
+        | "PeoplePageRemoveSkeletons"
+        | "PeoplePageRemoveUseMemoElements"
+        | "PeopleCardsEnableVirtualizedGrid"
+        // SettingsHub: MenuButtons (blue Resume + focus navigation)
+        | "RelocateMobileMenuButtons4"
+        | "AddTraversalHistoryReactMenuButtons"
+        | "MenuButtonsMountWithIEM"
+        | "MenuButtonsCheckVisibilityBeforeMount"
+        | "MenuButtonsCheckVisibilityBeforeMount2"
+        | "MenuButtonsUseKeyImages"
+        | "MenuButtonsDisconnectGamepadConnected"
+        | "MenuButtonsReplaceUseEffect"
+        | "MenuButtonsSkipAnimation"
+        | "MenuButtonsIncreaseIconSize"
+        | "RefactorMenuConfirmationButtons5"
+        | "IEMFocusNavSupportNewButtons2"
+        | "IEMFocusNavToButtons"
+        | "IEMFocusNavPeoplePageToButtons"
+        | "IEMTabFocusNav"
+        // Built-in TerrainEditor: MaterialGrid forwards AutomaticSize/ScrollingDirection to its Grid pane.
+        | "MaterialGridExtraProps2"
+        // Studio 0.748 built-in plugin lazy startup flags (StudioAppSettings.json):
+        // defer mounting React/Rodux trees until first user interaction via PluginLoaderBuilder.
+        | "ImprovePluginSpeedPivotEditor"
+        | "ImprovePluginSpeed_AssetManager"
+        | "ImprovePluginSpeed_TagEditor"
+        | "ImprovePluginSpeed_ManageCollaborators"
+        | "FoundationLazyOverlayLoading"
+        // Studio 0.748 GameSettings flags (StudioAppSettings.json + live Studio 0.748):
+        // GameSettingsExperienceGuidelines is asserted by BrowserUtils.OpenExperienceQuestionnaire
+        // (Additional Settings / CreatorHub page) and BasicInfoPage.Components.Guidelines.
+        | "GameSettingsExperienceGuidelines"
+        | "PruneGameSettings"
+        | "RemoveGameSettingsMonetizationPage"
+        | "RemoveGameSettingsPermissionsBanner"
+        | "RemoveQuestionnaireFromGameSettings"
+        | "EnableRestartServersRedirectInGameSettings"
+        | "GameSettingsAddCreatorHubLinkToFooter"
+        | "GameSettingsGameToExperience"
+        | "GameSettingsEditableApiRemoveIdVerification"
+        | "GameSettingsRenameOptions"
+        | "EnableDeveloperAdsStatsApiMonetizationPageFix" => Some(true),
+        "MenuButtonsUseGreyResumeButton"
+        | "PeoplePageEnablePersonSignalStore" => Some(false),
+        _ => None,
     }
-    let mut defined = super::state(lua)?.fast_flags.0.get(flag).cloned();
-    if defined.is_none() {
-        let place = place_id(lua)?;
-        if let Some(f) = rustudio_core::client_flags::current() {
-            use rustudio_core::client_flags::Kind;
-            defined = match method {
-                "GetFFlag" => f.flag(flag, place).map(Fast::Flag),
-                _ => [Kind::Str, Kind::Int, Kind::Flag].iter().find_map(|k| f.raw(*k, flag, place)).map(|s| Fast::Str(s.to_string())),
-            };
-        }
+}
+
+fn studio_fast_int(flag: &str) -> Option<i64> {
+    match flag {
+        // Measured live in Studio 0.748 (StudioAppSettings.json):
+        "RelocateMobileMenuButtonsVariant" => Some(2),
+        // Built-in Toolbox & TerrainEditor FastInt defaults (measured live in Studio 0.748:
+        // returning 0 breaks Toolbox Essential section limit=0 / modulo-by-zero insert yielding,
+        // and SmoothTerrainMaxCppRegion < selection volume forces TerrainEditor RegionTransform
+        // out of LiveEdit into simpleMove, which pastes without clearing the source region):
+        "ToolboxHomeViewInitialPageSize" => Some(30),
+        "ToolboxAutocompleteDropdownSize" => Some(6),
+        "ToolboxYieldInsertPerInstanceModulus" => Some(500),
+        "ToolboxAssetDependencyGrantEventTimeout" => Some(5),
+        "ToolboxMaxManualRetryAttempts" => Some(3),
+        "SmoothTerrainMaxCppRegion" => Some(67_108_864),
+        "SmoothTerrainMaxLuaRegion" => Some(4_194_304),
+        "TerrainEditorMaxImportVolumeMegaVoxels" => Some(256),
+        _ => None,
     }
-    let v = match (method, defined) {
-        ("GetFFlag", Some(Fast::Flag(b))) => Fast::Flag(b),
-        ("GetFFlag", _) => Fast::Flag(false),
-        (_, Some(Fast::Flag(b))) => Fast::Str(b.to_string()),
-        (_, Some(Fast::Int(i))) => Fast::Str(i.to_string()),
-        (_, Some(Fast::Str(s))) => Fast::Str(s),
-        _ => Fast::Str(String::new()),
+}
+
+fn studio_engine_feature(feature: &str) -> bool {
+    matches!(
+        feature,
+        // Measured live in Studio 0.747/0.748
+        "InGameChromeSignalAPI"
+            | "EnablePerBubbleCustomization"
+            | "EnableDisplayBubble"
+            | "EnableChatInputBarConfigurationAutocompleteEnabled"
+            | "EnableBubbleChatFromChatService"
+            | "EnableTCSChatTranslation"
+            | "DeviceSafeInsetsSupportLuaApp"
+            | "GuiHidingApiSupport"
+            | "CoreAttributes"
+            | "AvatarChatServiceEnabled"
+            | "AddPeoplePageLayoutSettings"
+            | "CoreScriptGalleryRetrieval"
+    )
+}
+
+pub(super) fn get_global_flag(lua: &Lua, method: &str, flag: &str) -> mlua::Result<MultiValue> {
+    let defined = super::state(lua)?.fast_flags.0.get(flag).cloned();
+    if method == "GetFFlag" {
+        let b = match defined {
+            Some(Fast::Flag(b)) => b,
+            _ => studio_fast_flag(flag).unwrap_or(false),
+        };
+        return Ok(MultiValue::from_iter([Value::Boolean(b)]));
+    }
+    let s = match defined {
+        Some(Fast::Str(s)) => s,
+        Some(Fast::Int(i)) => i.to_string(),
+        Some(Fast::Flag(b)) => b.to_string(),
+        None => if let Some(i) = studio_fast_int(flag) {
+            i.to_string()
+        } else {
+            match flag {
+                "InGameGlobalGuiInset" => "36".to_string(),
+                "FriendRequestNotificationThrottle" => "5".to_string(),
+                "NewDevConsoleMaxGraphCount" => "60".to_string(),
+                "NewDevConsoleMaxLogCount" | "NewDevConsoleMaxHttpCount" => "500".to_string(),
+                "StudioSearchWithoutInsertionTimeSeconds" => "60".to_string(),
+                "FileMaxSizeBytes" => "20971520".to_string(),
+                _ => String::new(),
+            }
+        },
     };
-    one(lua, v)
+    Ok(MultiValue::from_iter([Value::String(lua.create_string(s)?)]))
 }
-
-/// The DataModel's PlaceId (a `_PlaceFilter` flag's test).
-fn place_id(lua: &Lua) -> mlua::Result<i64> {
-    let w = world(lua)?;
-    let d = w.d();
-    Ok(match d.prop(d.dom.root_ref(), "PlaceId") {
-        Some(rbx_dom_weak::types::Variant::Int64(i)) => i,
-        _ => 0,
-    })
-}
-
-/// Roblox's served value of fast flag `name`, of `like`'s kind
-/// (rustudio_core::client_flags, loaded when the CoreScripts start).
-fn live_flag(lua: &Lua, name: &str, like: &Fast) -> mlua::Result<Option<Fast>> {
-    let Some(f) = rustudio_core::client_flags::current() else { return Ok(None) };
-    let place = place_id(lua)?;
-    Ok(match like {
-        Fast::Flag(_) => f.flag(name, place).map(Fast::Flag),
-        Fast::Int(_) => f.int(name, place).map(Fast::Int),
-        Fast::Str(_) => f.string(name, place).map(Fast::Str),
-    })
-}
-
-pub(super) fn luau_member(lua: &Lua, owner: &str, name: &str) -> mlua::Result<bool> {
-    let m: Table = lua.named_registry_value("svc_core_impl")?;
-    m.contains_key(format!("{owner}.{name}"))
-}
-
-/// Whether a CoreScript registered `key` for StarterGui's `kind` ("SetCore"
-/// / "GetCore"): services_core.luau's tables. A key none did is the
-/// engine's own SetCore / GetCore (services.rs call).
-pub(super) fn core_registered(lua: &Lua, kind: &str, key: Option<&str>) -> mlua::Result<bool> {
-    let Some(key) = key else { return Ok(false) };
-    let m: Table = lua.named_registry_value("svc_core_impl")?;
-    let f: Function = m.get("StarterGui.core_registered")?;
-    f.call((kind, key))
-}
-
-/// Engine features rustudio answers true: the API each gates is
-/// implemented. AvatarChatServiceEnabled: AvatarChatService
-/// (media_misc.rs). Roblox's clients have it on: VoiceChatCore's
-/// CoreVoiceManager:FetchVoicePermissions calls `self.AvatarChatService`
-/// unconditionally, and that field is nil with the feature off.
-const ENGINE_FEATURES: &[&str] = &["AvatarChatServiceEnabled"];
 
 pub(super) fn call(lua: &Lua, owner: &str, name: &str, args: &MultiValue) -> mlua::Result<MultiValue> {
+    if matches!(
+        owner,
+        "MessageBusService"
+            | "MessageBusConnection"
+            | "LocalStorageService"
+            | "StarterGui"
+            | "RunService"
+            | "IXPService"
+            | "MemStorageService"
+            | "MemStorageConnection"
+            | "RbxAnalyticsService"
+            | "SessionService"
+            | "ExperienceService"
+            | "PolicyService"
+            | "SafetyService"
+            | "PermissionsService"
+            | "UserGameSettings"
+            | "ThirdPartyUserService"
+            | "NotificationService"
+            | "AdService"
+            | "AchievementService"
+            | "Animator"
+            | "CaptureService"
+            | "HttpService"
+            | "HttpRequest"
+            | "AvatarEditorService"
+            | "GenericChallengeService"
+            | "AvatarChatService"
+            | "VideoCaptureService"
+            | "CoreGui"
+            | "EventIngestService"
+            | "SocialService"
+            | "GroupService"
+            | "AvatarCreationService"
+            | "MarketplaceService"
+            | "PlayerScripts"
+            | "TelemetryService"
+            | "AudioFocusService"
+            | "SoundService"
+            | "MaterialService"
+    ) {
+        let m: Table = lua.named_registry_value("svc_core_impl")?;
+        if let Ok(f) = m.get::<Function>(format!("{owner}.{name}")) {
+            return f.call(args.clone());
+        }
+    }
     match name {
-        // services_core.luau: every member it defines.
-        _ if luau_member(lua, owner, name)? => {
-            let m: Table = lua.named_registry_value("svc_core_impl")?;
-            let f: Function = m.get(format!("{owner}.{name}"))?;
-            f.call(args.clone())
-        }
-        "GetMessageId" | "GetProtocolMethodRequestMessageId" | "GetProtocolMethodResponseMessageId" | "Subscribe"
-        | "SubscribeToProtocolMethodRequest" | "SubscribeToProtocolMethodResponse" | "Publish" | "GetLast" | "Call"
-        | "PublishProtocolMethodRequest" | "PublishProtocolMethodResponse" | "SetRequestHandler" | "MakeRequest"
-        | "Disconnect" | "GetItem" | "SetItem" | "Flush" | "WhenLoaded" | "RegisterSetCore" | "RegisterGetCore" | "SetCore"
-        | "GetCore" => {
-            let m: Table = lua.named_registry_value("svc_core_impl")?;
-            let f: Function = m.get(format!("{owner}.{name}"))?;
-            f.call(args.clone())
-        }
-        // A model from the client's own content (rbxasset://, ExtraContent
-        // included: assets::resolve), for the CoreScripts' bundled models.
-        // Its one top instance, parentless.
-        "LoadLocalAsset" => {
-            let id = name_arg(args, name)?;
-            if !id.trim().starts_with("rbxasset://") {
-                return Err(rt_err(format!("LoadLocalAsset: {id} is not an rbxasset:// path")));
-            }
-            let path = rustudio_core::assets::resolve(&id, None)
-                .filter(|p| p.is_file())
-                .ok_or_else(|| rt_err(format!("LoadLocalAsset: {id} not found")))?;
-            let bytes = std::fs::read(&path).map_err(|e| rt_err(format!("LoadLocalAsset: {e}")))?;
-            let mut tmp = rustudio_core::doc::Document::decode(&bytes).map_err(|e| rt_err(format!("LoadLocalAsset: {e}")))?;
-            let top = tmp.root().children().first().copied().ok_or_else(|| rt_err(format!("LoadLocalAsset: {id} is empty")))?;
-            {
-                let mut w = world(lua)?;
-                // (transfer needs a parent: in at the root, then out to none)
-                let root = w.d().dom.root_ref();
-                tmp.transfer(top, &mut w.dm().dom, root);
-                w.dm().dom.transfer_within(top, Ref::none());
-                w.orphans.insert(top);
-                w.structure_changed = true;
-            }
-            Ok(MultiValue::from_iter([inst_value(lua, top)?]))
-        }
-        // The size text takes (wrapped at frameSize.X): rustudio's own
-        // text layout, as GUI objects measure their TextBounds. Before any
-        // GUI text was drawn there are no font metrics yet: one line of
-        // TextSize per char-height (estimate).
         "GetTextSize" => {
-            let text = name_arg(args, name)?;
+            let text = match arg(args, 1) {
+                Value::String(s) => s.to_str()?.to_string(),
+                _ => return Err(rt_err("GetTextSize: Argument 1 missing or nil")),
+            };
             let size = match arg(args, 2) {
-                Value::Integer(i) => i as f32,
+                Value::Integer(n) => n as f32,
                 Value::Number(n) => n as f32,
                 _ => return Err(rt_err("GetTextSize: Argument 2 missing or nil")),
             };
-            let font = match arg(args, 3) {
-                v => match crate::ltypes::enum_arg(Some(&v), "Font", "SourceSans") {
-                    Ok(e) => crate::gui::face_of_legacy(&e.name),
-                    Err(e) => return Err(e),
-                },
+            let font_name = match arg(args, 3) {
+                Value::UserData(u) => u.get::<String>("Name").unwrap_or_else(|_| "SourceSans".into()),
+                Value::Table(t) => t.get::<String>("Name").unwrap_or_else(|_| "SourceSans".into()),
+                Value::String(s) => s.to_str().map(|x| x.to_string()).unwrap_or_else(|_| "SourceSans".into()),
+                _ => "SourceSans".into(),
             };
-            let width = match opt_ud::<crate::ltypes::LVector2>(&arg(args, 4)) {
-                Some(v) => v.0.x,
-                None => f32::INFINITY,
+            let frame_w = match arg(args, 4) {
+                Value::UserData(u) => u.get::<f64>("X").unwrap_or(0.0) as f32,
+                Value::Table(t) => t.get::<f64>("X").unwrap_or(0.0) as f32,
+                _ => 0.0,
             };
-            let m = crate::gui::measure_plain(&text, &font, size, width).unwrap_or([text.chars().count() as f32 * size * 0.5, size]);
-            Ok(MultiValue::from_iter([Value::UserData(lua.create_userdata(crate::ltypes::LVector2(glam::Vec2::new(m[0], m[1])))?)]))
+            let fk = crate::gui::legacy_face_key(&font_name);
+            let [w, h] = crate::gui::measure_text_string(&text, size, &fk, frame_w, false);
+            let v2_new: Function = lua.globals().get::<Table>("Vector2")?.get("new")?;
+            Ok(MultiValue::from_iter([v2_new.call::<Value>((w as f64, h as f64))?]))
         }
-        // GetTextBoundsParams: Text, Font, Size, Width (and RichText).
         "GetTextBoundsAsync" => {
-            let Value::UserData(p) = arg(args, 1) else { return Err(rt_err("GetTextBoundsAsync: Argument 1 missing or nil")) };
-            let get = |k: &str| -> mlua::Result<Value> {
-                let t: mlua::Function = lua.load("return function(p, k) return p[k] end").eval()?;
-                t.call((Value::UserData(p.clone()), k))
+            let p = opt_inst(&arg(args, 1))
+                .ok_or_else(|| rt_err("GetTextBoundsAsync: GetTextBoundsParams expected"))?;
+            let (text, size, fk, width, rich) = {
+                let w = world(lua)?;
+                let d = w.d();
+                let text = match d.prop(p, "Text") {
+                    Some(rbx_dom_weak::types::Variant::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                let size = match d.prop(p, "Size") {
+                    Some(rbx_dom_weak::types::Variant::Float32(n)) => n,
+                    Some(rbx_dom_weak::types::Variant::Float64(n)) => n as f32,
+                    Some(rbx_dom_weak::types::Variant::Int32(n)) => n as f32,
+                    _ => 16.0,
+                };
+                let width = match d.prop(p, "Width") {
+                    Some(rbx_dom_weak::types::Variant::Float32(n)) => n,
+                    Some(rbx_dom_weak::types::Variant::Float64(n)) => n as f32,
+                    Some(rbx_dom_weak::types::Variant::Int32(n)) => n as f32,
+                    _ => 0.0,
+                };
+                let rich = matches!(d.prop(p, "RichText"), Some(rbx_dom_weak::types::Variant::Bool(true)));
+                let fk = match d.prop(p, "Font") {
+                    Some(rbx_dom_weak::types::Variant::Font(f)) => {
+                        let wt = match f.weight {
+                            rbx_dom_weak::types::FontWeight::Thin => 100,
+                            rbx_dom_weak::types::FontWeight::ExtraLight => 200,
+                            rbx_dom_weak::types::FontWeight::Light => 300,
+                            rbx_dom_weak::types::FontWeight::Regular => 400,
+                            rbx_dom_weak::types::FontWeight::Medium => 500,
+                            rbx_dom_weak::types::FontWeight::SemiBold => 600,
+                            rbx_dom_weak::types::FontWeight::Bold => 700,
+                            rbx_dom_weak::types::FontWeight::ExtraBold => 800,
+                            rbx_dom_weak::types::FontWeight::Heavy => 900,
+                            _ => 400,
+                        };
+                        let italic = matches!(f.style, rbx_dom_weak::types::FontStyle::Italic);
+                        crate::gui::normalize_face_key(&f.family, wt, italic)
+                    }
+                    _ => crate::gui::legacy_face_key("SourceSans"),
+                };
+                (text, size, fk, width, rich)
             };
-            let text = match get("Text")? {
-                Value::String(s) => s.to_str()?.to_string(),
-                _ => String::new(),
-            };
-            let size = match get("Size")? {
-                Value::Integer(i) => i as f32,
-                Value::Number(n) => n as f32,
-                _ => 14.0,
-            };
-            let width = match get("Width")? {
-                Value::Integer(i) => i as f32,
-                Value::Number(n) => n as f32,
-                _ => f32::INFINITY,
-            };
-            let font = match opt_ud::<crate::ltypes::LFont>(&get("Font")?) {
-                Some(f) => crate::gui::face_of_font(&f.0),
-                None => crate::gui::face_of_legacy("SourceSans"),
-            };
-            let m = crate::gui::measure_plain(&text, &font, size, width).unwrap_or([text.chars().count() as f32 * size * 0.5, size]);
-            Ok(MultiValue::from_iter([Value::UserData(lua.create_userdata(crate::ltypes::LVector2(glam::Vec2::new(m[0], m[1])))?)]))
+            let [w, h] = crate::gui::measure_text_string(&text, size, &fk, width, rich);
+            let v2_new: Function = lua.globals().get::<Table>("Vector2")?.get("new")?;
+            Ok(MultiValue::from_iter([v2_new.call::<Value>((w as f64, h as f64))?]))
         }
+        "GetTextSizeOffsetAsync" => Ok(MultiValue::from_iter([Value::Number(0.0)])),
+        "OpenScreenshotsFolder" => Ok(MultiValue::new()),
+        "GetMaxQualityLevel" => Ok(MultiValue::from_iter([Value::Integer(21)])),
         "AddCoreScriptLocal" => {
             let script = name_arg(args, name)?;
-            let parent = opt_inst(&arg(args, 2)).ok_or_else(|| rt_err("AddCoreScriptLocal: Argument 2 missing or nil"))?;
-            if start_core_script(lua, &script, parent, None)?.is_none() {
+            let parent = opt_inst(&arg(args, 2)).unwrap_or(Ref::none());
+            if start_core_script(lua, &script, parent)?.is_none() {
                 return Err(rt_err(format!("AddCoreScriptLocal: no CoreScript named '{script}'")));
             }
             Ok(MultiValue::new())
         }
+        "LoadLocalAsset" => {
+            let uri = name_arg(args, name)?;
+            let path = rustudio_core::assets::resolve(&uri, None)
+                .ok_or_else(|| rt_err(format!("LoadLocalAsset: could not resolve '{uri}'")))?;
+            let bytes = std::fs::read(&path).map_err(|e| rt_err(format!("LoadLocalAsset {uri}: {e}")))?;
+            let mut dom = rustudio_core::doc::Document::decode(&bytes)
+                .map_err(|e| rt_err(format!("LoadLocalAsset {uri}: {e}")))?;
+            let first = dom
+                .root()
+                .children()
+                .first()
+                .copied()
+                .ok_or_else(|| rt_err(format!("LoadLocalAsset {uri}: empty model")))?;
+            let (r, holder) = {
+                let mut w = world(lua)?;
+                let holder = w.dm().dom.insert(Ref::none(), InstanceBuilder::new("Folder").with_name("_tmp_local_asset"));
+                dom.transfer(first, &mut w.dm().dom, holder);
+                w.orphans.insert(first);
+                (first, holder)
+            };
+            set_parent(lua, r, Ref::none())?;
+            if let Ok(mut w) = world(lua) {
+                w.dm().dom.destroy(holder);
+            }
+            Ok(MultiValue::from_iter([inst_value(lua, r)?]))
+        }
+        "GetLocalFileContents" => {
+            let uri = name_arg(args, name)?;
+            let path = rustudio_core::assets::resolve(&uri, None)
+                .ok_or_else(|| rt_err(format!("GetLocalFileContents: could not resolve '{uri}'")))?;
+            let bytes = std::fs::read(&path).map_err(|e| rt_err(format!("GetLocalFileContents {uri}: {e}")))?;
+            Ok(MultiValue::from_iter([Value::String(lua.create_string(bytes)?)]))
+        }
         "DefineFastFlag" | "DefineFastInt" | "DefineFastString" => {
             let flag = name_arg(args, name)?;
             let default = match (name, arg(args, 2)) {
-                ("DefineFastFlag", Value::Boolean(b)) => Fast::Flag(b),
-                ("DefineFastInt", Value::Integer(i)) => Fast::Int(i),
-                ("DefineFastInt", Value::Number(n)) => Fast::Int(n as i64),
+                ("DefineFastFlag", Value::Boolean(b)) => Fast::Flag(studio_fast_flag(&flag).unwrap_or(b)),
+                ("DefineFastInt", Value::Integer(i)) => Fast::Int(studio_fast_int(&flag).unwrap_or(i)),
+                ("DefineFastInt", Value::Number(n)) => Fast::Int(studio_fast_int(&flag).unwrap_or(n as i64)),
                 ("DefineFastString", Value::String(s)) => Fast::Str(s.to_str()?.to_string()),
                 _ => return Err(rt_err(format!("{name}: Argument 2 missing or nil"))),
             };
-            // Roblox's live value when it serves one (client_flags.rs).
-            let live = live_flag(lua, &flag, &default)?;
-            let v = super::state(lua)?.fast_flags.0.entry(flag).or_insert(live.unwrap_or(default)).clone();
+            let v = super::state(lua)?.fast_flags.0.entry(flag).or_insert(default).clone();
             one(lua, v)
         }
         "GetFastFlag" | "GetFastInt" | "GetFastString" => {
             let flag = name_arg(args, name)?;
             let defined = super::state(lua)?.fast_flags.0.get(&flag).cloned();
-            let kind = match name {
-                "GetFastFlag" => Fast::Flag(false),
-                "GetFastInt" => Fast::Int(0),
-                _ => Fast::Str(String::new()),
-            };
-            let defined = match defined {
-                Some(v) => Some(v),
-                None => live_flag(lua, &flag, &kind)?,
-            };
             let v = match (name, defined) {
                 ("GetFastFlag", Some(v @ Fast::Flag(_)))
                 | ("GetFastInt", Some(v @ Fast::Int(_)))
                 | ("GetFastString", Some(v @ Fast::Str(_))) => v,
-                ("GetFastFlag", _) => Fast::Flag(false),
-                ("GetFastInt", _) => Fast::Int(0),
+                ("GetFastFlag", _) => Fast::Flag(studio_fast_flag(&flag).unwrap_or(false)),
+                ("GetFastInt", _) => Fast::Int(studio_fast_int(&flag).unwrap_or(0)),
                 _ => Fast::Str(String::new()),
             };
             one(lua, v)
@@ -363,151 +438,8 @@ pub(super) fn call(lua: &Lua, owner: &str, name: &str, args: &MultiValue) -> mlu
         }
         // "GetEngineFeature"
         _ => {
-            let feature = name_arg(args, name)?;
-            Ok(MultiValue::from_iter([Value::Boolean(ENGINE_FEATURES.contains(&feature.as_str()))]))
+            let feat = name_arg(args, name)?;
+            Ok(MultiValue::from_iter([Value::Boolean(studio_engine_feature(&feat))]))
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use rbx_dom_weak::InstanceBuilder;
-    use rustudio_core::core_scripts::{Bytecode, Installed};
-    use rustudio_core::doc::Document;
-
-    use crate::runtime::*;
-
-    fn compile(src: &str) -> Bytecode {
-        Bytecode::from(crate::bytecode_cache::compiler().compile(src).unwrap())
-    }
-
-    /// Runs `starter` as the data model patch's StarterScript in a Play
-    /// client, with `CoreScripts/Child` and a CorePackages module `Lib`;
-    /// then a game LocalScript-identity check. Returns Output.
-    fn run_core(starter: &str) -> Vec<String> {
-        let mut d = Document::new_place();
-        let root = d.dom.root_ref();
-        let packages = d.dom.insert(root, InstanceBuilder::new("CorePackages").with_name("CorePackages"));
-        let lib = d.dom.insert(packages, InstanceBuilder::new("ModuleScript").with_name("Lib"));
-        d.dom.insert(root, InstanceBuilder::new("CoreGui").with_name("CoreGui"));
-        let installed = Installed {
-            modules: HashMap::from([(lib, compile("return { n = 7 }"))]),
-            scripts: HashMap::from([
-                ("StarterScript".to_string(), compile(starter)),
-                ("CoreScripts/Child".to_string(), compile("print('child', script:GetFullName(), debug.info(1, 's'))")),
-            ]),
-        };
-        let rt = Runtime::new().unwrap();
-        let mut w = World::new(d, RunMode::Play);
-        w.side = Side::Client;
-        rt.enter(w);
-        rt.bind_globals().unwrap();
-        rt.start_core_scripts(installed).unwrap();
-        // A game script's SetCore reaches the CoreScript's handler, which
-        // runs at the CoreScript's identity (GetEngineFeature needs LocalUser).
-        let r = security::with_main_identity(&rt.lua, security::GAME, || {
-            let env = crate::globals_parity::harness_env(&rt.lua)?;
-            rt.lua
-                .load("game:GetService('StarterGui'):SetCore('Probe', 1) print('probe-done', pcall(game.GetEngineFeature, game, 'X'))")
-                .set_name("=game-script")
-                .set_environment(env)
-                .exec()
-        });
-        assert!(r.is_ok(), "{r:?}");
-        for _ in 0..10 {
-            rt.step(1.0 / 60.0);
-        }
-        rt.leave().output.into_iter().map(|(_, t)| t).collect()
-    }
-
-    #[test]
-    fn core_scripts_run_at_their_identity_with_their_services() {
-        let out = run_core(
-            r#"
-            local sg = game:GetService("StarterGui")
-            print("flag", game:DefineFastFlag("X", true), game:GetFastFlag("X"), game:GetFastFlag("Undefined"))
-            sg:RegisterSetCore("Greet", function(v) print("setcore", v) end)
-            sg:RegisterSetCore("Probe", function(v) print("probe", v, game:GetEngineFeature("X")) end)
-            sg:RegisterGetCore("Answer", function() return 42 end)
-            sg:SetCore("Greet", "hi")
-            print("getcore", sg:GetCore("Answer"))
-            print("unregistered", pcall(sg.SetCore, sg, "Nope", 1))
-            local mb = game:GetService("MessageBusService")
-            local id = mb:GetMessageId("Domain", "Name")
-            local conn = mb:Subscribe(id, function(p) print("bus", p.n) end, false, false)
-            mb:Publish(id, { n = 1 })
-            conn:Disconnect()
-            mb:Publish(id, { n = 2 })
-            print("last", mb:GetLast(id).n, id, mb:GetProtocolMethodResponseMessageId("P", "M"))
-            local mem = game:GetService("MemStorageService")
-            mem:Bind("k", function(v) print("mem", v) end)
-            mem:SetItem("k", "a")
-            print("memget", mem:GetItem("k", "d"), mem:GetItem("missing", "d"), mem:HasItem("k"))
-            print("lerp", UDim2.new(0, 0, 0, 0):lerp(UDim2.new(1, 10, 0, 0), 0.5))
-            print("starter", script.Parent and script.Parent.Name, debug.info(1, "s"))
-            game:GetService("ScriptContext"):AddCoreScriptLocal("CoreScripts/Child", game:GetService("CoreGui"))
-            print("lib", require(game:GetService("CorePackages").Lib).n)
-            "#,
-        );
-        let has = |s: &str| out.iter().any(|t| t.starts_with(s));
-        assert!(has("flag true true false"), "{out:?}");
-        assert!(has("setcore hi"), "{out:?}");
-        assert!(has("getcore 42"), "{out:?}");
-        assert!(has("unregistered false SetCore: Nope has not been registered by the CoreScripts"), "{out:?}");
-        assert!(has("bus 1"), "{out:?}");
-        assert!(!has("bus 2"), "{out:?}");
-        assert!(has("last 2 Domain.Name P.M.Response"), "{out:?}");
-        assert!(has("mem a"), "{out:?}");
-        assert!(has("memget a d true"), "{out:?}");
-        assert!(has("lerp {0.5, 5}, {0, 0}"), "{out:?}");
-        assert!(has("starter CoreGui StarterScript"), "{out:?}");
-        assert!(has("child CoreGui.CoreScripts/Child CoreGui.CoreScripts/Child"), "{out:?}");
-        assert!(has("lib 7"), "{out:?}");
-        // The handler ran with the CoreScript's capabilities; the game
-        // script itself still lacks LocalUser.
-        assert!(has("probe 1 false"), "{out:?}");
-        assert!(has("probe-done false"), "{out:?}");
-    }
-
-    /// GuiService:GetClosestDialogToPosition (MainBotChatScript2 asks every
-    /// Heartbeat) follows Dialogs added and destroyed after its first call,
-    /// and only the Workspace's.
-    #[test]
-    fn closest_dialog_follows_added_and_destroyed_dialogs() {
-        let out = run_core(
-            r#"
-            local gs = game:GetService("GuiService")
-            local function dialog(parent, x, name)
-                local p = Instance.new("Part")
-                p.Name = name
-                p.Anchored = true
-                p.Position = Vector3.new(x, 0, 0)
-                local d = Instance.new("Dialog")
-                d.ConversationDistance = 25
-                d.Parent = p
-                p.Parent = parent
-                return p
-            end
-            local function closest(x)
-                local d = gs:GetClosestDialogToPosition(Vector3.new(x, 0, 0))
-                return d and d.Parent.Name
-            end
-            dialog(workspace, 10, "Far")
-            dialog(game:GetService("ReplicatedStorage"), 1, "Stored")
-            print("first", closest(0))
-            local near = dialog(workspace, 2, "Near")
-            print("added", closest(0))
-            near:Destroy()
-            print("destroyed", closest(0))
-            print("beyond", closest(100))
-            "#,
-        );
-        let has = |s: &str| out.iter().any(|t| t.starts_with(s));
-        assert!(has("first Far"), "{out:?}");
-        assert!(has("added Near"), "{out:?}");
-        assert!(has("destroyed Far"), "{out:?}");
-        assert!(has("beyond nil"), "{out:?}");
     }
 }

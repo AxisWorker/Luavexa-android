@@ -31,6 +31,10 @@ pub const LUA_METHODS: &[(&str, &str)] = &[
     ("GetAssetIdsForPackage","AssetService"),
     ("GetAssetIdsForPackageAsync","AssetService"),
     ("GetObjects","DataModel"),
+    ("GetObjectsAsync","DataModel"),
+    ("GetObjectsAllOrNone","DataModel"),
+    ("GetObjectsList","DataModel"),
+    ("InsertObjectsAndJoinIfLegacyAsync","DataModel"),
     ("CaptureScreenshot","CaptureService"),("TakeScreenshotCaptureAsync","CaptureService"),("StartVideoCaptureAsync","CaptureService"),("StopVideoCapture","CaptureService"),("ReadCapturesFromGalleryAsync","CaptureService"),("PromptSaveCapturesToGallery","CaptureService"),("PromptShareCapture","CaptureService"),
 
     ("CreateDataModelContentAsync","AssetService"),
@@ -346,7 +350,7 @@ local M = __rs_lua_methods
 -- call waits assets::preload_deadline seconds at most (20;
 -- RUSTUDIO_PRELOAD_DEADLINE): a place that preloads its 2000 animations
 -- and sounds from one server script, and starts its game after, would
--- otherwise sit for minutes on a phone's link. The downloads go on in the
+-- otherwise sit for minutes on a slow link. The downloads go on in the
 -- background (GetAssetFetchStatus moves to Success as each arrives, the
 -- AssetFetchStatus signals fire), and the next use of an asset finds its
 -- bytes cached.
@@ -369,10 +373,14 @@ end
 pub fn step(lua: &Lua, _: f64) -> mlua::Result<()> {
     let completed: Vec<_> = {
         let s = lua.app_data_ref::<State>().unwrap();
-        s.fetches
-            .iter()
-            .filter_map(|(id, r)| r.lock().ok().and_then(|v| *v).map(|ok| (id.clone(), ok)))
-            .collect()
+        if s.fetches.is_empty() {
+            Vec::new()
+        } else {
+            s.fetches
+                .iter()
+                .filter_map(|(id, r)| r.lock().ok().and_then(|v| *v).map(|ok| (id.clone(), ok)))
+                .collect()
+        }
     };
     for (id, ok) in completed {
         let provider = {
@@ -393,13 +401,19 @@ pub fn step(lua: &Lua, _: f64) -> mlua::Result<()> {
     // asking for every watched id's status each frame was 0.85 ms a frame
     // in a live Place A match (a lock, a canonical key and a lookup per id).
     let generation=rustudio_core::assets::content_status_generation();
-    let changes: Vec<_> = if lua.app_data_ref::<State>().unwrap().status_gen==generation {Vec::new()} else {
-        let mut s=lua.app_data_mut::<State>().unwrap();
-        s.status_gen=generation;
-        s.watched.iter().filter_map(|(id,(r,old))| {
-            let current=rustudio_core::assets::content_fetch_status(id);
-            (current!=*old).then(||(id.clone(),*r,current))
-        }).collect()
+    let changes: Vec<_> = {
+        let s = lua.app_data_ref::<State>().unwrap();
+        if s.watched.is_empty() || s.status_gen == generation {
+            Vec::new()
+        } else {
+            drop(s);
+            let mut s=lua.app_data_mut::<State>().unwrap();
+            s.status_gen=generation;
+            s.watched.iter().filter_map(|(id,(r,old))| {
+                let current=rustudio_core::assets::content_fetch_status(id);
+                (current!=*old).then(||(id.clone(),*r,current))
+            }).collect()
+        }
     };
     for (id,r,current) in changes {
         lua.app_data_mut::<State>().unwrap().watched.insert(id.clone(),(r,current));
@@ -408,9 +422,13 @@ pub fn step(lua: &Lua, _: f64) -> mlua::Result<()> {
     }
     let cursor=lua.app_data_ref::<State>().unwrap().failure_seq;
     let (next,failures)=rustudio_core::assets::content_failures_since(cursor);
-    lua.app_data_mut::<State>().unwrap().failure_seq=next;
-    let provider={let w=world(lua)?;let d=w.d();d.find_child(d.dom.root_ref(),"ContentProvider")};
-    if let Some(r)=provider {for id in failures {world(lua)?.fire(r,"AssetFetchFailed",vec![Value::String(lua.create_string(id)?)]);}}
+    if next != cursor {
+        lua.app_data_mut::<State>().unwrap().failure_seq=next;
+    }
+    if !failures.is_empty() {
+        let provider={let w=world(lua)?;let d=w.d();d.find_child(d.dom.root_ref(),"ContentProvider")};
+        if let Some(r)=provider {for id in failures {world(lua)?.fire(r,"AssetFetchFailed",vec![Value::String(lua.create_string(id)?)]);}}
+    }
     Ok(())
 }
 
