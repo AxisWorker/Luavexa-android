@@ -355,12 +355,13 @@ pub fn run() -> eframe::Result<()> {
                 }
             }
             "--luau" => {
-                // --luau server|client FILE@S
+                // --luau server|client|core FILE@S
                 let side = args.next().unwrap_or_default();
                 let v = args.next().unwrap_or_default();
                 match v.rsplit_once('@').and_then(|(f, at)| {
                     Some((std::fs::read_to_string(f).ok()?, at.parse::<f32>().ok()?))
                 }) {
+                    Some((code, at)) if side == "core" => actions.push((at, HarnessAction::LuauCore(code))),
                     Some((code, at)) => {
                         actions.push((at, HarnessAction::Luau(side != "client", code)))
                     }

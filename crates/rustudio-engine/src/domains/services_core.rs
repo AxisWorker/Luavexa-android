@@ -38,6 +38,20 @@ pub(super) fn install(lua: &Lua, rs: &Table) -> mlua::Result<()> {
             inst_value(lua, r)
         })?,
     )?;
+    // The running thread's identity, and a call on a new thread at a given
+    // identity: a StarterGui SetCore/GetCore handler runs as the CoreScript
+    // that registered it (Roblox runs it in the CoreScript's context), not
+    // as the game script calling SetCore — NewChat's CoreGuiChatConnections
+    // handler asks GetEngineFeature, which a LocalScript's thread may not.
+    rs.set("identity", lua.create_function(|lua, ()| Ok(security::current(lua)))?)?;
+    rs.set(
+        "call_as",
+        lua.create_function(|lua, (ident, f, args): (u8, Function, MultiValue)| {
+            let th = crate::runtime::domains::assets_cloud::scene::create_thread(lua, f)?;
+            security::set_thread(&th, ident);
+            th.resume::<MultiValue>(args)
+        })?,
+    )?;
     let m: Table = lua.load(include_str!("services_core.luau")).set_name("=rustudio.services.core").call(rs.clone())?;
     lua.set_named_registry_value("svc_core_impl", m)
 }

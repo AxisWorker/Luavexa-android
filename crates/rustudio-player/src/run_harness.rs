@@ -323,25 +323,31 @@ impl RunHarness {
         // Timed Luau (`--luau`), once Play runs.
         let t = self.now()?;
         if game.is_playing() {
-            let due: Vec<(bool, String)> = self.input
+            let due: Vec<(bool, bool, String)> = self.input
                 .actions
                 .iter()
                 .filter_map(|(at, a)| match a {
-                    HarnessAction::Luau(server, code) if *at <= t => Some((*server, code.clone())),
+                    HarnessAction::Luau(server, code) if *at <= t => Some((*server, false, code.clone())),
+                    HarnessAction::LuauCore(code) if *at <= t => Some((false, true, code.clone())),
                     _ => None,
                 })
                 .collect();
             if !due.is_empty() {
                 self.input
                     .actions
-                    .retain(|(at, a)| !(matches!(a, HarnessAction::Luau(..)) && *at <= t));
-                for (server, code) in due {
+                    .retain(|(at, a)| !(matches!(a, HarnessAction::Luau(..) | HarnessAction::LuauCore(..)) && *at <= t));
+                for (server, core, code) in due {
                     let side = if server {
                         rustudio_engine::runtime::Side::Server
                     } else {
                         rustudio_engine::runtime::Side::Client
                     };
-                    if let Some(e) = game.run_luau(side, &code) {
+                    let err = if core {
+                        game.run_luau_as(side, &code, rustudio_engine::runtime::security::CORE)
+                    } else {
+                        game.run_luau(side, &code)
+                    };
+                    if let Some(e) = err {
                         game.error(format!("--luau: {e}"));
                     }
                 }
@@ -575,8 +581,11 @@ pub enum HarnessAction {
     /// going down / up.
     PointerAt(f32, f32),
     LeftButton(f32, f32, bool),
-    /// `--luau server|client FILE@S`: run Luau on that side of Play.
+    /// `--luau server|client|core FILE@S`: run Luau on that side of Play
+    /// (`core`: on the client at CoreScript identity, as the in-game menu
+    /// runs — the chunk can require RobloxGui.Modules).
     Luau(bool, String),
+    LuauCore(String),
     /// `--action NAME@S`: a Studio menu action by id (`panel_output` closes
     /// or opens the Output panel, resizing the 3D view mid-run).
     UiAction(String),
@@ -802,13 +811,13 @@ impl HarnessInput {
                 i += 1;
                 continue;
             }
-            if matches!(self.actions[i].1, HarnessAction::Luau(..)) {
+            if matches!(self.actions[i].1, HarnessAction::Luau(..) | HarnessAction::LuauCore(..)) {
                 i += 1;
                 continue;
             }
             let (_, a) = self.actions.remove(i);
             match a {
-                HarnessAction::Luau(..) => {}
+                HarnessAction::Luau(..) | HarnessAction::LuauCore(..) => {}
                 HarnessAction::Click(x, y) => {
                     let p = if locked { held_at } else { vp.min + egui::vec2(x, y) };
                     if !locked {

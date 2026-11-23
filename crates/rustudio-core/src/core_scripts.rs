@@ -329,6 +329,45 @@ fn named(dom: &WeakDom, parent: Ref, name: &str) -> Option<Ref> {
         .find(|c| dom.get_by_ref(*c).is_some_and(|i| i.name == name))
 }
 
+/// The engine-made `CoreGui.RobloxGui` the CoreScripts expect: the ScreenGui
+/// with its `ControlFrame` and the three control corners (Roblox's client
+/// makes them before any CoreScript runs). StarterScript's touch branch waits
+/// for `ControlFrame.BottomLeftControl` (and hides it) before it starts the
+/// scripts after it — ExperienceChatMain, InspectAndBuy, NetworkPause … — so
+/// without the frame a phone never gets Roblox's chat window;
+/// MainBotChatScript2 waits for `BottomLeftControl` to hold its DialogFrame.
+pub fn ensure_roblox_gui(doc: &mut Document, core_gui: Ref) -> Ref {
+    use rbx_dom_weak::types::{UDim, UDim2};
+    if let Some(rg) = named(&doc.dom, core_gui, "RobloxGui") {
+        return rg;
+    }
+    let udim2 = |xs: f32, xo: i32, ys: f32, yo: i32| UDim2::new(UDim::new(xs, xo), UDim::new(ys, yo));
+    let corner = |name: &str, pos: UDim2, size: UDim2| {
+        InstanceBuilder::new("Frame")
+            .with_name(name)
+            .with_property("Position", pos)
+            .with_property("Size", size)
+            .with_property("BackgroundTransparency", 1.0f32)
+            .with_property("BorderSizePixel", 0i32)
+    };
+    let control_frame = InstanceBuilder::new("Frame")
+        .with_name("ControlFrame")
+        .with_property("Size", udim2(1.0, 0, 1.0, 0))
+        .with_property("BackgroundTransparency", 1.0f32)
+        .with_property("BorderSizePixel", 0i32)
+        .with_child(corner("BottomLeftControl", udim2(0.0, 0, 1.0, -46), udim2(0.0, 130, 0.0, 46)))
+        .with_child(corner("BottomRightControl", udim2(1.0, -180, 1.0, -46), udim2(0.0, 180, 0.0, 46)))
+        .with_child(corner("TopLeftControl", udim2(0.0, 0, 0.0, 0), udim2(0.0, 180, 0.0, 36)));
+    doc.dom.insert(
+        core_gui,
+        InstanceBuilder::new("ScreenGui")
+            .with_name("RobloxGui")
+            .with_property("ResetOnSpawn", false)
+            .with_property("ZIndexBehavior", Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1)))
+            .with_child(control_frame),
+    )
+}
+
 /// Puts the patch in a client DataModel: `DataModelInstances` into the
 /// services they name (CoreGui gets its `RobloxGui` ScreenGui first, as the
 /// engine makes it), the `CoreScriptLocalization` tables under CoreGui, and
@@ -344,15 +383,7 @@ pub fn install(doc: &mut Document, mut patch: Patch) -> Result<Installed, String
             .unwrap_or_else(|| doc.dom.insert(root, InstanceBuilder::new(class).with_name(class)))
     };
     let core_gui = service(doc, "CoreGui");
-    if named(&doc.dom, core_gui, "RobloxGui").is_none() {
-        doc.dom.insert(
-            core_gui,
-            InstanceBuilder::new("ScreenGui")
-                .with_name("RobloxGui")
-                .with_property("ResetOnSpawn", false)
-                .with_property("ZIndexBehavior", Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1))),
-        );
-    }
+    ensure_roblox_gui(doc, core_gui);
     let tops: Vec<Ref> = patch.dom.get_by_ref(instances).map(|i| i.children().to_vec()).unwrap_or_default();
     let mut touched = vec![core_gui];
     for top in tops {
@@ -396,15 +427,7 @@ fn install_cloned(doc: &mut Document, patch: &Patch) -> Result<Installed, String
             .unwrap_or_else(|| doc.dom.insert(root, InstanceBuilder::new(class).with_name(class)))
     };
     let core_gui = service(doc, "CoreGui");
-    if named(&doc.dom, core_gui, "RobloxGui").is_none() {
-        doc.dom.insert(
-            core_gui,
-            InstanceBuilder::new("ScreenGui")
-                .with_name("RobloxGui")
-                .with_property("ResetOnSpawn", false)
-                .with_property("ZIndexBehavior", Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1))),
-        );
-    }
+    ensure_roblox_gui(doc, core_gui);
     let mut installed = Installed {
         modules: HashMap::with_capacity(patch.bytecode.len()),
         scripts: HashMap::new(),

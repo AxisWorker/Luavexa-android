@@ -246,6 +246,30 @@ mod tests {
         game.stop_play(&mut ());
     }
 
+    /// The client's scripts see the view's size from their first line
+    /// (Camera.ViewportSize, GuiService:GetHardwareSafeViewport): the Play
+    /// worker starts from the editor's rect rather than the first frame's
+    /// input (Roblox's PlayerList took a 0x0 view for a small touch screen,
+    /// then opened as a modal over the game).
+    #[test]
+    fn play_worker_starts_with_the_views_size() {
+        let mut game = Game::new(None);
+        game.viewport_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(870.0, 400.0));
+        game.start_play_threaded(RunMode::Play, &mut (), false, None);
+        assert!(game.is_playing());
+        let err = game.run_luau(
+            Side::Client,
+            r#"
+            local v = workspace.CurrentCamera.ViewportSize
+            assert(v.X == 870 and v.Y == 400, "ViewportSize " .. tostring(v))
+            local u = game:GetService("UserInputService")
+            assert(u:GetFocusedTextBox() == nil)
+        "#,
+        );
+        assert_eq!(err, None);
+        game.stop_play(&mut ());
+    }
+
     /// With the Play worker on, the main thread has no client VM of its own:
     /// the in-game menu's Settings page reads UserGameSettings published in
     /// PlayView.settings so toggling CameraYInverted On then Off (even after
@@ -892,6 +916,9 @@ impl Game {
         let show_client = self.play_shows_client;
         let keep_game_settings = self.keep_game_settings;
         let fixed_dt = self.fixed_dt;
+        // (the client's view size before its scripts run: Input::apply
+        // carries the following frames')
+        let viewport = self.viewport_rect;
         let teleport = self.teleport_to.take();
         if teleport.is_none() {
             self.play_origin = live_ids;
@@ -901,6 +928,7 @@ impl Game {
             game.doc = doc;
             game.teleport_to = teleport;
             game.cam = cam;
+            game.viewport_rect = viewport;
             game.account = account;
             game.play_rig = play_rig;
             game.play_here = play_here;

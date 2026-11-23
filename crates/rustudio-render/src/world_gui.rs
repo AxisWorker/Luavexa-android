@@ -891,8 +891,16 @@ pub struct WorldGuiPass {
     /// on first use. Keyed by egui's texture; the copy, its view, and the
     /// frame each was last used (and, for the font atlas, refilled).
     mips: std::collections::HashMap<wgpu::Texture, (wgpu::Texture, wgpu::TextureView, u64, TextureRevision)>,
-    /// Static textures' mip copies being made on another thread.
-    mips_making: std::collections::HashMap<wgpu::Texture, std::sync::mpsc::Receiver<(wgpu::Texture, wgpu::TextureView)>>,
+    /// Static textures' mip copies being made on another thread (None: the
+    /// device refused the copy's memory).
+    mips_making: std::collections::HashMap<wgpu::Texture, std::sync::mpsc::Receiver<Option<(wgpu::Texture, wgpu::TextureView)>>>,
+    /// Textures whose mip copy the device refused (out of memory, or over
+    /// [`mip_budget`]) and the frame it did: drawn from egui's own texture,
+    /// unmipped, until [`MIP_RETRY_FRAMES`] later — not asked again every
+    /// frame (a refused copy left in `mips` fails every view and bind group
+    /// made from it, and a phone's driver gives up the device after enough
+    /// of those: 2026-11-23 crash reports).
+    mips_refused: std::collections::HashMap<wgpu::Texture, u64>,
     /// Let-go mip copies waiting to be freed a few at a time (and whether
     /// they may be destroyed).
     mips_release: std::collections::VecDeque<(wgpu::Texture, bool)>,
@@ -1091,6 +1099,49 @@ fn draw_mips(
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.draw(0..3, 0..1);
+    }
+}
+
+/// Frames a refused mip copy waits before it is asked for again (~30 s).
+const MIP_RETRY_FRAMES: u64 = 1800;
+
+/// The memory the mip copies may hold together: beyond it the least
+/// recently used are let go first, and a copy that still does not fit is
+/// refused (its texture draws unmipped). Phones share the GPU's memory with
+/// everything else and refuse allocations long before a desktop would.
+/// `RUSTUDIO_GUI_MIP_BUDGET_MB` overrides.
+pub fn mip_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let default_mb: u64 = if cfg!(target_os = "android") { 64 } else { 512 };
+        std::env::var("RUSTUDIO_GUI_MIP_BUDGET_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default_mb) << 20
+    })
+}
+
+/// The bytes a `width` x `height` RGBA8 texture with a full mip chain holds.
+pub fn mip_copy_bytes(width: u32, height: u32) -> u64 {
+    u64::from(width) * u64::from(height) * 16 / 3
+}
+
+/// `device.create_texture` inside an out-of-memory error scope: None when
+/// the device refused the memory (wgpu otherwise hands back a texture that
+/// is invalid for everything after, and reports the failure only to the
+/// uncaptured-error handler).
+pub fn try_create_texture(device: &wgpu::Device, desc: &wgpu::TextureDescriptor<'_>) -> Option<wgpu::Texture> {
+    let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let texture = device.create_texture(desc);
+    match crate::gpu_caps::block_on(scope.pop()) {
+        None => Some(texture),
+        Some(e) => {
+            log::warn!(
+                "rustudio: no GPU memory for a {}x{} {} texture ({}): drawn without it — {e}",
+                desc.size.width,
+                desc.size.height,
+                desc.label.unwrap_or("unnamed"),
+                desc.mip_level_count
+            );
+            None
+        }
     }
 }
 
@@ -1523,6 +1574,7 @@ impl WorldGuiPass {
             sampler_wrap,
             mips: Default::default(),
             mips_making: Default::default(),
+            mips_refused: Default::default(),
             mips_release: Default::default(),
             mip_pipeline,
             mip_bgl,
@@ -1533,14 +1585,61 @@ impl WorldGuiPass {
         }
     }
 
+    /// Whether `tex`'s mip copy was refused lately (`mips_refused`).
+    fn mip_refused(&mut self, tex: &wgpu::Texture) -> bool {
+        let frame = self.frame;
+        match self.mips_refused.get(tex) {
+            Some(at) if frame.saturating_sub(*at) < MIP_RETRY_FRAMES => true,
+            Some(_) => {
+                self.mips_refused.remove(tex);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Makes room under [`mip_budget`] for a copy of `bytes`: the copies
+    /// not used this frame go, least recently used first. False when it
+    /// still does not fit.
+    fn mip_room_for(&mut self, bytes: u64) -> bool {
+        let budget = mip_budget();
+        if bytes > budget {
+            return false;
+        }
+        let held = |mips: &std::collections::HashMap<wgpu::Texture, (wgpu::Texture, wgpu::TextureView, u64, TextureRevision)>| {
+            mips.values().map(|(c, ..)| mip_copy_bytes(c.size().width, c.size().height)).sum::<u64>()
+        };
+        if held(&self.mips) + bytes <= budget {
+            return true;
+        }
+        let frame = self.frame;
+        let mut by_age: Vec<(u64, wgpu::Texture)> =
+            self.mips.iter().filter(|(_, (_, _, used, _))| *used != frame).map(|(t, (_, _, used, _))| (*used, t.clone())).collect();
+        by_age.sort_by_key(|(used, _)| *used);
+        for (_, t) in by_age {
+            if held(&self.mips) + bytes <= budget {
+                break;
+            }
+            if let Some((copy, view, ..)) = self.mips.remove(&t) {
+                let sampled = self.tex_groups.values().any(|(s, _, _)| *s == t);
+                self.tex_groups.retain(|_, (s, _, _)| *s != t);
+                egui_wgpu::prewarm::drop_later(view);
+                self.mips_release.push_back((copy, !sampled));
+            }
+        }
+        held(&self.mips) + bytes <= budget
+    }
+
     /// Copy and downsample a texture when its uploaded contents change.
-    fn mipped(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, tex: &wgpu::Texture, revision: TextureRevision) -> wgpu::TextureView {
+    /// None when the device has no memory for the copy (`mips_refused`):
+    /// the caller samples egui's texture unmipped.
+    fn mipped(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, tex: &wgpu::Texture, revision: TextureRevision) -> Option<wgpu::TextureView> {
         let frame = self.frame;
         let mut dirty = None;
         let reuse = if let Some((copy, view, used, last)) = self.mips.get_mut(tex) {
             *used = frame;
             if *last == revision {
-                return view.clone();
+                return Some(view.clone());
             }
             // The Context only tracks its latest delta. After skipped
             // revisions, refill the full copy to include every missed write.
@@ -1560,26 +1659,45 @@ impl WorldGuiPass {
         if reuse.is_none() && std::env::var_os("RUSTUDIO_ATLAS_TRACE").is_some() {
             eprintln!("[mips] new {}x{} ({} levels) for {:?}", size.width, size.height, levels, revision);
         }
-        let mipped = if let Some((copy, _)) = &reuse { copy.clone() } else {
+        let mipped = if let Some((copy, _)) = &reuse {
+            copy.clone()
+        } else {
+            if self.mip_refused(tex) {
+                return None;
+            }
             // (a grown font atlas's copy is made ahead of time: mip_copy_key)
-            egui_wgpu::prewarm::take(mip_copy_key(size.width, size.height)).unwrap_or_else(|| device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("world gui effect texture"),
-                size: wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
-                mip_level_count: levels,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            }))
+            let made = match egui_wgpu::prewarm::take(mip_copy_key(size.width, size.height)) {
+                Some(t) => Some(t),
+                None if !self.mip_room_for(mip_copy_bytes(size.width, size.height)) => None,
+                None => try_create_texture(
+                    device,
+                    &wgpu::TextureDescriptor {
+                        label: Some("world gui effect texture"),
+                        size: wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
+                        mip_level_count: levels,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        view_formats: &[],
+                    },
+                ),
+            };
+            match made {
+                Some(t) => t,
+                None => {
+                    self.mips_refused.insert(tex.clone(), frame);
+                    return None;
+                }
+            }
         };
         draw_mips(device, encoder, &self.mip_pipeline, &self.mip_bgl, &self.mip_sampler, tex, &mipped, dirty);
         if let Some((_, view)) = reuse {
-            return view;
+            return Some(view);
         }
         let view = mipped.create_view(&Default::default());
         self.mips.insert(tex.clone(), (mipped, view.clone(), frame, revision));
-        view
+        Some(view)
     }
 
     /// The world GUIs (`batches`) and, into the scene, the effects (`fx`),
@@ -1637,6 +1755,7 @@ impl WorldGuiPass {
         // freeing a large texture costs an integrated GPU's driver tens of
         // milliseconds)
         let gone_mips: Vec<_> = self.mips.extract_if(|_, (_, _, used, _)| frame - *used >= 600).collect();
+        self.mips_refused.retain(|_, at| frame.saturating_sub(*at) < MIP_RETRY_FRAMES);
         let egui = rs.renderer.read();
         let gone_groups: Vec<_> = self.tex_groups.extract_if(|_, (_, _, used)| frame - *used >= 600).collect();
         if !gone_groups.is_empty() {
@@ -1690,60 +1809,86 @@ impl WorldGuiPass {
                 if *t == tex {
                     let bg = bg.clone();
                     let first = std::mem::replace(used, frame) != frame;
-                    if first && mipped {
+                    // (a group made while the copy was refused samples egui's
+                    // texture: made again, below, once a copy may fit)
+                    let remake = first && mipped && !this.mips.contains_key(&tex) && !this.mips_making.contains_key(&tex) && !this.mip_refused(&tex);
+                    if first && mipped && !remake {
                         this.mipped(device, encoder, &tex, revision);
                     }
-                    return Some(bg);
+                    if !remake {
+                        return Some(bg);
+                    }
                 }
             }
             // (a static image's mip copy is made on another thread the first
             // time it is drawn; until it is, it draws as an image still
             // loading does: not at all. Fixed-step runs make it here.)
+            let mut mipped = mipped;
             if mipped && revision == TextureRevision::Static && !this.mips.contains_key(&tex) && !rustudio_core::sim_clock::on() {
-                match this.mips_making.get(&tex).map(|rx| rx.try_recv()) {
-                    Some(Ok((copy, view))) => {
-                        this.mips_making.remove(&tex);
-                        this.mips.insert(tex.clone(), (copy, view, frame, revision));
-                    }
-                    Some(Err(std::sync::mpsc::TryRecvError::Empty)) => return None,
-                    Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                        this.mips_making.remove(&tex);
-                    }
-                    None => {
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        let (device, queue) = (device.clone(), rs.queue.clone());
-                        let (pipeline, bgl, sampler) = (this.mip_pipeline.clone(), this.mip_bgl.clone(), this.mip_sampler.clone());
-                        let source = tex.clone();
-                        let made = std::thread::Builder::new().name("gui-mips".into()).spawn(move || {
-                            let size = source.size();
-                            let key = mip_copy_key(size.width, size.height);
-                            let copy = device.create_texture(&wgpu::TextureDescriptor {
-                                label: Some("world gui effect texture"),
-                                size: wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
-                                mip_level_count: key.mip_levels,
-                                sample_count: 1,
-                                dimension: wgpu::TextureDimension::D2,
-                                format: key.format,
-                                usage: key.usage,
-                                view_formats: &[],
+                let size = tex.size();
+                if this.mip_refused(&tex) {
+                    mipped = false;
+                } else {
+                    match this.mips_making.get(&tex).map(|rx| rx.try_recv()) {
+                        Some(Ok(Some((copy, view)))) => {
+                            this.mips_making.remove(&tex);
+                            this.mips.insert(tex.clone(), (copy, view, frame, revision));
+                        }
+                        Some(Ok(None)) => {
+                            this.mips_making.remove(&tex);
+                            this.mips_refused.insert(tex.clone(), frame);
+                            mipped = false;
+                        }
+                        Some(Err(std::sync::mpsc::TryRecvError::Empty)) => return None,
+                        Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                            this.mips_making.remove(&tex);
+                        }
+                        None if !this.mip_room_for(mip_copy_bytes(size.width, size.height)) => {
+                            this.mips_refused.insert(tex.clone(), frame);
+                            mipped = false;
+                        }
+                        None => {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let (device, queue) = (device.clone(), rs.queue.clone());
+                            let (pipeline, bgl, sampler) = (this.mip_pipeline.clone(), this.mip_bgl.clone(), this.mip_sampler.clone());
+                            let source = tex.clone();
+                            let made = std::thread::Builder::new().name("gui-mips".into()).spawn(move || {
+                                let size = source.size();
+                                let key = mip_copy_key(size.width, size.height);
+                                let Some(copy) = try_create_texture(
+                                    &device,
+                                    &wgpu::TextureDescriptor {
+                                        label: Some("world gui effect texture"),
+                                        size: wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
+                                        mip_level_count: key.mip_levels,
+                                        sample_count: 1,
+                                        dimension: wgpu::TextureDimension::D2,
+                                        format: key.format,
+                                        usage: key.usage,
+                                        view_formats: &[],
+                                    },
+                                ) else {
+                                    let _ = tx.send(None);
+                                    return;
+                                };
+                                let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui mips") });
+                                draw_mips(&device, &mut enc, &pipeline, &bgl, &sampler, &source, &copy, None);
+                                queue.submit([enc.finish()]);
+                                let view = copy.create_view(&Default::default());
+                                let _ = tx.send(Some((copy, view)));
                             });
-                            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui mips") });
-                            draw_mips(&device, &mut enc, &pipeline, &bgl, &sampler, &source, &copy, None);
-                            queue.submit([enc.finish()]);
-                            let view = copy.create_view(&Default::default());
-                            let _ = tx.send((copy, view));
-                        });
-                        if made.is_ok() {
-                            this.mips_making.insert(tex.clone(), rx);
-                            return None;
+                            if made.is_ok() {
+                                this.mips_making.insert(tex.clone(), rx);
+                                return None;
+                            }
                         }
                     }
                 }
             }
-            let (view, sampler) = if mipped {
-                (this.mipped(device, encoder, &tex, revision), if wrap { &this.sampler_mip_wrap } else { &this.sampler_mip })
-            } else {
-                (tex.create_view(&Default::default()), if wrap { &this.sampler_wrap } else { &this.sampler })
+            let mip_view = if mipped { this.mipped(device, encoder, &tex, revision) } else { None };
+            let (view, sampler) = match mip_view {
+                Some(view) => (view, if wrap { &this.sampler_mip_wrap } else { &this.sampler_mip }),
+                None => (tex.create_view(&Default::default()), if wrap { &this.sampler_wrap } else { &this.sampler }),
             };
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("world gui texture"),

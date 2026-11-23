@@ -250,6 +250,10 @@ impl PluginHost {
         self.repaint_context = Some(ctx);
     }
 
+    pub fn repaint_context(&self) -> Option<&egui::Context> {
+        self.repaint_context.as_ref()
+    }
+
     pub fn needs_idle_tick(&self) -> bool {
         !self.cmds.is_empty() || !self.pending_triggers.is_empty() || self.specs.iter().any(|s| s.running)
     }

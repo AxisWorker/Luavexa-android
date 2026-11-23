@@ -2204,6 +2204,14 @@ impl Gui {
                 y,
             };
             if pressed {
+                if std::env::var_os("RUSTUDIO_GUI_TRACE").is_some() {
+                    let q = |h: &Hit| format!("{:?}{} {:.0},{:.0} {:.0}x{:.0}", h.r, if h.textbox { " textbox" } else if h.button { " button" } else { "" }, h.quad[0].x, h.quad[0].y, h.quad[2].x - h.quad[0].x, h.quad[2].y - h.quad[0].y);
+                    eprintln!(
+                        "[gui] press {b} at {x:.0},{y:.0}: top {:?}; sinks under: [{}]",
+                        top.as_ref().map(q),
+                        under.iter().filter(|h| h.sink).map(q).collect::<Vec<_>>().join("; ")
+                    );
+                }
                 // Clicking anywhere else ends text editing.
                 if let Some(f) = self
                     .focus

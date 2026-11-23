@@ -3042,30 +3042,44 @@ local function start_dialog_ui()
     local p = local_player()
     local pg = p and p:FindFirstChildOfClass("PlayerGui")
     if not pg then return end
+    local cg = svc("CoreGui")
+    if not cg then return end
     dialog_ui_started = true
     dialog_added, dialog_removed = Instance.new("BindableEvent"), Instance.new("BindableEvent")
-    -- RobloxGui stand-in: Studio's has ControlFrame.BottomLeftControl at
-    -- (0, 0, 1, -46), 130 × 46.
-    local rg = Instance.new("ScreenGui")
-    rg.Name = "RobloxGui"
-    rg.ResetOnSpawn = false
-    rg.DisplayOrder = 100000
-    local cf = Instance.new("Frame")
-    cf.Name = "ControlFrame"
-    cf.Size = UDim2.fromScale(1, 1)
-    cf.BackgroundTransparency = 1
-    cf.Parent = rg
-    local bl = Instance.new("Frame")
-    bl.Name = "BottomLeftControl"
-    bl.Position = UDim2.new(0, 0, 1, -46)
-    bl.Size = UDim2.fromOffset(130, 46)
-    bl.BackgroundTransparency = 1
-    bl.Parent = cf
+    -- Roblox's client keeps these in CoreGui, out of the game's PlayerGui:
+    -- the engine-made RobloxGui with ControlFrame.BottomLeftControl at
+    -- (0, 0, 1, -46), 130 × 46 (the CoreScripts' own when they are on,
+    -- core_scripts.rs ensure_roblox_gui; a stand-in otherwise), and the
+    -- dialog bubbles (BillboardGuis MainBotChatScript2 parents to CoreGui;
+    -- a ScreenGui holds them here).
+    local rg = cg:FindFirstChild("RobloxGui")
+    if not rg then
+        rg = Instance.new("ScreenGui")
+        rg.Name = "RobloxGui"
+        rg.ResetOnSpawn = false
+        rg.DisplayOrder = 100000
+    end
+    local cf = rg:FindFirstChild("ControlFrame")
+    if not cf then
+        cf = Instance.new("Frame")
+        cf.Name = "ControlFrame"
+        cf.Size = UDim2.fromScale(1, 1)
+        cf.BackgroundTransparency = 1
+        cf.Parent = rg
+    end
+    if not cf:FindFirstChild("BottomLeftControl") then
+        local bl = Instance.new("Frame")
+        bl.Name = "BottomLeftControl"
+        bl.Position = UDim2.new(0, 0, 1, -46)
+        bl.Size = UDim2.fromOffset(130, 46)
+        bl.BackgroundTransparency = 1
+        bl.Parent = cf
+    end
     local holder = Instance.new("ScreenGui")
     holder.Name = "DialogBubbles"
     holder.ResetOnSpawn = false
-    holder.Parent = pg
-    rg.Parent = pg
+    holder.Parent = cg
+    if rg.Parent ~= cg then rg.Parent = cg end
     local rrs = {}
     local remote = {}
     function remote:FireServer(dialog, on)

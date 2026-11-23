@@ -428,6 +428,32 @@ local function update_topbar_badge()
 	topbar_badge.Visible = (not chat_visible) and unread_count > 0
 end
 
+-- Roblox's CoreScripts running (RUSTUDIO_CORE_SCRIPTS): their TopBarApp is
+-- the top bar, so none is built here, and its chat button reaches this
+-- window the way it reaches Roblox's Lua chat — through the BindableEvents
+-- the chat hands NewChat.lua with StarterGui:SetCore("CoreGuiChatConnections").
+local core_active = false
+local bridge = nil          -- our side of those connections, once registered
+local bridge_tries = 0
+local legacy_message_count = 0
+
+local function set_chat_visible(on)
+	on = not not on
+	local changed = on ~= chat_visible
+	chat_visible = on
+	if on then
+		unread_count = 0
+		last_activity_t = os.clock()
+	end
+	if topbar_icon_body then topbar_icon_body.BackgroundTransparency = on and 0 or 0.45 end
+	if topbar_icon_tail then topbar_icon_tail.BackgroundTransparency = on and 0 or 0.45 end
+	update_topbar_badge()
+	if bridge and changed then
+		bridge.VisibilityStateChanged:Fire(on)
+		bridge.ChatWindowToggled:Fire(on)
+	end
+end
+
 local function refresh_line_visibility()
 	local cwc = get_cwc()
 	local cib = get_cib()
@@ -561,9 +587,12 @@ local function build_ui()
 	local core = R.core_gui()
 	if not core then return end
 	ui_ready = true
+	core_active = R.core_scripts_active ~= nil and R.core_scripts_active() == true
 
 	-- 1. CoreGui.TopBarApp (matches Studio's Chrome/Unibar top-left layout:
 	--    44x44 Roblox logo circle at (16, 12) + 96x44 pill at (68, 12) holding hamburger + chat toggle)
+	--    — Roblox's own when the CoreScripts run.
+	if not core_active then
 	topbar_gui = Instance.new("ScreenGui")
 	topbar_gui.Name = "TopBarApp"
 	topbar_gui.ResetOnSpawn = false
@@ -767,19 +796,9 @@ local function build_ui()
 	topbar_btn.MouseEnter:Connect(function() chat_hl.Visible = true end)
 	topbar_btn.MouseLeave:Connect(function() chat_hl.Visible = false end)
 	topbar_btn.Activated:Connect(function()
-		chat_visible = not chat_visible
-		if chat_visible then
-			unread_count = 0
-			last_activity_t = os.clock()
-		end
-		if topbar_icon_body then
-			topbar_icon_body.BackgroundTransparency = chat_visible and 0 or 0.45
-		end
-		if topbar_icon_tail then
-			topbar_icon_tail.BackgroundTransparency = chat_visible and 0 or 0.45
-		end
-		update_topbar_badge()
+		set_chat_visible(not chat_visible)
 	end)
+	end -- (our top bar)
 
 	-- 2. CoreGui.ExperienceChat (matches Studio's CoreGui hierarchy)
 	root_gui = Instance.new("ScreenGui")
@@ -1042,6 +1061,7 @@ local function build_ui()
 	-- Wire TextBox events
 	input_box.Focused:Connect(function()
 		box_focused = true
+		if bridge then bridge.ChatBarFocusChanged:Fire(true) end
 		last_activity_t = os.clock()
 		update_target_chip()
 		update_send_button()
@@ -1049,6 +1069,7 @@ local function build_ui()
 	end)
 	input_box.FocusLost:Connect(function(enter_pressed)
 		box_focused = false
+		if bridge then bridge.ChatBarFocusChanged:Fire(false) end
 		last_activity_t = os.clock()
 		hide_autocomplete()
 		if enter_pressed then
@@ -1142,6 +1163,12 @@ local function build_ui()
 	legacy_box.TextXAlignment = Enum.TextXAlignment.Left
 	legacy_box.Parent = legacy_bar
 
+	legacy_box.Focused:Connect(function()
+		if bridge then bridge.ChatBarFocusChanged:Fire(true) end
+	end)
+	legacy_box.FocusLost:Connect(function()
+		if bridge then bridge.ChatBarFocusChanged:Fire(false) end
+	end)
 	legacy_box.FocusLost:Connect(function(enter_pressed)
 		if enter_pressed then
 			local txt = legacy_box.Text
@@ -1165,10 +1192,7 @@ local function build_ui()
 			if hotkey ~= Enum.KeyCode.Unknown and kc == hotkey then
 				if tcs and cib and not cib.Enabled then return end
 				if not tcs and not svc.Chat.LoadDefaultChat then return end
-				chat_visible = true
-				unread_count = 0
-				update_topbar_badge()
-				last_activity_t = os.clock()
+				set_chat_visible(true)
 				if active_box then
 					active_box:CaptureFocus()
 				end
@@ -1241,6 +1265,8 @@ end
 -- Add a formatted message line to the ExperienceChat window.
 local next_line_order = 0
 local function add_window_line(info)
+	legacy_message_count += 1
+	if bridge then bridge.MessagesChanged:Fire(legacy_message_count) end
 	build_ui()
 	if not scroll_view then return end
 	local cwc = get_cwc()
@@ -1342,6 +1368,8 @@ end
 -- Add a line to the LegacyChat window (and SetCore("ChatMakeSystemMessage")).
 local legacy_order = 0
 local function add_legacy_line(text, color3, text_size, font_face)
+	legacy_message_count += 1
+	if bridge then bridge.MessagesChanged:Fire(legacy_message_count) end
 	build_ui()
 	if not legacy_scroll then return end
 	legacy_order += 1
@@ -1807,10 +1835,101 @@ local function show_translation_notice()
 	})
 end
 
+-- NewChat.lua's CoreGuiChatConnections (Modules/NewChat.lua
+-- RegisterCoreGuiConnections): ChatWindow events the top bar fires at the
+-- chat and functions it asks, SetCore/GetCore events for the Chat* keys.
+-- Registered once NewChat has registered the SetCore (the TopBar requires
+-- it a while after the CoreScripts start): until then the engine's SetCore
+-- answers false and the next frame tries again.
+local set_core, get_core -- (defined below)
+local bridge_offer = nil -- the table handed to NewChat (built once, offered until taken)
+local bridge_warned = false
+local function connect_core_bridge()
+	if bridge or not core_active or type(__rs_core_set_core) ~= "function" then return end
+	if bridge_offer then
+		local ok, registered = pcall(__rs_core_set_core, "CoreGuiChatConnections", bridge_offer)
+		if ok and registered then
+			bridge = bridge_offer.ChatWindow
+		elseif not ok and not bridge_warned then
+			bridge_warned = true
+			warn("rustudio: the CoreScripts' chat bridge (SetCore CoreGuiChatConnections) failed: " .. tostring(registered))
+		end
+		return
+	end
+	local function event(name, fn)
+		local e = Instance.new("BindableEvent")
+		e.Name = name
+		if fn then e.Event:Connect(fn) end
+		return e
+	end
+	local function func(name, fn)
+		local f = Instance.new("BindableFunction")
+		f.Name = name
+		f.OnInvoke = fn
+		return f
+	end
+	local function focus_bar()
+		local box = is_tcs_mode() and input_box or legacy_box
+		if box and not box_focused and core_chat_enabled() and not chat_bar_disabled then
+			set_chat_visible(true)
+			box:CaptureFocus()
+		end
+	end
+	local b = {
+		ChatWindow = {
+			ToggleVisibility = event("ToggleVisibility", function() set_chat_visible(not chat_visible) end),
+			SetVisible = event("SetVisible", function(on) set_chat_visible(on) end),
+			FocusChatBar = event("FocusChatBar", focus_bar),
+			EnterWhisperState = event("EnterWhisperState", focus_bar),
+			TopbarEnabledChanged = event("TopbarEnabledChanged", function(on) topbar_enabled = on ~= false end),
+			CoreGuiEnabled = event("CoreGuiEnabled"),
+			SpecialKeyPressed = event("SpecialKeyPressed", function(key)
+				if key == Enum.SpecialKey.ChatHotkey then focus_bar() end
+			end),
+			IsFocused = func("IsFocused", function() return box_focused end),
+			GetVisibility = func("GetVisibility", function() return chat_visible end),
+			GetMessageCount = func("GetMessageCount", function() return legacy_message_count end),
+			VisibilityStateChanged = event("VisibilityStateChanged"),
+			ChatWindowToggled = event("ChatWindowToggled"),
+			ChatBarFocusChanged = event("ChatBarFocusChanged"),
+			MessagesChanged = event("MessagesChanged"),
+			ChatTypes = {
+				ClassicChatEnabled = svc.Players.ClassicChat,
+				BubbleChatEnabled = svc.Players.BubbleChat,
+			},
+		},
+		SetCore = {
+			ChatMakeSystemMessage = event("ChatMakeSystemMessage", function(data) set_core("ChatMakeSystemMessage", data) end),
+			ChatWindowPosition = event("ChatWindowPosition", function(v) set_core("ChatWindowPosition", v) end),
+			ChatWindowSize = event("ChatWindowSize", function(v) set_core("ChatWindowSize", v) end),
+			ChatBarDisabled = event("ChatBarDisabled", function(v) set_core("ChatBarDisabled", v) end),
+		},
+		GetCore = {
+			ChatWindowPosition = func("ChatWindowPosition", function() return get_core("ChatWindowPosition") end),
+			ChatWindowSize = func("ChatWindowSize", function() return get_core("ChatWindowSize") end),
+			ChatBarDisabled = func("ChatBarDisabled", function() return get_core("ChatBarDisabled") end),
+		},
+	}
+	bridge_offer = b
+	local ok, registered = pcall(__rs_core_set_core, "CoreGuiChatConnections", b)
+	if ok and registered then
+		bridge = b.ChatWindow
+	elseif not ok and not bridge_warned then
+		bridge_warned = true
+		warn("rustudio: the CoreScripts' chat bridge (SetCore CoreGuiChatConnections) failed: " .. tostring(registered))
+	end
+end
+
 -- Per-frame UI sync: layout, configuration styling, fade timing, CoreGuiType.Chat.
 local function step_ui(dt)
 	build_ui()
 	if not root_gui then return end
+	-- (NewChat registers the SetCore when the TopBar first requires it,
+	-- which can be long after the CoreScripts start: offered until taken)
+	if core_active and not bridge then
+		bridge_tries += 1
+		if bridge_tries % 10 == 1 then connect_core_bridge() end
+	end
 	dt = math.clamp(dt or (1 / 60), 0, 0.25)
 
 	local tcs = is_tcs_mode()
@@ -1992,14 +2111,12 @@ local function layout_query(class, key)
 	return sx, sy
 end
 
-local function set_core(key, val)
+function set_core(key, val)
 	if key == "TopbarEnabled" then
 		topbar_enabled = not not val
 		if topbar_gui then topbar_gui.Enabled = topbar_enabled end
 	elseif key == "ChatActive" then
-		chat_visible = not not val
-		if chat_visible then unread_count = 0; last_activity_t = os.clock() end
-		update_topbar_badge()
+		set_chat_visible(val)
 	elseif key == "ChatBarDisabled" then
 		chat_bar_disabled = not not val
 	elseif key == "ChatMakeSystemMessage" and type(val) == "table" then
@@ -2025,7 +2142,7 @@ local function set_core(key, val)
 	end
 end
 
-local function get_core(key)
+function get_core(key)
 	if key == "ChatActive" then return chat_visible end
 	if key == "ChatBarDisabled" then return chat_bar_disabled end
 	if key == "ChatWindowPosition" then

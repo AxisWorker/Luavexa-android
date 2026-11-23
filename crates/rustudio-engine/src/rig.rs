@@ -46,6 +46,11 @@ pub struct BodyColors {
     pub right_leg: [u8; 3],
 }
 
+/// A body colour as the Color3 BodyColors' *Color3 properties hold.
+fn body_color3(c: [u8; 3]) -> rbx_dom_weak::types::Color3 {
+    rbx_dom_weak::types::Color3::new(c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0)
+}
+
 impl Default for BodyColors {
     fn default() -> Self {
         let skin = mech::CHARACTER_SKIN;
@@ -645,40 +650,17 @@ pub fn build_default(
     let humanoid = humanoid
         .with_property("HipHeight", hip_height)
         .with_property("RigType", Enum::from_u32(rig_type));
+    // (BodyColors' *Color3 are Color3 in the file format — a Color3uint8
+    // here fails the save: "Expected BodyColors.HeadColor3 to be of type
+    // Color3, but it was of type Color3uint8".)
     let body_colors = InstanceBuilder::new("BodyColors")
         .with_name("Body Colors")
-        .with_property(
-            "HeadColor3",
-            Color3uint8::new(colors.head[0], colors.head[1], colors.head[2]),
-        )
-        .with_property(
-            "TorsoColor3",
-            Color3uint8::new(colors.torso[0], colors.torso[1], colors.torso[2]),
-        )
-        .with_property(
-            "LeftArmColor3",
-            Color3uint8::new(colors.left_arm[0], colors.left_arm[1], colors.left_arm[2]),
-        )
-        .with_property(
-            "RightArmColor3",
-            Color3uint8::new(
-                colors.right_arm[0],
-                colors.right_arm[1],
-                colors.right_arm[2],
-            ),
-        )
-        .with_property(
-            "LeftLegColor3",
-            Color3uint8::new(colors.left_leg[0], colors.left_leg[1], colors.left_leg[2]),
-        )
-        .with_property(
-            "RightLegColor3",
-            Color3uint8::new(
-                colors.right_leg[0],
-                colors.right_leg[1],
-                colors.right_leg[2],
-            ),
-        );
+        .with_property("HeadColor3", body_color3(colors.head))
+        .with_property("TorsoColor3", body_color3(colors.torso))
+        .with_property("LeftArmColor3", body_color3(colors.left_arm))
+        .with_property("RightArmColor3", body_color3(colors.right_arm))
+        .with_property("LeftLegColor3", body_color3(colors.left_leg))
+        .with_property("RightLegColor3", body_color3(colors.right_leg));
     let mut model = InstanceBuilder::new("Model")
         .with_name(name)
         .with_property("PrimaryPart", Variant::Ref(refs["HumanoidRootPart"]))
@@ -970,17 +952,16 @@ fn studio_character(
             set(dom, p, "Color", Color3uint8::new(c[0], c[1], c[2]));
         }
     }
-    let bc = |c: [u8; 3]| Color3uint8::new(c[0], c[1], c[2]);
     dom.insert(
         m,
         InstanceBuilder::new("BodyColors")
             .with_name("Body Colors")
-            .with_property("HeadColor3", bc(colors.head))
-            .with_property("TorsoColor3", bc(colors.torso))
-            .with_property("LeftArmColor3", bc(colors.left_arm))
-            .with_property("RightArmColor3", bc(colors.right_arm))
-            .with_property("LeftLegColor3", bc(colors.left_leg))
-            .with_property("RightLegColor3", bc(colors.right_leg)),
+            .with_property("HeadColor3", body_color3(colors.head))
+            .with_property("TorsoColor3", body_color3(colors.torso))
+            .with_property("LeftArmColor3", body_color3(colors.left_arm))
+            .with_property("RightArmColor3", body_color3(colors.right_arm))
+            .with_property("LeftLegColor3", body_color3(colors.left_leg))
+            .with_property("RightLegColor3", body_color3(colors.right_leg)),
     );
     Ok(m)
 }

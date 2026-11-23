@@ -142,8 +142,14 @@ M["LocalStorageService.WhenLoaded"] = function(self, fn)
 end
 
 ------------------------------------------------------------ StarterGui SetCore/GetCore registry
+-- name -> handler, and the identity of the CoreScript that registered it:
+-- a handler function runs on a thread at that identity (Roblox runs it in
+-- the CoreScript's context), whoever calls SetCore/GetCore. (A BindableEvent
+-- or BindableFunction handler's connection already runs as its connector.)
 local set_core_handlers = {}
 local get_core_handlers = {}
+local set_core_ident = {}
+local get_core_ident = {}
 
 M["StarterGui.RegisterSetCore"] = function(self, name, fn)
 	local k = str_arg(name, 1)
@@ -151,6 +157,7 @@ M["StarterGui.RegisterSetCore"] = function(self, name, fn)
 		fail("RegisterSetCore: Argument 2 must be a function or BindableEvent")
 	end
 	set_core_handlers[k] = fn
+	set_core_ident[k] = rs.identity()
 end
 M["StarterGui.RegisterGetCore"] = function(self, name, fn)
 	local k = str_arg(name, 1)
@@ -158,13 +165,14 @@ M["StarterGui.RegisterGetCore"] = function(self, name, fn)
 		fail("RegisterGetCore: Argument 2 must be a function or BindableFunction")
 	end
 	get_core_handlers[k] = fn
+	get_core_ident[k] = rs.identity()
 end
 
 function __rs_core_set_core(name, val)
 	local h = set_core_handlers[name]
 	if h == nil then return false end
 	if type(h) == "function" then
-		h(val)
+		rs.call_as(set_core_ident[name] or rs.identity(), h, val)
 	elseif typeof(h) == "Instance" and h:IsA("BindableEvent") then
 		h:Fire(val)
 	end
@@ -175,7 +183,7 @@ function __rs_core_get_core(name)
 	local h = get_core_handlers[name]
 	if h == nil then return false, nil end
 	if type(h) == "function" then
-		return true, h()
+		return true, rs.call_as(get_core_ident[name] or rs.identity(), h)
 	elseif typeof(h) == "Instance" and h:IsA("BindableFunction") then
 		return true, h:Invoke()
 	end

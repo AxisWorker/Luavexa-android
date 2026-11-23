@@ -126,6 +126,21 @@ impl Editor {
         }
         let live_ids = self.live_team_create_ids();
         self.game.keep_game_settings = self.harness.keeps_game_settings();
+        // The view's size before the game's scripts run (Camera.ViewportSize,
+        // GuiService:GetHardwareSafeViewport: Roblox's CoreScripts decide the
+        // phone layouts from it as they start — a 0x0 or the dock's 3D view
+        // made the PlayerList a small-touch modal that then opened over the
+        // game, taking the first tap). With View > Play Fills the Screen the
+        // game takes the whole window from its next frame; at zoom 1 (as
+        // play_full_frame sets it).
+        if self.ui.play_full {
+            if let Some(ctx) = self.plugins.repaint_context() {
+                let size = ctx.content_rect().size() * ctx.zoom_factor();
+                if size.x > 0.0 && size.y > 0.0 {
+                    self.game.viewport_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                }
+            }
+        }
         // Deterministic editor self-tests inspect intermediate VM state.
         let threaded = self.game.use_gameplay_worker() && self.harness.selftest.is_none();
         self.plugins.stop_edit_audio_vm_state();

@@ -391,13 +391,15 @@ pub fn gpu_watch(ed: &mut crate::app::Editor) -> bool {
     let Some(why) = why else { return false };
     HANDLED.store(true, Ordering::Relaxed);
     // The open place, if one is (the Start Page's empty document isn't).
+    // During Play `game.doc` is the session's server copy (characters,
+    // run-time clones): the edit document Stop would bring back is what
+    // goes to the recovery folder.
     let open = !(ed.start.visible && ed.game.doc.id == ed.start.doc_id);
+    let doc = ed.game.play_saved_doc().unwrap_or(&ed.game.doc);
     let saved = if open {
         let dir = rustudio_core::android_dirs::data_dir().join("recovery");
         let _ = std::fs::create_dir_all(&dir);
-        let mut name: String = ed
-            .game
-            .doc
+        let mut name: String = doc
             .title
             .chars()
             .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
@@ -407,7 +409,7 @@ pub fn gpu_watch(ed: &mut crate::app::Editor) -> bool {
             name = "place".into();
         }
         let path = dir.join(format!("{name}-{}.rbxl", chrono::Local::now().format("%Y%m%d-%H%M%S")));
-        match ed.game.doc.encode_all(false).and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string())) {
+        match doc.encode_all(false).and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string())) {
             Ok(()) => format!("The open place was saved to {}", path.display()),
             Err(e) => format!("The open place could not be saved ({e})"),
         }
