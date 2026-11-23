@@ -15,7 +15,7 @@
 //! - `ReflectionMetadata.xml`, taken alone out of `RobloxStudio.zip` with
 //!   HTTP range requests (about 30 KB instead of the 120 MB package).
 //!
-//! About 60 MB to download, a few packages at a time. `rustudio
+//! About 70 MB to download, a few packages at a time. `rustudio
 //! --install-studio-content` does it in the terminal; a normal launch does
 //! it in the background the first time (`RUSTUDIO_NO_STUDIO_FETCH=1` turns
 //! that off). The install counts as complete — Play uses it — once the
@@ -42,6 +42,10 @@ const PACKAGES: &[(&str, &str)] = &[
     ("extracontent-scripts.zip", "ExtraContent/scripts"),
     ("extracontent-models.zip", "ExtraContent/models"),
     ("extracontent-textures.zip", "ExtraContent/textures"),
+    // The CoreScripts' packages the client serves under rbxasset:// (the
+    // Builder Icons font their top bar and menus draw their icons with:
+    // rbxasset://LuaPackages/Packages/_Index/BuilderIcons/…; core_scripts.rs).
+    ("extracontent-luapackages.zip", "ExtraContent/LuaPackages"),
 ];
 /// Single files pulled out of a big package by range requests.
 const SINGLE_FILES: &[(&str, &str)] = &[("RobloxStudio.zip", "ReflectionMetadata.xml")];
@@ -66,6 +70,23 @@ pub fn install_dir() -> PathBuf {
 pub fn installed() -> Option<PathBuf> {
     let d = install_dir();
     d.join(MARKER).is_file().then_some(d)
+}
+
+/// The packages an installed download lacks (one made before they were
+/// listed): fetched into it as they are, nothing else touched.
+fn missing_packages(root: &Path) -> Vec<(&'static str, &'static str)> {
+    PACKAGES.iter().copied().filter(|(_, sub)| !root.join(sub).is_dir()).collect()
+}
+
+/// Fetches `missing_packages` into an installed `root` of `version`.
+fn install_missing_packages(agent: &ureq::Agent, version: &str, root: &Path, progress: &(dyn Fn(&str) + Sync)) -> Result<(), String> {
+    for (pkg, sub) in missing_packages(root) {
+        progress(&format!("downloading {pkg}"));
+        let done = root.join(format!(".done-{pkg}"));
+        install_package(agent, version, pkg, &root.join(sub), &done)?;
+        let _ = std::fs::remove_file(done);
+    }
+    Ok(())
 }
 
 static MESSAGES: Mutex<Vec<(bool, String)>> = Mutex::new(Vec::new());
@@ -93,14 +114,27 @@ pub fn spawn_background_install_if_missing() {
         return;
     }
     if let Some(root) = crate::default_scripts::studio_dir() {
-        // Upgrade older rustudio downloads without replacing the rest of their content.
-        if root == install_dir() && !has_view_selector(&root) {
+        // Upgrade older rustudio downloads without replacing the rest of
+        // their content: the View Selector, and packages listed since.
+        let packages = if root == install_dir() { missing_packages(&root) } else { Vec::new() };
+        if root == install_dir() && (!has_view_selector(&root) || !packages.is_empty()) {
             if let Some(marker) = std::fs::read_to_string(root.join(MARKER)).ok() {
                 if let Some(version) = marker.split_whitespace().next().and_then(studio_version) {
                     let version = version.to_owned();
-                    let _ = std::thread::Builder::new().name("studio-view-selector".into()).spawn(move || {
-                        if let Err(e) = install_view_selector(&agent(), &version, &root) {
-                            post(true, format!("Couldn't download Studio's View Selector: {e}"));
+                    let _ = std::thread::Builder::new().name("studio-content-upgrade".into()).spawn(move || {
+                        let agent = agent();
+                        if !packages.is_empty() {
+                            let names: Vec<&str> = packages.iter().map(|(p, _)| *p).collect();
+                            post(false, format!("Studio content: downloading {} (new in this version of rustudio)…", names.join(", ")));
+                            match install_missing_packages(&agent, &version, &root, &|_| {}) {
+                                Ok(()) => post(false, "Studio content: downloaded".into()),
+                                Err(e) => post(true, format!("Couldn't download Studio content: {e}")),
+                            }
+                        }
+                        if !has_view_selector(&root) {
+                            if let Err(e) = install_view_selector(&agent, &version, &root) {
+                                post(true, format!("Couldn't download Studio's View Selector: {e}"));
+                            }
                         }
                     });
                 }
@@ -109,7 +143,7 @@ pub fn spawn_background_install_if_missing() {
         return;
     }
     let _ = std::thread::Builder::new().name("studio-content".into()).spawn(|| {
-        post(false, "No Roblox Studio install found: downloading Studio's built-in content (default character, player scripts, fonts, textures, sounds; about 60 MB) from Roblox's CDN…".into());
+        post(false, "No Roblox Studio install found: downloading Studio's built-in content (default character, player scripts, fonts, textures, sounds, the CoreScripts' packages; about 70 MB) from Roblox's CDN…".into());
         // The packages as they come, so a slow connection is seen to get
         // somewhere (the retired textures are a hundred small fetches: one
         // line for all of them).
@@ -275,6 +309,7 @@ pub fn install(progress: &(dyn Fn(&str) + Sync)) -> Result<String, String> {
 
     let dest = install_dir();
     if std::fs::read_to_string(dest.join(MARKER)).is_ok_and(|s| s.trim() == format!("{version} {CONTENT_REVISION}")) {
+        install_missing_packages(&agent, &version, &dest, progress)?;
         if !has_view_selector(&dest) {
             progress("downloading Studio View Selector");
             install_view_selector(&agent, &version, &dest)?;

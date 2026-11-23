@@ -500,9 +500,10 @@ Roblox's default character (the R15 body with its face and dynamic head),
 its `Animate` and `Health` scripts, and the PlayerModule whose
 CameraModule follows the character and whose ControlModule moves it all
 come from Studio's own content, which rustudio has none of in the APK: at
-its first start the editor downloads it from Roblox's CDN (about 60 MB
-compressed, 13 packages plus a hundred or so retired textures fetched one
-by one; `crates/rustudio-core/src/studio_content.rs`) into the app's files folder
+its first start the editor downloads it from Roblox's CDN (about 70 MB
+compressed, 14 packages plus a hundred or so retired textures fetched one
+by one; `crates/rustudio-core/src/studio_content.rs`; an install from an
+earlier build fetches the packages listed since at the next start) into the app's files folder
 (`…/files/rustudio/studio`). That takes a few minutes on a phone. Until
 it is there, Play spawns rustudio's stand-in character — plain blocks, no
 face, no animation — and no camera or movement script follows it unless
