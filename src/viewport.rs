@@ -1052,6 +1052,12 @@ impl Editor {
         if !self.game.is_playing() {
             self.toolbox_viewport_drop(ui, rect, &resp);
         }
+        // A game put back here from a filled screen (app.rs play_full_button):
+        // the button that fills the screen with it again.
+        if self.game.is_playing() && self.ui.play_full && self.play_full_exit && !self.clean_view && self.play_full_button(ui, false) {
+            self.play_full_exit = false;
+            ctx.request_repaint();
+        }
     }
 
     pub(crate) fn draw_box(

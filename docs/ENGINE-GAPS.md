@@ -638,6 +638,43 @@ TextService:GetTextSizeOffsetAsync is still a stub. The Help tab wraps
 movement / Menu items groups are not on screen; setting FontFace doesn't
 set Font back; `<stroke>` rich text tags are read but not drawn.
 
+A game's top bar beside Roblox's (round 4, Legends Battlegrounds with the
+CoreScripts on, on a phone):
+- The settings menu's Settings page errored at `Utility:1429` ("invalid
+  argument #1 to 'pairs'"): GameSettings' updateAudioDevices pcalls
+  `SoundService:GetOutputDevices()` / `GetInputDevices()`, and when the
+  call fails it hands the error string to UpdateOptions as the option
+  list. rustudio had none of SoundService's device members, so the
+  CoreScripts' call fell to the generic "lacking capability RobloxScript".
+  Now (domains/media.rs) `GetOutputDevices` / `GetInputDevices` answer the
+  default device's name as a one-entry list with the empty GUID the page
+  labels "Default (...)" and index 1; `GetOutputDevice` / `GetInputDevice`
+  the same name and GUID; `SetOutputDevice` is a no-op (one device: the
+  mixer plays through cpal's default output); the camera selector is behind
+  the VideoCaptureService engine feature, which reads false.
+- TopbarPlus's icons drew over the Chrome top bar's menu and chat buttons.
+  TopbarPlus is a ScreenGui with ScreenInsets TopbarSafeInsets, placed by
+  the engine at this build's own bar (mech GUI_TOPBAR_LEFT_CHAT: 128 px
+  from the left), while the Chrome unibar reaches 164 px. The CoreScripts
+  say where the free area is: CoreGuiCommon's keep-out-area store (and the
+  older KeepOutAreasHandler) takes the unibar's, menu icon's and health
+  bar's boxes and calls `GuiService:SetTopbarInset(Rect)` with the widest
+  strip between them. GuiService.TopbarInset already returned that rect;
+  now it also places TopbarSafeInsets ScreenGuis (World::topbar_inset ->
+  the play view -> Gui::topbar_inset in gui_input.rs, runtime_ext.rs's
+  AbsolutePosition and GetInsetArea): with the CoreScripts on, TopbarPlus
+  starts at 164 px, after the chat button (test
+  core_scripts_topbar_inset_places_topbar_safe_insets_guis). The Chrome
+  bar mounts a few seconds into Play (React renders it as its modules
+  load; 12-15 s on the 2-CPU test machine); until then TopbarPlus sits at
+  the first inset (0, the store's before any area), as on Roblox.
+- `StarterGui:SetCore("TopbarEnabled" / "ChatActive")` and
+  `GetCore("TopbarEnabled")` went to the CoreScripts' SetCore / GetCore
+  registry even when no CoreScript had registered the key, which swallowed
+  them (GetCore("TopbarEnabled") nil; TopbarPlus's IconController polls
+  it, and rustudio's own top bar never hid). Those two keys now fall
+  through to the engine when unregistered (domains/services.rs).
+
 ## Next (open, by how much they block real games)
 
 1. **Soft spot lights** (render): Studio spreads a SpotLight's light well

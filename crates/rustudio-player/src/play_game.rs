@@ -2795,6 +2795,17 @@ impl Game {
             .map_or_else(|| self.core_gui_on("Chat"), |view| view.chat_on)
     }
 
+    /// The CoreScripts' GuiService:SetTopbarInset while Roblox's own
+    /// CoreScripts run (World::topbar_inset; the presentation's copy on the
+    /// worker): where a TopbarSafeInsets ScreenGui goes (`Gui::topbar_inset`).
+    pub(crate) fn core_topbar_inset(&self) -> Option<[f32; 4]> {
+        let s = self.play.as_ref()?;
+        match s.presentation.as_ref() {
+            Some(view) => view.topbar_inset,
+            None => s.client.as_ref().and_then(|c| c.world.as_ref()).and_then(|w| w.topbar_inset),
+        }
+    }
+
     /// Roblox's top bar over the game, as the CoreScripts' TopBar draws it
     /// (Studio's ExtraContent/scripts/CoreScripts/Modules/TopBar:
     /// Constants.lua, Components/TopBarApp.lua and Presentation/{MenuIcon,

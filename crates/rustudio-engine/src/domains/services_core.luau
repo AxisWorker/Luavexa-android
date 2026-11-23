@@ -181,6 +181,14 @@ M["StarterGui.GetCore"] = function(self, name)
 	end
 	return nil
 end
+-- Whether a CoreScript registered `name` (services_core.rs: a SetCore /
+-- GetCore nobody registered is the engine's own — TopbarEnabled over
+-- rustudio's drawn bar, ChatActive, ResetButtonCallback… — not this
+-- module's, which would take it quietly with Roblox's CoreScripts off).
+M["StarterGui.core_registered"] = function(kind, name)
+	local t = if kind == "SetCore" then set_core else get_core
+	return type(name) == "string" and t[name] ~= nil
+end
 
 ------------------------------------------------------------ RunService
 -- The client build the CoreScripts report in telemetry and version checks.

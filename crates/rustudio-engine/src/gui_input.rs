@@ -815,11 +815,16 @@ impl Gui {
                         let ignore = matches!(si, Some(0) | Some(1));
                         let inset = if ignore { 0.0 } else { mech::GUI_TOP_INSET };
                         let (target, canvas, abs_offset) = if si == Some(3) {
-                            let left = mech::gui_topbar_left(self.topbar_chat.unwrap_or(true)).min(rect.width());
+                            // (Roblox's CoreScripts running: the rect their
+                            // TopBar set, past their unibar — World::topbar_inset)
+                            let [x1, y1, x2, y2] = self.topbar_inset.unwrap_or_else(|| {
+                                let left = mech::gui_topbar_left(self.topbar_chat.unwrap_or(true)).min(rect.width());
+                                [left, 0.0, rect.width(), mech::GUI_TOP_INSET]
+                            });
                             (
-                                Target::Screen(Pos2::new(rect.left() + left, rect.top())),
-                                [rect.width() - left, mech::GUI_TOP_INSET],
-                                [left, -mech::GUI_TOP_INSET],
+                                Target::Screen(Pos2::new(rect.left() + x1, rect.top() + y1)),
+                                [(x2 - x1).max(0.0), (y2 - y1).max(0.0)],
+                                [x1, y1 - mech::GUI_TOP_INSET],
                             )
                         } else {
                             (

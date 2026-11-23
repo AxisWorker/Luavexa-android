@@ -572,6 +572,25 @@ pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua:
         .iter()
         .find(|(m, b)| *m == name && rustudio_core::doc::is_a(&class, b))
         .map(|(_, b)| *b)?;
+    // StarterGui:SetCore / GetCore "TopbarEnabled" and "ChatActive" with
+    // no CoreScript registered for them (Roblox's CoreScripts off: this
+    // build's drawn top bar and chat) are the engine's own (runtime_ext.rs:
+    // TopbarEnabled hides the bar — TopbarPlus polls GetCore for it —
+    // ChatActive opens the chat); services_core.luau would take them
+    // quietly. Other keys keep the CoreScripts' rules there.
+    if owner == "StarterGui" && matches!(name, "SetCore" | "GetCore") {
+        let key = match arg(args, 1) {
+            Value::String(k) => k.to_str().ok().map(|s| s.to_string()),
+            _ => None,
+        };
+        if matches!(key.as_deref(), Some("TopbarEnabled" | "ChatActive")) {
+            match core_members::core_registered(lua, name, key.as_deref()) {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
     Some(call_inner(lua, name, owner, &class, this, args))
 }
 

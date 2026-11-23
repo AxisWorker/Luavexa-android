@@ -254,6 +254,9 @@ pub(super) struct PlayView {
     pub(crate) backpack_on: bool,
     /// GuiService.TopbarEnabled (Roblox's top bar over the game).
     pub(crate) topbar_on: bool,
+    /// The CoreScripts' GuiService:SetTopbarInset (World::topbar_inset):
+    /// where TopbarSafeInsets ScreenGuis go while Roblox's own run.
+    pub(crate) topbar_inset: Option<[f32; 4]>,
     pub(crate) hotbar: Vec<(String, String, bool)>,
     status: String,
     /// The client's UserGameSettings (the in-game menu's Settings page
@@ -564,14 +567,14 @@ impl Publication {
         } else if !updated {
             PublishedFrame::Reuse
         } else {
-            let (chat, chat_on, backpack_on, topbar_on, settings) = game.with_play_side(Side::Client, |rt, _, _| {
-                let (chat_on, backpack_on, topbar_on) = rt.world_mut().map_or((true, true, true), |w| {
-                    (!w.core_gui_off.contains("Chat"), !w.core_gui_off.contains("Backpack"), !w.topbar_off)
+            let (chat, chat_on, backpack_on, topbar_on, topbar_inset, settings) = game.with_play_side(Side::Client, |rt, _, _| {
+                let (chat_on, backpack_on, topbar_on, topbar_inset) = rt.world_mut().map_or((true, true, true, None), |w| {
+                    (!w.core_gui_off.contains("Chat"), !w.core_gui_off.contains("Backpack"), !w.topbar_off, w.topbar_inset)
                 });
                 let view = rustudio_engine::runtime::domains::players_chat::chat_view(&rt.lua);
                 let settings = crate::play::game::game_menu::user_game_settings(&rt.lua);
-                (view, chat_on, backpack_on, topbar_on, settings)
-            }).unwrap_or((None, true, true, true, None));
+                (view, chat_on, backpack_on, topbar_on, topbar_inset, settings)
+            }).unwrap_or((None, true, true, true, None, None));
             let status = game.play_status().unwrap_or_default();
             let chat_active = game.play.as_mut().and_then(|s| s.game.chat_active.take());
             let s = game.play.as_ref().expect("live Play publication");
@@ -587,6 +590,7 @@ impl Publication {
                 chat_on,
                 backpack_on,
                 topbar_on,
+                topbar_inset,
                 hotbar: game.play_hotbar(),
                 status,
                 settings,

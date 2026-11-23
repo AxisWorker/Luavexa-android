@@ -4041,8 +4041,12 @@ fn gui_rect(w: &World, r: Ref, depth: usize) -> ([f32; 2], [f32; 2]) {
             // TopbarSafeInsets: the bar's free area, GuiService.TopbarInset
             // (gui_input.rs roots; gui_input.luau topbar_inset).
             "ScreenGui" if inset > 0.0 && rustudio_render::scene::enum_u32(d.prop(r, "ScreenInsets")) == Some(3) => {
-                let left = mech::gui_topbar_left(!w.core_gui_off.contains("Chat")).min(screen[0]);
-                ([left, -inset], [screen[0] - left, inset])
+                // (the CoreScripts' SetTopbarInset when Roblox's own run)
+                let [x1, y1, x2, y2] = w.topbar_inset.unwrap_or_else(|| {
+                    let left = mech::gui_topbar_left(!w.core_gui_off.contains("Chat")).min(screen[0]);
+                    [left, 0.0, screen[0], inset]
+                });
+                ([x1, y1 - inset], [(x2 - x1).max(0.0), (y2 - y1).max(0.0)])
             }
             "ScreenGui" => ([0.0, 0.0], [screen[0], screen[1] - inset]),
             "SurfaceGui" => match d.prop(r, "CanvasSize") {

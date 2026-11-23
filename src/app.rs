@@ -313,6 +313,14 @@ pub struct Editor {
     /// Play Fills the Screen's Stop button is pressed (`play_stop_button`:
     /// the release over it stops the game, however long the press).
     pub stop_pressed: bool,
+    /// … and its Studio button (`play_full_button`).
+    pub full_pressed: bool,
+    /// View > Play Fills the Screen is on, but this Play's game was put
+    /// back in the dock's 3D view by the Studio button at its top right
+    /// (Output, Explorer, plugins and the ribbon's Stop around it); the
+    /// view's Fill the Screen button undoes it. Not saved: the next Play
+    /// fills the screen again.
+    pub play_full_exit: bool,
     /// The open project folder (files are the truth; src/project_sync.rs).
     pub project: Option<crate::project_sync::ProjectState>,
     /// A folder with several project files: (folder, the files) to choose from.
@@ -494,6 +502,8 @@ impl RustudioApp {
             auto_zoom: false,
             last_work_ms: 0.0,
             stop_pressed: false,
+            full_pressed: false,
+            play_full_exit: false,
             project: None,
             project_choice: None,
             project_export: None,
@@ -2849,7 +2859,7 @@ impl RustudioApp {
     /// Roblox a 886 × 411 unit canvas: the phone layout, 70-unit jump
     /// button, every button on the screen).
     fn play_fills_screen(&self) -> bool {
-        self.ed.ui.play_full && self.ed.game.play.is_some()
+        self.ed.ui.play_full && !self.ed.play_full_exit && self.ed.game.play.is_some()
     }
 
     fn play_full_frame(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, frame_start: Instant, dt: f32) {
@@ -2871,15 +2881,22 @@ impl RustudioApp {
         self.ed.ui.viewport_hidden = false;
         let ed = &mut self.ed;
         let mut stop = false;
+        let mut dock = false;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG))
             .show(ui, |ui| {
                 let _p = rustudio_core::bench::scope("viewport");
                 ed.viewport_ui(ui);
                 stop = ed.play_stop_button(ui);
+                dock = ed.play_full_button(ui, true);
             });
         if stop {
             ed.stop_play();
+        } else if dock {
+            // Back to Studio around the game: the next frame is the editor's
+            // (`frame`), the game in the dock's 3D view until Fill the Screen.
+            ed.play_full_exit = true;
+            ctx.request_repaint();
         }
         ed.user_screenshot_tick(ctx);
         rustudio_engine::runtime::domains::assets_cloud::capture::frame_tick(ctx, ed.game.viewport_rect);
@@ -2972,7 +2989,76 @@ impl Editor {
     /// finger landing on it stays egui's (`Zones::ui`, src/touch_input.rs).
     /// Returns whether it was tapped.
     pub fn play_stop_button(&mut self, ui: &mut egui::Ui) -> bool {
+        use egui::{Color32, Rect, Stroke};
+        const SQUARE: f32 = 16.0;
+        let mut pressed = self.stop_pressed;
+        let hit = self.play_top_right_button(ui, 0, "play_full_stop", "Stop (Shift+F5)", &mut pressed, |painter, r| {
+            let square = Rect::from_center_size(r.center(), egui::vec2(SQUARE, SQUARE));
+            painter.rect_filled(square, 2.0, Color32::from_rgb(242, 72, 72));
+            painter.rect_stroke(square, 2.0, Stroke::new(1.0, Color32::from_white_alpha(200)), egui::StrokeKind::Outside);
+        });
+        self.stop_pressed = pressed;
+        hit
+    }
+
+    /// Beside Stop, the way between the two places a played game is shown
+    /// (`play_full_exit`): over a filled screen (`full`) a Studio button —
+    /// a window glyph — puts the game back in the dock's 3D view, with the
+    /// Output, Explorer, plugin widgets and the ribbon's Stop around it
+    /// (the phone's Studio around a game, which Play Fills the Screen hid);
+    /// in that view (View > Play Fills the Screen on, `viewport_ui`) a Fill
+    /// the Screen button — four corners — takes the game back over the
+    /// window. Returns whether it was tapped.
+    pub fn play_full_button(&mut self, ui: &mut egui::Ui, full: bool) -> bool {
         use egui::{Color32, Pos2, Rect, Stroke};
+        let mut pressed = self.full_pressed;
+        let (id, tip) = if full {
+            ("play_full_studio", "Studio around the game (Output, Explorer, plugins; View > Play Fills the Screen)")
+        } else {
+            ("play_full_fill", "Fill the screen with the game")
+        };
+        // (the Stop button's slot in a filled screen; the dock's view has
+        // the ribbon's Stop, so this one takes the corner)
+        let slot = if full { 1 } else { 0 };
+        let hit = self.play_top_right_button(ui, slot, id, tip, &mut pressed, |painter, r| {
+            let stroke = Stroke::new(2.0, Color32::from_white_alpha(230));
+            let c = r.center();
+            if full {
+                // A window: its frame and title bar.
+                let w = Rect::from_center_size(c, egui::vec2(18.0, 15.0));
+                painter.rect_stroke(w, 2.0, stroke, egui::StrokeKind::Inside);
+                painter.rect_filled(Rect::from_min_max(w.min, Pos2::new(w.max.x, w.min.y + 4.0)), 1.0, Color32::from_white_alpha(230));
+            } else {
+                // Four corners of a screen.
+                let h = egui::vec2(9.0, 8.0);
+                let arm = 5.0;
+                for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                    let corner = Pos2::new(c.x + sx * h.x, c.y + sy * h.y);
+                    painter.line_segment([corner, Pos2::new(corner.x - sx * arm, corner.y)], stroke);
+                    painter.line_segment([corner, Pos2::new(corner.x, corner.y - sy * arm)], stroke);
+                }
+            }
+        });
+        self.full_pressed = pressed;
+        hit
+    }
+
+    /// One of the top-right buttons over a played game, in `slot` (0 at the
+    /// right edge, 1 beside it …): drawn as one of Roblox's top-bar
+    /// IconButtons (iconBase under `glyph`), after the view so it is over
+    /// the game's GUIs and the menu's shield; a finger landing on it stays
+    /// egui's (`Zones::ui`, src/touch_input.rs). `pressed` is the button's
+    /// own press memory. Returns whether it was tapped.
+    fn play_top_right_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        slot: usize,
+        id: &str,
+        tip: &str,
+        pressed: &mut bool,
+        glyph: impl FnOnce(&egui::Painter, egui::Rect),
+    ) -> bool {
+        use egui::{Color32, Pos2, Rect};
         if !self.game.is_playing() {
             return false;
         }
@@ -2983,21 +3069,18 @@ impl Editor {
         const BAR_H: f32 = mech::GUI_TOP_INSET; // TopBarHeight
         const BUTTON: f32 = 44.0; // TopBarButtonHeight
         const BUTTON_PAD: f32 = 2.0; // TopBarButtonPadding
+        const GAP: f32 = 12.0; // between the bar's buttons (TopBar Constants Padding)
         const TOP_MARGIN: f32 = BAR_H - BUTTON - 2.0 * BUTTON_PAD; // TopBarTopMargin
         const SIDE: f32 = 16.0; // ScreenSideOffset
-        const SQUARE: f32 = 16.0;
         let y = rect.min.y + TOP_MARGIN + (BAR_H - TOP_MARGIN - BUTTON) * 0.5;
-        let r = Rect::from_min_size(Pos2::new(rect.max.x - SIDE - BUTTON, y), egui::vec2(BUTTON, BUTTON));
+        let x = rect.max.x - SIDE - BUTTON - slot as f32 * (BUTTON + GAP);
+        let r = Rect::from_min_size(Pos2::new(x, y), egui::vec2(BUTTON, BUTTON));
         self.game.touch.zones.ui.push(r);
-        let resp = ui
-            .interact(r, ui.id().with("play_full_stop"), egui::Sense::click())
-            .on_hover_text("Stop (Shift+F5)");
+        let resp = ui.interact(r, ui.id().with(id), egui::Sense::click()).on_hover_text(tip);
         let painter = ui.painter_at(rect);
         // (iconBase.png: black at 0.5, corners 8 of its 32)
         painter.rect_filled(r, 8.0, Color32::from_black_alpha(128));
-        let square = Rect::from_center_size(r.center(), egui::vec2(SQUARE, SQUARE));
-        painter.rect_filled(square, 2.0, Color32::from_rgb(242, 72, 72));
-        painter.rect_stroke(square, 2.0, Stroke::new(1.0, Color32::from_white_alpha(200)), egui::StrokeKind::Outside);
+        glyph(&painter, r);
         // IconButton's StateOverlay: black at 0.3 while pressed, white at 0.1 while hovered.
         let down_on = resp.is_pointer_button_down_on();
         if down_on {
@@ -3008,13 +3091,13 @@ impl Editor {
         // A click, or a press on it let go over it: egui's click needs the
         // release within 0.8 s and 6 points of the press, and a game's long
         // frame (a phone loading one) or a finger that rests on the button
-        // breaks that — the one button that leaves the game has to work
-        // regardless (the harness's `--ui-click` lost it that way at 1 fps).
+        // breaks that — the buttons that leave the game have to work
+        // regardless (the harness's `--ui-click` lost Stop that way at 1 fps).
         let (released, at) = ui.input(|i| (i.pointer.any_released(), i.pointer.interact_pos()));
-        let let_go = released && self.stop_pressed && at.is_some_and(|p| r.contains(p));
-        self.stop_pressed = down_on || (self.stop_pressed && !released && ui.input(|i| i.pointer.any_down()));
+        let let_go = released && *pressed && at.is_some_and(|p| r.contains(p));
+        *pressed = down_on || (*pressed && !released && ui.input(|i| i.pointer.any_down()));
         if resp.clicked() || let_go {
-            self.stop_pressed = false;
+            *pressed = false;
             return true;
         }
         false

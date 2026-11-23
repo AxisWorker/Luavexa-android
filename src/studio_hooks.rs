@@ -112,6 +112,9 @@ impl Editor {
         if self.defer_play_until_loaded(mode) {
             return;
         }
+        // (View > Play Fills the Screen: every Play starts over the window;
+        // the Studio button's exit lasted the last one)
+        self.play_full_exit = false;
         // (a teleport's new session keeps the Output, as Studio's does)
         let teleport = self.game.teleport_to.as_ref().map(|t| t.place_id);
         let clear_output = teleport.is_none()

@@ -189,6 +189,14 @@ pub struct World {
     /// StarterGui:SetCore("TopbarEnabled", false) hid Roblox's top bar
     /// (the menu button and the chat button over the game view).
     pub topbar_off: bool,
+    /// GuiService:SetTopbarInset from Roblox's own CoreScripts when they run
+    /// (gui_input.luau; their KeepOutAreasHandler: the top bar's widest
+    /// strip clear of the unibar, health bar and the rest): x1, y1, x2, y2
+    /// in screen pixels from the top-left of the view. A ScreenGui with
+    /// ScreenInsets TopbarSafeInsets is this rect (gui_input.rs roots,
+    /// runtime_ext.rs AbsolutePosition); None: this build's drawn bar
+    /// (mech::gui_topbar_left).
+    pub topbar_inset: Option<[f32; 4]>,
     /// Current Enum.HumanoidStateType name per Humanoid (Humanoid:GetState).
     pub humanoid_states: HashMap<Ref, &'static str>,
     /// Humanoid:SetStateEnabled(state, false) per Humanoid (state names).
@@ -681,6 +689,7 @@ impl World {
             keys_down: HashSet::new(),
             core_gui_off: HashSet::new(),
             topbar_off: false,
+            topbar_inset: None,
             humanoid_states: HashMap::new(),
             states_disabled: HashMap::new(),
             groups: rustudio_core::collision_groups::shared(),
@@ -9048,6 +9057,76 @@ mod legacy_tests {
         assert!(has("area 128 -58 800 0"), "{out:?}");
         assert!(has("nochat 72 728 72 72"), "{out:?}");
         assert!(has("core 0 0 800 542"), "{out:?}");
+    }
+
+    /// With Roblox's own CoreScripts running, their TopBar's
+    /// GuiService:SetTopbarInset (the bar's widest strip clear of the
+    /// unibar and the health bar) is where a TopbarSafeInsets ScreenGui
+    /// goes — TopbarPlus's icons after the real unibar, not after this
+    /// build's drawn bar — in its AbsolutePosition / AbsoluteSize, in
+    /// GetInsetArea and in the TopbarInset property (changed signal too).
+    /// The settings page's SoundService:GetOutputDevices() is a device list
+    /// (names, guids, index), never an error it would feed to pairs().
+    #[test]
+    fn core_scripts_topbar_inset_places_topbar_safe_insets_guis() {
+        let mut d = Document::new_place();
+        let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
+        let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
+        let src = r#"
+            local GuiService = game:GetService("GuiService")
+            local gui = Instance.new("ScreenGui")
+            gui.Name = "TopbarPlus"
+            gui.IgnoreGuiInset = true
+            gui.ScreenInsets = Enum.ScreenInsets.TopbarSafeInsets
+            gui.Parent = game:GetService("StarterGui")
+            GuiService:GetPropertyChangedSignal("TopbarInset"):Connect(function()
+                local i = GuiService.TopbarInset
+                print("changed", i.Min.X, i.Max.X, gui.AbsolutePosition.X, gui.AbsoluteSize.X)
+            end)
+        "#;
+        let s = d.dom.insert(
+            sps,
+            InstanceBuilder::new("LocalScript").with_name("T").with_property("Source", src.to_string()),
+        );
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(d, RunMode::Run);
+        w.side = Side::Client;
+        w.input.view_size = [800.0, 600.0];
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        rt.step(1.0 / 60.0);
+        let r = security::with_main_identity(&rt.lua, security::CORE, || {
+            rt.lua
+                .load(r#"
+                    local GuiService = game:GetService("GuiService")
+                    GuiService:SetTopbarInset(Rect.new(212, 0, 660, 58))
+                    local i = GuiService.TopbarInset
+                    print("inset", i.Min.X, i.Min.Y, i.Max.X, i.Max.Y)
+                    local gui = game:GetService("StarterGui").TopbarPlus
+                    print("gui", gui.AbsolutePosition.X, gui.AbsolutePosition.Y, gui.AbsoluteSize.X, gui.AbsoluteSize.Y)
+                    local a = GuiService:GetInsetArea(Enum.ScreenInsets.TopbarSafeInsets)
+                    print("area", a.Min.X, a.Min.Y, a.Max.X, a.Max.Y)
+                    local names, guids, index = game:GetService("SoundService"):GetOutputDevices()
+                    print("devices", typeof(names), #names, typeof(guids), guids[1] == "", index, typeof(names[1]))
+                    local n, g = game:GetService("SoundService"):GetOutputDevice()
+                    print("device", n == names[1], g)
+                "#)
+                .set_name("=core")
+                .exec()
+        });
+        assert!(r.is_ok(), "{r:?}");
+        rt.step(1.0 / 60.0);
+        let inset = world(&rt.lua).unwrap().topbar_inset;
+        let out = rt.leave().output;
+        let has = |p: &str| out.iter().any(|(_, t)| t.starts_with(p));
+        assert_eq!(inset, Some([212.0, 0.0, 660.0, 58.0]));
+        assert!(has("inset 212 0 660 58"), "{out:?}");
+        assert!(has("changed 212 660 212 448"), "{out:?}");
+        assert!(has("gui 212 -58 448 58"), "{out:?}");
+        assert!(has("area 212 -58 660 0"), "{out:?}");
+        assert!(has("devices table 1 table true 1 string"), "{out:?}");
+        assert!(has("device true "), "{out:?}");
     }
 
     /// Two things a fighting game's modules do that Roblox takes: index

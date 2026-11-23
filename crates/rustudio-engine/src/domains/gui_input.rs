@@ -747,6 +747,17 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         "core_gui_on",
         lua.create_function(|lua, name: String| Ok(world(lua).is_ok_and(|w| !w.core_gui_off.contains(&name))))?,
     )?;
+    // set_topbar_inset(x1, y1, x2, y2): the CoreScripts' GuiService:SetTopbarInset,
+    // for the layout of TopbarSafeInsets ScreenGuis (World::topbar_inset).
+    g.set(
+        "set_topbar_inset",
+        lua.create_function(|lua, (x1, y1, x2, y2): (f32, f32, f32, f32)| {
+            if let Ok(mut w) = world(lua) {
+                w.topbar_inset = Some([x1, y1, x2, y2]);
+            }
+            Ok(())
+        })?,
+    )?;
     // A handle adornment is under the mouse or held: the edit viewport's
     // selection tools leave the press to it (Studio's priority).
     g.set(

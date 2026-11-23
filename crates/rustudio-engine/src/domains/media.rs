@@ -575,6 +575,11 @@ const OWN_FNS: &[(&str, &str)] = &[
     ("SetUserIdAccessList", "AudioDeviceInput"),
     ("GetMixerTime", "SoundService"),
     ("SetInputDevice", "SoundService"),
+    ("GetInputDevice", "SoundService"),
+    ("GetInputDevices", "SoundService"),
+    ("GetOutputDevice", "SoundService"),
+    ("GetOutputDevices", "SoundService"),
+    ("SetOutputDevice", "SoundService"),
 ];
 
 const N_METHODS: usize = WIRE_FNS.len() + OWN_FNS.len() + misc::METHODS.len();
@@ -625,9 +630,45 @@ pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua:
         "SetInputDevice" if class == "SoundService" => Err(rt_err(
             "The current thread cannot call 'SetInputDevice' (lacking capability InternalTest)",
         )),
+        // The CoreScripts' settings page (GameSettings.lua updateAudioDevices):
+        // `names, guids, selected = SoundService:GetOutputDevices()` inside a
+        // pcall whose failure it then feeds to a selector as if it were the
+        // list (Utility.lua UpdateOptions: "invalid argument #1 to 'pairs'
+        // (table expected, got string)"). One device each way: the system
+        // default (guid "", which the page labels "Default (…)").
+        "GetInputDevices" | "GetOutputDevices" if class == "SoundService" => (|| {
+            let names = lua.create_sequence_from([audio_device_name(name == "GetInputDevices")])?;
+            let guids = lua.create_sequence_from([""])?;
+            Ok(MultiValue::from_vec(vec![Value::Table(names), Value::Table(guids), Value::Integer(1)]))
+        })(),
+        "GetInputDevice" | "GetOutputDevice" if class == "SoundService" => (|| {
+            let n = lua.create_string(audio_device_name(name == "GetInputDevice"))?;
+            Ok(MultiValue::from_vec(vec![Value::String(n), Value::String(lua.create_string("")?)]))
+        })(),
+        "SetOutputDevice" if class == "SoundService" => Ok(MultiValue::new()),
         _ => return None,
     };
     Some(r)
+}
+
+/// The system's default output (or input) device, as the audio backend
+/// names it, once; "Default" where there is none to ask.
+fn audio_device_name(input: bool) -> String {
+    use std::sync::OnceLock;
+    static NAMES: [OnceLock<String>; 2] = [OnceLock::new(), OnceLock::new()];
+    NAMES[input as usize]
+        .get_or_init(|| {
+            std::panic::catch_unwind(|| {
+                use rodio::cpal::traits::{DeviceTrait, HostTrait};
+                let host = rodio::cpal::default_host();
+                let dev = if input { host.default_input_device() } else { host.default_output_device() };
+                dev.and_then(|d| d.description().ok()).map(|d| d.name().trim().to_string()).filter(|n| !n.is_empty())
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "Default".to_string())
+        })
+        .clone()
 }
 
 fn one(v: Value) -> MultiValue {

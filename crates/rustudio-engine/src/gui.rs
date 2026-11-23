@@ -373,6 +373,11 @@ pub struct Gui {
     /// with ScreenInsets TopbarSafeInsets — starts (`mech::gui_topbar_left`).
     /// Set by the view before each draw; None reads as on (Roblox's default).
     pub topbar_chat: Option<bool>,
+    /// The CoreScripts' GuiService:SetTopbarInset while Roblox's own
+    /// CoreScripts run (World::topbar_inset: x1, y1, x2, y2 from the view's
+    /// top-left): where a TopbarSafeInsets ScreenGui goes, over `topbar_chat`.
+    /// Set by the view before each draw.
+    pub topbar_inset: Option<[f32; 4]>,
     /// SurfaceGui / BillboardGui triangles (AlwaysOnTop false) for the
     /// renderer's depth-tested pass, by egui texture (round 23).
     pub world_batches: Vec<rustudio_render::world_gui::GuiBatch>,

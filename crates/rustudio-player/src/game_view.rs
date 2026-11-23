@@ -2241,6 +2241,7 @@ impl Game {
         // (where the top bar's free area starts: after the chat button when
         // Roblox's chat is on — TopbarSafeInsets ScreenGuis)
         self.gui.topbar_chat = Some(!playing || self.chat_core_gui_on());
+        self.gui.topbar_inset = if playing { self.core_topbar_inset() } else { None };
         {
             let doc_dir = self
                 .doc

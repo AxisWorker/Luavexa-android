@@ -184,6 +184,16 @@ pub(super) fn luau_member(lua: &Lua, owner: &str, name: &str) -> mlua::Result<bo
     m.contains_key(format!("{owner}.{name}"))
 }
 
+/// Whether a CoreScript registered `key` for StarterGui's `kind` ("SetCore"
+/// / "GetCore"): services_core.luau's tables. A key none did is the
+/// engine's own SetCore / GetCore (services.rs call).
+pub(super) fn core_registered(lua: &Lua, kind: &str, key: Option<&str>) -> mlua::Result<bool> {
+    let Some(key) = key else { return Ok(false) };
+    let m: Table = lua.named_registry_value("svc_core_impl")?;
+    let f: Function = m.get("StarterGui.core_registered")?;
+    f.call((kind, key))
+}
+
 /// Engine features rustudio answers true: the API each gates is
 /// implemented. AvatarChatServiceEnabled: AvatarChatService
 /// (media_misc.rs). Roblox's clients have it on: VoiceChatCore's

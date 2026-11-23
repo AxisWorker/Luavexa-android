@@ -351,7 +351,17 @@ counts however long it lasted or the frame between was, egui's own click
 giving up after 0.8 s), since the ribbon's Stop is hidden with the ribbon
 and a phone has no Shift+F5. Checked headless: `--play --window 1280x720
 --ui-click 1242,34@10` on a place ends the session (the result JSON's
-`state` reads `edit`). The Back
+`state` reads `edit`). **Beside Stop, a Studio button** (a window glyph,
+`play_full_button`) puts the game back in the dock's 3D view without
+ending it — the Output, Explorer, Properties, plugin widgets and the
+ribbon's Stop around it, the editor's zoom back — for reading a game's
+prints or using a plugin while it runs; the view's top-right **Fill the
+Screen button** (four corners) takes it back over the window. Session
+state only (`Editor::play_full_exit`): the next Play fills the screen
+again, and View > Play Fills the Screen stays the setting. Headless:
+`--ui-click 1186,34@10` docks it (the window shows the ribbon and the
+dock with the game still playing) and a click on the view's corner
+button fills it again. The Back
 button still opens Roblox's menu, whose Leave (then its confirmation)
 ends the session too, and a game that kicked the player (`Player:Kick`)
 shows Studio's "Disconnected" dialog with a Leave button that ends it as

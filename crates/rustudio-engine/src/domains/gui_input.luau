@@ -172,7 +172,12 @@ LM.GetInspectMenuEnabled = function() return gs_state.inspect_enabled end
 -- pixels the CoreScripts' own top bar asks for (TopBar Constants).
 methods["GuiService.SetTopbarInset"] = function(inst, r)
     if typeof(r) ~= "Rect" then argerr(1, "SetTopbarInset", "Rect", r) end
-    if gs_state.topbar_inset ~= r then gs_state.topbar_inset = r changed(inst, "TopbarInset") end
+    if gs_state.topbar_inset ~= r then
+        gs_state.topbar_inset = r
+        -- (the layout of TopbarSafeInsets ScreenGuis follows: World::topbar_inset)
+        G.set_topbar_inset(r.Min.X, r.Min.Y, r.Max.X, r.Max.Y)
+        changed(inst, "TopbarInset")
+    end
 end
 methods["GuiService.SetGlobalGuiInset"] = function(_, x1, y1, x2, y2)
     gs_state.global_inset = { x1, y1, x2, y2 }
@@ -359,7 +364,7 @@ methods["GuiService.GetInsetArea"] = function(_, insets)
     -- TopbarSafeInsets: the bar's free area (TopbarInset), above y = 0.
     if insets == Enum.ScreenInsets.TopbarSafeInsets and inset > 0 then
         local bar = topbar_inset()
-        return Rect.new(bar.Min.X, -inset, w, 0)
+        return Rect.new(bar.Min.X, bar.Min.Y - inset, bar.Max.X, bar.Max.Y - inset)
     end
     return Rect.new(0, -inset, w, h - inset)
 end
