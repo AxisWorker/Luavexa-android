@@ -1,5 +1,13 @@
 # Developing rustudio
 
+rustudio builds for Linux, Windows, macOS and Android from one workspace.
+Everything below is about the desktop binary unless it says otherwise; the
+Android app (the same `rustudio` library inside a `NativeActivity`, built
+into an APK with xbuild, driven by touch, tested on a device over `adb`)
+has its own guide: [ANDROID.md](ANDROID.md) — building, what differs on a
+phone (`src/android/`, `crates/rustudio-android/`), the touch layer, the
+soft keyboard, graphics on a phone's GPU, and the device-run notes.
+
 ## Command-line options
 
 Mostly for automated testing and benchmarking.
@@ -39,7 +47,10 @@ thread ("(resume) Chunk:line" where it waits) and by script start, and
 FindPartOnRayWithIgnoreList", "index Position") with their call counts.
 `RUSTUDIO_HITCH=1` prints every Lua resume over 10 ms (with the engine
 calls inside one over 300 ms) and every engine call over 5 ms, to find
-hitches.
+hitches. `RUSTUDIO_MEMORY_LOG=1` has the Play worker log, every 15 s, its
+two Lua heaps, the two DataModels' sizes and how many of its publications
+replaced the viewport's whole document rather than sending a delta (on by
+default on Android: `docs/ANDROID.md`), to place a memory growth.
 
 On macOS there is no gamescope: `--screenshot`, `--self-test` and `--bench`
 open a normal window (keep it in front; macOS slows down hidden windows).

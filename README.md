@@ -8,9 +8,10 @@
   <a href="https://discord.gg/pdVZpADpWr"><img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white" alt="Join the rustudio Discord"></a>
 </p>
 
-**A native Linux/Windows/macOS Roblox Studio, written in Rust.** Open, edit and save
+**A native Linux/Windows/macOS/Android Roblox Studio, written in Rust.** Open, edit and save
 Roblox places, press Play and run them with real Luau, physics, characters
-and GUIs, without Wine.
+and GUIs, without Wine — on a desktop, or on a phone or tablet with a touch
+screen, where Studio has never run.
 
 ![Editing a place in rustudio](docs/images/editor.png)
 
@@ -107,8 +108,10 @@ export RUSTUDIO_STUDIO_DIR=~/.var/app/org.vinegarhq.Vinegar/data/vinegar/version
 | Linux ARM64 | Should build; untested |
 | macOS 11+ (Apple Silicon and Intel) | Builds and runs (tested on Apple Silicon) |
 | Windows x86_64 (MSVC) | Builds and runs (tested on Windows 11) |
+| Android 7+ (arm64-v8a; x86_64 for the emulator) | Builds and runs (tested on Samsung Galaxy phones, Android 13); see [docs/ANDROID.md](docs/ANDROID.md) |
 
-CI builds and tests on Linux, Windows and macOS (ARM and Intel).
+CI builds and tests on Linux, Windows and macOS (ARM and Intel), and builds
+the Android APKs.
 
 - **Windows:** data and caches live in `%LOCALAPPDATA%\rustudio`, settings
   in `%APPDATA%\rustudio`. Video playback is off, and native crashes don't
@@ -116,6 +119,19 @@ CI builds and tests on Linux, Windows and macOS (ARM and Intel).
 - **macOS:** data and settings live in `~/Library/Application Support/rustudio`,
   caches in `~/Library/Caches/rustudio`. Shortcuts follow Studio for Mac.
   Video playback needs `brew install libvpx opus`.
+- **Android:** the same editor inside a `NativeActivity`: the whole Studio
+  — Explorer, Properties, script editor, terrain, Play with the game's own
+  touch controls — driven by fingers (tap, hold-to-drag, two-finger camera,
+  long press for menus), with the soft keyboard typing through its own
+  input connection and a Cut / Copy / Paste bar above it. Places open from
+  the app's folder in shared storage (`Android/data/dev.rustudio.studio/
+  files`), from any Files app ("Open with"), or from Roblox when signed in;
+  Studio's content (the default character, the PlayerModule) is downloaded
+  at the first Play. Phones get the Automatic graphics quality and a Mesa
+  Turnip / PanVK driver switch for Snapdragon and Mali GPUs. Crash reports
+  and logs are copied to `Download/rustudio/` (Help > Copy Logs to
+  Download). Install the APK from the releases page with `adb install` or
+  by opening it on the device.
 
 ## Signing in
 
@@ -128,6 +144,7 @@ session in your system keyring (the Keychain on macOS). See
 ## Docs
 
 - [DEVELOPING.md](docs/DEVELOPING.md): workspace layout, command-line options and tests
+- [ANDROID.md](docs/ANDROID.md): the Android app — building the APK, touch input, the soft keyboard, graphics on a phone, device-run notes
 - [MECHANICS.md](docs/MECHANICS.md): every tuning number and where it comes from
 - [ENGINE-GAPS.md](docs/ENGINE-GAPS.md): engine API that's still missing
 - [TEAMCREATE.md](docs/TEAMCREATE.md): Team Create

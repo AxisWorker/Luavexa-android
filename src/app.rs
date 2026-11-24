@@ -2457,6 +2457,16 @@ impl eframe::App for RustudioApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // A lost GPU device: on the desktop the frame stops here with the
+        // reason in the crash report. On Android the device is lost when a
+        // phone runs out of memory (a 2026-11-24 report: a 250 s Play of a
+        // large place, 7.2 GB resident, "GPU device lost: Out of memory");
+        // that check ran before `gpu_watch` below and panicked before it
+        // could save the open place and relaunch — the user got a crash
+        // report where a saved copy was meant. The Android build leaves the
+        // loss to `gpu_watch` (a save to the recovery folder, a report, a
+        // relaunch) and never panics for it.
+        #[cfg(not(target_os = "android"))]
         rustudio_render::gpu_health::check();
         // The driver's pipeline cache goes to disk once a burst of pipeline
         // builds is over (pipeline_cache.rs): the next start skips them.
@@ -2464,9 +2474,6 @@ impl eframe::App for RustudioApp {
         if let Some(message) = rustudio_render::gpu_health::take_uncaptured() {
             self.ed.warn(message);
         }
-        // The driver's pipeline cache goes to disk once a burst of pipeline
-        // builds is over (pipeline_cache.rs): the next start skips them.
-        rustudio_render::pipeline_cache::save(false);
         // (a phone shows black until this frame is presented: logcat
         // `RustStdoutStderr` has the renderer's and the first frame's share
         // of its start, render.rs `ensure_pipelines` the viewport's)
@@ -3073,7 +3080,14 @@ impl RustudioApp {
                 ),
                 (None, _) => String::new(),
             };
-            crate::android::memory::tick(&doing);
+            let game = &self.ed.game;
+            crate::android::memory::tick(&doing, || {
+                let mut parts = vec![format!("DataModel {} instances", game.doc.dom.descendants().count())];
+                if let Some(r) = game.renderer.as_ref() {
+                    parts.push(r.memory_summary());
+                }
+                parts.join("; ")
+            });
         }
     }
 }
@@ -3204,7 +3218,20 @@ impl RustudioApp {
                 Some(p) => format!("playing {}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
                 None => String::new(),
             };
-            crate::android::memory::tick(&doing);
+            let game = &self.ed.game;
+            crate::android::memory::tick(&doing, || {
+                let mut parts = vec![format!("DataModel {} instances", game.doc.dom.descendants().count())];
+                if let Some(r) = game.renderer.as_ref() {
+                    parts.push(r.memory_summary());
+                }
+                parts.join("; ")
+            });
+            // As in `frame`: a copy made while the game fills the screen
+            // (the bar's Copy of a TextBox, the game's own Ctrl+C) reaches
+            // the system clipboard too — it didn't, so a text copied in
+            // Play pasted nowhere outside the editor.
+            crate::android::clipboard::after_frame(ctx);
+            self.text_menu.end_frame(ctx);
         }
     }
 

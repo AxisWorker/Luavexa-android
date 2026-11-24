@@ -4394,6 +4394,7 @@ dependencies = [
  "glam 0.30.10",
  "image",
  "libc",
+ "log",
  "mlua",
  "pollster 0.4.0",
  "rapier3d",

@@ -2421,7 +2421,7 @@ pub(crate) fn typed_write(lua: &Lua, r: Ref, key: &str, atom: i32, val: FastVal)
         return Some(store_prop_in_world(lua, w, r, *CFRAME, value).map(|_| no_dispatch));
     }
     let canon = info.canon.as_str();
-    if key == "FontSize" || canon == "Disabled" || (canon == "Health" && class == "Humanoid")
+    if key == "FontSize" || canon == "Disabled" || (matches!(canon, "Health" | "MaxHealth") && class == "Humanoid")
         || camera_zoom_opposite(class, canon).is_some()
     {
         return None;
@@ -4245,6 +4245,27 @@ fn newindex_routed(
             w.died.push(r);
         }
         return Ok(());
+    }
+    // MaxHealth lowered under Health: Health follows it (Roblox keeps
+    // Health within [0, MaxHealth], HealthChanged fires for the cut).
+    if class == "Humanoid" && canon == "MaxHealth" {
+        if let Variant::Float32(max) = v {
+            let health = match world(lua)?.d().prop(r, "Health") {
+                Some(Variant::Float32(h)) => h,
+                _ => 100.0,
+            };
+            store_prop(lua, r, canon, Variant::Float32(max))?;
+            if health > max {
+                store_prop(lua, r, "Health", Variant::Float32(max))?;
+                let mut w = world(lua)?;
+                w.fire(r, "HealthChanged", vec![Value::Number(max as f64)]);
+                if max <= 0.0 && health > 0.0 {
+                    w.fire(r, "Died", vec![]);
+                    w.died.push(r);
+                }
+            }
+            return Ok(());
+        }
     }
     let enabling = canon == "Disabled"
         && matches!(v, Variant::Bool(false))
@@ -8909,6 +8930,46 @@ mod tests {
                 assert(instance.CameraMinZoomDistance == 10 and instance.CameraMaxZoomDistance == 25)
             end
         "#).exec().unwrap();
+    }
+
+    /// Roblox clamps a Humanoid's speeds and jumps at 0 (WalkSpeed since
+    /// 2017): a game taking 100 off a WalkSpeed of 8 to hold the player
+    /// still during an emote gets 0, not a walk backwards at 92 studs/s;
+    /// a tween of WalkSpeed passes the same setter. MaxHealth lowered
+    /// under Health takes Health with it.
+    #[test]
+    fn humanoid_speed_and_jump_setters_clamp_at_zero() {
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(Document::new_place(), RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.lua.load(r#"
+            local model = Instance.new("Model", workspace)
+            local h = Instance.new("Humanoid", model)
+            h.WalkSpeed = 8
+            h.WalkSpeed = h.WalkSpeed - 100
+            assert(h.WalkSpeed == 0, "WalkSpeed " .. h.WalkSpeed)
+            h.WalkSpeed = 16
+            assert(h.WalkSpeed == 16)
+            h.JumpPower = -5
+            assert(h.JumpPower == 0, "JumpPower " .. h.JumpPower)
+            h.JumpPower = 5000
+            assert(h.JumpPower == 1000, "JumpPower " .. h.JumpPower)
+            h.JumpHeight = -1
+            assert(h.JumpHeight == 0)
+            h.MaxSlopeAngle = 120
+            assert(h.MaxSlopeAngle == 89)
+            h.MaxHealth = 100
+            h.Health = 100
+            h.MaxHealth = 40
+            assert(h.MaxHealth == 40 and h.Health == 40, "Health " .. h.Health)
+            local tween = game:GetService("TweenService"):Create(h, TweenInfo.new(0.2), { WalkSpeed = -30 })
+            tween:Play()
+            _G.h = h
+        "#).exec().unwrap();
+        for _ in 0..30 {
+            rt.step(1.0 / 60.0);
+        }
+        rt.lua.load(r#"assert(_G.h.WalkSpeed == 0, "tweened WalkSpeed " .. _G.h.WalkSpeed)"#).exec().unwrap();
     }
 
     #[test]

@@ -571,6 +571,11 @@ impl PlaySession {
     pub fn other_doc_id(&self) -> Option<u64> {
         self.other_doc.as_ref().map(|d| d.id)
     }
+
+    /// How many instances the DataModel not shown has (the memory log).
+    pub fn other_doc_instances(&self) -> Option<usize> {
+        self.other_doc.as_ref().map(|d| d.dom.descendants().count())
+    }
 }
 
 /// KeyCode names for the keys the play session reports to scripts. `all`

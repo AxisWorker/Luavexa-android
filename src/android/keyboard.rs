@@ -395,13 +395,19 @@ impl Keyboard {
         self.height_px as f32 / ctx.pixels_per_point().max(0.1)
     }
 
-    /// The keyboard's height plus the band of the text bar above it
-    /// (text_bar.rs: Cut / Copy / Paste / Select all), in points: what the
-    /// window's bottom gives up while the keyboard is up (0 while it is
-    /// down).
+    /// The keyboard's height plus, without the input-connection bridge
+    /// (ime.rs), the band of the text bar above it (text_bar.rs: Cut /
+    /// Copy / Paste / Select all), in points: what the window's bottom
+    /// gives up while the keyboard is up (0 while it is down).
     pub fn room(&self, ctx: &egui::Context) -> f32 {
         let keyboard = self.height(ctx);
-        if keyboard <= 0.0 { 0.0 } else { keyboard + super::text_bar::HEIGHT }
+        if keyboard <= 0.0 {
+            0.0
+        } else if super::text_bar::in_use() {
+            keyboard + super::text_bar::HEIGHT
+        } else {
+            keyboard
+        }
     }
 
     /// What the keyboard and the bar cover of the window while the
@@ -421,5 +427,16 @@ impl Keyboard {
         }
         let full = ui.max_rect().height();
         ui.set_max_height((full - room).max(MIN_HEIGHT.min(full)));
+        // The room given up is painted the window's colour: nothing else
+        // draws there (the panels end above it), and the keyboard doesn't
+        // always cover all of it — the moment between its going and the
+        // next height reading, the band of the text bar while the bar is
+        // not up — which left a black strip over the panels' bottom.
+        let max = ui.max_rect();
+        let band = egui::Rect::from_min_max(egui::pos2(max.min.x, max.max.y), egui::pos2(max.max.x, max.min.y + full));
+        if band.is_positive() {
+            ui.ctx().layer_painter(egui::LayerId::background()).rect_filled(band, 0.0, rustudio_engine::theme::BG);
+        }
     }
+
 }

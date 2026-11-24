@@ -10,6 +10,11 @@
 //! memory: 1280 MB resident (+256 MB in 2.1 s), opening Game.rbxl
 //! ```
 //!
+//! Each line is followed by what the editor holds — the renderer's
+//! meshes, textures and items, the shown DataModel's size (`App::ui`
+//! passes it) — and the Play worker logs its own two Lua heaps and
+//! DataModels (play_worker.rs `memory_log`), so a growth can be placed.
+//!
 //! The first line also tells the device's memory (`ActivityManager
 //! .getMemoryInfo`: total, available now, and the level under which the
 //! system starts ending background processes). When the system sends the
@@ -101,7 +106,7 @@ fn device_line() -> String {
 /// Once a frame: logs the resident size when it has moved a step (the
 /// module comment), and answers the system's low-memory notice. `doing`
 /// names what the app is at (the place opening).
-pub fn tick(doing: &str) {
+pub fn tick(doing: &str, detail: impl FnOnce() -> String) {
     let now = Instant::now();
     if super::lifecycle::take_low_memory() {
         rustudio_core::heap::trim();
@@ -140,4 +145,11 @@ pub fn tick(doing: &str) {
     let device = if first { device_line() } else { String::new() };
     log::info!("memory: {mb} MB resident{change}{doing}{device}");
     w.logged = Some((mb, now));
+    drop(w);
+    // What the editor holds (the renderer's meshes, textures and items;
+    // the shown DataModel), with each line: which of them grew.
+    let detail = detail();
+    if !detail.is_empty() {
+        log::info!("memory: {detail}");
+    }
 }

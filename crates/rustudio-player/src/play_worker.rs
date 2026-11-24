@@ -829,6 +829,10 @@ impl Publication {
                 flashes: s.game.flashes.clone(),
             })
         };
+        if let PublishedFrame::Updated(p) = &frame {
+            let (replaces, serial) = (p.snapshot.replaces_document(), p.snapshot.serial());
+            memory_log(game, replaces, serial);
+        }
         Self {
             frame,
             log: std::mem::take(&mut game.log),
@@ -883,6 +887,62 @@ impl Publication {
             host.document_changed(&game.doc);
         }
     }
+}
+
+/// The worker's memory, in the log while a Play runs on a phone (or with
+/// `RUSTUDIO_MEMORY_LOG=1` anywhere): every [`MEMORY_LOG_EVERY`] the two
+/// Lua heaps and the two DataModels' sizes, and every publication that
+/// replaces the viewport's whole document rather than sending a delta
+/// (the first ten, then every hundredth: one a frame would mean the
+/// viewport rebuilding its scene each frame — the lag and the memory
+/// growth a 2026-11-24 report showed after a switch to the client view,
+/// 7.2 GB resident before the GPU gave out). `adb logcat -s rustudio`
+/// then says where the memory went: a Lua heap, a DataModel, or the
+/// renderer (src/android/memory.rs has the renderer's share).
+const MEMORY_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn memory_log_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("RUSTUDIO_MEMORY_LOG").as_deref() {
+        Ok("0") => false,
+        Ok(_) => true,
+        Err(_) => cfg!(target_os = "android"),
+    })
+}
+
+fn memory_log(game: &mut Game, replaces: bool, serial: u64) {
+    if !memory_log_on() {
+        return;
+    }
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    static REPLACES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if replaces {
+        let n = REPLACES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 10 || n % 100 == 0 {
+            log::info!(
+                "memory: play publication {serial} replaces the viewport's document ({} instances; full snapshot #{n})",
+                game.doc.dom.descendants().count()
+            );
+        }
+    }
+    let now = std::time::Instant::now();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| now.duration_since(t) < MEMORY_LOG_EVERY) {
+        return;
+    }
+    *last = Some(now);
+    drop(last);
+    let showing = game.play.as_ref().map(|s| s.showing);
+    let shown = game.doc.dom.descendants().count();
+    let other = game.play.as_ref().and_then(|s| s.other_doc_instances());
+    let mut heap = |side: Side| game.with_play_side(side, |rt, _, _| rt.lua.used_memory() >> 20).unwrap_or(0);
+    let (server_mb, client_mb) = (heap(Side::Server), heap(Side::Client));
+    log::info!(
+        "memory: play worker: Lua server {server_mb} MB, client {client_mb} MB; {} DataModel {shown} instances{}; {} full snapshots",
+        showing.map_or("shown", |s| s.label()),
+        other.map_or(String::new(), |n| format!(", the other {n}")),
+        REPLACES.load(std::sync::atomic::Ordering::Relaxed)
+    );
 }
 
 impl Game {

@@ -128,7 +128,7 @@ xbuild quirks worth knowing (commit e67b501):
 | Graphics quality (File > Studio Settings > rustudio > Performance) | Manual at the full profile, 100% 3D resolution; Automatic from level 5 | weak-GPU mode (`gpu_caps.rs`: every Android device): Automatic from level 1 — no shadows, SSAO, clouds, bloom, DoF, probe or grass until the frame times allow — and 75% 3D resolution (`rustudio_settings::choice_default`); "Frame time on a phone" below. View > GPU Driver names the adapter and holds the Mesa driver switch |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
 | Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root — and since Android 11 the Files apps can't open `Android/data` either, so the start after a crash copies the report, the session log and the app's own `logcat -d` into **`Download/rustudio/rustudio-logs-<stamp>.txt`**, a file any Files app shows and a user can send; Help > Copy Logs to Download does the same at any time: `src/android/logs.rs`, a `MediaStore.Downloads` row the app inserts, no permission needed). Same `crates/rustudio-core/src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`). A report ends with the last 24 notes (`crash::note`): the GPU errors wgpu reported, a lost device, so it says what led up to it |
-| GPU device lost, GPU out of memory | wgpu's default: a panic | The device gets an uncaptured-error handler and a device-lost callback (`android/mod.rs install_gpu_error_handler`): errors go to logcat and the report notes, the frame goes on. The vendored egui-wgpu (upstream's `renderer.rs` `upload_failed`, since 0.3.3-alpha.2) skips a frame whose index/vertex upload the device refuses instead of panicking (`renderer.rs:984 Failed to create staging buffer for index data` — what a reset Adreno driver looked like). A lost device, or out-of-memory errors every frame for 5 s, ends the run in order (`gpu_watch`): the open place is written to `Android/data/dev.rustudio.studio/files/recovery/<name>-<stamp>.rbxl`, a report says so for the next start, and the activity is relaunched (`jni::relaunch`) |
+| GPU device lost, GPU out of memory | wgpu's default: a panic | The device gets an uncaptured-error handler and a device-lost callback (`android/mod.rs install_gpu_error_handler`): errors go to logcat and the report notes, the frame goes on. The vendored egui-wgpu (upstream's `renderer.rs` `upload_failed`, since 0.3.3-alpha.2) skips a frame whose index/vertex upload the device refuses instead of panicking (`renderer.rs:984 Failed to create staging buffer for index data` — what a reset Adreno driver looked like). A lost device, or out-of-memory errors every frame for 5 s, ends the run in order (`gpu_watch`): the open place is written to `Android/data/dev.rustudio.studio/files/recovery/<name>-<stamp>.rbxl`, a report says so for the next start, and the activity is relaunched (`jni::relaunch`). The desktop's own check (`gpu_health::check` in `App::ui`, which panics on a lost device so a desktop run ends with a report) is not run on Android: it ran before `gpu_watch` got its turn, and a 2026-11-24 device — 7.2 GB resident after four minutes of a 288,000-instance place, the driver out of memory — crashed in it (`gpu_health.rs:88`) instead of saving the place and relaunching |
 | Studio content download | ureq + rustls (ring) | the same, three packages at a time; Play can use the content once the packages are in (the retired textures and View Selector follow in the background). Without a network at start (ConnectivityManager, INTERNET capability — not VALIDATED, which some networks never get) it starts when one comes. A `network check: …` line in Output (and logcat) at every start says how Roblox's servers are reached, phase by phase — DNS, a TCP connect to the first IPv4 and the first IPv6 address, an HTTPS GET — with the time each took; `rustudio --network-check` prints the same on a desktop. Every agent resolves a host IPv4 first (`rustudio_account::http`): a network that advertises an IPv6 that doesn't route — some phones' Wi-Fi and mobile networks — otherwise cost every new connection a connect timeout, and the app "worked, but very slowly". Connects time out after 10 s; one agent (connection pool) per purpose for the process, so an asset doesn't pay DNS, TCP and TLS twice over |
 | Login keyring | `keyring` 4 (Secret Service / Keychain / Credential Manager) | `keyring-core` + `android-native-keyring-store` (SharedPreferences + Android Keystore) behind the same `Entry` API (`crates/rustudio-account/src/store.rs`) |
 | TLS roots (`rustudio-account` MessagingService socket) | OS store (`rustls-native-certs`) | Mozilla's (`webpki-roots`, enabled alongside): Android's CA store isn't in a form `rustls-native-certs` reads; `ureq` already used `webpki-roots` |
@@ -470,6 +470,17 @@ are applied to the mirror and swallowed there, so they aren't typed a
 second time through the window; arrows and the rest pass through to
 native code as before. The keyboard's own Select all / Cut / Copy / Paste
 (`performContextMenuAction`) work on the mirror and the system clipboard.
+A character that nonetheless arrives through the window as a key event
+while the keyboard is up through the bridge (a 2026-11 device typed "s"
+as "ss") is the same character again: once the keyboard's operations have
+been seen for the field, key-event text (winit's `Event::Text`; never
+`Event::Key`) is dropped, and before that it is held back one frame and
+dropped if an operation arrives meanwhile — the key event can reach the
+window a frame before the operation — else typed (`ime.rs key_text`; a
+hardware keyboard whose keys the input method passes on untouched types
+as before, a frame later). Logcat says which way a doubled character came:
+`ime: op …` for the bridge's, `ime: N key-event character(s) dropped /
+typed` for the window's.
 
 The class is compiled by `tools/android/build-dex.sh` (javac → d8, with
 an SDK's `android.jar` and `d8`; run it when the Java changes) into
@@ -522,13 +533,24 @@ the room away at once.
 
 The soft keyboard has no Ctrl, egui's text fields have no menu of their
 own, and egui-winit has no clipboard on Android. So while the keyboard is
-up for anything, a **text bar** stands in a band right above it
-(`src/android/text_bar.rs`, `HEIGHT` points; part of the room keyboard.rs
-makes, or of what the view slides up for a game's TextBox): Cut, Copy,
-Paste and Select all for an egui field, Paste and Copy for a Roblox
-TextBox (a game's in Play, a plugin widget's), fed to egui as the events
-the shortcuts would be (`Event::Cut` / `Copy` / `Paste(text)` / Ctrl+A)
-through `raw_input_hook` on the next frame. egui's `TextEdit` answers
+up for anything **without the input-connection bridge** (its dex failed
+to load: `ime: bridge …` in logcat says), a **text bar** stands in a band
+right above it (`src/android/text_bar.rs`, `HEIGHT` points; part of the
+room keyboard.rs makes, or of what the view slides up for a game's
+TextBox — `text_bar::in_use`): Cut, Copy, Paste and Select all for an
+egui field, Paste and Copy for a Roblox TextBox (a game's in Play, a
+plugin widget's), fed to egui as the events the shortcuts would be
+(`Event::Cut` / `Copy` / `Paste(text)` / Ctrl+A) through `raw_input_hook`
+on the next frame. With the bridge there is no bar: the keyboard's own
+paste, clipboard panel and Select all reach the field through the input
+connection (`commitText`, `performContextMenuAction`), and the bar only
+took a band of the screen — a dark strip labelled "Text" / "TextBox" over
+a game in Play, where the keyboard lies over the view, which a 2026-11
+report called a black bar covering the text. Whatever room the keyboard
+takes is painted the window's colour (`Keyboard::shrink`): the band
+between the panels' end and the keyboard's top was left unpainted, black,
+the moment the keyboard went before the next height reading, and while
+the bar's band was reserved with the bar not up. egui's `TextEdit` answers
 them; a TextBox gets them in `Gui::keyboard` (crates/rustudio-engine/src/gui_input.rs): Paste
 types the clipboard's text in (a single-line box gets line breaks as
 spaces), Copy copies the box's text. The `Editor::shortcuts` Copy / Cut /
@@ -1388,7 +1410,14 @@ release), `clipboard` (each copy put on the system clipboard, each read
 and its length, or "no clip"), `text menu` (open, cut, copy, paste,
 select all), `render quality` (each Automatic level change, with
 `RUSTUDIO_QUALITY_TRACE=1`) and `memory:` (the resident size each 256 MB
-it grows, with the place being opened: `src/android/memory.rs`). For a
+it grows, with the place being opened, followed by what the editor holds
+— the DataModel's instances, the renderer's meshes, slabs, textures and
+items — and, during Play, the worker's own line every 15 s: the two Lua
+heaps, the two DataModels' sizes, and how many publications replaced the
+viewport's whole document instead of sending a delta — one a frame would
+be the viewport rebuilding its scene every frame: `src/android/memory.rs`,
+`play_worker.rs memory_log`; `RUSTUDIO_MEMORY_LOG=1` turns the worker's
+line on on a desktop). For a
 crash: `adb logcat -b crash -d` (debuggerd's tombstone: the
 signal, an abort's message — `memory allocation of N bytes failed` for
 one out of memory — and every thread's stack) and `adb shell dumpsys

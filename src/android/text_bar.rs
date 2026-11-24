@@ -29,6 +29,15 @@
 //! focus never ([`TextBar::before_frame`]); and should the field lack the
 //! focus all the same, it is asked back for the frame the event is handled
 //! in (as the long-press menu does).
+//!
+//! With the input-connection bridge (ime.rs) there is no bar: the
+//! keyboard's own paste, clipboard panel and Select all reach the field
+//! through its `InputConnection` (`commitText`, `performContextMenuAction`),
+//! so the bar only took a band of the screen — a dark strip labelled
+//! "Text" / "TextBox" over a game in Play, where the keyboard lies over
+//! the view — and its band stood unpainted (black) over panel text while
+//! the keyboard was up for nothing. The bar is the fallback for a phone
+//! whose bridge failed to load ([`in_use`]).
 
 use egui::{Align, Event, Id, Key, Layout, Modifiers, Order, Pos2, Rect, SurrenderFocusOn};
 
@@ -36,6 +45,12 @@ use super::keyboard::{Keyboard, Want};
 
 /// The bar's band, in points.
 pub const HEIGHT: f32 = 34.0;
+
+/// Whether the bar (and its band in `Keyboard::room`) is in use: only
+/// without the input-connection bridge (the module comment).
+pub fn in_use() -> bool {
+    !super::ime::available()
+}
 
 const ID: &str = "rustudio text bar";
 
@@ -94,6 +109,11 @@ impl TextBar {
     /// keyboard is up (`keyboard`) for `want`.
     pub fn end_frame(&mut self, ctx: &egui::Context, keyboard: &Keyboard, want: Option<Want>) {
         let keyboard_h = keyboard.height(ctx);
+        if !in_use() {
+            self.shown = false;
+            self.rect = None;
+            return;
+        }
         let Some(want) = want.filter(|_| keyboard_h > 0.0) else {
             self.shown = false;
             self.rect = None;
