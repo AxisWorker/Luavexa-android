@@ -3682,6 +3682,9 @@ impl Game {
         {
             let _s = rustudio_core::bench::scope("p2_player_humanoid");
             hum_out = Some(self.hum_pre(dt));
+            // (the roots the Animator's markers / Stepped / PreSimulation
+            // write against: `hum_stepped_root`)
+            self.hum_roots_seen();
         }
         {
             let _s = rustudio_core::bench::scope("p2_npc_pre");
@@ -3727,6 +3730,7 @@ impl Game {
             }
         }
         if hum_out.is_some() {
+            self.hum_stepped_root();
             self.hum_roots_seen();
         }
         if hum_out.is_some() {

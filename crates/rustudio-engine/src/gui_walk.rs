@@ -2340,7 +2340,23 @@ impl Walk<'_, '_> {
             );
             let canvas_rect = Rect::from_min_size(origin, canvas);
             // UIPadding pads inside the canvas (not added on top of CanvasSize).
-            let mut inner_canvas = padded(d, r, canvas_rect, me.scale);
+            // On an AutomaticCanvasSize axis the children's Scale follows the
+            // ScrollingFrame itself, not the canvas it grew — Roblox lays an
+            // automatic canvas' children out against the frame, so a
+            // UIGridLayout of (0.2, 0.35) cells in an automatic-Y canvas
+            // keeps 0.35 of the window instead of 0.35 of a canvas that then
+            // holds more again (a shop's cards 2.4x too tall after one
+            // frame, taller after each). The canvas is still the scroll
+            // range; `content_size_in` above measured the children the same
+            // way, and `runtime_ext::scroll_geometry` reads them so.
+            let basis = Rect::from_min_size(
+                canvas_rect.min,
+                egui::vec2(
+                    if acs & 1 != 0 { rect.width().min(canvas.x - inset_v).max(0.0) } else { canvas.x },
+                    if acs & 2 != 0 { rect.height().min(canvas.y - inset_h).max(0.0) } else { canvas.y },
+                ),
+            );
+            let mut inner_canvas = padded(d, r, basis, me.scale);
             if chat_style {
                 inner_canvas = inner_canvas.shrink(17.0 * me.scale);
             }
@@ -4019,6 +4035,62 @@ mod layout_tests {
             assert_eq!(b(sf).window, Some([163.0, 100.0]));
             assert_eq!(b(child).pos, [17.0, 0.0]);
             assert_eq!(b(child).size, [163.0, 150.0]);
+        });
+        out.textures_delta.clear();
+    }
+
+    /// AutomaticCanvasSize: on the automatic axis the children's Scale
+    /// follows the frame, not the canvas it grows (three (1, 0.5) children
+    /// of a 100 px automatic-Y frame are 50 px each, the canvas 150 — not
+    /// 75 px in a canvas that then holds 225, and so on); an explicit
+    /// CanvasSize beyond the content is the scroll range but not the
+    /// children's basis either. Without AutomaticCanvasSize the canvas
+    /// stays the basis (`scrolling_frame_insets_gutter_and_direction`).
+    #[test]
+    fn automatic_canvas_children_scale_with_the_frame() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let parent = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let mut frames = Vec::new();
+        for (canvas, auto) in [(0.0f32, 2u32), (400.0, 2), (400.0, 0)] {
+            let sf = doc.dom.insert(parent, InstanceBuilder::new("ScrollingFrame")
+                .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)))
+                .with_property("CanvasSize", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, canvas as i32)))
+                .with_property("ScrollBarThickness", 0i32)
+                .with_property("AutomaticCanvasSize", Enum::from_u32(auto)));
+            doc.dom.insert(sf, InstanceBuilder::new("UIListLayout"));
+            let kids: Vec<Ref> = (0..3)
+                .map(|_| doc.dom.insert(sf, InstanceBuilder::new("Frame")
+                    .with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(0.5, 0)))))
+                .collect();
+            frames.push((sf, kids));
+        }
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(300.0, 300.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let b = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1;
+            let (auto_sf, auto_kids) = &frames[0];
+            assert_eq!(b(*auto_sf).canvas, Some([100.0, 150.0]), "automatic Y holds three 50 px children");
+            for k in auto_kids {
+                assert_eq!(b(*k).size, [100.0, 50.0], "half the frame, not half the canvas");
+            }
+            let (big_sf, big_kids) = &frames[1];
+            assert_eq!(b(*big_sf).canvas, Some([100.0, 400.0]), "an explicit CanvasSize beyond the content");
+            for k in big_kids {
+                assert_eq!(b(*k).size, [100.0, 50.0], "still the frame's half");
+            }
+            let (plain_sf, plain_kids) = &frames[2];
+            assert_eq!(b(*plain_sf).canvas, Some([100.0, 400.0]));
+            for k in plain_kids {
+                assert_eq!(b(*k).size, [100.0, 200.0], "no AutomaticCanvasSize: half the canvas");
+            }
         });
         out.textures_delta.clear();
     }

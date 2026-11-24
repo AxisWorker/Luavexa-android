@@ -7798,10 +7798,17 @@ fn report_frames(lua: &Lua, e: &mlua::Error, mut frames: Vec<(String, u32, Optio
                 Some((p, _)) => p,
                 None => frames.first().map(|f| f.0.as_str()).unwrap_or(""),
             };
+            // (By name, segment by segment: `find_child` is by class, which
+            // only ever matched a service's first segment — the game's
+            // handler got nil for every script.)
             let mut cur = root;
             let mut found = !path.is_empty();
             for name in path.split('.') {
-                match d.find_child(cur, name) {
+                let next = d
+                    .dom
+                    .get_by_ref(cur)
+                    .and_then(|p| p.children().iter().copied().find(|c| d.dom.get_by_ref(*c).is_some_and(|i| i.name == name)));
+                match next {
                     Some(c) => cur = c,
                     None => {
                         found = false;
@@ -10988,6 +10995,40 @@ mod weld_offset_tests {
         );
         assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
         assert_eq!(line(&out, "COUNTS"), "0 1 0 1 0", "{out:?}");
+    }
+
+    /// ScriptContext.Error's third argument is the script that erred — the
+    /// one the error's "Full.Name:line:" prefix names (an engine error with
+    /// no prefix: the innermost frame's) — so a game's error reporter can
+    /// call `script:GetFullName()`; it was always nil (the walk down the
+    /// name went by class).
+    #[test]
+    fn script_context_error_passes_the_script() {
+        let out = run(
+            |d| {
+                let rs = d.find_child(d.dom.root_ref(), "ReplicatedStorage").unwrap();
+                d.dom.insert(
+                    rs,
+                    InstanceBuilder::new("ModuleScript")
+                        .with_name("Mod")
+                        .with_property("Source", "local M = {}\nfunction M.go() error('boom mod') end\nreturn M"),
+                );
+            },
+            r#"
+            game:GetService("ScriptContext").Error:Connect(function(m, t, s)
+                print("SCE_" .. (m:match("boom %w+") or "nil index") .. " " .. typeof(s) .. " " .. (typeof(s) == "Instance" and s:GetFullName() or "-") .. " | " .. t:gsub("\n", "/"))
+            end)
+            task.spawn(function() error("boom main") end)
+            task.spawn(function() require(game.ReplicatedStorage.Mod).go() end)
+            task.spawn(function() local x = nil; x:GetFullName() end)
+            "#,
+        );
+        assert_eq!(line(&out, "SCE_boom main"), "Instance ServerScriptService.T | ServerScriptService.T, line 5/");
+        assert_eq!(
+            line(&out, "SCE_boom mod"),
+            "Instance ReplicatedStorage.Mod | ReplicatedStorage.Mod, line 2 - function go/ServerScriptService.T, line 6/"
+        );
+        assert_eq!(line(&out, "SCE_nil index"), "Instance ServerScriptService.T | ServerScriptService.T, line 7/");
     }
 
     #[test]

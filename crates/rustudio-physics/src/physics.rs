@@ -2814,18 +2814,27 @@ impl Physics {
                 (f, Vec3::ZERO)
             }
             Law::BodyPosition { pos, max, p, d } => {
-                // Studio's BodyPosition closes the gap at a first-order
-                // rate independent of mass, λ = 386·P / max(D, 196)²
-                // (fitted to Studio 0.744: P 1e4 D 1250 → 2.47/s, P 4e4 →
-                // 9.88, D 5000 → 0.154, P 1e3 D 100 → ≈10), holding the
-                // part's weight; the force is capped per world axis by
-                // MaxForce (a 4-stud cube at the default 4000 falls, as in
-                // Studio). ReachedTarget: within 0.1 stud (
-                // compares the squared gap with 0.01).
-                let dd = d.max(196.0);
-                let lambda = (386.0 * p.max(0.0) / (dd * dd)).min(0.9 / h);
+                // Roblox's BodyPosition is a PD controller on the
+                // assembly's acceleration, independent of mass: a = P·e −
+                // D·v re-evaluated every step (Roblox staff, devforum "Body
+                // Mover Mathematics for P and D"), holding the part's
+                // weight; the force is capped per world axis by MaxForce
+                // (a 4-stud cube at the default 4000 falls, as in Studio).
+                // Studio 0.744's large-D rates (P 1e4 D 1250 → 2.47/s, P
+                // 4e4 → 9.88, D 5000 → 0.154, P 1e3 D 100 → ≈10) are that
+                // controller's overdamped limit with D read as
+                // D·max(1, D/386); below 386 it is the plain PD — an
+                // underdamped P 160 D 22 lifts a character 33 studs in a
+                // third of a second (LBG's Savage Fangs), where the earlier
+                // first-order fit took seconds. Implicit in position and
+                // velocity, so any P and D are stable. ReachedTarget:
+                // within 0.1 stud (compares the squared gap with 0.01).
+                let p = p.max(0.0);
+                let d = d.max(0.0);
+                let d_eff = d * (d / 386.0).max(1.0);
                 let e = pos - part.pos;
-                (clamp_axes(force_for(e * lambda), max), Vec3::ZERO)
+                let v_new = (st.v + h * p * e) / (1.0 + h * d_eff + h * h * p);
+                (clamp_axes(force_for(v_new), max), Vec3::ZERO)
             }
             Law::AlignPosition {
                 goal,
@@ -5957,6 +5966,44 @@ mod tests {
     fn floating(doc: &mut Document, at: Vec3) -> Ref {
         let ws = doc.workspace().unwrap();
         doc.dom.insert(ws, part("Box", at, false))
+    }
+
+    /// Savage Fangs (LBG) lifts the caster 33 studs with P 160, D 22,
+    /// MaxForce 1e5: Roblox's PD on acceleration gets there in about a
+    /// third of a second with a small overshoot, mass or not (a 3-stud
+    /// cube weighs about what an R6 character does; 1e5 is not the cap).
+    #[test]
+    fn body_position_small_d_lifts_quickly() {
+        for size in [2.0_f32, 3.0] {
+            let mut doc = Document::new_place();
+            let ws = doc.workspace().unwrap();
+            let a = doc.dom.insert(
+                ws,
+                InstanceBuilder::new("Part")
+                    .with_property("Size", Vector3::new(size, size, size))
+                    .with_property("CFrame", CFrame::new(Vector3::new(0.0, 20.0, 0.0), CFrame::identity().orientation))
+                    .with_property("Anchored", false),
+            );
+            let goal = Vec3::new(0.0, 53.0, 15.0);
+            doc.dom.insert(
+                a,
+                InstanceBuilder::new("BodyPosition")
+                    .with_property("Position", v3(goal))
+                    .with_property("P", 160.0_f32)
+                    .with_property("D", 22.0_f32)
+                    .with_property("MaxForce", Vector3::new(1e5, 1e5, 1e5)),
+            );
+            let mut p = Physics::new(&mut doc);
+            run(&mut p, &mut doc, 24);
+            let at = pos_of(&doc, a);
+            assert!(
+                (at - goal).length() < 4.0,
+                "size {size}: at {at:?} after 0.4 s, goal {goal:?}"
+            );
+            run(&mut p, &mut doc, 60);
+            let at = pos_of(&doc, a);
+            assert!((at - goal).length() < 0.5, "size {size}: settled at {at:?}, goal {goal:?}");
+        }
     }
 
     #[test]
