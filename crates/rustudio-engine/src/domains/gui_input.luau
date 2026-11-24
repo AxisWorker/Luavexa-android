@@ -1297,14 +1297,16 @@ local function drag_step(kind, x, y)
 end
 local function step_drags()
     for _, e in G.drags() do
-        if e.kind == 0 then drag = { obj = e.obj } end
+        if e.kind == 0 then drag = { obj = e.obj, finger = e.finger } end
         if drag and drag.obj == e.obj then
             local ok, err = pcall(drag_step, e.kind, e.x, e.y)
             if not ok then log("error", tostring(err)) end
             if e.kind == 2 then drag = nil end
         end
     end
-    if drag and not G.buttons() then
+    -- A mouse drag ends when the button is no longer held (a release
+    -- the view never saw); a finger's drag ends with its lift (above).
+    if drag and not drag.finger and not G.buttons() then
         local _, _, mx, my = G.view()
         pcall(drag_step, 2, mx, my - 58)
         drag = nil

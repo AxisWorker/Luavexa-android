@@ -285,7 +285,8 @@ impl Editor {
             "grid_2" => (self.show_grid, Some(self.ui.grid_size == 2.0)),
             "grid_4" => (self.show_grid, Some(self.ui.grid_size == 4.0)),
             "grid_16" => (self.show_grid, Some(self.ui.grid_size == 16.0)),
-            "show_ui" => (true, Some(self.ui.show_gui)),
+            "show_ui" => (true, Some(self.starter_gui_shown())),
+            "show_core_ui" => (true, Some(self.ui.show_core_gui)),
             "play_full" => (true, Some(self.ui.play_full)),
             "screenshot" => (true, None),
             "mute" => (true, Some(rustudio_engine::audio::muted())),
@@ -379,12 +380,29 @@ impl Editor {
             .all(|r| matches!(self.game.doc.prop(*r, prop), Some(Variant::Bool(true))))
     }
 
-    /// Where a UI-tab insert goes: the first selected LayerCollector or GuiObject.
+    /// Where a UI-tab insert goes: the first selected `GuiBase2d`
+    /// (`LayerCollector` or `GuiObject`), else — when nothing is selected —
+    /// `StarterGui`'s first `ScreenGui` child (Studio's
+    /// `InsertObjectUtils::setGuiObjectParent`).
     pub fn gui_target(&self) -> Option<Ref> {
+        if self.game.doc.selection.is_empty() {
+            let root = self.game.doc.dom.root_ref();
+            let sg = self.game.doc.find_child(root, "StarterGui")?;
+            return self
+                .game
+                .doc
+                .dom
+                .get_by_ref(sg)?
+                .children()
+                .iter()
+                .copied()
+                .find(|r| self.game.doc.class_of(*r).as_deref() == Some("ScreenGui"));
+        }
         self.game.doc.selection.iter().copied().find(|r| {
-            self.game.doc
+            self.game
+                .doc
                 .class_of(*r)
-                .is_some_and(|c| rustudio_core::doc::is_a(&c, "GuiObject") || rustudio_core::doc::is_a(&c, "LayerCollector"))
+                .is_some_and(|c| rustudio_core::doc::is_a(&c, "GuiBase2d"))
         })
     }
 
@@ -488,6 +506,12 @@ impl Editor {
             a if a.starts_with("toolbox:") => self.toolbox_action(a),
             "about" => self.ui.about = true,
             "logs_folder" => {
+                #[cfg(target_os = "android")]
+                match crate::android::logs::export("Help menu") {
+                    Ok(path) => self.info(format!("The logs were copied to {path} (a Files app: Download > rustudio)")),
+                    Err(e) => self.error(format!("The logs couldn't be copied to Download: {e}")),
+                }
+                #[cfg(not(target_os = "android"))]
                 if let Err(error) = rustudio_core::diagnostics::open_folder() {
                     self.error(format!("Could not open the logs folder: {error}"));
                 }
@@ -629,7 +653,14 @@ impl Editor {
             "grid_2" => self.ui.grid_size = 2.0,
             "grid_4" => self.ui.grid_size = 4.0,
             "grid_16" => self.ui.grid_size = 16.0,
-            "show_ui" => self.ui.show_gui = !self.ui.show_gui,
+            "show_ui" => {
+                let next = !self.starter_gui_shown();
+                self.set_starter_gui_shown(next);
+            }
+            "show_core_ui" => {
+                self.ui.show_core_gui = !self.ui.show_core_gui;
+                self.ui.show_core_gui_saved = None;
+            }
             "play_full" => self.ui.play_full = !self.ui.play_full,
             "screenshot" => {
                 let dir = rustudio_core::paths::pictures();
@@ -663,7 +694,7 @@ impl Editor {
                 };
                 self.show_play_side(side);
             }
-            "stop" => self.stop_play(),
+            "stop" => self.request_stop(),
             "panel_properties" => self.ui.panel_requests.push((Tab::Properties, None)),
             "panel_explorer" => self.ui.panel_requests.push((Tab::Explorer, None)),
             "panel_output" => self.ui.panel_requests.push((Tab::Output, None)),
@@ -751,13 +782,15 @@ impl Editor {
             other => {
                 if let Some(class) = other.strip_prefix("class:") {
                     let class = class.to_string();
-                    let gui_class = class.starts_with("UI") || rustudio_core::doc::is_a(&class, "GuiObject");
-                    match self.gui_target().filter(|_| gui_class) {
-                        Some(t) => self.insert_class(&class, t),
-                        None => {
-                            for p in self.selected_parts() {
-                                self.insert_class(&class, p);
-                            }
+                    let gui_class = rustudio_core::doc::is_a(&class, "UIComponent")
+                        || rustudio_core::doc::is_a(&class, "GuiObject");
+                    if gui_class {
+                        if let Some(t) = self.gui_target() {
+                            self.insert_class(&class, t);
+                        }
+                    } else {
+                        for p in self.selected_parts() {
+                            self.insert_class(&class, p);
                         }
                     }
                 }
@@ -901,6 +934,11 @@ impl Editor {
                     ui.separator();
                 }
                 M::I(label, sc, a) => {
+                    let label = if *a == "group" && self.game.doc.should_group_as_frame(&self.game.doc.selection) {
+                        "Group as Frame"
+                    } else {
+                        *label
+                    };
                     let (en, ck) = self.action_state(a);
                     if menu_item_at(ui, label, sc, en, ck, col, w).clicked() {
                         *chosen = Some(a.to_string());

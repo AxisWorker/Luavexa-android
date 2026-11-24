@@ -35,11 +35,13 @@
 
 mod assets;
 pub mod clipboard;
+pub mod ime;
 pub mod intent;
 pub mod jni;
 pub mod keyboard;
 pub mod lifecycle;
 mod logcat;
+pub mod logs;
 pub mod memory;
 pub mod perf_hint;
 pub mod sensors;
@@ -162,6 +164,9 @@ pub fn run(app: AndroidApp) {
     // The navigation and status bars out of the way (immersive mode), on
     // the main thread when it gets to it; the window grows to the screen.
     system_bars::hide();
+    // The soft keyboard's input connection (ime.rs): its Java class out of
+    // the library, its view into the activity.
+    ime::install();
     log::info!(
         "files {} / data {} / cache {}",
         files_dir().display(),
@@ -328,6 +333,9 @@ pub fn install_gpu_error_handler(device: &egui_wgpu::wgpu::Device) {
         log::error!("{line}");
         rustudio_core::crash::note(line);
         GPU_LOST.store(true, std::sync::atomic::Ordering::Release);
+        // (the renderer skips uploads that would panic on the device's
+        // destroyed buffers in the rest of this frame: world_gui.rs `stage`)
+        rustudio_render::gpu_health::mark_lost(format!("GPU device lost ({reason:?}: {message})"));
     });
 }
 

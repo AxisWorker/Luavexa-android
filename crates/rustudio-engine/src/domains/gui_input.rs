@@ -1261,12 +1261,13 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, ()| {
             let evs = std::mem::take(&mut crate::gui::share().drags);
             let out = lua.create_table()?;
-            for (r, kind, x, y) in evs {
+            for (r, kind, x, y, finger) in evs {
                 let t = lua.create_table()?;
                 t.set("obj", inst_value(lua, r)?)?;
                 t.set("kind", kind)?;
                 t.set("x", x)?;
                 t.set("y", y)?;
+                t.set("finger", finger)?;
                 out.push(t)?;
             }
             Ok(out)
@@ -1379,7 +1380,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                 }
                 src = src.replacen(from, to, 1);
             }
-            let f = lua.load(src).set_name("=CoreGui.RobloxGui.CoreScripts/ProximityPrompt").set_environment(crate::globals_parity::new_env(lua, None)?).into_function()?;
+            let f = lua.load(src).set_name("=CoreGui.RobloxGui.CoreScripts/ProximityPrompt").set_environment(crate::globals_parity::new_privileged_env(lua, None)?).into_function()?;
             Ok(Value::Function(f))
         })?,
     )?;
@@ -1423,7 +1424,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                 .replace("SelectedCoreObject", "SelectedObject")
                 .replace("game:GetEngineFeature(\"ClosestVisibleDialogAPI\")", "false");
             let src = format!("local __D = ...\n{src}");
-            let f = lua.load(src).set_name("=CoreGui.RobloxGui.CoreScripts/MainBotChatScript2").set_environment(crate::globals_parity::new_env(lua, None)?).into_function()?;
+            let f = lua.load(src).set_name("=CoreGui.RobloxGui.CoreScripts/MainBotChatScript2").set_environment(crate::globals_parity::new_privileged_env(lua, None)?).into_function()?;
             Ok(Value::Function(f))
         })?,
     )?;

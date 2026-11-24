@@ -165,17 +165,23 @@ fn release_textbox() {
     }
 }
 
-/// Asks the activity for the keyboard (what winit's `set_ime_allowed` does).
+/// Asks for the keyboard: through the input-connection bridge (ime.rs),
+/// which shows it for the view that mirrors the focused field; without
+/// the bridge, through the activity (what winit's `set_ime_allowed` does),
+/// in the framework's fallback mode.
 fn soft_input(show: bool) {
-    match super::app() {
-        Some(app) if show => app.show_soft_input(true),
-        Some(app) => {
-            app.hide_soft_input(true);
-            // (the navigation bar came up with the keyboard; API 26–29's
-            // sticky flags don't always take it down again)
-            super::system_bars::keyboard_closed();
+    let bridged = if show { super::ime::show() } else { super::ime::hide() };
+    if !bridged {
+        match super::app() {
+            Some(app) if show => app.show_soft_input(true),
+            Some(app) => app.hide_soft_input(true),
+            None => log::warn!("soft keyboard: no activity to ask"),
         }
-        None => log::warn!("soft keyboard: no activity to ask"),
+    }
+    if !show {
+        // (the navigation bar came up with the keyboard; API 26–29's
+        // sticky flags don't always take it down again)
+        super::system_bars::keyboard_closed();
     }
 }
 

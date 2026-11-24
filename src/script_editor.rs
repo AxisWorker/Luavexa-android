@@ -245,11 +245,18 @@ pub struct ScriptBuf {
     plugin_diags: Vec<(i64, String)>,
     plugin_checked: Option<String>,
     completions: Vec<(String, String)>,
+    /// The built-in completions (src/luau_intel) and signature help for
+    /// the caret they were made at.
+    intel: Vec<crate::luau_intel::Completion>,
+    sig: Option<crate::luau_intel::SignatureHelp>,
+    intel_at: Option<usize>,
 }
 
 #[derive(Default)]
 pub struct ScriptTabs {
     pub bufs: HashMap<Ref, ScriptBuf>,
+    /// The place's Luau index for the completions, rebuilt as it changes.
+    pub intel: crate::luau_intel::Intel,
     /// Lines (1-based) to put the cursor on and scroll to once the tab
     /// draws (the profiler's "Open script at line N").
     pub goto: HashMap<Ref, usize>,
@@ -289,6 +296,9 @@ impl Editor {
             plugin_diags: Vec::new(),
             plugin_checked: None,
             completions: Vec::new(),
+            intel: Vec::new(),
+            sig: None,
+            intel_at: None,
         });
         let editor_id = egui::Id::new(("script_text", r));
         let goto = self.scripts.goto.get(&r).copied();
@@ -362,6 +372,33 @@ impl Editor {
                 }
             });
         }
+        // The built-in completions for the caret (src/luau_intel): a tap
+        // puts one in place of what was typed of it; the call's signature
+        // with the parameter the caret is at.
+        let mut accept_intel: Option<crate::luau_intel::Completion> = None;
+        if let Some(sig) = &buf.sig {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.label(RichText::new(format!("{}(", sig.name)).small().color(theme::TEXT_DIM));
+                for (i, p) in sig.parameters.iter().enumerate() {
+                    let active = sig.active_parameter == Some(i);
+                    let t = RichText::new(if i + 1 < sig.parameters.len() { format!("{p}, ") } else { p.clone() }).small();
+                    ui.label(if active { t.strong().color(theme::TEXT) } else { t.color(theme::TEXT_DIM) });
+                }
+                ui.label(RichText::new(")").small().color(theme::TEXT_DIM));
+            });
+        }
+        if !buf.intel.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for c in buf.intel.iter().take(if cfg!(target_os = "android") { 8 } else { 12 }) {
+                    let b = ui.small_button(&c.label);
+                    let b = if c.detail.is_empty() { b } else { b.on_hover_text(&c.detail) };
+                    if b.clicked() {
+                        accept_intel = Some(c.clone());
+                    }
+                }
+            });
+        }
         ui.separator();
 
         // Studio Settings > Script Editor > Font (size), Background Color,
@@ -428,9 +465,13 @@ impl Editor {
                         .layouter(&mut layouter)
                         .show(ui);
                     // The soft keyboard came up under the editor: the caret
-                    // scrolls into the room left above it.
+                    // scrolls into the room left above it. The keyboard types
+                    // code here: no suggestions or capitals (android/ime.rs).
                     #[cfg(target_os = "android")]
-                    crate::android::keyboard::reveal_cursor(ui, &out);
+                    {
+                        crate::android::keyboard::reveal_cursor(ui, &out);
+                        crate::android::ime::code_field(editor_id);
+                    }
                     let resp = out.response.response;
                     if resp.changed() {
                         changed = true;
@@ -470,6 +511,18 @@ impl Editor {
             let b = crate::plugin_host::script_docs::index_of(&buf.text, sel.2, sel.3);
             st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(b), egui::text::CCursor::new(a))));
             st.store(ui.ctx(), editor_id);
+        }
+        // A built-in completion taken: the text and the caret after it.
+        let mut moved_caret: Option<usize> = None;
+        if let (Some(c), Some(end)) = (accept_intel, word_end) {
+            let at = crate::luau_intel::apply_suggestion_at(&mut buf.text, end, &c);
+            let mut st = egui::TextEdit::load_state(ui.ctx(), editor_id).unwrap_or_default();
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(at))));
+            st.store(ui.ctx(), editor_id);
+            ui.ctx().memory_mut(|m| m.request_focus(editor_id));
+            buf.completions.clear();
+            moved_caret = Some(at);
+            changed = true;
         }
         if let (Some(insert), Some(end)) = (accept, word_end) {
             let chars: Vec<char> = buf.text.chars().collect();
@@ -514,6 +567,29 @@ impl Editor {
             };
             if let Some(b) = self.scripts.bufs.get_mut(&r) {
                 b.completions = items;
+            }
+        }
+        // The built-in completions, for the caret where it is now (after a
+        // change, or when it moved; the index itself is cached).
+        let caret = moved_caret.or(word_end);
+        let stale = self.scripts.bufs.get(&r).is_some_and(|b| changed || b.intel_at != caret);
+        if stale && focused {
+            let text = self.scripts.bufs.get(&r).map(|b| b.text.clone()).unwrap_or_default();
+            let (items, sig) = match caret {
+                Some(at) if at <= text.chars().count() => {
+                    let overrides: Vec<(Ref, &str)> = self.scripts.bufs.iter().map(|(k, b)| (*k, b.text.as_str())).collect();
+                    let dom = &self.game.doc.dom;
+                    let intel = &mut self.scripts.intel;
+                    let items = intel.complete(dom, overrides.iter().copied(), r, &text, at);
+                    let sig = intel.signature(dom, overrides.iter().copied(), r, &text, at);
+                    (items, sig)
+                }
+                _ => (Vec::new(), None),
+            };
+            if let Some(b) = self.scripts.bufs.get_mut(&r) {
+                b.intel = items;
+                b.sig = sig;
+                b.intel_at = caret;
             }
         }
         if buf_needs_repaint(self.scripts.bufs.get(&r)) {

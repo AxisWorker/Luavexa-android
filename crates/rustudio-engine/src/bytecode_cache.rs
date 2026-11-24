@@ -22,11 +22,28 @@ const MIN_DISK: usize = if cfg!(target_os = "android") { 4 * 1024 } else { 256 *
 /// Bytecode held in memory at most (later sources compile as before).
 const MEMORY_CAP: usize = if cfg!(target_os = "android") { 128 * 1024 * 1024 } else { 768 * 1024 * 1024 };
 
+/// Luau's optimization level for every script: Studio's 1 (no inlining,
+/// so Output stacks keep every frame: runtime.rs Runtime::new). Roblox's
+/// live client and server compile at 2 (local function inlining, loop
+/// unrolling, more constant folding: luau.org/performance), so a phone,
+/// which plays rather than debugs, does the same. RUSTUDIO_LUAU_OPT=0|1|2
+/// picks it anywhere (a script's own `--!optimize N` still wins).
+pub fn optimization_level() -> u8 {
+    static L: OnceLock<u8> = OnceLock::new();
+    *L.get_or_init(|| {
+        std::env::var("RUSTUDIO_LUAU_OPT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .filter(|l| *l <= 2)
+            .unwrap_or(if cfg!(target_os = "android") { 2 } else { 1 })
+    })
+}
+
 /// The compiler every script runs through: Studio's options (runtime.rs
 /// Runtime::new explains each).
 pub fn compiler() -> mlua::chunk::Compiler {
     mlua::chunk::Compiler::new()
-        .set_optimization_level(1)
+        .set_optimization_level(optimization_level())
         .set_debug_level(1)
         .set_vector_ctor("Vector3.new")
         .set_vector_type("Vector3")
@@ -54,7 +71,7 @@ local function f(a, ...) local s = `{a}:{select("#", ...)}` for i, v in ipairs(t
 local v = Vector3.new(1, 2, 3) local g = game:GetService("Workspace") workspace.Name = script.Name
 return f(1, 2, 3), math.floor(v.X // 2) % 3, (if t[1] then 1 else 2) + bit32.band(7, 3), string.format("%d", 4)"##;
         let mut h = blake3::Hasher::new();
-        h.update(b"rustudio bytecode 2|O1 D1 Vector3.new Vector3 mutable globals _G|");
+        h.update(format!("rustudio bytecode 2|O{} D1 Vector3.new Vector3 mutable globals _G|", optimization_level()).as_bytes());
         h.update(&compiler().compile(PROBE).unwrap_or_default());
         h.finalize().as_bytes().to_vec()
     })

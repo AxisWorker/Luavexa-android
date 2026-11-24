@@ -926,3 +926,55 @@ pub fn move_task_to_back() -> Result<()> {
         std::time::Duration::from_millis(400),
     )?
 }
+
+/// Writes a file into the shared Download folder, `Download/rustudio/<name>`,
+/// where a Files app shows it — the app's own folders under `Android/data`
+/// are closed to them since Android 11, so a crash report there was out of
+/// a user's reach. API 29+: a `MediaStore.Downloads` row the app inserts
+/// (no permission is needed for files an app makes itself); below that,
+/// written straight into the public Download folder (which needs the
+/// storage permission). Returns the path as the Files app shows it.
+pub fn export_download(name: &str, mime: &str, bytes: &[u8]) -> Result<String> {
+    let rel = format!("Download/rustudio/{name}");
+    if sdk_int() < 29 {
+        let dir = std::path::Path::new("/storage/emulated/0/Download/rustudio");
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        std::fs::write(dir.join(name), bytes).map_err(|e| format!("{rel}: {e}"))?;
+        return Ok(rel);
+    }
+    with_activity(|env, activity| {
+        let resolver = env
+            .call_method(activity, jni_str!("getContentResolver"), jni_sig!("()Landroid/content/ContentResolver;"), &[])?
+            .l()?;
+        let values = env.new_object(jni_str!("android/content/ContentValues"), jni_sig!("()V"), &[])?;
+        for (key, value) in [("_display_name", name), ("mime_type", mime), ("relative_path", "Download/rustudio")] {
+            let k = env.new_string(key)?;
+            let v = env.new_string(value)?;
+            env.call_method(&values, jni_str!("put"), jni_sig!("(Ljava/lang/String;Ljava/lang/String;)V"), &[JValue::Object(&k), JValue::Object(&v)])?;
+        }
+        let collection = env
+            .get_static_field(jni_str!("android/provider/MediaStore$Downloads"), jni_str!("EXTERNAL_CONTENT_URI"), jni_sig!("Landroid/net/Uri;"))?
+            .l()?;
+        let uri = env
+            .call_method(
+                &resolver,
+                jni_str!("insert"),
+                jni_sig!("(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;"),
+                &[JValue::Object(&collection), JValue::Object(&values)],
+            )?
+            .l()?;
+        if uri.is_null() {
+            return Err(jni::errors::Error::NullPtr("MediaStore insert"));
+        }
+        let stream = env
+            .call_method(&resolver, jni_str!("openOutputStream"), jni_sig!("(Landroid/net/Uri;)Ljava/io/OutputStream;"), &[JValue::Object(&uri)])?
+            .l()?;
+        if stream.is_null() {
+            return Err(jni::errors::Error::NullPtr("openOutputStream"));
+        }
+        let array = env.byte_array_from_slice(bytes)?;
+        env.call_method(&stream, jni_str!("write"), jni_sig!("([B)V"), &[JValue::Object(&array)])?;
+        env.call_method(&stream, jni_str!("close"), jni_sig!("()V"), &[])?;
+        Ok(rel.clone())
+    })
+}

@@ -127,7 +127,7 @@ xbuild quirks worth knowing (commit e67b501):
 | GPU driver | the system's | the device's Vulkan driver, or on Snapdragon phones the Turnip (Mesa) driver shipped in the APK, swapped in before wgpu starts (`src/android/turnip.rs`; "Turnip driver" below) — on an Adreno 6xx with its bandwidth compression (UBWC) off, which restarted a Snapdragon 865 phone outright ("UBWC and the whole-device restarts" below); OpenGL ES as the fallback either way |
 | Graphics quality (File > Studio Settings > rustudio > Performance) | Manual at the full profile, 100% 3D resolution; Automatic from level 5 | weak-GPU mode (`gpu_caps.rs`: every Android device): Automatic from level 1 — no shadows, SSAO, clouds, bloom, DoF, probe or grass until the frame times allow — and 75% 3D resolution (`rustudio_settings::choice_default`); "Frame time on a phone" below. View > GPU Driver names the adapter and holds the Mesa driver switch |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
-| Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root). Same `crates/rustudio-core/src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`). A report ends with the last 24 notes (`crash::note`): the GPU errors wgpu reported, a lost device, so it says what led up to it |
+| Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root — and since Android 11 the Files apps can't open `Android/data` either, so the start after a crash copies the report, the session log and the app's own `logcat -d` into **`Download/rustudio/rustudio-logs-<stamp>.txt`**, a file any Files app shows and a user can send; Help > Copy Logs to Download does the same at any time: `src/android/logs.rs`, a `MediaStore.Downloads` row the app inserts, no permission needed). Same `crates/rustudio-core/src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`). A report ends with the last 24 notes (`crash::note`): the GPU errors wgpu reported, a lost device, so it says what led up to it |
 | GPU device lost, GPU out of memory | wgpu's default: a panic | The device gets an uncaptured-error handler and a device-lost callback (`android/mod.rs install_gpu_error_handler`): errors go to logcat and the report notes, the frame goes on. The vendored egui-wgpu (upstream's `renderer.rs` `upload_failed`, since 0.3.3-alpha.2) skips a frame whose index/vertex upload the device refuses instead of panicking (`renderer.rs:984 Failed to create staging buffer for index data` — what a reset Adreno driver looked like). A lost device, or out-of-memory errors every frame for 5 s, ends the run in order (`gpu_watch`): the open place is written to `Android/data/dev.rustudio.studio/files/recovery/<name>-<stamp>.rbxl`, a report says so for the next start, and the activity is relaunched (`jni::relaunch`) |
 | Studio content download | ureq + rustls (ring) | the same, three packages at a time; Play can use the content once the packages are in (the retired textures and View Selector follow in the background). Without a network at start (ConnectivityManager, INTERNET capability — not VALIDATED, which some networks never get) it starts when one comes. A `network check: …` line in Output (and logcat) at every start says how Roblox's servers are reached, phase by phase — DNS, a TCP connect to the first IPv4 and the first IPv6 address, an HTTPS GET — with the time each took; `rustudio --network-check` prints the same on a desktop. Every agent resolves a host IPv4 first (`rustudio_account::http`): a network that advertises an IPv6 that doesn't route — some phones' Wi-Fi and mobile networks — otherwise cost every new connection a connect timeout, and the app "worked, but very slowly". Connects time out after 10 s; one agent (connection pool) per purpose for the process, so an asset doesn't pay DNS, TCP and TLS twice over |
 | Login keyring | `keyring` 4 (Secret Service / Keychain / Credential Manager) | `keyring-core` + `android-native-keyring-store` (SharedPreferences + Android Keystore) behind the same `Entry` API (`crates/rustudio-account/src/store.rs`) |
@@ -421,6 +421,71 @@ in the game's coordinates (`touch_input::set_soft_keyboard`, read by
 runtime test drives both through the Lua side on the host:
 `runtime.rs soft_keyboard_reaches_the_scripts`).
 
+**What the keyboard types goes through an `InputConnection` of the
+app's own** (`src/android/ime.rs`, `tools/android/java/dev/rustudio/studio/ImeBridge.java`).
+A NativeActivity has no view that offers the keyboard one, so the
+keyboard ran in the framework's fallback mode: single characters came as
+key events (winit's `Event::Text`), and everything else a keyboard does —
+a word composed with suggestions and committed, an auto-correction, a
+swiped word, its own paste key, deleting a word — came as a
+`KeyEvent.ACTION_MULTIPLE` whose characters only the Java object carries,
+which native code never sees. Text went missing, keyboards that both
+compose and send keys (Samsung's) delivered some of it twice or garbled,
+and in the script editor, where a keyboard composes every word, nothing
+much arrived at all. The fix is a Java class: `ImeBridge` is a 1 × 1
+`View` added to the activity's content (`addContentView`), focusable only
+while the editor wants the keyboard, whose `onCreateInputConnection` hands
+the keyboard a `BaseInputConnection` over a `SpannableStringBuilder` that
+mirrors the focused field — text, selection, the keyboard's composing
+span — so the keyboard works as it does in an `EditText`. Every change
+the keyboard makes to the mirror (one call, or the batch it bracketed with
+`beginBatchEdit` / `endBatchEdit`) is found by comparing the mirror before
+and after and reported to the editor as one replacement, code points
+`[a, b)` becoming a string with the selection at `[selStart, selEnd)`,
+through a native method (`nativeOp`, on the Java main thread, queued for
+the editor's thread). The editor applies one replacement a frame from
+`App::raw_input_hook`: an egui `TextEdit` gets its cursor range set to
+`[a, b)` (`TextEditState`) and the text as `Event::Text` (Backspace for a
+deletion, Enter for the action key), which it handles as typing over the
+selection; a Roblox TextBox gets the same as a selection and an insertion
+in `Gui::keyboard` (`gui::share().tb_ime`). At the end of the frame the
+field's text (egui's `OutputEvent::FocusGained / ValueChanged /
+TextSelectionChanged / Clicked` carry it; a TextBox's state is
+`share().tb_live`) is hashed (FNV-1a over code points, the same on both
+sides) and checked against what the Java side computed of its mirror; a
+difference — the editor auto-indented an Enter, closed a bracket, the
+user tapped the caret elsewhere, pasted, undid, a hardware key — sends the
+Java side the editor's state (`setState`, with the number of the last
+operation it includes, so a state behind an operation in flight is left
+for the next one; the keyboard is restarted when its composition would be
+stale). The editor's text is the truth throughout, so a disagreement
+costs at most a dropped suggestion. The script editor's field is
+`KIND_CODE`: no suggestions, auto-correction or capitals
+(`TYPE_TEXT_FLAG_NO_SUGGESTIONS` plus the visible-password variation,
+which is what Samsung's keyboard honours); a multi-line TextBox is
+`KIND_MULTILINE` (Enter is a line); everything else `KIND_TEXT` (Enter is
+the action key: the field commits, as Enter from a hardware keyboard
+does). Key events the keyboard still sends — Enter, Delete, a character —
+are applied to the mirror and swallowed there, so they aren't typed a
+second time through the window; arrows and the rest pass through to
+native code as before. The keyboard's own Select all / Cut / Copy / Paste
+(`performContextMenuAction`) work on the mirror and the system clipboard.
+
+The class is compiled by `tools/android/build-dex.sh` (javac → d8, with
+an SDK's `android.jar` and `d8`; run it when the Java changes) into
+`assets/android/ImeBridge.dex`, which is committed, built into the native
+library with `include_bytes!`, and loaded at start by `ime::install`
+with an `InMemoryDexClassLoader` whose parent is the activity's class
+loader; `nativeOp` is bound with `RegisterNatives` — the APK build needs
+no Java toolchain, Gradle or SDK, and the manifest's `NativeActivity`
+stays. logcat says `ime: bridge loaded (N byte dex)` and `ime: input
+connection view attached`, then `ime: show for Code, N chars, selection
+a..b`, `ime: op 12 replace 3..3 with 5 chars, selection 8..8`, and `ime:
+op 12 left the field another text than the keyboard's mirror: the mirror
+takes the editor's` when a resync happened. Should the dex fail to load
+(`ime: the bridge's class couldn't be loaded (…)`), the keyboard is asked
+up through the activity as before, in the fallback mode.
+
 The keyboard is shown and hidden by `keyboard.rs` itself
 (`Keyboard::end_frame`), not by egui-winit. egui-winit shows it while
 egui reports an IME field (`PlatformOutput::ime`, a focused `TextEdit`:
@@ -433,10 +498,13 @@ that moves its caret included (`egui-winit` 0.36 `handle_platform_output`,
 again on each tap into a field, whatever the editor's own fields did
 (they had already stopped asking for the focus every frame). So at the
 end of each frame the IME output is taken out of egui's platform output
-(egui-winit never asks winit for the keyboard) and the activity is asked
-directly, as winit would, when what wants the keyboard changes: a focused
-egui text field, or a Roblox TextBox with the focus — the game's in Play,
-a plugin widget's — which egui-winit never showed it for. Up at once
+(egui-winit never asks winit for the keyboard) and the bridge's view is
+asked (`ime::show` / `hide`: `InputMethodManager.showSoftInput` for the
+view, with the field's kind, text and selection — or the activity
+directly, as winit would, without the bridge) when what wants the
+keyboard changes: a focused egui text field, or a Roblox TextBox with the
+focus — the game's in Play, a plugin widget's — which egui-winit never
+showed it for. Up at once
 (`soft keyboard asked up for a text field` / `a TextBox` in logcat), down
 once nothing has wanted it for 250 ms (`asked down`), so a field losing
 the focus for a frame or the focus moving between fields keeps it up, as
@@ -453,10 +521,8 @@ and a tap on the field starts it again. A zero with nothing focused takes
 the room away at once.
 
 The soft keyboard has no Ctrl, egui's text fields have no menu of their
-own, egui-winit has no clipboard on Android, and the keyboard's own paste
-key never reaches a NativeActivity (its text arrives as key events, which
-winit drops — the clipboard isn't involved). So while the keyboard is up
-for anything, a **text bar** stands in a band right above it
+own, and egui-winit has no clipboard on Android. So while the keyboard is
+up for anything, a **text bar** stands in a band right above it
 (`src/android/text_bar.rs`, `HEIGHT` points; part of the room keyboard.rs
 makes, or of what the view slides up for a game's TextBox): Cut, Copy,
 Paste and Select all for an egui field, Paste and Copy for a Roblox
@@ -471,8 +537,18 @@ the focus, as they do for an egui field. A long press on an egui text
 field still opens the same entries as a menu (`src/android/text_menu.rs`,
 which keeps the field's focus for its tap — egui's rule is a click
 outside takes it — and puts back the selection egui's right click
-collapsed), and the bar keeps the focus the same way. Objects are cut,
-copied and pasted from the Explorer's long-press menu as before.
+collapsed). The bar keeps the focus too, and had to be more careful
+about it: egui judges the click outside as the *field* draws, before the
+bar does, so the field had lost the focus by the time the bar's turn
+came, the bar (drawn for a focused field) wasn't drawn in the very frame
+the tap completed in, and its button never saw the click — the bar did
+nothing on a device. From a press that begins on the bar to its release,
+egui's rule is set to `SurrenderFocusOn::Never` (`TextBar::before_frame`,
+from the raw input), and put back after. Objects are cut, copied and
+pasted from the Explorer's long-press menu as before. The keyboard's own
+clipboard key pastes through the input connection as well (above), which
+needs no clipboard access of the app's: the keyboard reads it as the
+default IME.
 
 The clipboard itself is `src/android/clipboard.rs` over
 `ClipboardManager`, asked on the editor's thread (since API 24 the
@@ -503,6 +579,39 @@ that are taps, long presses for its menus — and has none of the editor's
 reasons to tell a scroll from a drag. Switching off lets go of anything
 held; a finger down at a switch stays egui's until it lifts, so no press
 is left half delivered. Once a place opens, the layer is on.
+
+### Publish on a phone
+
+Publish / Save to Roblox copied the whole tree (`Document::save_snapshot`)
+to encode it on the upload's thread, so the editor went on meanwhile. A
+place of some size doubled in memory at the press of Publish and the
+system killed the process on the spot — no panic, no signal, so no crash
+report; `logcat` says `lowmemorykiller` / `am_kill`, which the logs file
+above now carries. On Android the place is encoded on the editor's thread
+from the tree itself, as Save to File does (`cloud_ui.rs start_save`,
+`cloud: place encoded for the upload in 0.8s, N bytes` in logcat), and
+only the bytes go to the upload's thread.
+
+### Luau completions in the script editor (`src/luau_intel`)
+
+The script editor's row of completions above the text (plugins'
+`ScriptEditorService` items were all it had) now comes first from the
+place and Roblox's API, ported from Android-rbxl's `luau_intelligence.rs`
+(the "Sora" completions): globals and libraries, `game:GetService("…")`,
+the services' children by name, classes' properties / methods / events,
+`Enum.X.Y`, the script's locals, functions and parameters, the members a
+required ModuleScript returns (instance and string requires, `./`, `../`,
+`@self`) and require paths; a line above it shows the signature of the
+call the caret is in with the current parameter in bold. A tap on an item
+replaces what was typed of it (`apply_suggestion_at`) and puts the caret
+after it. The place's index (`ProjectIndex`, every script's source with
+the open tabs' unsaved text over it) is cached by a fingerprint and
+rebuilt when the place changes, at most every four times its own cost
+(`luau intel: place indexed in N ms` in logcat when that is over 50 ms);
+the completion itself is computed when the text or the caret changes. The
+API tables (`api_data.rs`, static) and the reflection questions
+(`schema.rs`, over `rbx_reflection_database`) came along; the port's 47
+unit tests run on the host (`cargo test --lib luau_intel`).
 
 ## The first Play on a phone: Studio's content
 
@@ -807,6 +916,27 @@ will look up (nothing named `__clear_cache`), `llvm-readelf -d … | grep
 NEEDED` the libraries it may look in (no libc++_shared.so), and `llvm-nm
 librustudio_android.so | grep -E ' (__register_frame|__cxa_throw|_Unwind_RaiseException)$'`
 must show all three defined (`t`/`T`) inside the library.
+
+### Luau compiler level and fast flags: `RUSTUDIO_LUAU_OPT`, `RUSTUDIO_LUAU_FLAGS`
+
+Studio compiles scripts at Luau optimization level 1; the desktop build
+keeps that (a debugger's view of locals, upvalues and call sites matches
+the source). A phone build compiles at level 2 by default — inlining
+and loop unrolling, the level Roblox's own clients use — because a
+big game's interpreted scripts are most of a phone's frame
+(`bytecode_cache.rs optimization_level`). `RUSTUDIO_LUAU_OPT=0|1|2` sets
+it anywhere (`adb shell setprop debug.rustudio.env "RUSTUDIO_LUAU_OPT=1"`,
+relaunch); the bytecode disk cache keys on it (`salt`), so switching
+never reuses the other level's bytecode. `RUSTUDIO_LUAU_FLAGS=
+"LuauFlagA,LuauFlagB=false"` sets Luau fast flags (a name alone turns it
+on) before the first VM is made, for trying a flag the vendored Luau
+has (`runtime.rs luau_flags`). Neither changes what scripts see: a
+level-2 chunk behaves as a level-1 one, only `debug.info` line
+and name details of inlined calls differ.
+
+(Script speed is judged on the release APK — "Install the release APK
+to judge speed", above: the debug one runs the Luau VM and the engine
+with assertions and overflow checks, several times slower.)
 
 ## Turnip driver (Snapdragon) and PanVK (Mali): `src/android/turnip.rs`
 

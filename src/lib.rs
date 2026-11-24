@@ -24,6 +24,7 @@
 pub mod asset_manager;
 pub mod plugin_store;
 pub mod toolbox;
+pub mod luau_intel;
 pub mod ui_pointer;
 pub mod update;
 pub mod account_ui;
@@ -128,8 +129,11 @@ usage: rustudio [FILE] [--demo] [--play] [--screenshot OUT.png] [--self-test OUT
   --headless           no window, no compositor, no display server (no gamescope
                        or Xvfb needed): frames are drawn offscreen at --window
                        WxH and read back for shots; 60 frames a second (unpaced
-                       with --bench). Silent unless --audio. With --no-ui or
-                       --play-only only
+                       with --bench). Silent unless --audio. Hides Play Core UI
+                       (topbar, leaderboard, chat) by default unless --show-core-ui
+                       or RUSTUDIO_SHOW_CORE_UI=1. With --no-ui or --play-only only
+  --show-core-ui       show Play Core UI (topbar, leaderboard, chat, backpack)
+  --no-core-ui         hide Play Core UI while keeping game UI (PlayerGui) visible
   --no-render          --headless with no GPU at all: scripts, physics, sound
                        state and the harness run, nothing is drawn; --shots
                        write the log and frame times but no picture. The Output
@@ -719,6 +723,7 @@ pub fn run() -> eframe::Result<()> {
     let mut overlays = false;
     let mut headless = false;
     let mut no_render = false;
+    let mut show_core_ui: Option<bool> = None;
     let mut seconds_given = false;
     let mut fixed_dt: Option<f64> = None;
     let mut fail_on_error = false;
@@ -835,6 +840,20 @@ pub fn run() -> eframe::Result<()> {
                 match app::HarnessAction::parse_ldrag(&v) {
                     Some(list) => actions.extend(list),
                     None => eprintln!("--ldrag: can't read {v:?} (X1,Y1>X2,Y2@SECONDS)"),
+                }
+            }
+            "--finger" => {
+                let v = args.next().unwrap_or_default();
+                match app::HarnessAction::parse_finger(&v) {
+                    Some(list) => actions.extend(list),
+                    None => eprintln!("--finger: can't read {v:?} (X1,Y1>X2,Y2@SECONDS)"),
+                }
+            }
+            "--tap" => {
+                let v = args.next().unwrap_or_default();
+                match app::HarnessAction::parse_tap(&v) {
+                    Some(list) => actions.extend(list),
+                    None => eprintln!("--tap: can't read {v:?} (X,Y@SECONDS)"),
                 }
             }
             "--lhold" => {
@@ -1101,6 +1120,8 @@ pub fn run() -> eframe::Result<()> {
                 headless = true;
                 no_render = true;
             }
+            "--show-core-ui" => show_core_ui = Some(true),
+            "--hide-core-ui" | "--no-core-ui" => show_core_ui = Some(false),
             // (read at the start of main)
             "--audio" => {}
             "-h" | "--help" => {
@@ -1131,6 +1152,11 @@ pub fn run() -> eframe::Result<()> {
     if let Some(dt) = fixed_dt {
         rustudio_core::sim_clock::enable(dt);
     }
+    let (show_core_gui, show_core_gui_explicit) = run_harness::resolve_show_core_gui(
+        show_core_ui,
+        std::env::var("RUSTUDIO_SHOW_CORE_UI").ok().as_deref(),
+        headless,
+    );
     let harness = app::Harness {
         run: run_harness::RunHarness {
             shot_after,
@@ -1152,6 +1178,8 @@ pub fn run() -> eframe::Result<()> {
             last_frame: None,
             no_ui,
             no_render,
+            show_core_gui,
+            show_core_gui_explicit,
             end_after: (no_ui && seconds_given && bench.is_none() && profile_capture.is_none()).then_some(seconds),
             fail_on_error,
             result,
