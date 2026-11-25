@@ -365,6 +365,7 @@ pub const LUA_METHODS: &[(&str, &str)] = &[
     ("GetAllBoundActionInfo", "ContextActionService"),
     ("GetButton", "ContextActionService"),
     ("FireActionButtonFoundSignal", "ContextActionService"),
+    ("CallFunction", "ContextActionService"),
     ("Emit", "ParticleEmitter"),
     ("Clear", "ParticleEmitter"),
     ("SetTitle", "ContextActionService"),

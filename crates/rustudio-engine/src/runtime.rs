@@ -10356,6 +10356,159 @@ mod legacy_tests {
         assert!(!out.iter().any(|(l, _)| *l == Level::Error), "{out:?}");
     }
 
+    /// Without the CoreScripts, this build's own touch buttons
+    /// (domains/context_action_touch.luau, started by gui_input.luau) stand
+    /// in for ContextActionTouch on a touch screen:
+    /// PlayerGui.ContextActionGui.ContextButtonFrame gets Roblox's 45 × 45
+    /// ImageButton at its first place for an action bound with
+    /// createTouchButton (none for one without), its ActionTitle /
+    /// ActionIcon / Position follow SetTitle / SetImage / SetPosition,
+    /// GetButton gets it, a finger landing on it runs the handler with
+    /// Begin and its lift there with End — a lift elsewhere, after it
+    /// dragged off, with Cancel — through CallFunction (which a game
+    /// script may not call itself), and UnbindAction takes it away.
+    #[test]
+    fn touch_buttons_without_the_core_scripts() {
+        crate::touch_input::TEST_GAME_TOUCH.with(|c| c.set(Some(true)));
+        let mut d = Document::new_place();
+        let players = d.find_child(d.dom.root_ref(), "Players").unwrap();
+        let p = d.dom.insert(players, InstanceBuilder::new("Player").with_name("Local"));
+        d.dom.get_by_ref_mut(players).unwrap().properties.insert(ustr("LocalPlayer"), Variant::Ref(p));
+        let pg = d.dom.insert(p, InstanceBuilder::new("PlayerGui").with_name("PlayerGui"));
+        let src = r#"
+            local CAS = game:GetService("ContextActionService")
+            local pg = script.Parent
+            task.wait()
+            CAS:BindAction("Dash", function(name, state, io)
+                print("act", name, state.Name, io.UserInputType.Name, io.Position.X, io.Position.Y)
+                return Enum.ContextActionResult.Sink
+            end, true, Enum.KeyCode.Q)
+            CAS:BindAction("Quiet", function() end, false, Enum.KeyCode.E)
+            CAS:SetTitle("Dash", "Dash!")
+            CAS:SetImage("Dash", "rbxassetid://1234")
+            task.wait()
+            local gui = pg:FindFirstChild("ContextActionGui")
+            local frame = gui and gui:FindFirstChild("ContextButtonFrame")
+            local b = frame and frame:FindFirstChild("ContextActionButton")
+            print("gui", tostring(gui and gui.ResetOnSpawn), tostring(frame and frame.Visible), tostring(b and b.ClassName), #frame:GetChildren())
+            print("button", b.Size.X.Offset, b.Size.Y.Offset, b.Position.X.Offset, b.Position.Y.Offset, tostring(b.Active), b.Image)
+            print("title", b.ActionTitle.Text, b.ActionIcon.Image, b.ActionTitle.Font.Name, b.ActionTitle.TextSize, tostring(b.ActionTitle.TextWrapped))
+            print("get", tostring(CAS:GetButton("Dash") == b), tostring(CAS:GetButton("Quiet")))
+            CAS:SetPosition("Dash", UDim2.fromOffset(10, 20))
+            CAS:SetTitle("Dash", nil)
+            print("moved", b.Position.X.Offset, b.Position.Y.Offset, "[" .. b.ActionTitle.Text .. "]")
+            local ok, err = pcall(function() return CAS:CallFunction("Dash", Enum.UserInputState.Begin, nil) end)
+            print("call", tostring(ok), tostring(err))
+            print("ready")
+            -- (the fingers come now, from the test)
+            for _ = 1, 8 do task.wait() end
+            CAS:UnbindAction("Dash")
+            task.wait()
+            print("gone", tostring(frame:FindFirstChild("ContextActionButton")), tostring(CAS:GetButton("Dash")))
+        "#;
+        let s = d.dom.insert(
+            pg,
+            InstanceBuilder::new("LocalScript").with_name("T").with_property("Source", src.to_string()),
+        );
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(d, RunMode::Play);
+        w.side = Side::Client;
+        w.input.view_size = [1000.0, 600.0];
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        let printed = |p: &str| rt.world_mut().is_some_and(|w| w.output.iter().any(|(_, t)| t.starts_with(p)));
+        for _ in 0..12 {
+            if printed("ready") {
+                break;
+            }
+            rt.step(1.0 / 60.0);
+        }
+        assert!(printed("ready"), "{:?}", rt.world_mut().map(|w| w.output.clone()));
+        let button = {
+            let w = rt.world_mut().unwrap();
+            let d = w.d();
+            d.dom.descendants_of(d.dom.root_ref()).find(|i| i.name == "ContextActionButton").map(|i| i.referent())
+        }
+        .expect("the touch button");
+        // A finger: its InputObject (the GUI's events get it first, as
+        // play_game.rs fire_gui_events does), then UserInputService's event.
+        let finger = |state: &str, x: f64, y: f64| -> Value {
+            let f: Function = rt.lua.globals().get("__rs_touch_object").unwrap();
+            f.call::<Value>((7.0, state, x, y, 0.0, 0.0)).unwrap()
+        };
+        let str = |x: &str| Value::String(rt.lua.create_string(x).unwrap());
+        let uis = |state: &str, x: f64, y: f64| {
+            let began_on = rt.lua.create_table().unwrap();
+            rt.spawn_global(
+                "__rs_touch_event",
+                vec![
+                    str(state),
+                    Value::Number(7.0),
+                    Value::Number(x),
+                    Value::Number(y),
+                    Value::Number(0.0),
+                    Value::Number(0.0),
+                    Value::Boolean(true),
+                    Value::Table(began_on),
+                ],
+            );
+        };
+        // Lands on the button, lifts on it: Begin, End.
+        let io = finger("Begin", 10.0, 20.0);
+        rt.fire(button, "InputBegan", vec![io]);
+        rt.input_resumption_point();
+        uis("Begin", 10.0, 20.0);
+        rt.step(1.0 / 60.0);
+        let io = finger("End", 11.0, 21.0);
+        rt.fire(button, "InputEnded", vec![io]);
+        rt.input_resumption_point();
+        uis("End", 11.0, 21.0);
+        rt.step(1.0 / 60.0);
+        // Lands on it, drags off, lifts elsewhere: Begin, Cancel.
+        let io = finger("Begin", 12.0, 22.0);
+        rt.fire(button, "InputBegan", vec![io]);
+        rt.input_resumption_point();
+        uis("Begin", 12.0, 22.0);
+        rt.step(1.0 / 60.0);
+        uis("End", 300.0, 300.0);
+        rt.step(1.0 / 60.0);
+        for _ in 0..12 {
+            if printed("gone") {
+                break;
+            }
+            rt.step(1.0 / 60.0);
+        }
+        let out = rt.leave().output;
+        crate::touch_input::TEST_GAME_TOUCH.with(|c| c.set(None));
+        let has = |p: &str| out.iter().any(|(_, t)| t.starts_with(p));
+        assert!(has("gui false true ImageButton 1"), "{out:?}");
+        assert!(has("button 45 45 123 70 true https://www.roblox.com/asset/?id=97166444"), "{out:?}");
+        assert!(has("title Dash! rbxassetid://1234 SourceSansBold 18 true"), "{out:?}");
+        assert!(has("get true nil"), "{out:?}");
+        assert!(has("moved 10 20 []"), "{out:?}");
+        assert!(has("call false"), "{out:?}");
+        assert!(out.iter().any(|(_, t)| t.starts_with("call false") && t.contains("lacking capability RobloxScript")), "{out:?}");
+        // (a print's line carries its script and line after an em dash)
+        let acts: Vec<&str> = out
+            .iter()
+            .filter(|(_, t)| t.starts_with("act "))
+            .map(|(_, t)| t.split("  \u{2014}").next().unwrap_or(t).trim_end())
+            .collect();
+        assert_eq!(
+            acts,
+            [
+                "act Dash Begin Touch 10 20",
+                "act Dash End Touch 11 21",
+                "act Dash Begin Touch 12 22",
+                "act Dash Cancel Touch 300 300",
+            ],
+            "{out:?}"
+        );
+        assert!(has("gone nil nil"), "{out:?}");
+        assert!(!out.iter().any(|(l, _)| *l == Level::Error), "{out:?}");
+    }
+
     /// an admin script's client anti-tamper, condensed (Client.Core.Anti and
     /// Shared.Service ReadOnly): settings() refused inside a metamethod
     /// (rt0001 kicked every Play), Instance/Enum metamethods are unnamed C

@@ -117,7 +117,8 @@ xbuild quirks worth knowing (commit e67b501):
 | Input | mouse + keyboard | fingers through `crates/rustudio-engine/src/touch_input.rs` (below); hardware mice / keyboards work as on a desktop |
 | Clipboard | egui-winit (arboard) | egui's copies mirrored to `ClipboardManager` after each frame, pastes read from it (`src/android/clipboard.rs`) |
 | Browser links (`platform::open_url`) | `ctx.open_url` (webbrowser) | `ACTION_VIEW` Intent from the activity (`jni::open_url`); eframe's `links` feature isn't built for Android |
-| System bars | — | hidden (immersive mode): the navigation bar — Back / Home / Recents or the gesture pill, the right edge in landscape — and the status bar; a swipe from the edge shows them for a moment, translucent over the editor, and they go again by themselves (`src/android/system_bars.rs`: API 30+ `WindowInsetsController.hide(systemBars)` with transient-by-swipe, before that the sticky immersive view flags; asked at start and again on focus regained / keyboard down, on the Java main thread). `RUSTUDIO_SYSTEM_BARS=1` keeps them. The camera hole's side stays letterboxed in landscape (the cutout mode isn't changed: the chrome doesn't pad by the cutout inset yet) |
+| System bars | — | hidden (immersive mode): the navigation bar — Back / Home / Recents or the gesture pill, the right edge in landscape — and the status bar; a swipe from the edge shows them for a moment, translucent over the editor, and they go again by themselves (`src/android/system_bars.rs`: API 30+ `WindowInsetsController.hide(systemBars)` with transient-by-swipe, before that the sticky immersive view flags; asked at start and again on focus regained / keyboard down, on the Java main thread). `RUSTUDIO_SYSTEM_BARS=1` keeps them |
+| Display cutout (the camera hole / notch) | — | the window goes under it on the screen's short edges (`layoutInDisplayCutoutMode` shortEdges, API 28+, set on the window's attributes from the Java main thread at start: `src/android/cutout.rs`, `jni::set_layout_in_display_cutout_mode`) where Android had letterboxed the hole's whole side in landscape, black, like the navigation bar's strip before; the editor pads itself by the hole's safe insets instead — `App::ui` lays the frame out in a child `Ui` that ends short of the hole (`Cutout::child`, as keyboard.rs's `shrink` takes the keyboard's room), the strip painted the window's colour, and the insets are egui's safe-area insets too (`Cutout::before_frame`, with the keyboard's bottom), so windows, menus and popups keep off it. The insets come from `jni::display_cutout_later` on the Java main thread, never waited for: at start (again every ½ s until the window has insets), on focus regained and after a resize (a rotation moves the hole: three readings over the second after). A played game lies inside the padded area — its view and GUIs never reach the hole, so the engine's `DeviceSafeInsets` stay zero; drawing the 3D view under the hole with only the GUIs inset would need those first. `RUSTUDIO_CUTOUT=0` leaves the window out of the cutout, as before |
 | Back button | — | closes what is open on top (Escape); in Play opens / closes the Roblox menu (Escape's job, as Back does in Roblox's app; its Leave ends the session, as the Stop button at the game's top right does); otherwise `moveTaskToBack` — the activity isn't destroyed (`src/android/lifecycle.rs`) |
 | Roblox menu and chat in Play | Esc and `/` | the top bar over the game view is upstream's Luau one (`players_chat_ui.luau`: `CoreGui.TopBarApp`, the Roblox button and the unibar pill with the menu and chat buttons, drawn as GUI and so hit by fingers like any button; the chat button opens the chat window with its box, the keyboard comes up for the box) when the CoreScripts are off, and Roblox's own TopBarApp / Chrome unibar when they run (Settings > rustudio > Play > CoreScripts). `SetCore("TopbarEnabled", false)` hides it; `GuiService.TopbarInset` is the bar's free area either way (`World::topbar_inset`, upstream's) |
 | Activity destroyed | — | `onDestroy` hook: close request, then `process::exit(0)`; `android_main` always leaves the process when the loop ends (`lifecycle.rs`): status 0 for a close, 2 for an eframe error, 101 for a panic (named in logcat with its crash report) |
@@ -189,8 +190,8 @@ provides or still has to.
 | `OnScreenKeyboardVisible / OnScreenKeyboardSize / OnScreenKeyboardPosition`, `TextBoxFocused / TextBoxFocusReleased`, `TextBox.ReturnPressedFromOnScreenKeyboard` | focus events fire (`play_game.rs` 247); keyboard size zero | the soft keyboard comes up for a focused TextBox and goes with its focus (`keyboard.rs` `end_frame`, `gui::share().focus`); the user hiding it releases the focus (FocusLost). While it is up for a game's TextBox it lies over the view, which slides up to show the box (`Editor::keyboard_pan`, src/viewport.rs), and `OnScreenKeyboardVisible / Position / Size` report it in the game's coordinates (`touch_input::soft_keyboard`, `runtime_ext.rs` `device_prop`); Enter on a touch screen fires `ReturnPressedFromOnScreenKeyboard` before `FocusLost` (gui_input.luau `lose`) |
 | `HapticService.IsVibrationSupported / IsMotorSupported / SetMotor / GetMotor` | gamepad-only flags, in-memory motor table (`gui_input.luau` 1796-1845) | `jni::vibrator_info()` (hasVibrator, hasAmplitudeControl) and `jni::vibrate(ms, strength)` — **wiring to do**: `UserInputType.Touch` supported, `VibrationMotor.Large` (and `Small` when amplitude control exists) |
 | `HapticEffect:Play / Stop`, `HapticEffect.Type` presets | simulated durations (UIHover .035 s, UIClick .055, UINotification .4, GameplayCollision .3, GameplayExplosion .8) | `jni::vibrate_pattern` (VibrationEffect.createWaveform) — **mapping of each preset to do** |
-| `ContextActionService.BindAction(..., createTouchButton)`, `GetButton / SetTitle / SetImage / SetPosition` | bindings stored, priority dispatch (`library.luau` ContextActionService section); with the CoreScripts on, Roblox's own ContextActionTouch draws the buttons (PlayerGui `ContextActionGui`) from `BoundActionAdded / Removed / Changed` and answers `GetButton` through `GetActionButtonEvent` / `FireActionButtonFoundSignal`, as StarterScript starts it on a touch screen (`UserInputService.TouchScreenEnabled`, RobloxScriptSecurity, is `TouchEnabled`); without them no buttons | **to do**: this build's own buttons when the CoreScripts are off (70×70 ImageButton right of the thumbstick) |
-| `GuiService:GetGuiInset()`, `TopbarInset`, `GetInsetArea`, `ScreenGui.ScreenInsets` (`None / DeviceSafeInsets / CoreUISafeInsets / TopbarSafeInsets`), `ScreenGui.SafeAreaCompatibility` | `(0, 58)` constant (`mech::GUI_TOP_INSET`); `TopbarInset` in Play is the top bar's free area — from the end of the menu and chat buttons (128 px with the chat button, 72 without: `gui::fallback_topbar_inset`; the CoreScripts' own `GuiService:SetTopbarInset` when they run) to the viewport's right edge, 58 high — and `GetPropertyChangedSignal("TopbarInset")` fires when the viewport or the chat button changes (`gui_input.luau step_topbar`, upstream's; LBG's ClientRenderer and TopbarPlus wait on it); an empty Rect in the edit DataModel; a `TopbarSafeInsets` ScreenGui is that rect (TopbarPlus's icons: starts after the buttons, 58 high; `gui_input.rs` roots, `runtime_ext.rs gui_rect`) | `jni::window_insets()` (system bars + display cutout; the 4 sides) — **wiring to do**: DeviceSafeInsets = those, CoreUISafeInsets = those + topbar, TopbarSafeInsets = topbar only |
+| `ContextActionService.BindAction(..., createTouchButton)`, `GetButton / SetTitle / SetImage / SetPosition` | bindings stored, priority dispatch (`library.luau` ContextActionService section); with the CoreScripts on, Roblox's own ContextActionTouch draws the buttons (PlayerGui `ContextActionGui`) from `BoundActionAdded / Removed / Changed` and answers `GetButton` through `GetActionButtonEvent` / `FireActionButtonFoundSignal`, as StarterScript starts it on a touch screen (`UserInputService.TouchScreenEnabled`, RobloxScriptSecurity, is `TouchEnabled`); without them no buttons | without them, this build's own (`crates/rustudio-engine/src/domains/context_action_touch.luau`, started by `gui_input.luau start_touch_buttons` in Play on a touch screen once the LocalPlayer's PlayerGui is there): Roblox's ContextActionTouch rebuilt the way it builds — `PlayerGui.ContextActionGui.ContextButtonFrame` (30 % × 50 % of the screen from (70 %, 50 %)), a 45 × 45 `ContextActionButton` ImageButton per action (35 × 35 on a screen 320 tall or less) at one of its seven places, its `ActionIcon` / `ActionTitle` from `SetImage` / `SetTitle`, `SetPosition` moving it, the frame visible while `PreferredInput == Touch` and `GuiService.TouchControlsEnabled` — so a game that finds the button with `GetButton` and restyles it finds what it finds in Roblox. A finger on a button runs the handler with `Begin`, its moves `Change`, its lift `End` (a lift after it dragged off the button: `Cancel`) through `ContextActionService:CallFunction` (RobloxScriptSecurity, new in `library.luau`: Roblox's own ContextActionTouch presses its buttons with it too, so with the CoreScripts on the buttons now work as well as show). Test: `touch_buttons_without_the_core_scripts` |
+| `GuiService:GetGuiInset()`, `TopbarInset`, `GetInsetArea`, `ScreenGui.ScreenInsets` (`None / DeviceSafeInsets / CoreUISafeInsets / TopbarSafeInsets`), `ScreenGui.SafeAreaCompatibility` | `(0, 58)` constant (`mech::GUI_TOP_INSET`); `TopbarInset` in Play is the top bar's free area — from the end of the menu and chat buttons (128 px with the chat button, 72 without: `gui::fallback_topbar_inset`; the CoreScripts' own `GuiService:SetTopbarInset` when they run) to the viewport's right edge, 58 high — and `GetPropertyChangedSignal("TopbarInset")` fires when the viewport or the chat button changes (`gui_input.luau step_topbar`, upstream's; LBG's ClientRenderer and TopbarPlus wait on it); an empty Rect in the edit DataModel; a `TopbarSafeInsets` ScreenGui is that rect (TopbarPlus's icons: starts after the buttons, 58 high; `gui_input.rs` roots, `runtime_ext.rs gui_rect`) | `jni::window_insets()` (system bars + display cutout; the 4 sides) — **wiring to do**: DeviceSafeInsets = those, CoreUISafeInsets = those + topbar, TopbarSafeInsets = topbar only. With the system bars hidden and the editor laying the game out short of the display cutout (`src/android/cutout.rs`) all four are zero today, so the constant answer is the right one on a device |
 | `StarterGui.ScreenOrientation`, `PlayerGui.ScreenOrientation / CurrentScreenOrientation` | stored (`start_page/builtin.rs` 144); `CurrentScreenOrientation = LandscapeLeft` | `jni::set_requested_orientation` + `jni::current_orientation()` — **wiring to do**: apply at Play start, restore `sensorLandscape` at stop |
 | `Player:GetMouse()`, `Mouse` while playing | desktop pointer | **to do**: the first touch stands in (as Roblox does) |
 | `VRService`, gamepads | stubs | unchanged |
@@ -335,6 +336,40 @@ Block buttons only with the next spawn's re-send). `RUSTUDIO_TOUCH=0` (the
 `debug.rustudio.env` property) puts the editor's stick and jump back
 (the keyboard-and-mouse reading of fingers) on a device; `=1` turns the
 game's touch on on a desktop with a touch screen.
+
+**ContextActionService's touch buttons** (`BindAction(name, fn, true,
+...)`): Roblox's ContextActionTouch CoreScript draws one per action with
+`createTouchButton` in `PlayerGui.ContextActionGui` and presses it with
+`ContextActionService:CallFunction(name, state, inputObject)`
+(RobloxScriptSecurity). With the CoreScripts on (Settings > rustudio >
+Play > CoreScripts) that script runs here; without them
+`crates/rustudio-engine/src/domains/context_action_touch.luau` does its
+job, built from its source (Roblox-Client-Tracker
+`scripts/CoreScripts/CoreScripts/ContextActionTouch.lua`): the same
+`ContextButtonFrame` (the screen's lower-right 30 % × 50 %), the same
+45 × 45 `ContextActionButton` ImageButtons (35 × 35 on a screen 320 tall
+or less) at its seven places — the first free one, `SetPosition` moving
+a button —, `ActionIcon` and `ActionTitle` children from `SetImage` /
+`SetTitle` (SourceSansBold 18, white, stroked), its up / down images
+(assets 97166444 / 97166756), `Maximum of 7 allowed touch buttons` as
+its warning, the frame shown while `PreferredInput == Touch` and
+`GuiService.TouchControlsEnabled`; `GetButton` gets the button through
+`GetActionButtonEvent` / `FireActionButtonFoundSignal`. A finger
+landing on a button runs the handler with `UserInputState.Begin` and
+the finger's InputObject, its moves with `Change`, its lift on the
+button with `End`, and a lift anywhere else after it dragged off with
+`Cancel` (Roblox's AWAY state; heard from `UserInputService.InputEnded`,
+since the button no longer has the finger) — `CallFunction` is new in
+`library.luau` for both scripts (the CoreScript's buttons showed but did
+nothing before, the method missing), runs the handler at the binder's
+identity and reports its error as the script's. `gui_input.luau
+start_touch_buttons` starts the drawer once in Play on a touch screen
+(`touch_input::game_touch`) when the LocalPlayer's PlayerGui exists and
+the CoreScripts aren't running (`core_scripts.scripts` empty); the
+PlayerModule's own thumbstick and jump button are theirs as before. Test:
+`runtime.rs touch_buttons_without_the_core_scripts` (the button, its
+children, `GetButton`, a game script refused `CallFunction`, Begin / End
+and Begin / Cancel from two fingers, `UnbindAction` taking it away).
 
 **The game's canvas: View > Play Fills the Screen** (on by default on
 Android; `RUSTUDIO_PLAY_FULL=1` / `0` sets it, saved with the layout).
@@ -1781,12 +1816,15 @@ also echoed to logcat at the next start.
    is done), orientation; a selection
    in a game's TextBox (the text bar's Copy takes the whole text, its
    Cut and Select all are for egui fields).
-5. `ContextActionService` touch buttons (`createTouchButton`) without the
-   CoreScripts (with them, Roblox's ContextActionTouch draws them).
-6. The display cutout: the window under the camera hole
-   (`layoutInDisplayCutoutMode` shortEdges) once the chrome pads itself
-   by the cutout inset (`jni::window_insets`), so the letterboxed strip
-   on that side goes the way the navigation bar's did (`system_bars.rs`).
+5. ~~`ContextActionService` touch buttons (`createTouchButton`) without
+   the CoreScripts~~ (`domains/context_action_touch.luau`, Roblox's
+   ContextActionTouch rebuilt; `ContextActionService:CallFunction` for
+   both; the "Audit: Roblox services on a device" row).
+6. ~~The display cutout: the window under the camera hole
+   (`layoutInDisplayCutoutMode` shortEdges), the chrome padded by the
+   cutout inset~~ (`src/android/cutout.rs`; the "What is where" row).
+   Left: the 3D view under the hole with only the GUIs inset, which
+   wants `ScreenInsets.DeviceSafeInsets` in the engine first.
 
 Each step closes rows in docs/ENGINE-GAPS.md; the Creator Hub reference
 pages are the source of truth for every member name, argument and enum.

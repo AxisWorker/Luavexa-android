@@ -399,8 +399,11 @@ camera 75 → 100 with the 2° tolerance unchanged.
    `InputBegan / Changed / Ended` and `TouchStarted / Moved / Ended`,
    ContextActionService `UserInputType.Touch` bindings and the
    touch-button CoreScript's feed (`BoundActionAdded / Removed / Changed`,
-   `GetActionButtonEvent`, `FireActionButtonFoundSignal`: ContextActionTouch
-   draws `createTouchButton` buttons when the CoreScripts run), the input action
+   `GetActionButtonEvent`, `FireActionButtonFoundSignal`, and
+   `CallFunction` for the press: ContextActionTouch draws
+   `createTouchButton` buttons when the CoreScripts run, and
+   `domains/context_action_touch.luau` draws the same ones — Roblox's
+   ContextActionGui, places, sizes and children — when they don't), the input action
    system's `TouchPosition / TouchDelta / TouchPinch` with `UIButton` /
    `UIModifier`, GuiObject `InputBegan(Touch)` / `TouchTap`, the gestures
    (`TouchTap`, `TouchTapInWorld`, `TouchLongPress`, `TouchPan`,

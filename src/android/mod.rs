@@ -35,6 +35,7 @@
 
 mod assets;
 pub mod clipboard;
+pub mod cutout;
 pub mod ime;
 pub mod intent;
 pub mod jni;
@@ -164,6 +165,9 @@ pub fn run(app: AndroidApp) {
     // The navigation and status bars out of the way (immersive mode), on
     // the main thread when it gets to it; the window grows to the screen.
     system_bars::hide();
+    // And under the camera hole on its side (cutout.rs): the editor pads
+    // itself by the hole's insets instead of Android letterboxing the side.
+    cutout::request();
     // The soft keyboard's input connection (ime.rs): its Java class out of
     // the library, its view into the activity.
     ime::install();

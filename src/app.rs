@@ -380,6 +380,10 @@ pub struct RustudioApp {
     /// Room for the soft keyboard (src/android/keyboard.rs).
     #[cfg(target_os = "android")]
     keyboard: crate::android::keyboard::Keyboard,
+    /// The display cutout's insets, which the frame is laid out short of
+    /// (src/android/cutout.rs).
+    #[cfg(target_os = "android")]
+    cutout: crate::android::cutout::Cutout,
     /// The text fields' long-press menu (src/android/text_menu.rs).
     #[cfg(target_os = "android")]
     text_menu: crate::android::text_menu::TextMenu,
@@ -734,6 +738,8 @@ impl RustudioApp {
             panels,
             #[cfg(target_os = "android")]
             keyboard: Default::default(),
+            #[cfg(target_os = "android")]
+            cutout: Default::default(),
             #[cfg(target_os = "android")]
             text_menu: Default::default(),
             #[cfg(target_os = "android")]
@@ -2407,6 +2413,8 @@ impl eframe::App for RustudioApp {
             let textbox = self.ed.textbox_focused();
             let game_box = self.ed.game.play.is_some() && self.ed.game.gui.focus.is_some();
             self.keyboard.before_frame(ctx, raw, textbox, game_box);
+            // The display cutout's insets (with the keyboard's bottom).
+            self.cutout.before_frame(ctx, raw);
             let playing = self.ed.game.play_game_input();
             crate::android::lifecycle::back_pressed(ctx, raw, playing);
             // The window back in focus: the system bars hidden again.
@@ -2644,6 +2652,12 @@ impl RustudioApp {
             self.ed.keyboard_cover = self.keyboard.cover(&ctx);
             self.keyboard.shrink(ui);
         }
+        // And short of the display cutout (android/cutout.rs): the rest of
+        // the frame is laid out in a Ui that ends before the camera hole.
+        #[cfg(target_os = "android")]
+        let mut cutout_ui = self.cutout.child(ui);
+        #[cfg(target_os = "android")]
+        let ui = &mut cutout_ui;
         let ed = &mut self.ed;
         // Files opened from Finder (double-click, Open With, the Dock icon).
         #[cfg(target_os = "macos")]
