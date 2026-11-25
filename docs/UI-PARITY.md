@@ -25,7 +25,7 @@ Status: **done** = matches Studio; **partial** = as noted; **open** = not yet.
 | Document tab | the place's file name over the 3D view | the place's name (was "Viewport") | done |
 | Panel headers | full-width bar, name centred, float / close at the right | full-width centred title with close; no float button | partial |
 | Command bar | Script > Command Bar at the bottom (on by default) | not built: Window > Script > Command Bar disabled | open |
-| Status bar | none in this Studio | rustudio keeps its status bar (selection, parts, camera, snap, fps; rebuild_check reads it) | different on purpose |
+| Status bar | none in this Studio | rustudio keeps its status bar (selection, parts, camera, snap, fps; rebuild_check reads it); on Android it is not drawn while the soft keyboard is up, and the menu bar, test bar and ribbon go too while an editor field has the keyboard (`Keyboard::typing_layout`, docs/ANDROID.md "Text: the soft keyboard") | different on purpose |
 | Fonts | Builder Sans (ribbon, panels) | Builder Sans read from Studio's content folder at run time, else egui's | done |
 | Animations | menus open at once | egui fades turned off | done |
 

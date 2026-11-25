@@ -290,7 +290,7 @@ impl Game {
         let behavior = if behavior != 0
             && !ctx.input(|i| i.pointer.secondary_down())
             && self.play.as_ref().is_some_and(|s| s.showing == rustudio_engine::runtime::Side::Client)
-            && rustudio_engine::gui_modal::modal_shown(&self.doc, &self.gui.layout)
+            && self.gui.modal.shown(&mut self.doc, &self.gui.layout)
         {
             0
         } else {

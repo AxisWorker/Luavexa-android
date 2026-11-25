@@ -491,6 +491,8 @@ pub struct Gui {
     pub topbar_chat: Option<bool>,
     /// Free rectangle published by the client CoreScripts, in viewport pixels.
     pub topbar_inset: Option<crate::ltypes::LRect>,
+    /// The Modal buttons (gui_modal.rs): asked each frame the game holds the mouse.
+    pub modal: crate::gui_modal::ModalIndex,
     /// Hide Play Core UI (`CoreGui`: topbar, leaderboard, chat, backpack, …)
     /// while keeping game UI (`PlayerGui` and world GUIs) visible.
     pub hide_core_gui: bool,

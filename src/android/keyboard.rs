@@ -417,6 +417,18 @@ impl Keyboard {
         if self.over { self.room(ctx) } else { 0.0 }
     }
 
+    /// An editor text field is being typed into with room made for the
+    /// keyboard (not a game's TextBox, which the keyboard lies over): the
+    /// typing layout, `RustudioApp::ui` leaves the menu bar, the test bar
+    /// and the ribbon out while it lasts. A landscape phone's window is
+    /// some 410 points tall; the keyboard and the text bar take 200 of
+    /// them and the chrome 140 of the rest, which left the script editor
+    /// two or three lines, the one typed into as often as not off them
+    /// (the 2026-11-25 report, again: "still can't see what I'm typing").
+    pub fn typing_layout(&self, ctx: &egui::Context) -> bool {
+        !self.over && self.room(ctx) > 0.0
+    }
+
     /// At the start of `App::ui`: the root `Ui` ends above the keyboard
     /// and the bar, so every panel laid out in it does too (not while the
     /// keyboard lies over the window: `cover`).

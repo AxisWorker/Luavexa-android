@@ -2871,36 +2871,46 @@ impl RustudioApp {
 
         {
             let _p = rustudio_core::bench::scope("editor_chrome");
-            egui::Panel::top("menu")
-                .frame(
-                    egui::Frame::new()
-                        .fill(theme::MENU_BAR)
-                        .inner_margin(egui::Margin::symmetric(6, 2)),
-                )
-                .show(ui, |ui| {
-                    let _p = rustudio_core::bench::scope("menu_bar");
-                    ed.studio_menu_bar(ui);
-                });
-            egui::Panel::top("testbar")
-                .frame(
-                    egui::Frame::new()
-                        .fill(theme::PANEL)
-                        .inner_margin(egui::Margin::symmetric(8, 4)),
-                )
-                .show(ui, |ui| {
-                    let _p = rustudio_core::bench::scope("test_toolbar");
-                    ed.studio_top_row(ui);
-                });
-            egui::Panel::top("toolbar")
-                .frame(
-                    egui::Frame::new()
-                        .fill(theme::PANEL)
-                        .inner_margin(egui::Margin::symmetric(6, 4)),
-                )
-                .show(ui, |ui| {
-                    let _p = rustudio_core::bench::scope("ribbon");
-                    ed.studio_ribbon(ui);
-                });
+            // Android, the typing layout (keyboard.rs `typing_layout`): the
+            // soft keyboard is up for an editor field, and the menu bar,
+            // the test bar and the ribbon leave their height to the dock
+            // — the script editor, the Properties cell — until it goes.
+            #[cfg(target_os = "android")]
+            let chrome = !self.keyboard.typing_layout(&ctx);
+            #[cfg(not(target_os = "android"))]
+            let chrome = true;
+            if chrome {
+                egui::Panel::top("menu")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(theme::MENU_BAR)
+                            .inner_margin(egui::Margin::symmetric(6, 2)),
+                    )
+                    .show(ui, |ui| {
+                        let _p = rustudio_core::bench::scope("menu_bar");
+                        ed.studio_menu_bar(ui);
+                    });
+                egui::Panel::top("testbar")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(theme::PANEL)
+                            .inner_margin(egui::Margin::symmetric(8, 4)),
+                    )
+                    .show(ui, |ui| {
+                        let _p = rustudio_core::bench::scope("test_toolbar");
+                        ed.studio_top_row(ui);
+                    });
+                egui::Panel::top("toolbar")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(theme::PANEL)
+                            .inner_margin(egui::Margin::symmetric(6, 4)),
+                    )
+                    .show(ui, |ui| {
+                        let _p = rustudio_core::bench::scope("ribbon");
+                        ed.studio_ribbon(ui);
+                    });
+            }
             // Android: no status bar while the soft keyboard is up. It
             // carries nothing a typist needs, and it sat over the text
             // being typed — a game TextBox the view had slid up to show

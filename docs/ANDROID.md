@@ -452,7 +452,16 @@ is not drawn while the keyboard is up**, in either mode (`RustudioApp::ui`,
 `Keyboard::room` > 0): it carries nothing a typist needs, a 2026-11-25
 report had its Team Create / camera strip over the text being typed, and
 in the panel mode it took a line off the few a landscape phone has left
-above the keyboard. The game's scripts see the
+above the keyboard. **Neither are the menu bar, the test bar and the
+ribbon while an editor field has the keyboard** (`Keyboard::typing_layout`:
+a field of the editor's own focused and room made for the keyboard — not
+a game's TextBox, which moves nothing): a landscape phone is about 410 pt
+tall, the keyboard and the text bar take about 200 of them and the three
+top panels about 140, which left the script editor two or three lines
+("still can't see what I'm typing", 2026-11-25); without them the dock
+gets the whole strip above the keyboard, eight to ten lines. They come
+back with the keyboard going down (the focus released, Back, Done). The
+game's scripts see the
 keyboard where Roblox's client reports it: `UserInputService.
 OnScreenKeyboardVisible / OnScreenKeyboardPosition / OnScreenKeyboardSize`
 in the game's coordinates (`touch_input::set_soft_keyboard`, read by
@@ -799,7 +808,26 @@ Settings > rustudio, and the MicroProfiler). What a phone gets from it:
   `RUSTUDIO_NO_PRECOMPILE=1` skips it) — Roblox has a place's scripts
   compiled by the time the player is in, and rustudio's first Play of a
   place compiled everything as the game started, finding the cache only
-  from the second Play on. `RUSTUDIO_LOAD_TRACE=1` (through `debug.rustudio.env`)
+  from the second Play on. **Compiling is a small part of the start**:
+  LBG on a 2-core desktop (debug build) starts Play in 1.4–1.6 s, of
+  which the 209 scripts loaded at start compile in 411 ms cold and 41 ms
+  from the cache; the rest is making the two Luau VMs (`runtimes made`
+  ≈ 340 ms: `Runtime::new` + `install_side` each), copying the DataModel
+  for the server (≈ 350 ms) and replicating it to the client (≈ 350 ms),
+  the server scripts' first run (≈ 140 ms) and the player's set-up
+  (≈ 120 ms). After the start line the game's own first frames are the
+  wait a player feels: LBG's client runs about 2 s of script in its first
+  eight frames (`ClientRenderer` 1 s, TopbarPlus' `IconController` 0.4 s,
+  the camera module, the HUD scripts) and the server 1.2 s in its first
+  fourteen (`LimitedShopTimer`'s DataStore session, `Bootstrap.Init`),
+  which `RUSTUDIO_SCRIPT_PROFILE=live` (`--bench`'s `scripts` report,
+  docs/PROFILING.md) shows per script. A phone's own numbers: its
+  `[startup] Play started in …` line is in the session log. (Under
+  `--fixed-dt` the same start takes 55 s on the desktop, all of it in
+  `server head start`'s six frames and none of it script time (312 ms
+  for the whole run): a harness artefact of the simulated clock —
+  probably the synchronous decodes it asks for (`gui.rs`, `media.rs`
+  `sim_clock::on()`), not checked — not the phone's.) `RUSTUDIO_LOAD_TRACE=1` (through `debug.rustudio.env`)
   prints the full `LOADTRACE` trail instead: the place read and parsed,
   every frame over 100 ms with its biggest bench sections, the asset
   queues as they change, each line with the resident size (`[rss N MB]`,
@@ -880,6 +908,29 @@ Settings > rustudio, and the MicroProfiler). What a phone gets from it:
   the answer before any of that: the debug APK runs the editor at
   opt-level 1 with debug assertions in every crate, several times slower
   than the release APK.
+- **The main thread's own per-frame work in Play** is what a profile
+  capture of a big game shows first, and it is platform-independent: a
+  `--profile-capture` of LBG on the desktop (debug, `--no-render`,
+  2026-11-25, `devtools/lbg2-real.sh PROF=1`) had the main lane busy
+  10.4 ms a frame, 6.6 of them in `vp_input` — `gui_modal::modal_shown`
+  walking every descendant of the PlayerGui each frame the game held
+  the mouse, to see whether a Modal button is up (LBG's GUI is tens of
+  thousands of objects). It is an index kept from the change journal
+  now (`gui_modal::ModalIndex`, in `Gui`), a full walk once per
+  document. What is left on that lane is the game's: TopbarPlus'
+  `updateTopbar` at 4–56 ms a call, the GUI walk (`gui_walk`) at 27 ms
+  p95 when LBG's layout changes, `p9_collect` spikes to 300 ms while the
+  game's first clones become garbage, and the camera module's occlusion
+  raycasts (`popper`, 10 ms average over the first frames). The voxel
+  destruction behind LBG's craters (`VoxelClient.luau`: up to 400 pooled
+  debris parts with physics and a Heartbeat raycast loop,
+  `MaxSplitsPerHit` 4096 anchored pieces moved with `BulkMoveTo`,
+  `ClientDebrisPerHit` unlimited; the Virus Overlord's Infernal Blades
+  beam voxelises a 90-stud cube) is the game's own load, cut in half by
+  its Settings > Fast Mode (`S_FastMode` halves the debris) or off with
+  `S_NoDestruction`; the harness probe for it is
+  `devtools/lbg-probes/voxel1.luau` (it needs the character on a
+  `VoxelOrigin` part — the spawn is not on one).
 
 Switches for a device, which has no shell environment to launch from:
 
