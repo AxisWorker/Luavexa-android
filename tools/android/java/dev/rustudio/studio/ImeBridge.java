@@ -359,13 +359,31 @@ public final class ImeBridge extends View {
             mSelBeforeB = Selection.getSelectionEnd(mText);
         }
 
-        /** Runs one operation; outside a batch, it is reported by itself. */
+        /**
+         * Runs one operation; outside a batch of the keyboard's, it is
+         * reported by itself. The batch count is held up through the run:
+         * BaseInputConnection's commitText, setComposingText,
+         * setComposingRegion, finishComposingText and the two
+         * deleteSurroundingText each wrap their work in beginBatchEdit /
+         * endBatchEdit — this class's overrides — so an operation the
+         * keyboard made outside a batch of its own was reported twice,
+         * once as that inner batch ended and once here, the same
+         * replacement both times: the editor typed every letter, paste and
+         * deletion of such a keyboard twice (keyboards that batch their
+         * calls, as Gboard does, were reported once).
+         */
         private boolean mutate(Mut m) {
             boolean top = mBatch == 0;
             if (top) {
                 snapshot();
             }
-            boolean ok = m.run();
+            mBatch++;
+            boolean ok;
+            try {
+                ok = m.run();
+            } finally {
+                mBatch--;
+            }
             if (top) {
                 report();
             }

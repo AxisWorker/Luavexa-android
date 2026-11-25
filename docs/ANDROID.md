@@ -471,16 +471,32 @@ second time through the window; arrows and the rest pass through to
 native code as before. The keyboard's own Select all / Cut / Copy / Paste
 (`performContextMenuAction`) work on the mirror and the system clipboard.
 A character that nonetheless arrives through the window as a key event
-while the keyboard is up through the bridge (a 2026-11 device typed "s"
-as "ss") is the same character again: once the keyboard's operations have
-been seen for the field, key-event text (winit's `Event::Text`; never
-`Event::Key`) is dropped, and before that it is held back one frame and
-dropped if an operation arrives meanwhile — the key event can reach the
-window a frame before the operation — else typed (`ime.rs key_text`; a
-hardware keyboard whose keys the input method passes on untouched types
-as before, a frame later). Logcat says which way a doubled character came:
-`ime: op …` for the bridge's, `ime: N key-event character(s) dropped /
-typed` for the window's.
+while the keyboard is up through the bridge would be the same character
+again: key-event text (winit's `Event::Text`; never `Event::Key`) is held
+back one frame and dropped if an operation of the keyboard's arrives
+meanwhile — the key event can reach the window a frame before the
+operation — else typed (`ime.rs key_text`): a hardware keyboard, whose
+keys reach the window before any input method and so never come through
+the bridge, types as before, a frame later. Logcat says which way a
+doubled character came: `ime: op …` for the bridge's, `ime: N key-event
+character(s) dropped / typed` for the window's.
+
+The doubling a 2026-11 device had ("s" typed as "ss", a paste pasted
+twice) was the bridge's own: every operation a keyboard makes outside a
+`beginBatchEdit` / `endBatchEdit` pair of its own was reported twice —
+`BaseInputConnection`'s `commitText`, `setComposingText`,
+`finishComposingText` and `deleteSurroundingText` bracket their work with
+those two calls, and the bridge's overrides of them counted the inner
+pair as a batch of the keyboard's and reported it as it ended, then
+reported the operation again on its own account (`ImeBridge.java
+mutate`; keyboards that batch every call, as Gboard does, were reported
+once, which is why the bridge looked right with one keyboard and typed
+"ss" and pasted twice with another). The batch count is now held up
+through the operation's run, so the inner pair reports nothing. The
+editor also drops an operation that merely repeats the one before it —
+the next number, the same replacement, the mirror's hash the same after
+it, which a replacement made anew cannot leave (`ime.rs repeats`) — and
+logs `ime: op N reports op M again … dropped`.
 
 The class is compiled by `tools/android/build-dex.sh` (javac → d8, with
 an SDK's `android.jar` and `d8`; run it when the Java changes) into

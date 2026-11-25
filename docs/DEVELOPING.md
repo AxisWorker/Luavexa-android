@@ -35,6 +35,12 @@ rustudio place.rbxl --play --from-play --shots 5 --screenshot t.png \
 rustudio --write-corpus tools/fidelity/corpus   # regenerate the demo / control places
 cargo test --workspace           # unit tests (undo/redo, files, Luau runtime, physics, meshes, FBX, GUI, PKCE)
 ```
+A `--luau` chunk runs at the command bar's identity, so (as in Studio) its
+`require` gets separate copies of the place's ModuleScripts: a probe that reads
+a game module's state (a target cache, a stats table) has to create a `Script`
+or `LocalScript` with that code as `Source` and parent it (instance signals and
+remotes are shared either way).
+
 `RUSTUDIO_GUI_DEBUG=1` logs GUI clicks and remote calls to Output;
 `RUSTUDIO_NO_GUI=1` hides every GUI (to tell GUI from 3D in a picture).
 

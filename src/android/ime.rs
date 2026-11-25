@@ -40,10 +40,12 @@
 //!   sends the Java side the editor's state (`setState`), with the number of
 //!   the last operation it includes, so it is applied only when no newer
 //!   operation is in flight. The editor's text is the truth throughout.
-//! * Characters that still come as key events through the window while
-//!   the keyboard is up through the bridge are the same characters again
-//!   (a keyboard typing them both ways): dropped once the keyboard's
-//!   operations are seen, held back a frame before that ([`key_text`]).
+//! * Characters that come as key events through the window while the
+//!   keyboard is up through the bridge are held back a frame and dropped
+//!   if an operation of the keyboard's arrives with them (a keyboard
+//!   typing them both ways), else typed ([`key_text`]: a hardware
+//!   keyboard's). An operation that merely repeats the one before it is
+//!   dropped ([`repeats`]).
 //! * [`show`] / [`hide`] are what keyboard.rs asks the keyboard up and down
 //!   with: `show` hands the Java view the field's kind ([`Kind`]: a line,
 //!   many lines, code), text and selection, gives it the view focus and
@@ -123,13 +125,11 @@ struct Session {
     agreed: Option<(u64, (usize, usize))>,
     /// The last operation taken from `OPS`.
     seq: i32,
+    /// That operation itself, before any merging (`repeats`).
+    last: Option<Op>,
     /// The operation(s) applied this frame: its number, and the hash and
     /// selection the Java side expects after it.
     applied: Option<(i32, u64, (usize, usize))>,
-    /// An operation of the keyboard's has been applied to this field: its
-    /// text comes through the bridge, so a character arriving as a key
-    /// event is the same character again (`key_text`).
-    bridged: bool,
     /// Key-event characters held back one frame (`key_text`), and the
     /// frame they came in.
     held: Vec<String>,
@@ -436,8 +436,17 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
     let mut queue = ops();
     let arriving = !queue.is_empty();
     key_text(s, raw, arriving);
-    let Some(first) = queue.pop_front() else { return };
-    let mut op = first;
+    let mut op = loop {
+        let Some(op) = queue.pop_front() else { return };
+        if repeats(&op, s.last.as_ref()) {
+            log::warn!("ime: op {} reports op {} again (the same replacement, the mirror as it left it): dropped", op.seq, s.seq);
+            s.seq = op.seq;
+            s.last = Some(op);
+            continue;
+        }
+        s.last = Some(op.clone());
+        break op;
+    };
     // Replacements that go on at the cursor (typing) are one event.
     loop {
         let merged = match (&op.what, queue.front()) {
@@ -450,7 +459,7 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
         };
         match merged {
             Some(m) => {
-                queue.pop_front();
+                s.last = queue.pop_front();
                 op = m;
             }
             None => break,
@@ -459,7 +468,6 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
     drop(queue);
     s.seq = op.seq;
     s.applied = Some((op.seq, op.hash, op.sel));
-    s.bridged = true;
     match (&op.what, field) {
         (What::Replace { a, b, text }, Field::Egui(id)) => {
             set_egui_selection(ctx, id, (*a, *b));
@@ -489,6 +497,26 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
     ctx.request_repaint();
 }
 
+/// Whether `op` is the operation before it (`last`) reported a second
+/// time: the next number, the same replacement, and the mirror's hash the
+/// same after it — a replacement changes the text, so one made anew would
+/// leave another hash. The Java side reported every operation made outside
+/// a batch of the keyboard's twice (ImeBridge.java `mutate`, fixed there:
+/// `BaseInputConnection`'s own calls bracket their work with
+/// `beginBatchEdit` / `endBatchEdit`); applied twice, every letter typed
+/// twice and a paste pasted twice. Kept as the guard, and logged, should a
+/// keyboard find another way to say the same thing twice. (Enter and a
+/// selection move leave the text as it is: never judged repeats.)
+fn repeats(op: &Op, last: Option<&Op>) -> bool {
+    let Some(last) = last else { return false };
+    match (&op.what, &last.what) {
+        (What::Replace { a, b, text }, What::Replace { a: la, b: lb, text: ltext }) => {
+            op.seq == last.seq.wrapping_add(1) && op.hash == last.hash && op.sel == last.sel && a == la && b == lb && text == ltext
+        }
+        _ => false,
+    }
+}
+
 fn key(key: egui::Key, pressed: bool) -> egui::Event {
     egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE }
 }
@@ -496,16 +524,19 @@ fn key(key: egui::Key, pressed: bool) -> egui::Event {
 /// Characters that came as key events through the window (egui-winit's
 /// `Event::Text`, from winit's `KeyboardInput`) while the keyboard is up
 /// through the bridge. A keyboard whose characters come through the
-/// bridge's `InputConnection` sends none — unless it types a character
-/// both ways, as the keyboard's own key events were typed twice before
-/// the bridge ("s" typed as "ss"): once as the keyboard's operation, once
-/// as the key event the window turned into text. So while the keyboard
-/// is up for the field: once an operation of the keyboard's has been
-/// applied (`bridged`), key-event text is dropped; before that, it is
-/// held back one frame, and dropped if an operation arrives meanwhile
-/// (the key event may reach the window a frame before its operation),
-/// else let through — a hardware keyboard whose keys the input method
-/// passes on untouched types as before, a frame later. `Event::Key`
+/// bridge's `InputConnection` sends none (the bridge swallows the
+/// character keys it does send, ImeBridge.java `sendKeyEvent`) — should
+/// one type a character both ways all the same, the window's copy would
+/// be the same character again. So while the keyboard is up for the
+/// field, key-event text is held back one frame and dropped if an
+/// operation of the keyboard's arrives meanwhile (the key event may reach
+/// the window a frame before its operation), else let through: a
+/// hardware keyboard — whose keys reach the window before any input
+/// method, so never through the bridge — types as before, a frame later.
+/// (Dropping key-event text for good once the keyboard's operations had
+/// been seen, as this did for a while, ate a hardware keyboard's typing
+/// into a field the soft keyboard had typed in; the doubling it was meant
+/// for was the bridge's own double report, `repeats`.) `Event::Key`
 /// (arrows, Enter, Backspace, shortcuts) is never touched. Logged, so a
 /// logcat says which way a doubled character came.
 fn key_text(s: &mut Session, raw: &mut egui::RawInput, arriving: bool) {
@@ -523,14 +554,11 @@ fn key_text(s: &mut Session, raw: &mut egui::RawInput, arriving: bool) {
         }
         _ => true,
     });
-    if s.bridged || arriving {
+    if arriving {
         let dropped = s.held.len() + taken.len();
         s.held.clear();
         if dropped > 0 {
-            log::info!(
-                "ime: {dropped} key-event character(s) dropped: the keyboard's text comes through the bridge{}",
-                if s.bridged { "" } else { " (an operation arrived with them)" }
-            );
+            log::info!("ime: {dropped} key-event character(s) dropped: an operation of the keyboard's arrived with them");
         }
         return;
     }

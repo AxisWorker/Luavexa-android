@@ -8967,6 +8967,13 @@ mod tests {
             _G.h = h
         "#).exec().unwrap();
         for _ in 0..30 {
+            // Tweens advance on Heartbeat, as in a play session.
+            let rs = rt
+                .world_mut()
+                .and_then(|w| w.d().find_child(w.d().dom.root_ref(), "RunService"));
+            if let Some(rs) = rs {
+                rt.fire(rs, "Heartbeat", vec![Value::Number(1.0 / 60.0)]);
+            }
             rt.step(1.0 / 60.0);
         }
         rt.lua.load(r#"assert(_G.h.WalkSpeed == 0, "tweened WalkSpeed " .. _G.h.WalkSpeed)"#).exec().unwrap();

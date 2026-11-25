@@ -178,7 +178,11 @@ usage: rustudio [FILE] [--demo] [--play] [--screenshot OUT.png] [--self-test OUT
   --key NAME@S[:HOLD]  press a key at S seconds (held HOLD seconds)
   --shift S:HOLD       hold Shift from S seconds for HOLD seconds
   --luau server|client FILE@S  run the Luau in FILE on that side of Play at S
-                       seconds (with --play; see --from-play)
+                       seconds (with --play; see --from-play). The chunk runs
+                       like Studio's command bar: its require() gets its own
+                       copies of the place's ModuleScripts; to see a game's
+                       module state, have it create a Script with the code as
+                       Source
   --action NAME@S      run a Studio menu action by id at S seconds (e.g. panel_output)
   --move X,Y@S         move the pointer to view position X,Y (hover)
   --wheel N@S[:X,Y]    turn the mouse wheel N notches over the 3D view's centre
