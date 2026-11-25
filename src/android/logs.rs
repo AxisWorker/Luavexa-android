@@ -7,19 +7,22 @@
 //! text file in the shared Download folder (`Download/rustudio/
 //! rustudio-logs-<stamp>.txt`, [`super::jni::export_download`]): the
 //! build and device, the crash reports (newest first, three at most),
-//! the end of the session log, and the app's own logcat lines
+//! the end of the session logs (logcat.rs: this run's and the previous
+//! run's — the one that crashed, when the export follows a restart), and
+//! the app's own logcat lines
 //! (`logcat -d`: an app reads its own lines without a permission, and a
 //! process that died a minute ago still has its lines in the buffer, the
 //! kernel's and the system's lines about it included — `Out of memory`,
-//! `lowmemorykiller`, `Fatal signal`, `am_kill`). Done at the start after
-//! a run that left a crash report (`App::new`, named in Output), and on
-//! Help > Copy Logs to Download at any time.
+//! `lowmemorykiller`, `Fatal signal`, `am_kill`; but the buffer is small:
+//! the session logs are what holds a run's `memory:` lines). Done at the
+//! start after a run that left a crash report (`App::new`, named in
+//! Output), and on Help > Copy Logs to Download at any time.
 
 use std::fmt::Write as _;
 
-/// The log file's size cap, and the session log's share of it.
-const MAX: usize = 3 << 20;
-const SESSION_TAIL: usize = 512 << 10;
+/// The log file's size cap, and each session log's share of it.
+const MAX: usize = 4 << 20;
+const SESSION_TAIL: usize = 1 << 20;
 
 /// Writes the logs file and returns its path as a Files app shows it.
 pub fn export(reason: &str) -> Result<String, String> {
@@ -52,11 +55,22 @@ pub fn export(reason: &str) -> Result<String, String> {
         out.push('\n');
     }
 
-    // The session log's end.
+    // The session logs' ends: the previous run's (the crashed one, after a
+    // restart), then this run's (logcat.rs).
+    let dir = super::logcat::session_dir();
+    for (name, which) in [(super::logcat::SESSION_PREV_FILE, "previous run"), (super::logcat::SESSION_FILE, "this run")] {
+        let path = dir.join(name);
+        let Ok(text) = std::fs::read(&path) else { continue };
+        let start = text.len().saturating_sub(SESSION_TAIL);
+        let start = if start > 0 { text[start..].iter().position(|b| *b == b'\n').map_or(start, |i| start + i + 1) } else { 0 };
+        let _ = writeln!(out, "\n==== session log, {which}: {} ({} bytes{}) ====", path.display(), text.len(), if start > 0 { ", the end" } else { "" });
+        out.push_str(&String::from_utf8_lossy(&text[start..]));
+    }
+    // (The desktop's diagnostics log, should a build keep one here.)
     if let Some(path) = rustudio_core::diagnostics::path() {
         let text = std::fs::read(path).unwrap_or_default();
         let start = text.len().saturating_sub(SESSION_TAIL);
-        let _ = writeln!(out, "\n==== session log {} ({} bytes{}) ====", path.display(), text.len(), if start > 0 { ", the end" } else { "" });
+        let _ = writeln!(out, "\n==== diagnostics log {} ({} bytes{}) ====", path.display(), text.len(), if start > 0 { ", the end" } else { "" });
         out.push_str(&String::from_utf8_lossy(&text[start..]));
     }
 

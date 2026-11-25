@@ -769,14 +769,25 @@ impl Editor {
                     && self.trigger_builtin_plugin_button("ConstraintTool", Some("WeldConstraint"), Some("Place"))
                 {
                 } else {
+                    // Without the ConstraintTool plugin: a WeldConstraint
+                    // from the first selected part to each other one, under
+                    // the first (the button is enabled from two parts; the
+                    // action reached otherwise does nothing rather than
+                    // index a shorter selection).
                     let parts = self.selected_parts();
-                    let (p0, p1) = (parts[0], parts[1]);
-                    let builder = rbx_dom_weak::InstanceBuilder::new("WeldConstraint")
-                        .with_name("WeldConstraint")
-                        .with_property("Part0", Variant::Ref(p0))
-                        .with_property("Part1", Variant::Ref(p1));
-                    let w = self.game.doc.insert(p0, builder);
-                    self.select(vec![w]);
+                    let Some((&p0, rest)) = parts.split_first().filter(|(_, rest)| !rest.is_empty()) else {
+                        self.warn("Weld: select two or more parts");
+                        return;
+                    };
+                    let mut welds = Vec::new();
+                    for &p1 in rest {
+                        let builder = rbx_dom_weak::InstanceBuilder::new("WeldConstraint")
+                            .with_name("WeldConstraint")
+                            .with_property("Part0", Variant::Ref(p0))
+                            .with_property("Part1", Variant::Ref(p1));
+                        welds.push(self.game.doc.insert(p0, builder));
+                    }
+                    self.select(welds);
                 }
             }
             other => {

@@ -906,6 +906,21 @@ impl Editor {
         self.ui.dock_moves.clear();
         self.ui.panel_requests.retain(|(tab, _)| !matches!(tab, Tab::Script(_)));
         self.game.doc = doc;
+        // The scripts compile for Play in the background from here
+        // (bytecode_cache::precompile): a first Play then starts as a second
+        // one does, finding its bytecode ready.
+        rustudio_engine::bytecode_cache::precompile(
+            self.game
+                .doc
+                .dom
+                .descendants()
+                .filter(|i| matches!(i.class.as_str(), "Script" | "LocalScript" | "ModuleScript"))
+                .filter_map(|i| match i.properties.get(&rbx_dom_weak::ustr("Source")) {
+                    Some(rbx_dom_weak::types::Variant::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+        );
         self.game.edit_audio.reset();
         self.game.scene = Scene::default();
         self.drag = None;
@@ -2886,13 +2901,25 @@ impl RustudioApp {
                     let _p = rustudio_core::bench::scope("ribbon");
                     ed.studio_ribbon(ui);
                 });
-            egui::Panel::bottom("status")
-                .frame(
-                    egui::Frame::new()
-                        .fill(theme::PANEL_DARK)
-                        .inner_margin(egui::Margin::symmetric(8, 3)),
-                )
-                .show(ui, |ui| ed.status_bar(ui));
+            // Android: no status bar while the soft keyboard is up. It
+            // carries nothing a typist needs, and it sat over the text
+            // being typed — a game TextBox the view had slid up to show
+            // (2026-11-25 report: the Team Create / camera strip over the
+            // box) — or took a line off the few a landscape phone has left
+            // above the keyboard for the panels.
+            #[cfg(target_os = "android")]
+            let status_bar = self.keyboard.room(&ctx) <= 0.0;
+            #[cfg(not(target_os = "android"))]
+            let status_bar = true;
+            if status_bar {
+                egui::Panel::bottom("status")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(theme::PANEL_DARK)
+                            .inner_margin(egui::Margin::symmetric(8, 3)),
+                    )
+                    .show(ui, |ui| ed.status_bar(ui));
+            }
         }
 
         // Editor::start_run requests this when a playtest begins.
@@ -3100,6 +3127,12 @@ impl RustudioApp {
                 if let Some(r) = game.renderer.as_ref() {
                     parts.push(r.memory_summary());
                 }
+                if let Some(rs) = game.render_state.as_ref() {
+                    let gpu = crate::android::memory::gpu_line(&rs.device);
+                    if !gpu.is_empty() {
+                        parts.push(gpu);
+                    }
+                }
                 parts.join("; ")
             });
         }
@@ -3237,6 +3270,12 @@ impl RustudioApp {
                 let mut parts = vec![format!("DataModel {} instances", game.doc.dom.descendants().count())];
                 if let Some(r) = game.renderer.as_ref() {
                     parts.push(r.memory_summary());
+                }
+                if let Some(rs) = game.render_state.as_ref() {
+                    let gpu = crate::android::memory::gpu_line(&rs.device);
+                    if !gpu.is_empty() {
+                        parts.push(gpu);
+                    }
                 }
                 parts.join("; ")
             });

@@ -128,7 +128,7 @@ xbuild quirks worth knowing (commit e67b501):
 | GPU driver | the system's | the device's Vulkan driver, or on Snapdragon phones the Turnip (Mesa) driver shipped in the APK, swapped in before wgpu starts (`src/android/turnip.rs`; "Turnip driver" below) — on an Adreno 6xx with its bandwidth compression (UBWC) off, which restarted a Snapdragon 865 phone outright ("UBWC and the whole-device restarts" below); OpenGL ES as the fallback either way |
 | Graphics quality (File > Studio Settings > rustudio > Performance) | Manual at the full profile, 100% 3D resolution; Automatic from level 5 | weak-GPU mode (`gpu_caps.rs`: every Android device): Automatic from level 1 — no shadows, SSAO, clouds, bloom, DoF, probe or grass until the frame times allow — and 75% 3D resolution (`rustudio_settings::choice_default`); "Frame time on a phone" below. View > GPU Driver names the adapter and holds the Mesa driver switch |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
-| Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root — and since Android 11 the Files apps can't open `Android/data` either, so the start after a crash copies the report, the session log and the app's own `logcat -d` into **`Download/rustudio/rustudio-logs-<stamp>.txt`**, a file any Files app shows and a user can send; Help > Copy Logs to Download does the same at any time: `src/android/logs.rs`, a `MediaStore.Downloads` row the app inserts, no permission needed). Same `crates/rustudio-core/src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`). A report ends with the last 24 notes (`crash::note`): the GPU errors wgpu reported, a lost device, so it says what led up to it |
+| Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root — and since Android 11 the Files apps can't open `Android/data` either, so the start after a crash copies the report, the session logs (`src/android/logcat.rs`: this run's and the crashed run's) and the app's own `logcat -d` into **`Download/rustudio/rustudio-logs-<stamp>.txt`**, a file any Files app shows and a user can send; Help > Copy Logs to Download does the same at any time: `src/android/logs.rs`, a `MediaStore.Downloads` row the app inserts, no permission needed). Same `crates/rustudio-core/src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`). A report ends with the last 24 notes (`crash::note`): the GPU errors wgpu reported, a lost device, so it says what led up to it |
 | GPU device lost, GPU out of memory | wgpu's default: a panic | The device gets an uncaptured-error handler and a device-lost callback (`android/mod.rs install_gpu_error_handler`): errors go to logcat and the report notes, the frame goes on. The vendored egui-wgpu (upstream's `renderer.rs` `upload_failed`, since 0.3.3-alpha.2) skips a frame whose index/vertex upload the device refuses instead of panicking (`renderer.rs:984 Failed to create staging buffer for index data` — what a reset Adreno driver looked like). A lost device, or out-of-memory errors every frame for 5 s, ends the run in order (`gpu_watch`): the open place is written to `Android/data/dev.rustudio.studio/files/recovery/<name>-<stamp>.rbxl`, a report says so for the next start, and the activity is relaunched (`jni::relaunch`). The desktop's own check (`gpu_health::check` in `App::ui`, which panics on a lost device so a desktop run ends with a report) is not run on Android: it ran before `gpu_watch` got its turn, and a 2026-11-24 device — 7.2 GB resident after four minutes of a 288,000-instance place, the driver out of memory — crashed in it (`gpu_health.rs:88`) instead of saving the place and relaunching |
 | Studio content download | ureq + rustls (ring) | the same, three packages at a time; Play can use the content once the packages are in (the retired textures and View Selector follow in the background). Without a network at start (ConnectivityManager, INTERNET capability — not VALIDATED, which some networks never get) it starts when one comes. A `network check: …` line in Output (and logcat) at every start says how Roblox's servers are reached, phase by phase — DNS, a TCP connect to the first IPv4 and the first IPv6 address, an HTTPS GET — with the time each took; `rustudio --network-check` prints the same on a desktop. Every agent resolves a host IPv4 first (`rustudio_account::http`): a network that advertises an IPv6 that doesn't route — some phones' Wi-Fi and mobile networks — otherwise cost every new connection a connect timeout, and the app "worked, but very slowly". Connects time out after 10 s; one agent (connection pool) per purpose for the process, so an asset doesn't pay DNS, TCP and TLS twice over |
 | Login keyring | `keyring` 4 (Secret Service / Keychain / Credential Manager) | `keyring-core` + `android-native-keyring-store` (SharedPreferences + Android Keystore) behind the same `Entry` API (`crates/rustudio-account/src/store.rs`) |
@@ -447,7 +447,12 @@ text bar on it, below) — as Android pans a window to its focused field:
 never past the box's own top edge leaving the view, never further than
 the keyboard covers the view — and back when the keyboard goes. What
 slides above the view's panel is clipped; the fingers that land there are
-the toolbar's (`Zones::viewport` is the visible part). The game's scripts see the
+the toolbar's (`Zones::viewport` is the visible part). **The status bar
+is not drawn while the keyboard is up**, in either mode (`RustudioApp::ui`,
+`Keyboard::room` > 0): it carries nothing a typist needs, a 2026-11-25
+report had its Team Create / camera strip over the text being typed, and
+in the panel mode it took a line off the few a landscape phone has left
+above the keyboard. The game's scripts see the
 keyboard where Roblox's client reports it: `UserInputService.
 OnScreenKeyboardVisible / OnScreenKeyboardPosition / OnScreenKeyboardSize`
 in the game's coordinates (`touch_input::set_soft_keyboard`, read by
@@ -785,7 +790,16 @@ Settings > rustudio, and the MicroProfiler). What a phone gets from it:
   `load_trace::note_compile`) — and once more eight seconds in
   (`[startup] 8 s into Play; K scripts compiled …`: modules compile as
   they are required, so most of a big game's compiling comes after the
-  start line). `RUSTUDIO_LOAD_TRACE=1` (through `debug.rustudio.env`)
+  start line). **Since 2026-11-25 a place's scripts compile for Play in
+  the background as soon as the place is open**
+  (`bytecode_cache::precompile`, from `Editor::set_document`: one thread,
+  every Script / LocalScript / ModuleScript source of 1 KB and more,
+  into the memory and (4 KB and more) disk caches; a line `[startup] N
+  of M scripts (K KB) precompiled for Play in T ms` when it is through;
+  `RUSTUDIO_NO_PRECOMPILE=1` skips it) — Roblox has a place's scripts
+  compiled by the time the player is in, and rustudio's first Play of a
+  place compiled everything as the game started, finding the cache only
+  from the second Play on. `RUSTUDIO_LOAD_TRACE=1` (through `debug.rustudio.env`)
   prints the full `LOADTRACE` trail instead: the place read and parsed,
   every frame over 100 ms with its biggest bench sections, the asset
   queues as they change, each line with the resident size (`[rss N MB]`,
@@ -1487,12 +1501,29 @@ select all), `render quality` (each Automatic level change, with
 `RUSTUDIO_QUALITY_TRACE=1`) and `memory:` (the resident size each 256 MB
 it grows, with the place being opened, followed by what the editor holds
 — the DataModel's instances, the renderer's meshes, slabs, textures and
-items — and, during Play, the worker's own line every 15 s: the two Lua
-heaps, the two DataModels' sizes, and how many publications replaced the
-viewport's whole document instead of sending a delta — one a frame would
-be the viewport rebuilding its scene every frame: `src/android/memory.rs`,
-`play_worker.rs memory_log`; `RUSTUDIO_MEMORY_LOG=1` turns the worker's
-line on on a desktop). For a
+items, and the GPU allocator's account (`memory::gpu_line`, wgpu's
+`generate_allocator_report`: MB allocated and reserved, and the largest
+allocations by label — on a phone the GPU's memory is system memory,
+Turnip's heap is host memory, so this says how much of the resident size
+is the GPU's; a run of 2026-11-25 was lost to `Out of memory` at 5.3 GB
+resident with 173 MB of Lua heaps and 48 MB of meshes, and nothing said
+where the rest was) — and, during Play, the worker's own line every 15 s:
+the two Lua heaps, the two DataModels' sizes, and how many publications
+replaced the viewport's whole document instead of sending a delta — one a
+frame would be the viewport rebuilding its scene every frame:
+`src/android/memory.rs`, `play_worker.rs memory_log`;
+`RUSTUDIO_MEMORY_LOG=1` turns the worker's line on on a desktop). **All of
+these are in the session log** (`<cache>/rustudio/logs/session.log`,
+`src/android/logcat.rs`: the app's lines at Info and the graphics stack's
+warnings, 6 MB then rotated to `session-prev.log`; a new process rotates
+too, so the run that crashed is in `session-prev.log` after the restart)
+plus everything written to stdout and stderr (`capture_stdio`: the
+`[startup]` timings, `LOADTRACE`, Luau prints — the app's own pipe over
+android-activity's logcat forwarder, the lines still reach logcat under
+`RustStdoutStderr`), and the logs export (Help > Copy Logs to Download,
+and the start after a crash) carries the end of both — logcat's own buffer held 20 s of the app
+on the Note20 whose export of 2026-11-25 had none of the `memory:` lines
+that said when and into what the memory had grown. For a
 crash: `adb logcat -b crash -d` (debuggerd's tombstone: the
 signal, an abort's message — `memory allocation of N bytes failed` for
 one out of memory — and every thread's stack) and `adb shell dumpsys

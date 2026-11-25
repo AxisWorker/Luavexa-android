@@ -159,6 +159,8 @@ pub fn run(app: AndroidApp) {
     }
     init_dirs(&app);
     export_env();
+    // The session log file (logcat.rs): the lines logged so far go in first.
+    logcat::open_session();
     // The motion sensors behind UserInputService (sensors.rs), for the
     // engine's device_sensors.
     rustudio_engine::device_sensors::install(sensors::source());

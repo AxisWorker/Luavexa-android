@@ -77,6 +77,22 @@ pub struct PropertiesState {
     active_for: Option<Ref>,
     /// Each drawn row's rect, by property name (the self-test reads them).
     pub row_rects: HashMap<String, Rect>,
+    /// A Ref property being set by picking an instance (`RefPick`).
+    pub ref_pick: Option<RefPick>,
+}
+
+/// A Ref property (Part0 / Part1, Attachment0 / Attachment1, PrimaryPart,
+/// CameraSubject…) being set the way Studio sets one: the cell was
+/// clicked, and the next instance selected — in the Explorer or the 3D
+/// view — becomes the value, after which the selection goes back to the
+/// owners so the panel still shows them. Until then Ref cells were shown
+/// by name and could not be changed at all (the 2026-11-25 report: a
+/// WeldConstraint's parts "cannot be modified").
+pub struct RefPick {
+    /// The property.
+    pub prop: String,
+    /// The instances whose property it is: the selection at the click.
+    pub owners: Vec<Ref>,
 }
 
 pub struct SliderDrag {
@@ -463,6 +479,7 @@ impl Editor {
         ui.add_space(2.0);
         self.props.drawn.clear();
         self.ui_rects.insert("props.panel", ui.max_rect());
+        self.ref_pick_tick(ui.ctx());
         let sel = self.game.doc.selection.clone();
         let Some(&first) = sel.first() else {
             self.hud.property_rows = 0;
@@ -635,6 +652,85 @@ impl Editor {
             FontId::proportional(FONT)
         };
         painter.text(Pos2::new(x, r.center().y), egui::Align2::LEFT_CENTER, name, font, color);
+    }
+
+    /// A Ref pick in progress (`RefPick`): the selection moved off the
+    /// owners onto the picked instance — the value — or away (nothing
+    /// selected, Escape): the pick ends either way, the owners selected again.
+    fn ref_pick_tick(&mut self, ctx: &egui::Context) {
+        let Some(pick) = self.props.ref_pick.take() else { return };
+        let owners: Vec<Ref> = pick.owners.iter().copied().filter(|r| self.game.doc.exists(*r)).collect();
+        if owners.is_empty() {
+            return;
+        }
+        let sel = &self.game.doc.selection;
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.select(owners);
+            return;
+        }
+        if *sel == pick.owners || sel.iter().all(|r| owners.contains(r)) && !sel.is_empty() {
+            // Still waiting (a click on an owner changes nothing).
+            self.props.ref_pick = Some(pick);
+            return;
+        }
+        let Some(&picked) = sel.first() else {
+            // Deselected: the pick is given up.
+            self.select(owners);
+            return;
+        };
+        let changes: Vec<(Ref, rbx_dom_weak::Ustr, Variant)> = owners
+            .iter()
+            .copied()
+            .filter(|r| self.game.doc.class_of(*r).is_some_and(|c| has_prop(&c, &pick.prop)))
+            .map(|r| (r, ustr(&pick.prop), Variant::Ref(picked)))
+            .collect();
+        if !changes.is_empty() {
+            self.game.doc.set_props(&format!("Set {}", pick.prop), changes, None);
+        }
+        self.select(owners);
+    }
+
+    /// A Ref property's cell: the instance's name; a click starts a pick
+    /// (`RefPick`: the next instance selected is the value, the cell says
+    /// so meanwhile; a second click ends it), and a set value has a × at
+    /// the cell's right that clears it.
+    #[allow(clippy::too_many_arguments)]
+    fn ref_cell(&mut self, p: &mut Painter, name: &str, cur: Ref, mixed: bool, v: Rect, resp: &egui::Response, clicked_value: bool, edits: &mut Vec<Edit>) {
+        let picking = self.props.ref_pick.as_ref().is_some_and(|k| k.prop == name);
+        let shown = if mixed {
+            String::new()
+        } else {
+            self.game.doc.dom.get_by_ref(cur).map(|i| i.name.clone()).unwrap_or_default()
+        };
+        if picking {
+            Self::value_label(p, v, "Select an instance in the Explorer or the view…", rustudio_engine::theme::ACCENT);
+        } else {
+            Self::value_label(p, v, &shown, TEXT);
+        }
+        // The clear button, for a set value.
+        let mut on_clear = false;
+        if cur.is_some() && !mixed && !picking {
+            let br = Rect::from_center_size(Pos2::new(v.max.x - 10.0, v.center().y), Vec2::splat(16.0));
+            on_clear = resp.interact_pointer_pos().is_some_and(|q| br.contains(q));
+            let hovered = resp.hover_pos().is_some_and(|q| br.contains(q));
+            p.ui.painter_at(v).text(
+                br.center(),
+                egui::Align2::CENTER_CENTER,
+                "×",
+                FontId::proportional(FONT + 2.0),
+                if hovered { TEXT } else { READ_ONLY.gamma_multiply(1.6) },
+            );
+            if clicked_value && on_clear {
+                edits.push(Edit::Prop(name.to_string(), Variant::Ref(Ref::none())));
+            }
+        }
+        if clicked_value && !on_clear {
+            if picking {
+                self.props.ref_pick = None;
+            } else {
+                self.props.ref_pick = Some(RefPick { prop: name.to_string(), owners: self.game.doc.selection.clone() });
+            }
+        }
     }
 
     fn value_label(p: &mut Painter, v: Rect, text: &str, color: Color32) {
@@ -1412,6 +1508,11 @@ impl Editor {
                 }
             }
             Variant::Tags(_) | Variant::Attributes(_) => {}
+            // (Parent is moved in the Explorer, not set here.)
+            Variant::Ref(cur) if !ro && name != "Parent" => {
+                let cur = *cur;
+                self.ref_cell(p, name, cur, mixed, v, &resp, clicked_value, edits);
+            }
             other if !ro && number_of(other).is_some() && crate::prop_slider::spec_for(class, name).is_some() => {
                 let spec = crate::prop_slider::spec_for(class, name).unwrap_or(crate::prop_slider::SliderSpec { min: 0.0, max: 1.0, ticks: 20.0, square: false });
                 self.slider_cell(p, name, other, mixed, spec, v, &resp, clicked_value, edits);

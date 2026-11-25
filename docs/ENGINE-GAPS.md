@@ -387,8 +387,11 @@ camera 75 → 100 with the 2° tolerance unchanged.
    round 13); the Place A chapel's darkness comes mostly from this.
    **ForceField visual**: Studio draws the spawn bubble at 10 s in demo and
    control; rustudio draws none. Terrain editing from scripts (FillBlock …).
-2. **PathfindingService:CreatePath / Path:ComputeAsync / GetWaypoints** —
-   most NPC games.
+2. ~~PathfindingService:CreatePath / Path:ComputeAsync / GetWaypoints~~
+   (`domains/geometry_nav.rs`: a heightfield navmesh over the collidable
+   parts and terrain, A* with Costs, jump links, PathfindingModifier /
+   PathfindingLink, Blocked / Unblocked, the deprecated
+   ComputeSmoothPathAsync / FindPathAsync; `geometry_tests.rs`).
 3. **TextService:GetTextSize / GetTextBoundsAsync** — UI layout code.
 4. ~~GuiService.MenuOpened / MenuClosed with an in-game Esc menu~~ (round 13).
 5. Gamepad input (GamepadConnected / Disconnected, gamepad KeyCodes).
