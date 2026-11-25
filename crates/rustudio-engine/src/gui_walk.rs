@@ -1336,8 +1336,9 @@ impl Walk<'_, '_> {
         k
     }
 
-    /// The size of a text object's text, wrapped at `wrap` (AutomaticSize).
-    fn measure_text(&mut self, r: Ref, wrap: f32, scale: f32) -> egui::Vec2 {
+    /// The size of a text object's text, wrapped at `wrap` (AutomaticSize);
+    /// `fit_height` as `AutoText::measure_text`.
+    fn measure_text(&mut self, r: Ref, wrap: f32, scale: f32, fit_height: Option<f32>) -> egui::Vec2 {
         let d = self.input.doc;
         let mut text = text_prop(d, r, "Text");
         if text.is_empty() && d.class_of(r).is_some_and(|c| c == "TextBox") {
@@ -1346,7 +1347,10 @@ impl Walk<'_, '_> {
         let rich = boolp(d, r, "RichText", false);
         let font = font_of(d, r);
         let legacy_scale = legacy_text_scale(&font);
-        let mut size = num(d, r, "TextSize", 14.0) * scale * legacy_scale;
+        let mut size = match fit_height {
+            Some(h) => scaled_text_size(h, scale),
+            None => num(d, r, "TextSize", 14.0) * scale * legacy_scale,
+        };
         if let Some(c) = child_of_class(d, r, "UITextSizeConstraint") {
             size = constrain_font_size(
                 size,
@@ -1463,12 +1467,36 @@ impl Walk<'_, '_> {
 /// Measures a text object's text for AutomaticSize (`Walk::measure_text`
 /// in the GUI walk, `FaceText` for a script's read between walks).
 pub(super) trait AutoText {
-    fn measure_text(&mut self, d: &Document, r: Ref, wrap: f32, scale: f32) -> egui::Vec2;
+    /// `fit_height`: TextScaled growing on X alone sizes its text by the
+    /// box's height (`scaled_text_size`) instead of TextSize.
+    fn measure_text(&mut self, d: &Document, r: Ref, wrap: f32, scale: f32, fit_height: Option<f32>) -> egui::Vec2;
 }
 
 impl AutoText for &mut Walk<'_, '_> {
-    fn measure_text(&mut self, _: &Document, r: Ref, wrap: f32, scale: f32) -> egui::Vec2 {
-        Walk::measure_text(self, r, wrap, scale)
+    fn measure_text(&mut self, _: &Document, r: Ref, wrap: f32, scale: f32, fit_height: Option<f32>) -> egui::Vec2 {
+        Walk::measure_text(self, r, wrap, scale, fit_height)
+    }
+}
+
+/// The text size of a TextScaled object that grows on X alone: the largest
+/// whole size whose single line fits the box's height (at most 100, like
+/// TextScaled's search; the painted fit then finds the same size in the
+/// grown box). Roblox scales such a label's text to its height and widens
+/// it to the line — the {0, 0}, {1, 0} TextScaled AutomaticSize X name
+/// tags of a horizontal list (LBG's "Accessory" pill, 8 px wide and 2 px
+/// of text when measured at TextSize wrapped in no width).
+pub(super) fn scaled_text_size(height: f32, scale: f32) -> f32 {
+    (height + 0.5).floor().clamp(1.0, 100.0 * scale.max(1.0))
+}
+
+/// Which parent axis (bit 1 = X, bit 2 = Y) each of a GuiObject's Size
+/// scales reads: X and Y, or both the width under SizeConstraint RelativeXX
+/// (1), both the height under RelativeYY (2).
+pub(super) fn scale_axes(d: &Document, r: Ref) -> (u32, u32) {
+    match enum_u32(d.prop(r, "SizeConstraint")) {
+        Some(1) => (1, 1),
+        Some(2) => (2, 2),
+        _ => (1, 2),
     }
 }
 
@@ -1531,7 +1559,11 @@ impl<M: AutoText> Sizer<'_, M> {
             // three lines in its 302 px window,
             // checks/plugins/ref/corpus/screens/argon-load-popup.jpg).
             let sz = udim2(d, r, "Size");
-            let wrap = if !boolp(d, r, "TextWrapped", false) {
+            // TextScaled growing on X alone: text as tall as the box, the
+            // box as wide as that one line (nothing to wrap at).
+            let fit_height = (boolp(d, r, "TextScaled", false) && auto & 1 != 0 && auto & 2 == 0)
+                .then_some(inner.height());
+            let wrap = if fit_height.is_some() || !boolp(d, r, "TextWrapped", false) {
                 f32::INFINITY
             } else if auto & 1 != 0 {
                 if sz[0] > 0.0 && inner.width() > 0.0 {
@@ -1543,7 +1575,7 @@ impl<M: AutoText> Sizer<'_, M> {
             } else {
                 inner.width()
             };
-            ext = self.m.measure_text(d, r, wrap, scale);
+            ext = self.m.measure_text(d, r, wrap, scale, fit_height);
         }
         let kids: Vec<Ref> = children(d, r)
             .into_iter()
@@ -1714,8 +1746,16 @@ impl<M: AutoText> Sizer<'_, M> {
             return s;
         }
         let sz = udim2(self.d, k, "Size");
+        // A Scale counts as growing only when it reads a growing axis: under
+        // SizeConstraint RelativeXX a child's height follows the parent's
+        // width, which an AutomaticSize Y list has (LBG's limited emotes: a
+        // column of {1, 0}, {0.932, 0} RelativeXX cards, each with a 0.48
+        // UIAspectRatioConstraint frame inside — measured as "sized by the
+        // growing axis" the frame derived 500 px of height from its width
+        // and the 300 px list grew to 900).
+        let (rx, ry) = scale_axes(self.d, k);
         let grows = |axis: u32, sc: f32| auto & axis != 0 && sc != 0.0;
-        let (gx, gy) = (grows(1, sz[0]), grows(2, sz[2]));
+        let (gx, gy) = (grows(rx, sz[0]), grows(ry, sz[2]));
         if gx || gy {
             let axes = (gx as u32) | ((gy as u32) << 1);
             let c = self.content_size_in(k, s, scale, axes, depth, inner.width());
@@ -1773,8 +1813,9 @@ impl<M: AutoText> Sizer<'_, M> {
             // auto-growing axis isn't constrained yet (e.g. a 1:1 square thumbnail
             // with Size {1,0},{1,0} in an AutomaticSize.Y card), so derive that axis
             // from the known fixed axis instead of collapsing to 0.
-            let auto_gx = parent_auto & 1 != 0 && s[0] != 0.0;
-            let auto_gy = parent_auto & 2 != 0 && s[2] != 0.0;
+            let (rx, ry) = scale_axes(d, r);
+            let auto_gx = parent_auto & rx != 0 && s[0] != 0.0;
+            let auto_gy = parent_auto & ry != 0 && s[2] != 0.0;
             if enum_u32(d.prop(c, "AspectType")) == Some(1) {
                 if enum_u32(d.prop(c, "DominantAxis")) == Some(1) {
                     size.x = size.y * ratio;
@@ -3796,6 +3837,100 @@ mod layout_tests {
             assert!((b(custom).size[0] - 160.0).abs() < 0.01 && (b(custom).pos[0] - 90.0).abs() < 0.01, "{:?}", b(custom).size);
             let l = b(label);
             assert!(l.size[0] <= 250.0 && l.size[0] > 200.0 && l.size[1] > 40.0, "wrapped at the parent's width: {:?}", l.size);
+        });
+        out.textures_delta.clear();
+    }
+
+    /// An AutomaticSize Y list of RelativeXX cards ({1, 0}, {0.5, 0}: as
+    /// tall as half the list's width) is as tall as the cards: a card's
+    /// height follows the list's width, not the height being worked out, so
+    /// the card counts with its Size — not with what it holds, where a
+    /// {1, 0}, {1, 0} frame under a 0.25 UIAspectRatioConstraint would derive
+    /// 400 px of height from its width (LBG's limited emotes column, 3x too
+    /// tall, its header and footer centred off the screen).
+    #[test]
+    fn auto_size_counts_relative_xx_children_by_size() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let page = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let list = doc.dom.insert(page, InstanceBuilder::new("Frame")
+            .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 0)))
+            .with_property("AutomaticSize", Enum::from_u32(2)));
+        doc.dom.insert(list, InstanceBuilder::new("UIListLayout"));
+        let mut cards = Vec::new();
+        for n in 0..3 {
+            let card = doc.dom.insert(list, InstanceBuilder::new("Frame")
+                .with_property("LayoutOrder", n)
+                .with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(0.5, 0)))
+                .with_property("SizeConstraint", Enum::from_u32(1)));
+            let tall = doc.dom.insert(card, InstanceBuilder::new("Frame")
+                .with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(1.0, 0))));
+            doc.dom.insert(tall, InstanceBuilder::new("UIAspectRatioConstraint")
+                .with_property("AspectRatio", 0.25f32));
+            cards.push((card, tall));
+        }
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 300.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(page, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let b_ = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1.clone();
+            let l = b_(list);
+            assert!((l.size[0] - 100.0).abs() < 0.01 && (l.size[1] - 150.0).abs() < 0.01, "three 50 px cards: {:?}", l.size);
+            for (n, (card, tall)) in cards.iter().enumerate() {
+                let c = b_(*card);
+                assert!((c.size[1] - 50.0).abs() < 0.01 && (c.pos[1] - 50.0 * n as f32).abs() < 0.01, "card {n}: {:?} at {:?}", c.size, c.pos);
+                // The aspect frame fits within its 100 x 50 card: 12.5 x 50.
+                let t = b_(*tall);
+                assert!((t.size[0] - 12.5).abs() < 0.01 && (t.size[1] - 50.0).abs() < 0.01, "aspect frame {n}: {:?}", t.size);
+            }
+        });
+        out.textures_delta.clear();
+    }
+
+    /// A TextScaled label growing on X alone ({0, 0}, {0, 20}) has its text
+    /// as tall as its box and is as wide as that line: as wide as the same
+    /// text at TextSize 20 growing on X (LBG's "Accessory" tag).
+    #[test]
+    fn text_scaled_auto_x_sizes_text_by_height() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let page = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        // (SourceSans: Font.Legacy draws at 1.5 x TextSize, a fitted size as is)
+        let scaled = doc.dom.insert(page, InstanceBuilder::new("TextLabel")
+            .with_property("Text", "Accessory")
+            .with_property("Font", Enum::from_u32(3))
+            .with_property("TextScaled", true)
+            .with_property("TextWrapped", true)
+            .with_property("TextSize", 14.0f32)
+            .with_property("AutomaticSize", Enum::from_u32(1))
+            .with_property("Size", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 20))));
+        let plain = doc.dom.insert(page, InstanceBuilder::new("TextLabel")
+            .with_property("Text", "Accessory")
+            .with_property("Font", Enum::from_u32(3))
+            .with_property("TextSize", 20.0f32)
+            .with_property("AutomaticSize", Enum::from_u32(1))
+            .with_property("Position", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 40)))
+            .with_property("Size", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 20))));
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 300.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(page, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let size = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1.size;
+            let (s, p) = (size(scaled), size(plain));
+            assert!((s[1] - 20.0).abs() < 0.01, "keeps its height: {s:?}");
+            assert!(s[0] > 40.0 && (s[0] - p[0]).abs() < 0.01, "as wide as the 20 px line: {s:?} vs {p:?}");
         });
         out.textures_delta.clear();
     }

@@ -3280,7 +3280,7 @@ fn text_face(font: &FaceKey) -> Option<(&'static egui::Context, FontFamily, f32)
 struct FaceText;
 
 impl walk::AutoText for FaceText {
-    fn measure_text(&mut self, d: &Document, r: Ref, wrap: f32, scale: f32) -> egui::Vec2 {
+    fn measure_text(&mut self, d: &Document, r: Ref, wrap: f32, scale: f32, fit_height: Option<f32>) -> egui::Vec2 {
         let mut text = text_prop(d, r, "Text");
         if text.is_empty() && d.class_of(r).is_some_and(|c| c == "TextBox") {
             text = text_prop(d, r, "PlaceholderText");
@@ -3288,7 +3288,10 @@ impl walk::AutoText for FaceText {
         let rich = boolp(d, r, "RichText", false);
         let font = font_of(d, r);
         let legacy_scale = legacy_text_scale(&font);
-        let mut size = num(d, r, "TextSize", 14.0) * scale * legacy_scale;
+        let mut size = match fit_height {
+            Some(h) => walk::scaled_text_size(h, scale),
+            None => num(d, r, "TextSize", 14.0) * scale * legacy_scale,
+        };
         if let Some(c) = child_of_class(d, r, "UITextSizeConstraint") {
             size = size.clamp(
                 num(d, c, "MinTextSize", 1.0) * scale,
