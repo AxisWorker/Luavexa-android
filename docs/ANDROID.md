@@ -970,7 +970,7 @@ Settings > rustudio, and the MicroProfiler). What a phone gets from it:
 - **The main thread's own per-frame work in Play** is what a profile
   capture of a big game shows first, and it is platform-independent: a
   `--profile-capture` of LBG on the desktop (debug, `--no-render`,
-  2026-11-25, `devtools/lbg2-real.sh PROF=1`) had the main lane busy
+  2026-11-25, `--play-only --no-render --profile-capture`) had the main lane busy
   10.4 ms a frame, 6.6 of them in `vp_input` — `gui_modal::modal_shown`
   walking every descendant of the PlayerGui each frame the game held
   the mouse, to see whether a Modal button is up (LBG's GUI is tens of
@@ -988,8 +988,68 @@ Settings > rustudio, and the MicroProfiler). What a phone gets from it:
   beam voxelises a 90-stud cube) is the game's own load, cut in half by
   its Settings > Fast Mode (`S_FastMode` halves the debris) or off with
   `S_NoDestruction`; the harness probe for it is
-  `devtools/lbg-probes/voxel1.luau` (it needs the character on a
+  `tools/probes/voxel1.luau` (it needs the character on a
   `VoxelOrigin` part — the spawn is not on one).
+- **"The viewport lags only while things spawn and fly" (2026-11-26,
+  LBG on a phone).** Reproduced on the desktop with
+  `tools/probes/burst.luau` (400 falling debris parts, 2000
+  anchored parts, 10 VFX parts a Heartbeat; `--play-only --no-render
+  --luau server tools/probes/burst.luau@9 --luau client
+  tools/probes/fpswatch.luau@5 --profile-capture`, tools/probes/README.md).
+  The render lane keeps 60 fps throughout; what drops is the gameplay
+  thread's rate — Heartbeats a second 30–36 → 8–18 while ≥ 50 debris
+  parts are awake (`fpswatch.luau`), single digits in the worst second
+  — so every script-driven thing (VFX tweens, the camera, voxel debris
+  moved by `BulkMoveTo`) moves in steps while the world itself stays
+  smooth. Two causes, both in the gameplay step:
+  1. *Physics over budget while the debris is awake.* ≈400 awake bodies,
+     2800 contact pairs, 6400 solver rows at 240 Hz: the step waits
+     6–8 ms for the busy physics pool (`pf_spawn`) and the hurried
+     environment ticks (`physics_hurry_tail`) take 1–7 ms more, every
+     gameplay step. That is the sustained part of the lag; on a phone
+     the pool's threads also share the big cores with the render thread.
+     On Android the pool now defaults to **two threads**
+     (`android::export_env` sets `RUSTUDIO_PHYSICS_THREADS=2` unless
+     `debug.rustudio.env` says otherwise): a phone has four fast cores at
+     most and the render, gameplay and UI threads are on them already;
+     with four workers one lands on a slow core and every fork-join tick
+     waits for it. Other knobs: `RUSTUDIO_PHYSICS_HURRY=0`,
+     `RUSTUDIO_PHYSICS_CATCHUP=0` (a hurried frame's environment ticks
+     are lost, as Roblox's throttle loses them, instead of caught up
+     between frames), `RUSTUDIO_SOLVER_SERIAL=1` (`mech.rs`
+     `PHYSICS_HZ`, `PHYSICS_SERIAL_MAX_AWAKE`); the game's own Fast Mode
+     halves the debris. The desktop harness (2 CPUs, swapping at LBG's
+     1.7 GB) is too noisy to rank these — a phone capture during a
+     burst is what decides them.
+  2. *One-off stalls when a script mass-edits parts.* LBG's server init
+     (`Bootstrap.Init.Loaders.workspace`, ≈15 s into Play) sets
+     `CollisionGroup` on 6500 map parts and `CanCollide` on 2600; a
+     dropped leaderboard destroys hundreds; the debris pool is
+     (un)anchored in batches. Each used to cost: a 300 ms
+     `render_snapshot_apply` (the viewport dropped the previous frame's
+     6500-entry property map on the main thread — now deferred to the
+     worker, `snapshot.rs discard`); a physics rebuild that re-created
+     and woke every one of those parts (`[physics] big rebuild: 6567
+     seeds` — a `CollisionGroup` write now sets the collider's groups in
+     place, and the marks a publish moves aside keep their property
+     names (`held_marks`) instead of becoming bare refs that rebuilt the
+     part whatever the property was; the client's copy of the map, which
+     its physics leaves alone until a body of its own comes near, no
+     longer seeds a rebuild for each replicated write either; a rebuilt
+     resting assembly also stays asleep under the rapier solver); and a
+     `scene_sync` that
+     re-read every part's draw (`ss_part_draw` 278 ms — non-visual
+     properties no longer mark a part for re-reading,
+     `scene.rs non_visual_prop`). What is left of the stall is the
+     script's own run (the writes cost 1–25 µs each, the init's
+     `PreloadAsync`, `Voxel:RegisterOrigin` 3600 calls, `GetDescendants`
+     over the whole map).
+  Script hot spots the same captures showed (`RUSTUDIO_SCRIPT_PROFILE=exact`):
+  TopbarPlus (`setDropdown` 573 ms, `GetTextSize` 841 calls),
+  `QueryDescendants` (Luau, 65 calls 346 ms), `GetTagged` 64 ms (the
+  TagCache rebuilds), `IconController` Heartbeat (`TweenService:Create`
+  2754×), the camera's Popper rays. `RUSTUDIO_SNAPSHOT_LOG=1` prints
+  the mass edits as they happen (docs/PROFILING.md).
 
 Switches for a device, which has no shell environment to launch from:
 
@@ -1008,7 +1068,9 @@ back to FIFO), `RUSTUDIO_NO_PERF_HINT` (no ADPF hint session for the
 frame thread; below), `RUSTUDIO_TURNIP` (0|1|force), `RUSTUDIO_GPU_TURBO`
 (1), `RUSTUDIO_TU_DEBUG` (Turnip's flags; "Turnip driver" below),
 `RUSTUDIO_SYSTEM_BARS` (1: the navigation and status bars stay, instead of
-immersive mode).
+immersive mode), `RUSTUDIO_PHYSICS_THREADS` (the physics pool; 2 on a
+phone by default, "Frame time on a phone" above), `RUSTUDIO_PHYSICS_HURRY`,
+`RUSTUDIO_PHYSICS_CATCHUP`.
 
 ### The frame's pacing on Android
 

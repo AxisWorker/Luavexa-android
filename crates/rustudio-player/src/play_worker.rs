@@ -868,6 +868,7 @@ impl Publication {
         }
         let _ = game.doc.marks_for(Reader::RenderSnapshot);
         if let Some(publish) = self.publish_ui {
+            let _u = rustudio_core::bench::scope("pub_ui");
             publish();
         }
         let s = game.play.as_mut().expect("Play presentation retained");

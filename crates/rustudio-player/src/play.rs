@@ -3948,7 +3948,10 @@ impl Game {
         // Keep the rendered document on the UI thread while the solver works
         // on its owned world. Commit and replicate at the next frame boundary.
         let sc = rustudio_core::bench::scope("p3_physics_step");
-        self.sync_touch_interest();
+        {
+            let _t = rustudio_core::bench::scope("p3_touch_interest");
+            self.sync_touch_interest();
+        }
         let input = PlayFrameInput {
             mode, dt, realtime, humanoid: hum_out, local_input_edge: self.play_input_pose_due,
         };
