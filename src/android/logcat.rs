@@ -17,9 +17,20 @@
 //! that logger isn't used here, android_logger holds the `log` slot),
 //! up to [`SESSION_MAX`]; past that the file becomes the previous one
 //! (`session-prev.log`) and a new one starts, so the last two files
-//! always hold what happened. A new process does the same at its start:
-//! after a crash the app restarts itself, and the run that crashed is
-//! then in `session-prev.log` — logs.rs exports both.
+//! always hold what happened. A new process rotates the same way at its
+//! start, and keeps [`PREVIOUS`] previous files (`session-prev.log`,
+//! `session-prev2.log`, …): after a crash the app restarts itself, and
+//! that restart may crash or be left and started again before the user
+//! gets to Help > Copy Logs — with one previous file the run that
+//! crashed was gone by then (the 2026-11-25 report after the GPU
+//! out-of-memory: "the session log was not saved"). logs.rs exports them
+//! all, oldest first.
+//!
+//! The file is written unbuffered, so a process killed keeps every line
+//! up to its last; and it is synced to the flash every [`SYNC_EVERY`]
+//! ([`Session::write`]) for the crash that takes the phone down with it
+//! (a GPU fault that restarts the device loses what the kernel still
+//! held in memory).
 //!
 //! stdout and stderr go to the file too (`capture_stdio`): the `[startup]`
 //! timings, the `LOADTRACE` trail, Luau's own prints and every
@@ -31,11 +42,16 @@ use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once, OnceLock};
+use std::time::{Duration, Instant};
 
 static INSTALLED: Once = Once::new();
 
 /// The session log's size cap; at it the file rotates to `session-prev.log`.
 const SESSION_MAX: u64 = 6 << 20;
+/// Previous runs' files kept (`session-prev.log` … `session-prev{PREVIOUS}.log`).
+pub const PREVIOUS: usize = 3;
+/// The file is synced to storage this often while lines come.
+const SYNC_EVERY: Duration = Duration::from_millis(1500);
 /// Lines kept in memory from before the cache folder is known (a start's
 /// first lines), written to the file when it opens.
 const EARLY_LINES: usize = 400;
@@ -44,10 +60,34 @@ const EARLY_LINES: usize = 400;
 pub const SESSION_FILE: &str = "session.log";
 pub const SESSION_PREV_FILE: &str = "session-prev.log";
 
+/// The previous runs' file names, oldest first (`session-prev3.log`,
+/// `session-prev2.log`, `session-prev.log`).
+pub fn previous_files() -> Vec<String> {
+    (1..=PREVIOUS).rev().map(prev_name).collect()
+}
+
+fn prev_name(n: usize) -> String {
+    if n <= 1 { SESSION_PREV_FILE.to_string() } else { format!("session-prev{n}.log") }
+}
+
+/// `session.log` becomes `session-prev.log`, which becomes
+/// `session-prev2.log`, and so on up to [`PREVIOUS`]; the oldest goes.
+fn rotate(dir: &Path) {
+    for n in (1..=PREVIOUS).rev() {
+        let from = if n == 1 { dir.join(SESSION_FILE) } else { dir.join(prev_name(n - 1)) };
+        if from.exists() {
+            let _ = std::fs::rename(&from, dir.join(prev_name(n)));
+        }
+    }
+}
+
 struct Session {
     path: PathBuf,
     file: File,
     size: u64,
+    /// Lines written since the last sync, and when it was.
+    dirty: bool,
+    synced: Instant,
 }
 
 /// logcat and the session log, one `log::Log`.
@@ -83,6 +123,7 @@ pub fn install() {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             log::error!("panic: {info}");
+            sync_session();
             previous(info);
         }));
     });
@@ -104,9 +145,7 @@ pub fn open_session() {
         return;
     }
     let path = dir.join(SESSION_FILE);
-    if path.exists() {
-        let _ = std::fs::rename(&path, dir.join(SESSION_PREV_FILE));
-    }
+    rotate(&dir);
     match open_new(&path) {
         Ok(mut s) => {
             let early = std::mem::take(&mut *tee.early.lock().unwrap_or_else(|e| e.into_inner()));
@@ -178,17 +217,19 @@ fn capture_stdio(tee: &'static Tee) {
 
 fn open_new(path: &Path) -> std::io::Result<Session> {
     let file = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
-    Ok(Session { path: path.to_path_buf(), file, size: 0 })
+    Ok(Session { path: path.to_path_buf(), file, size: 0, dirty: false, synced: Instant::now() })
 }
 
 impl Session {
     fn write(&mut self, line: &str) {
         if self.size >= SESSION_MAX {
             // The file rotates: this one becomes the previous, a new one
-            // goes on (the last two files hold the most recent 6–12 MB).
-            let prev = self.path.with_file_name(SESSION_PREV_FILE);
+            // goes on (the files hold the most recent 6–24 MB).
             let _ = self.file.flush();
-            let _ = std::fs::rename(&self.path, prev);
+            let _ = self.file.sync_data();
+            if let Some(dir) = self.path.parent() {
+                rotate(dir);
+            }
             match open_new(&self.path) {
                 Ok(s) => *self = s,
                 Err(_) => return,
@@ -196,6 +237,31 @@ impl Session {
         }
         if self.file.write_all(line.as_bytes()).is_ok() {
             self.size += line.len() as u64;
+            self.dirty = true;
+        }
+        if self.dirty && self.synced.elapsed() >= SYNC_EVERY {
+            let _ = self.file.sync_data();
+            self.dirty = false;
+            self.synced = Instant::now();
+        }
+    }
+
+    fn sync(&mut self) {
+        let _ = self.file.flush();
+        if self.dirty {
+            let _ = self.file.sync_data();
+            self.dirty = false;
+            self.synced = Instant::now();
+        }
+    }
+}
+
+/// Writes the session log through to storage now (a crash report being
+/// written, the GPU lost: what follows may not run).
+pub fn sync_session() {
+    if let Some(tee) = TEE.get() {
+        if let Some(s) = tee.session.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            s.sync();
         }
     }
 }
@@ -247,7 +313,7 @@ impl log::Log for Tee {
 
     fn flush(&self) {
         if let Some(s) = self.session.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            let _ = s.file.flush();
+            s.sync();
         }
     }
 }

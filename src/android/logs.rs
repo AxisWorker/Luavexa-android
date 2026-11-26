@@ -8,7 +8,8 @@
 //! rustudio-logs-<stamp>.txt`, [`super::jni::export_download`]): the
 //! build and device, the crash reports (newest first, three at most),
 //! the end of the session logs (logcat.rs: this run's and the previous
-//! run's — the one that crashed, when the export follows a restart), and
+//! runs' — the one that crashed among them, when the export follows a
+//! restart or two), and
 //! the app's own logcat lines
 //! (`logcat -d`: an app reads its own lines without a permission, and a
 //! process that died a minute ago still has its lines in the buffer, the
@@ -21,7 +22,7 @@
 use std::fmt::Write as _;
 
 /// The log file's size cap, and each session log's share of it.
-const MAX: usize = 4 << 20;
+const MAX: usize = 8 << 20;
 const SESSION_TAIL: usize = 1 << 20;
 
 /// Writes the logs file and returns its path as a Files app shows it.
@@ -55,11 +56,18 @@ pub fn export(reason: &str) -> Result<String, String> {
         out.push('\n');
     }
 
-    // The session logs' ends: the previous run's (the crashed one, after a
-    // restart), then this run's (logcat.rs).
+    // The session logs' ends: the previous runs' (the crashed one among
+    // them, after a restart or two), oldest first, then this run's
+    // (logcat.rs).
     let dir = super::logcat::session_dir();
-    for (name, which) in [(super::logcat::SESSION_PREV_FILE, "previous run"), (super::logcat::SESSION_FILE, "this run")] {
-        let path = dir.join(name);
+    let mut files: Vec<(String, String)> = super::logcat::previous_files()
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| (name, format!("{} run(s) before this one", super::logcat::PREVIOUS - i)))
+        .collect();
+    files.push((super::logcat::SESSION_FILE.to_string(), "this run".to_string()));
+    for (name, which) in files {
+        let path = dir.join(&name);
         let Ok(text) = std::fs::read(&path) else { continue };
         let start = text.len().saturating_sub(SESSION_TAIL);
         let start = if start > 0 { text[start..].iter().position(|b| *b == b'\n').map_or(start, |i| start + i + 1) } else { 0 };

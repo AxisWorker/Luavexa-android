@@ -24,6 +24,7 @@
 pub mod asset_manager;
 pub mod plugin_store;
 pub mod toolbox;
+pub mod code_indent;
 pub mod luau_intel;
 pub mod ui_pointer;
 pub mod update;

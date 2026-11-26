@@ -700,6 +700,65 @@ API tables (`api_data.rs`, static) and the reflection questions
 (`schema.rs`, over `rbx_reflection_database`) came along; the port's 47
 unit tests run on the host (`cargo test --lib luau_intel`).
 
+**A tap on a completion keeps the keyboard up** (the 2026-11-25 report:
+"a suggestion tap closes the keyboard"). egui's rule is that a click
+outside the focused widget surrenders its focus, and it judges the click
+as the *field* draws — so the editor had no focus for the rest of the
+tap's frame, the keyboard's mirror ended its session on "no field"
+(ime.rs), the focus came back only through `request_focus` after the
+field (the built-in items; the plugins' items never asked for it), and
+the keyboard went down after `HIDE_AFTER` whenever the tap outlasted a
+frame or two. Now the strips register their rects every frame
+(`keyboard::keep_focus_in`) and `Keyboard::before_frame` holds egui's
+`surrender_focus_on` at `Never` from a press that began inside one to
+the frame of its release — the text bar's device (above), made general;
+both accept paths put the caret after the word and keep the focus; the
+keyboard is never asked down while a finger is on the screen
+(`Keyboard::end_frame`); and the editor hands the mirror its text at the
+end of every frame it draws (`ime::field_text`), since the mirror learned
+the text from egui's change events only, which a completion taken
+outside the field never made — the keyboard's next letter was placed by
+the old text. The log line for a hide now names what has the focus.
+
+**Enter, then a letter on the line before** (the same report). After each
+of its operations the keyboard was told nothing of where the caret now
+was: a TextView calls `InputMethodManager.updateSelection` (and
+`updateExtractedText`, for a keyboard that asked to follow the text)
+after every edit, its own included, and a keyboard keeps a model of the
+caret from those calls and composes and deletes by it. `ImeBridge.java`
+now does the same at the end of every operation (`Conn.finish`:
+`tellSelection`, and `getExtractedText` remembers a monitor request), and
+`ime::unshift` moves a reported insertion to where the mirror's caret
+says it was made when a plain diff put it at the end of a run of equal
+characters (Enter at the end of a line above other lines came back as a
+line break *at the start of the next line*, with the caret moved back a
+frame later).
+
+**Auto-indent and Tab** (`src/code_indent.rs`, 5 host tests: `cargo test
+--lib code_indent`). Studio's Auto Indent Rule, Tab Width and Indent
+Using Spaces settings drive it: Enter keeps the previous line's
+indentation and goes one level deeper after a line that opens a block
+(`then`, `do`, `function (...)`, `repeat`, `else`, `{`, `(`); Enter right
+before the block's closer (`if x then|end`, `{|}`) puts the closer on a
+line of its own at the outer level; a closer typed at the start of a line
+(`end`, `else`, `elseif`, `until`, `}`) steps out to its opener's
+indentation (a small Luau lexer skips strings and `--` comments; typing on
+past it, `endTime`, steps back in). On the desktop (and a hardware
+keyboard) the script editor applies it after egui's `TextEdit` handled
+the key (`script_editor::auto_indent`: the text inserted is found by the
+caret). The soft keyboard's text, though, goes through the mirror: had
+the editor indented after the fact, the mirror would have been a frame
+behind and the keyboard's next letter placed by the unindented text. So
+`Conn.codeFixup` asks the native side *inside* the keyboard's operation
+(`nativeCodeFixup` → `ime::native_code_fixup` → the same
+`code_indent::on_insert`) and makes the replacement on the mirror before
+the operation is reported: the one replacement the editor applies holds
+the indentation, and field, mirror and keyboard agree. The soft keyboard
+has no Tab key: the editor's header shows **Tab** and **Untab** while the
+field is focused (one unit at the caret, or the selection's lines in and
+out; `code_indent::tab` / `untab`), held in focus like the strips. The
+dex was rebuilt (`tools/android/build-dex.sh`, 18 088 bytes).
+
 ## The first Play on a phone: Studio's content
 
 Roblox's default character (the R15 body with its face and dynamic head),
@@ -1567,12 +1626,19 @@ frame would be the viewport rebuilding its scene every frame:
 these are in the session log** (`<cache>/rustudio/logs/session.log`,
 `src/android/logcat.rs`: the app's lines at Info and the graphics stack's
 warnings, 6 MB then rotated to `session-prev.log`; a new process rotates
-too, so the run that crashed is in `session-prev.log` after the restart)
+too, and **three previous runs are kept** (`session-prev.log`,
+`session-prev2.log`, `session-prev3.log`, `logcat::PREVIOUS`) — with one,
+the run that crashed was gone once its automatic restart had itself been
+left and the app started again before Help > Copy Logs: the 2026-11-25
+"the session log was not saved". The file is unbuffered (a killed process
+keeps every line) and synced to storage every 1.5 s and at a panic, a
+lost GPU device and the loop's end (`sync_session`), for the crash that
+takes the phone down with it)
 plus everything written to stdout and stderr (`capture_stdio`: the
 `[startup]` timings, `LOADTRACE`, Luau prints — the app's own pipe over
 android-activity's logcat forwarder, the lines still reach logcat under
 `RustStdoutStderr`), and the logs export (Help > Copy Logs to Download,
-and the start after a crash) carries the end of both — logcat's own buffer held 20 s of the app
+and the start after a crash) carries the end of all of them, oldest first — logcat's own buffer held 20 s of the app
 on the Note20 whose export of 2026-11-25 had none of the `memory:` lines
 that said when and into what the memory had grown. For a
 crash: `adb logcat -b crash -d` (debuggerd's tombstone: the

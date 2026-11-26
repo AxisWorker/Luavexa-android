@@ -63,7 +63,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use egui::text::{CCursor, CCursorRange};
-use jni::objects::{Global, JClass, JString, JValue};
+use jni::objects::{Global, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jint, jlong};
 use jni::{EnvUnowned, jni_sig, jni_str};
 
@@ -151,6 +151,9 @@ static OPS: Mutex<VecDeque<Op>> = Mutex::new(VecDeque::new());
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 /// Fields that are code (the script editor says so each frame it shows).
 static CODE_FIELDS: Mutex<Vec<egui::Id>> = Mutex::new(Vec::new());
+/// A field's text as its editor has it at the end of its frame
+/// ([`field_text`]), when it differs from the session's.
+static LIVE: Mutex<Option<(egui::Id, String)>> = Mutex::new(None);
 
 fn ops() -> std::sync::MutexGuard<'static, VecDeque<Op>> {
     OPS.lock().unwrap_or_else(|e| e.into_inner())
@@ -222,9 +225,16 @@ fn load_class() -> Result<Global<JClass<'static>>, String> {
         let class = env.as_cast::<JClass>(&class)?;
         // SAFETY: the signature matches `native_op`'s parameters (a static
         // method: EnvUnowned, the class, then the arguments).
-        let methods = [unsafe {
-            jni::NativeMethod::from_raw_parts(jni_str!("nativeOp"), jni_str!("(IILjava/lang/String;IIIIZJ)V"), native_op as *mut c_void)
-        }];
+        let methods = [
+            unsafe { jni::NativeMethod::from_raw_parts(jni_str!("nativeOp"), jni_str!("(IILjava/lang/String;IIIIZJ)V"), native_op as *mut c_void) },
+            unsafe {
+                jni::NativeMethod::from_raw_parts(
+                    jni_str!("nativeCodeFixup"),
+                    jni_str!("(Ljava/lang/String;ILjava/lang/String;)Ljava/lang/String;"),
+                    native_code_fixup as *mut c_void,
+                )
+            },
+        ];
         // SAFETY: as above; the class stays loaded (a global reference is
         // taken below) for as long as the function exists.
         unsafe { env.register_native_methods(&*class, &methods)? };
@@ -268,6 +278,35 @@ unsafe extern "system" fn native_op<'l>(
         Ok(())
     })
     .resolve::<jni::errors::LogErrorAndDefault>();
+}
+
+/// `ImeBridge.nativeCodeFixup`: the keyboard inserted `inserted` into the
+/// mirror of a code field, whose text is now `text` with the caret at
+/// `cursor` (code points): the auto-indent to make on the mirror before
+/// the operation is reported (code_indent.rs), as "a b cursor\ntext", or
+/// null. On the Java main thread, inside the keyboard's operation: the
+/// operation then reports the indented text, and the field, the mirror
+/// and the keyboard agree without a `setState` round trip (a round trip
+/// is a frame in which the keyboard's next letter would be placed by the
+/// old text).
+unsafe extern "system" fn native_code_fixup<'l>(mut env: EnvUnowned<'l>, _class: JClass<'l>, text: JString<'l>, cursor: jint, inserted: JString<'l>) -> JObject<'l> {
+    env.with_env(|env| -> jni::errors::Result<JObject<'l>> {
+        if text.is_null() || inserted.is_null() {
+            return Ok(JObject::null());
+        }
+        let text: String = text.try_to_string(env)?;
+        let inserted: String = inserted.try_to_string(env)?;
+        let Some(ind) = crate::code_indent::settings() else { return Ok(JObject::null()) };
+        match crate::code_indent::on_insert(&text, cursor.max(0) as usize, &inserted, &ind) {
+            Some(fix) => {
+                log::info!("ime: code fixup: {}..{} becomes {} chars, caret {}", fix.a, fix.b, fix.text.chars().count(), fix.cursor.0);
+                let out = env.new_string(format!("{} {} {}\n{}", fix.a, fix.b, fix.cursor.0, fix.text))?;
+                Ok(out.into())
+            }
+            None => Ok(JObject::null()),
+        }
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 /// Asks the keyboard up for `field`'s current state (keyboard.rs
@@ -337,6 +376,24 @@ fn set_state(text: &str, sel: (usize, usize), seq: i32, restart: bool) {
     });
     if let Err(e) = r {
         log::warn!("ime: setState failed: {e}");
+    }
+}
+
+/// A field's text as its editor has it at the end of its frame — after
+/// changes egui's `TextEdit` made no event for: a completion taken, an
+/// indent made by a key event, a soft Tab (script_editor.rs). The session
+/// otherwise learns the text from the `TextEdit`'s change events, so such
+/// a change reached the keyboard's mirror only on the next operation (the
+/// one made on the old text, placed by it: a letter after an accepted
+/// completion landed where the word had ended). Compared, not copied,
+/// while nothing changed.
+pub fn field_text(id: egui::Id, text: &str) {
+    let same = session().as_ref().is_some_and(|s| s.field == Some(Field::Egui(id)) && s.text == text);
+    let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    if same {
+        *live = None;
+    } else if !live.as_ref().is_some_and(|(lid, t)| *lid == id && t == text) {
+        *live = Some((id, text.to_owned()));
     }
 }
 
@@ -466,6 +523,7 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
         }
     }
     drop(queue);
+    unshift(s, &mut op);
     s.seq = op.seq;
     s.applied = Some((op.seq, op.hash, op.sel));
     match (&op.what, field) {
@@ -495,6 +553,41 @@ pub fn before_frame(ctx: &egui::Context, raw: &mut egui::RawInput) {
         }
     }
     ctx.request_repaint();
+}
+
+/// A pure insertion is moved to where the keyboard's caret says it was
+/// made when the two describe the same text. The Java side reports the
+/// difference between the mirror before and after (the first and last
+/// characters that differ), and an insertion at the end of a run of the
+/// same characters comes out at the run's end: Enter at the end of a line
+/// above other lines ("ab|\ncd" → "ab\n\ncd") is reported as a "\n" at 3,
+/// with the caret at 3. Applied at 3, egui's field puts its caret at 4
+/// and `end_frame` moves it back; applied at 2, the caret lands where the
+/// mirror's did, and the field's own Enter handling (script_editor.rs's
+/// indent) sees the line break where it was typed.
+fn unshift(s: &Session, op: &mut Op) {
+    let What::Replace { a, b, text } = &mut op.what else { return };
+    if a != b || op.sel.0 != op.sel.1 || text.is_empty() {
+        return;
+    }
+    let len = text.chars().count();
+    let Some(at) = op.sel.0.checked_sub(len) else { return };
+    if at == *a {
+        return;
+    }
+    let chars: Vec<char> = s.text.chars().collect();
+    if *a > chars.len() || at > chars.len() {
+        return;
+    }
+    let ins: Vec<char> = text.chars().collect();
+    let mut reported = chars.clone();
+    reported.splice(*a..*a, ins.iter().copied());
+    let mut at_caret = chars;
+    at_caret.splice(at..at, ins);
+    if reported == at_caret {
+        *a = at;
+        *b = at;
+    }
 }
 
 /// Whether `op` is the operation before it (`last`) reported a second
@@ -629,6 +722,13 @@ pub fn end_frame(ctx: &egui::Context, textbox: bool) {
             sel_now = egui_selection(id);
             if CODE_FIELDS.lock().unwrap_or_else(|e| e.into_inner()).contains(&id) {
                 kind = Kind::Code;
+            }
+            // (the editor's own word on the text comes last: after the
+            // frame's events and its own changes)
+            if let Some((lid, t)) = LIVE.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                if lid == id {
+                    text_now = Some(t);
+                }
             }
         }
         Some(Field::TextBox) => {

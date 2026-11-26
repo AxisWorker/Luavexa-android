@@ -275,6 +275,7 @@ pub fn run(app: AndroidApp) {
             // (eframe gave up: a surface or device it couldn't make)
             log::error!("eframe: {e}");
             log::error!("rustudio: the editor's loop ended with an error, leaving the process");
+            logcat::sync_session();
             std::process::exit(2);
         }
         Err(payload) => {
@@ -287,6 +288,7 @@ pub fn run(app: AndroidApp) {
             if let Some(p) = rustudio_core::crash::last_report() {
                 log::error!("rustudio: crash report {} (echoed to Output and logcat at the next start)", p.display());
             }
+            logcat::sync_session();
             std::process::exit(101);
         }
     }
@@ -433,6 +435,7 @@ pub fn gpu_watch(ed: &mut crate::app::Editor) -> bool {
     let line = format!("rustudio: {why}; nothing more can be drawn. {saved}. rustudio restarts; open the saved copy from Recent or the recovery folder.");
     log::error!("{line}");
     eprintln!("{line}");
+    logcat::sync_session();
     let _ = rustudio_core::crash::write_event(&why, &line);
     if let Err(e) = jni::relaunch() {
         log::error!("rustudio: relaunch: {e}");

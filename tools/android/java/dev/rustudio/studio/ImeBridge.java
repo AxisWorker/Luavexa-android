@@ -52,6 +52,16 @@ import android.view.inputmethod.InputMethodManager;
  * includes, so a state that is behind the keyboard's latest operation is
  * left for the editor's next one.
  *
+ * After each of its operations the keyboard is told the mirror's selection
+ * (and the whole text, if it asked to follow it), as a TextView tells it
+ * after every edit (InputMethodManager.updateSelection / updateExtractedText):
+ * a keyboard keeps its own idea of where the caret is and composes and
+ * deletes by it — one never told that its Enter had moved the caret to the
+ * next line went on typing at the end of the one before. In a code field
+ * the native side has its say on what was typed before the operation is
+ * reported ({@link #nativeCodeFixup}: the editor's auto-indent, made on the
+ * mirror inside the operation so the one replacement reported holds it).
+ *
  * Built into classes.dex by tools/android/build-dex.sh; loaded by
  * src/android/ime.rs with an InMemoryDexClassLoader (no Java in the build),
  * which binds the native method below. Everything here runs on the Java
@@ -79,6 +89,9 @@ public final class ImeBridge extends View {
     /** The last operation's number (`setState` says which one it includes). */
     private int mSeq;
     private Conn mConn;
+    /** The keyboard asked to follow the whole text (getExtractedText with a monitor flag): its token. */
+    private boolean mExtractMonitor;
+    private int mExtractToken;
 
     /**
      * An operation the keyboard made on the mirror (the editor applies it to
@@ -88,6 +101,14 @@ public final class ImeBridge extends View {
      * suggestions): the selection is the keyboard's, not to be judged.
      */
     private static native void nativeOp(int seq, int op, String text, int a, int b, int selStart, int selEnd, boolean composing, long hash);
+
+    /**
+     * The editor's auto-indent (src/code_indent.rs, bound by ime.rs): the
+     * keyboard inserted `inserted` into a code field whose text is now `text`
+     * with the caret at `cursor` (code points); returns "a b cursor\ntext" —
+     * code points [a, b) become text, the caret goes to cursor — or null.
+     */
+    private static native String nativeCodeFixup(String text, int cursor, String inserted);
 
     private ImeBridge(Context context) {
         super(context);
@@ -272,7 +293,23 @@ public final class ImeBridge extends View {
     private void tellSelection(InputMethodManager imm) {
         int a = Selection.getSelectionStart(mText), b = Selection.getSelectionEnd(mText);
         int ca = BaseInputConnection.getComposingSpanStart(mText), cb = BaseInputConnection.getComposingSpanEnd(mText);
+        if (mExtractMonitor) {
+            imm.updateExtractedText(this, mExtractToken, extracted());
+        }
         imm.updateSelection(this, a, b, ca, cb);
+    }
+
+    /** The mirror as an ExtractedText (the whole of it). */
+    private ExtractedText extracted() {
+        ExtractedText et = new ExtractedText();
+        et.text = mText.toString();
+        et.startOffset = 0;
+        et.partialStartOffset = -1;
+        et.partialEndOffset = -1;
+        et.selectionStart = Math.max(0, Selection.getSelectionStart(mText));
+        et.selectionEnd = Math.max(0, Selection.getSelectionEnd(mText));
+        et.flags = mKind == KIND_TEXT ? ExtractedText.FLAG_SINGLE_LINE : 0;
+        return et;
     }
 
     /** The UTF-16 index of code point `cp` of `s` (its length when past the end). */
@@ -334,6 +371,7 @@ public final class ImeBridge extends View {
         out.initialCapsMode = 0;
         out.packageName = getContext().getPackageName();
         out.fieldId = getId();
+        mExtractMonitor = false;
         mConn = new Conn();
         return mConn;
     }
@@ -385,9 +423,104 @@ public final class ImeBridge extends View {
                 mBatch--;
             }
             if (top) {
-                report();
+                finish();
             }
             return ok;
+        }
+
+        /**
+         * The end of an operation (or a batch): the editor's say on code
+         * typed, the report to the editor, and the keyboard told where the
+         * caret is now (the class comment).
+         */
+        private void finish() {
+            if (mKind == KIND_CODE && !hasComposing()) {
+                codeFixup();
+            }
+            report();
+            InputMethodManager imm = imm();
+            if (imm != null) {
+                tellSelection(imm);
+            }
+        }
+
+        /**
+         * What changed since the snapshot: {p, s}, the common prefix and
+         * suffix of the text before and after (UTF-16 units; a pair of
+         * surrogates is replaced whole).
+         */
+        private int[] diff() {
+            String now = mText.toString();
+            String before = mBefore;
+            int n0 = before.length(), n1 = now.length();
+            int p = 0;
+            while (p < n0 && p < n1 && before.charAt(p) == now.charAt(p)) {
+                p++;
+            }
+            if (p > 0 && p < n0 && p < n1 && Character.isHighSurrogate(before.charAt(p - 1))) {
+                p--;
+            }
+            int s = 0;
+            while (s < n0 - p && s < n1 - p && before.charAt(n0 - 1 - s) == now.charAt(n1 - 1 - s)) {
+                s++;
+            }
+            if (s > 0 && Character.isLowSurrogate(now.charAt(n1 - s)) && (n1 - s > p || n0 - s > p)) {
+                s--;
+            }
+            return new int[] {p, s};
+        }
+
+        /**
+         * A code field: text was inserted with the caret left after it (a
+         * letter, a word, Enter) — the native side may indent (the method's
+         * comment); its replacement is made on the mirror here, inside the
+         * operation.
+         */
+        private void codeFixup() {
+            String now = mText.toString();
+            int n0 = mBefore.length(), n1 = now.length();
+            int[] d = diff();
+            int p = d[0], s = d[1];
+            if (p + s >= n1) {
+                return;
+            }
+            int selA = Selection.getSelectionStart(mText), selB = Selection.getSelectionEnd(mText);
+            if (selA < 0 || selA != selB) {
+                return;
+            }
+            String inserted = now.substring(p, n1 - s);
+            int cursor = now.codePointCount(0, selA);
+            if (cursor < inserted.codePointCount(0, inserted.length())) {
+                return;
+            }
+            String fix;
+            try {
+                fix = nativeCodeFixup(now, cursor, inserted);
+            } catch (UnsatisfiedLinkError e) {
+                return;
+            }
+            if (fix == null) {
+                return;
+            }
+            int nl = fix.indexOf('\n');
+            if (nl < 0) {
+                return;
+            }
+            String[] h = fix.substring(0, nl).split(" ");
+            if (h.length != 3) {
+                return;
+            }
+            try {
+                int a = unitIndex(now, Integer.parseInt(h[0])), b = unitIndex(now, Integer.parseInt(h[1]));
+                if (a > b || b > mText.length()) {
+                    return;
+                }
+                mText.replace(a, b, fix.substring(nl + 1));
+                int c = unitIndex(mText.toString(), Integer.parseInt(h[2]));
+                Selection.setSelection(mText, c);
+            } catch (NumberFormatException e) {
+                Log.w(TAG, "ime: code fixup unreadable: " + fix.substring(0, nl));
+            }
         }
 
         @Override
@@ -401,7 +534,7 @@ public final class ImeBridge extends View {
         @Override
         public boolean endBatchEdit() {
             if (mBatch > 0 && --mBatch == 0) {
-                report();
+                finish();
             }
             return mBatch > 0;
         }
@@ -411,21 +544,8 @@ public final class ImeBridge extends View {
             String now = mText.toString();
             String before = mBefore;
             int n0 = before.length(), n1 = now.length();
-            int p = 0;
-            while (p < n0 && p < n1 && before.charAt(p) == now.charAt(p)) {
-                p++;
-            }
-            // (a pair of surrogates is replaced whole)
-            if (p > 0 && p < n0 && p < n1 && Character.isHighSurrogate(before.charAt(p - 1))) {
-                p--;
-            }
-            int s = 0;
-            while (s < n0 - p && s < n1 - p && before.charAt(n0 - 1 - s) == now.charAt(n1 - 1 - s)) {
-                s++;
-            }
-            if (s > 0 && Character.isLowSurrogate(now.charAt(n1 - s)) && (n1 - s > p || n0 - s > p)) {
-                s--;
-            }
+            int[] d = diff();
+            int p = d[0], s = d[1];
             int selA = Selection.getSelectionStart(mText), selB = Selection.getSelectionEnd(mText);
             if (selA < 0) {
                 selA = n1;
@@ -608,16 +728,13 @@ public final class ImeBridge extends View {
 
         @Override
         public ExtractedText getExtractedText(ExtractedTextRequest request, int flags) {
-            // (keyboards that follow the whole text ask for it so)
-            ExtractedText et = new ExtractedText();
-            et.text = mText.toString();
-            et.startOffset = 0;
-            et.partialStartOffset = -1;
-            et.partialEndOffset = -1;
-            et.selectionStart = Math.max(0, Selection.getSelectionStart(mText));
-            et.selectionEnd = Math.max(0, Selection.getSelectionEnd(mText));
-            et.flags = mKind == KIND_TEXT ? ExtractedText.FLAG_SINGLE_LINE : 0;
-            return et;
+            // (keyboards that follow the whole text ask for it so, and with
+            // the monitor flag are told of every change: `tellSelection`)
+            if ((flags & InputConnection.GET_EXTRACTED_TEXT_MONITOR) != 0 && request != null) {
+                mExtractMonitor = true;
+                mExtractToken = request.token;
+            }
+            return extracted();
         }
 
         @Override

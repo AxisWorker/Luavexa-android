@@ -129,6 +129,29 @@ pub struct Keyboard {
     /// kept until it is down, so the panels don't jump for the frames
     /// between a TextBox's focus going and the keyboard's slide out.
     over: bool,
+    /// A press began inside one of last frame's [`keep_focus_in`] rects
+    /// and hasn't been released.
+    hold_pressed: bool,
+    /// egui's focus rule from before that press, put back after it.
+    hold_surrender: Option<egui::SurrenderFocusOn>,
+}
+
+/// Rects (this frame's) a tap inside which must not take the focus from
+/// the text field: the script editor's completion strip and its soft Tab
+/// keys act on the focused field — egui's rule is that a click outside
+/// the focused widget surrenders its focus, so the field lost the focus
+/// for the frame of the tap, and with it the keyboard's mirror (ime.rs
+/// ends the session on "no field") and, when the tap took longer than a
+/// frame or two, the keyboard ([`HIDE_AFTER`]). Registered every frame
+/// they show; read in [`Keyboard::before_frame`], which holds egui's
+/// `surrender_focus_on` at `Never` through a press that began inside one
+/// (as text_bar.rs does for its bar).
+static KEEP_FOCUS: std::sync::Mutex<Vec<egui::Rect>> = std::sync::Mutex::new(Vec::new());
+
+/// A tap inside `rect` (this frame's) leaves the focused text field its
+/// focus (the module comment on [`KEEP_FOCUS`]).
+pub fn keep_focus_in(rect: egui::Rect) {
+    KEEP_FOCUS.lock().unwrap_or_else(|e| e.into_inner()).push(rect);
 }
 
 /// What wants the soft keyboard.
@@ -226,6 +249,7 @@ impl Keyboard {
     /// into, the view slid up by the keyboard's height behind it.
     pub fn before_frame(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput, textbox: bool, game_box: bool) {
         CHANGED.store(false, Ordering::Relaxed);
+        self.hold_focus(ctx, raw);
         let want = wanted(ctx, textbox);
         if let Some(w) = want {
             // (a focused egui field comes first in `wanted`: the game's
@@ -260,6 +284,43 @@ impl Keyboard {
         // Every frame, down (zero) or up: egui keeps the last inset given.
         let bottom = if self.over { 0.0 } else { self.room(ctx) };
         raw.safe_area_insets = Some(SafeAreaInsets(MarginF32 { left: 0.0, right: 0.0, top: 0.0, bottom }));
+    }
+
+    /// The focus held for the field through a press that began inside one
+    /// of last frame's [`keep_focus_in`] rects ([`KEEP_FOCUS`]): egui's
+    /// `surrender_focus_on` is `Never` from the press to the frame of its
+    /// release (the release's frame is the click's: the rule holds through
+    /// it), then what it was.
+    fn hold_focus(&mut self, ctx: &egui::Context, raw: &egui::RawInput) {
+        let rects = std::mem::take(&mut *KEEP_FOCUS.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut released = false;
+        for e in &raw.events {
+            if let egui::Event::PointerButton { pos, pressed, .. } = e {
+                if *pressed {
+                    self.hold_pressed = rects.iter().any(|r| r.contains(*pos));
+                } else {
+                    released = true;
+                }
+            }
+        }
+        let hold = self.hold_pressed;
+        if released {
+            self.hold_pressed = false;
+        }
+        if hold {
+            ctx.options_mut(|o| {
+                let was = std::mem::replace(&mut o.input_options.surrender_focus_on, egui::SurrenderFocusOn::Never);
+                if self.hold_surrender.is_none() && was != egui::SurrenderFocusOn::Never {
+                    self.hold_surrender = Some(was);
+                }
+            });
+        } else if let Some(rule) = self.hold_surrender.take() {
+            ctx.options_mut(|o| {
+                if o.input_options.surrender_focus_on == egui::SurrenderFocusOn::Never {
+                    o.input_options.surrender_focus_on = rule;
+                }
+            });
+        }
     }
 
     /// The last question's answer, once it has come.
@@ -359,12 +420,27 @@ impl Keyboard {
             }
             (Some(_), true) => self.unwanted_since = None,
             (None, true) => {
+                // (not while a finger is down: a tap's release may put the
+                // focus back — a completion taken, a soft key — and the
+                // keyboard's slide out and in for it is what's unwanted)
+                if ctx.input(|i| i.pointer.any_down()) {
+                    self.unwanted_since = None;
+                    ctx.request_repaint_after(HIDE_AFTER);
+                    return;
+                }
                 let since = *self.unwanted_since.get_or_insert(now);
                 let for_ms = now.duration_since(since);
                 if for_ms >= HIDE_AFTER {
                     self.shown = false;
                     self.unwanted_since = None;
-                    log::info!("soft keyboard asked down: nothing to type into for {} ms", for_ms.as_millis());
+                    log::info!(
+                        "soft keyboard asked down: nothing to type into for {} ms (focus now {})",
+                        for_ms.as_millis(),
+                        match ctx.memory(|m| m.focused()) {
+                            Some(id) => format!("{id:?}, not a text field"),
+                            None => "nothing".to_string(),
+                        }
+                    );
                     soft_input(false);
                 } else {
                     ctx.request_repaint_after(HIDE_AFTER - for_ms);
