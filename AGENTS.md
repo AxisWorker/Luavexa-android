@@ -99,7 +99,7 @@ The existing MCP implementation includes tool groups: **`Read`**, **`Edit`**, **
 
 **ARM64 Android is the primary target.** Preserve desktop functionality unless the task intentionally changes cross-platform behavior.
 
-- Keep the existing Android package identifier (`dev.rustudio.studio`) and native library/crate linkage intact **unless performing an explicit, separately reviewed migration**. A visible app-label change is not the same as a safe package migration.
+- Luavexa Aurora 0.1.1 changes the Android package ID to `dev.luavexa.studio` (legacy builds: `dev.rustudio.studio`). Preserve the new ID and native Rust library/crate linkage unless a separately reviewed migration is explicitly requested. Package migration does not automatically transfer private user data; see `docs/LUAVEXA-0.1.1-DIAGNOSTICS.md`.
 - Account for APK signing/install conflicts, stored project files, runtime permissions, and migration/rollback before changing application identity.
 - Preserve the existing NativeActivity integration and touch, keyboard, storage, GPU, and lifecycle behavior.
 - Avoid blocking the render/UI thread, excessive per-frame allocations, unnecessary network traffic, and expensive repeated disk operations.
