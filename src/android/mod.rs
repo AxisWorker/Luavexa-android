@@ -156,7 +156,7 @@ pub(crate) fn system_property(name: &str) -> String {
 pub fn run(app: AndroidApp) {
     logcat::install();
     log::info!(
-        "rustudio {} starting (Android API {}; {} build, {} {})",
+        "Luavexa {} starting (Android API {}; {} build, {} {})",
         env!("CARGO_PKG_VERSION"),
         AndroidApp::sdk_version(),
         if cfg!(debug_assertions) { "debug" } else { "release" },
@@ -178,7 +178,7 @@ pub fn run(app: AndroidApp) {
     // engine's device_sensors.
     rustudio_engine::device_sensors::install(sensors::source());
     // A MicroProfiler export (written under the app's files folder, which
-    // the Files apps can't open) is copied to Download/rustudio/<name>, as
+    // the Files apps can't open) is copied to Download/Luavexa/<name>, as
     // the logs are, so a capture of a laggy minute can be sent from the phone.
     rustudio_profiler_ui::on_saved(|path| {
         let name = path.file_name()?.to_str()?.to_string();
@@ -265,7 +265,7 @@ pub fn run(app: AndroidApp) {
 
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
-        viewport: egui::ViewportBuilder::default().with_title("rustudio").with_app_id("rustudio"),
+        viewport: egui::ViewportBuilder::default().with_title("Luavexa").with_app_id("luavexa"),
         // Vulkan first, GLES 3 where there is no usable Vulkan driver
         // (offscreen::wgpu_options_with, with Turnip's objects where
         // crate::wgpu_setup made them); vsync.
