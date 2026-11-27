@@ -53,9 +53,9 @@ on:
         type: choice
         options: [debug, release, both]
       turnip:
-        description: "Ship the Turnip (Mesa) Vulkan driver + libadrenotools in the arm64 APK (docs/ANDROID.md, Turnip driver)"
+        description: "Optional Mesa Vulkan driver (extra download/build work; enable when testing Vulkan)"
         required: false
-        default: true
+        default: false
         type: boolean
       turnip_zip:
         description: "Turnip driver zip URL (libvulkan_freedreno.so inside; nihui/mesa-turnip-android-driver release)"
@@ -68,9 +68,9 @@ on:
         default: "https://nightly.link/TouseefX/libadrenotools-native/actions/runs/44679007919/libadrenotools-arm64-v8a.zip"
         type: string
       panvk:
-        description: "Also ship the PanVK (Mesa) Vulkan driver for Mali GPUs (18 MB more APK; needs turnip on)"
+        description: "Optionally bundle PanVK for Mali GPUs (extra APK size; requires Turnip option)"
         required: false
-        default: true
+        default: false
         type: boolean
       panvk_zip:
         description: "PanVK driver URL (a zip with libvulkan_panfrost.so inside — a JimVulkan/mali-panvk release, Mesa PanVK on the stock Arm kbase driver — or a bare .so of your own)"
@@ -88,9 +88,9 @@ env:
   # manifest.yaml format and NDK downloads used here).
   XBUILD_REV: e67b501cbe0e9ca5436c223aa7ec0fe5e27544d1
   # The Mesa Vulkan drivers (Turnip for Adreno, PanVK for Mali) and
-  # libadrenotools that go into the arm64 APK's lib/arm64-v8a (push / PR
-  # builds; a manual run's inputs above can name others or leave them
-  # out). tools/android/fetch-turnip.sh checks these against pinned
+  # libadrenotools optional for manual builds, enabled by default for
+  # tagged public releases only; normal PR builds focus on fast validation.
+  # A manual run's inputs above can name other driver ZIPs. tools/android/fetch-turnip.sh checks these against pinned
   # SHA-256 sums; docs/ANDROID.md "Turnip driver". The libadrenotools
   # build is the fork's CI artifact of 2026-11-20 05:08 (commit 8c7d9f5,
   # run 44679007919: the driver.cpp rewrite of 4d4d482 — HyperOS' vendor
@@ -189,7 +189,7 @@ jobs:
       # it then skips) and leaves an empty marker file of that name in
       # it, nothing goes into the APK (the script's comment on it).
       - name: Mesa drivers (Turnip, PanVK) + libadrenotools (arm64-v8a)
-        if: matrix.arch == 'arm64' && github.event.inputs.turnip != 'false'
+        if: matrix.arch == 'arm64' && (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.turnip == 'true')
         env:
           # A manual run's inputs, else the pinned releases (env above).
           TURNIP_ZIP: ${{ github.event.inputs.turnip_zip || env.TURNIP_ZIP_URL }}
@@ -235,11 +235,11 @@ jobs:
           apk="dist/luavexa-${{ matrix.arch }}-${{ matrix.profile }}.apk"
           unzip -l "$apk" | grep -E "lib/|assets/|AndroidManifest" || true
           # The drivers the arm64 build fetched must have made it in.
-          if [ "${{ matrix.arch }}" = "arm64" ] && [ "${{ github.event.inputs.turnip }}" != "false" ]; then
+          if [ "${{ matrix.arch }}" = "arm64" ] && { [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = "true" ] || [ "${{ github.event.inputs.turnip }}" = "true" ]; }; then
             for f in libadrenotools.so libhook_impl.so libmain_hook.so libvulkan_freedreno.so; do
               unzip -l "$apk" | grep -q "lib/arm64-v8a/$f" || { echo "::error::$f is not in the APK"; exit 1; }
             done
-            if [ "${{ github.event.inputs.panvk }}" != "false" ]; then
+            if [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = "true" ] || [ "${{ github.event.inputs.panvk }}" = "true" ]; then
               unzip -l "$apk" | grep -q "lib/arm64-v8a/libvulkan_panfrost.so" || { echo "::error::libvulkan_panfrost.so is not in the APK"; exit 1; }
             fi
           fi
