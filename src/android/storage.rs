@@ -521,8 +521,8 @@ fn skip_crashed(p: &Path) -> bool {
     }
     let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let line = format!(
-        "rustudio ended within {} s of opening {name} the last time, so it wasn't opened again by itself. \
-         File ▸ Open Recent opens it on purpose (adb logcat -s rustudio RustStdoutStderr tells what ended the last start).",
+        "Luavexa ended within {} s of opening {name} the last time, so it wasn't opened again by itself. \
+         File ▸ Open Recent opens it on purpose (adb logcat -s Luavexa RustStdoutStderr tells what ended the last start).",
         SETTLED.as_secs()
     );
     log::warn!("{line}");
