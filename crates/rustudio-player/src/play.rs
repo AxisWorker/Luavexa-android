@@ -887,7 +887,7 @@ impl Game {
             if rustudio_engine::runtime::domains::data::local_mode_for(universe) {
                 self.push_log(
                     rustudio_core::log::Level::Warn,
-                    "DataStores, MemoryStores and Messaging stay in memory for this Play (Studio Settings > rustudio > Data in Play is \"In memory only\")".to_string(),
+                    "DataStores, MemoryStores and Messaging stay in memory for this Play (Studio Settings > Luavexa > Data in Play is \"In memory only\")".to_string(),
                 );
             } else {
                 self.info(format!(
