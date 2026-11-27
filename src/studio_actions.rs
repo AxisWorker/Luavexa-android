@@ -508,7 +508,7 @@ impl Editor {
             "logs_folder" => {
                 #[cfg(target_os = "android")]
                 match crate::android::logs::export("Help menu") {
-                    Ok(path) => self.info(format!("The logs were copied to {path} (a Files app: Download > rustudio)")),
+                    Ok(path) => self.info(format!("The logs were copied to {path} (a Files app: Download > Luavexa)")),
                     Err(e) => self.error(format!("The logs couldn't be copied to Download: {e}")),
                 }
                 #[cfg(not(target_os = "android"))]
