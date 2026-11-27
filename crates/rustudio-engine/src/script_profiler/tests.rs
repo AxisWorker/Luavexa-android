@@ -4,6 +4,16 @@ use rustudio_core::log::Level;
 use rbx_dom_weak::InstanceBuilder;
 use rustudio_core::doc::Document;
 
+// The profiler's recording/live/exact modes and its snapshot store are global.
+// Running these tests simultaneously can clear another test's samples, or
+// disable heap polling before it is observed. Serialize only profiler tests,
+// rather than slowing down the entire Rust workspace test suite.
+static PROFILER_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn profiler_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    PROFILER_TEST_MUTEX.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
 /// Aborts the test process if a run takes over 90 s (a hang must never
 /// hold a shared build lock); disarmed when dropped.
 struct Watchdog(Option<std::sync::mpsc::Sender<()>>);
@@ -91,6 +101,7 @@ print("DONE")
 
 #[test]
 fn records_scripts_functions_entries_markers_and_heap() {
+    let _profiler_test_guard = profiler_test_guard();
     start_recording(false);
     set_sample_hz(4000);
     let out = run("ProfHot", HOT, 12);
@@ -152,6 +163,7 @@ fn records_scripts_functions_entries_markers_and_heap() {
 
 #[test]
 fn heap_is_polled_per_script() {
+    let _profiler_test_guard = profiler_test_guard();
     set_live(true);
     // Poll every frame: a fast machine runs these 40 frames inside one 500 ms interval.
     super::HEAP_POLL_MS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -175,6 +187,7 @@ fn heap_is_polled_per_script() {
 
 #[test]
 fn native_directive() {
+    let _profiler_test_guard = profiler_test_guard();
     assert!(source_is_native("--!strict\n--!native\nlocal x = 1"));
     assert!(source_is_native("-- header\n--!native"));
     assert!(!source_is_native("local x = 1\n--!native"));
@@ -183,6 +196,7 @@ fn native_directive() {
 
 #[test]
 fn native_functions_are_flagged() {
+    let _profiler_test_guard = profiler_test_guard();
     start_recording(false);
     set_sample_hz(4000);
     let out = run(
@@ -222,6 +236,7 @@ print("NDONE")
 
 #[test]
 fn off_records_nothing_new() {
+    let _profiler_test_guard = profiler_test_guard();
     // A script that never ran while profiling has no row.
     // (Tests run in parallel: only meaningful when nothing turned it on
     // before or during the run.)
@@ -237,6 +252,7 @@ fn off_records_nothing_new() {
 
 #[test]
 fn exact_mode_counts_calls_and_times_functions() {
+    let _profiler_test_guard = profiler_test_guard();
     set_exact(true);
     let out = run(
         "ProfExact",
@@ -289,6 +305,7 @@ print("XDONE", ok)
 
 #[test]
 fn resumes_and_markers_are_script_spans_on_the_timeline() {
+    let _profiler_test_guard = profiler_test_guard();
     use rustudio_core::profiler as p;
     p::enable();
     let out = run(
