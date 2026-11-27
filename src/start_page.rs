@@ -1078,7 +1078,7 @@ impl Editor {
                     let o = &recent[i].origin;
                     let sub = format!("Opened {}", ago(now, recent[i].opened_at));
                     let icon = self.start.icons.get(&o.universe_id).map(|t| t.id());
-                    let r = card(ui, &o.name, &sub, |p, rect| icon_thumb(p, rect, icon, &o.name));
+                    let r = card(ui, self.start.reduced_motion, &o.name, &sub, |p, rect| icon_thumb(p, rect, icon, &o.name));
                     let r = r.on_hover_text(format!(
                         "{} by {}\nplace {} · universe {}",
                         o.experience,
@@ -1316,7 +1316,12 @@ impl Editor {
         let carrying = egui::DragAndDrop::has_any_payload(ui.ctx());
         let hov = ui.rect_contains_pointer(r) && !dragging && !carrying;
         let title = if renaming { "" } else { e.name() };
-        paint_card(ui, r, hov, title, &sub, |p, tr| match e {
+        let hover = if self.start.reduced_motion {
+            if hov { 1.0 } else { 0.0 }
+        } else {
+            ui.ctx().animate_bool_with_time(resp.id.with("aurora_template_hover"), hov, 0.16)
+        };
+        paint_card(ui, r, hover, title, &sub, |p, tr| match e {
             Entry::Roblox(t) => icon_thumb(p, tr, thumb, &t.name),
             Entry::Custom(c) => custom_thumb(p, tr, thumb, c.thumb.is_none() && c.preview.is_some(), &c.name),
         });
@@ -1639,7 +1644,7 @@ impl Editor {
                 format!("Updated {}", e.updated.get(..10).unwrap_or(&e.updated))
             };
             let icon = self.start.icons.get(&e.id).map(|t| t.id());
-            let r = card(ui, &e.name, &sub, |p, rect| {
+            let r = card(ui, self.start.reduced_motion, &e.name, &sub, |p, rect| {
                 icon_thumb(p, rect, icon, &e.name);
                 if e.team_create == Some(true) {
                     let b = Rect::from_min_size(rect.min + Vec2::new(6.0, 6.0), Vec2::new(86.0, 18.0));
@@ -1736,19 +1741,24 @@ fn grid(ui: &mut egui::Ui, n: usize, mut each: impl FnMut(&mut egui::Ui, usize))
 }
 
 /// A card: thumbnail (drawn by `thumb`), title and one dim line.
-fn card(ui: &mut egui::Ui, title: &str, sub: &str, thumb: impl FnOnce(&egui::Painter, Rect)) -> egui::Response {
+fn card(ui: &mut egui::Ui, reduced_motion: bool, title: &str, sub: &str, thumb: impl FnOnce(&egui::Painter, Rect)) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(Vec2::new(CARD_W, CARD_H), Sense::click());
-    paint_card(ui, r, resp.hovered(), title, sub, thumb);
+    let hover = if reduced_motion {
+        if resp.hovered() { 1.0 } else { 0.0 }
+    } else {
+        ui.ctx().animate_bool_with_time(resp.id.with("aurora_card_hover"), resp.hovered(), 0.16)
+    };
+    paint_card(ui, r, hover, title, sub, thumb);
     resp
 }
 
-fn paint_card(ui: &egui::Ui, r: Rect, hov: bool, title: &str, sub: &str, thumb: impl FnOnce(&egui::Painter, Rect)) {
+fn paint_card(ui: &egui::Ui, r: Rect, hover: f32, title: &str, sub: &str, thumb: impl FnOnce(&egui::Painter, Rect)) {
     let p = ui.painter().with_clip_rect(r);
-    p.rect_filled(r, CornerRadius::same(6), if hov { theme::ACTIVE_TAB } else { theme::PANEL_DARK });
+    p.rect_filled(r, CornerRadius::same(10), if hover > 0.5 { theme::ACTIVE_TAB } else { theme::PANEL_DARK });
     let tr = Rect::from_min_size(r.min, Vec2::new(CARD_W, THUMB_H));
     thumb(&p.with_clip_rect(tr), tr);
-    if hov {
-        p.rect_stroke(r, CornerRadius::same(6), Stroke::new(1.5, theme::SELECT), egui::StrokeKind::Inside);
+    if hover > 0.0 {
+        p.rect_stroke(r, CornerRadius::same(10), Stroke::new(1.0 + hover * 0.6, theme::SELECT.gamma_multiply(hover)), egui::StrokeKind::Inside);
     }
     let font = egui::FontId::proportional(13.5);
     let title = elide(&p, title, &font, CARD_W - 20.0);
@@ -1756,7 +1766,7 @@ fn paint_card(ui: &egui::Ui, r: Rect, hov: bool, title: &str, sub: &str, thumb: 
     let small = egui::FontId::proportional(11.5);
     let sub = elide(&p, sub, &small, CARD_W - 20.0);
     p.text(Pos2::new(r.min.x + 10.0, tr.max.y + 35.0), egui::Align2::LEFT_CENTER, sub, small, theme::TEXT_DIM);
-    if hov {
+    if hover > 0.5 {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 }
