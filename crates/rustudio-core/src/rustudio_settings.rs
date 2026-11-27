@@ -93,7 +93,7 @@ impl ToolImpl {
     }
 }
 
-pub const TOOL_IMPLS: &[(&str, &str)] = &[("rustudio", "rustudio's"), ("roblox", "Roblox's")];
+pub const TOOL_IMPLS: &[(&str, &str)] = &[("rustudio", "Luavexa's"), ("roblox", "Roblox's")];
 
 /// Duplicated Studio tools that can use either rustudio's native
 /// implementation or Roblox's built-in plugin when built-in plugins are on.
@@ -306,7 +306,7 @@ pub const OPTS: &[Opt] = &[
         key: "core_scripts",
         cat: "Play",
         label: "Roblox's CoreScripts",
-        desc: "Play runs Roblox's own CoreScripts and CorePackages from Studio's data model patch (in-game chat, top bar, player list and escape menu) when installed, falling back to rustudio's built-in UI when absent or turned off. Next Play.",
+        desc: "Play runs Roblox's own CoreScripts and CorePackages from Studio's data model patch (in-game chat, top bar, player list and escape menu) when installed, falling back to Luavexa's built-in UI when absent or turned off. Next Play.",
         env: "RUSTUDIO_CORE_SCRIPTS",
         kind: OptKind::Bool,
     },
@@ -322,7 +322,7 @@ pub const OPTS: &[Opt] = &[
         key: "builtin_toolbox",
         cat: "Plugins",
         label: "Toolbox",
-        desc: "Use rustudio's native Toolbox or Roblox's built-in Toolbox plugin. Applies when opening a place or restarting.",
+        desc: "Use Luavexa's native Toolbox or Roblox's built-in Toolbox plugin. Applies when opening a place or restarting.",
         env: "RUSTUDIO_BUILTIN_TOOLBOX",
         kind: OptKind::Choice(TOOL_IMPLS),
     },
@@ -330,7 +330,7 @@ pub const OPTS: &[Opt] = &[
         key: "builtin_terrain_editor",
         cat: "Plugins",
         label: "Terrain Editor",
-        desc: "Use rustudio's native Terrain Editor or Roblox's built-in TerrainEditor plugin. Applies when opening a place or restarting.",
+        desc: "Use Luavexa's native Terrain Editor or Roblox's built-in TerrainEditor plugin. Applies when opening a place or restarting.",
         env: "RUSTUDIO_BUILTIN_TERRAIN_EDITOR",
         kind: OptKind::Choice(TOOL_IMPLS),
     },
@@ -338,7 +338,7 @@ pub const OPTS: &[Opt] = &[
         key: "builtin_draggers",
         cat: "Plugins",
         label: "Select / Move / Scale / Rotate",
-        desc: "Use rustudio's native viewport tools or Roblox's built-in Select, Move, Scale and Rotate dragger plugins. Applies when opening a place or restarting.",
+        desc: "Use Luavexa's native viewport tools or Roblox's built-in Select, Move, Scale and Rotate dragger plugins. Applies when opening a place or restarting.",
         env: "RUSTUDIO_BUILTIN_DRAGGERS",
         kind: OptKind::Choice(TOOL_IMPLS),
     },
@@ -346,7 +346,7 @@ pub const OPTS: &[Opt] = &[
         key: "builtin_view_selector",
         cat: "Plugins",
         label: "View cube",
-        desc: "Use rustudio's native viewport orientation cube or Roblox's built-in ViewSelector plugin. Applies when opening a place or restarting.",
+        desc: "Use Luavexa's native viewport orientation cube or Roblox's built-in ViewSelector plugin. Applies when opening a place or restarting.",
         env: "RUSTUDIO_BUILTIN_VIEW_SELECTOR",
         kind: OptKind::Choice(TOOL_IMPLS),
     },
@@ -354,7 +354,7 @@ pub const OPTS: &[Opt] = &[
         key: "builtin_rig_builder",
         cat: "Plugins",
         label: "Character / Rig Builder",
-        desc: "Use rustudio's native Character builder or Roblox's built-in RigGenerator plugin. Applies when opening a place or restarting.",
+        desc: "Use Luavexa's native Character builder or Roblox's built-in RigGenerator plugin. Applies when opening a place or restarting.",
         env: "RUSTUDIO_BUILTIN_RIG_BUILDER",
         kind: OptKind::Choice(TOOL_IMPLS),
     },
@@ -362,7 +362,7 @@ pub const OPTS: &[Opt] = &[
         key: "builtin_material_picker",
         cat: "Plugins",
         label: "Material Picker",
-        desc: "Use rustudio's native Material picker or Roblox's built-in MaterialPicker plugin. Applies when opening a place or restarting.",
+        desc: "Use Luavexa's native Material picker or Roblox's built-in MaterialPicker plugin. Applies when opening a place or restarting.",
         env: "RUSTUDIO_BUILTIN_MATERIAL_PICKER",
         kind: OptKind::Choice(TOOL_IMPLS),
     },
@@ -378,7 +378,7 @@ pub const OPTS: &[Opt] = &[
         key: "update_check",
         cat: "Updates",
         label: "Check for updates on start",
-        desc: "Looks for a newer rustudio release on GitHub when rustudio starts. Takes effect at the next start.",
+        desc: "Checks for a newer Luavexa release on GitHub when Luavexa starts. Takes effect at the next start.",
         env: "RUSTUDIO_NO_UPDATE_CHECK",
         kind: OptKind::Bool,
     },
