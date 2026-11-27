@@ -28,19 +28,42 @@ fn benchmark_enabled() -> bool {
 }
 
 static AUTOMATIC: AtomicBool = AtomicBool::new(false);
+// User-enabled from Luavexa Debug: off unless explicitly requested.
+// Do not pay for detailed timestamp queries during ordinary editing.
+static LIVE_DEBUG: AtomicBool = AtomicBool::new(false);
+
+pub fn set_live_debug(enabled: bool) {
+    LIVE_DEBUG.store(enabled, Ordering::Relaxed);
+}
+
+pub fn live_debug_enabled() -> bool {
+    LIVE_DEBUG.load(Ordering::Relaxed)
+}
+
+pub fn supported(device: &wgpu::Device) -> bool {
+    device.features().contains(wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+}
+
+pub fn live_debug_snapshot() -> Vec<(&'static str, f64)> {
+    if !live_debug_enabled() {
+        return Vec::new();
+    }
+    STATE.lock().unwrap_or_else(|e| e.into_inner())
+        .as_ref().map_or_else(Vec::new, |st| st.last_debug.clone())
+}
 
 pub(crate) fn set_automatic(enabled: bool) {
     AUTOMATIC.store(enabled, Ordering::Relaxed);
 }
 
 fn on() -> bool {
-    benchmark_enabled() || AUTOMATIC.load(Ordering::Relaxed) || rustudio_core::profiler::gpu_wanted()
+    benchmark_enabled() || AUTOMATIC.load(Ordering::Relaxed) || live_debug_enabled() || rustudio_core::profiler::gpu_wanted()
 }
 
 /// Every labelled span is timed (the bench or the profiler wants them), not
 /// only the scene span automatic quality reads.
 fn detailed() -> bool {
-    benchmark_enabled() || rustudio_core::profiler::gpu_wanted()
+    benchmark_enabled() || live_debug_enabled() || rustudio_core::profiler::gpu_wanted()
 }
 
 /// Keep timestamp queries available if Automatic is selected after startup.
@@ -77,6 +100,9 @@ struct State {
     results: Vec<(&'static str, f64)>,
     totals: Vec<f64>,
     last_scene_ms: Option<f32>,
+    /// Most recently resolved GPU pass timings while Luavexa Debug is enabled.
+    /// Updated asynchronously, normally one or two frames behind the UI.
+    last_debug: Vec<(&'static str, f64)>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -126,6 +152,7 @@ fn init(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<State> {
         results: Vec::new(),
         totals: Vec::new(),
         last_scene_ms: None,
+        last_debug: Vec::new(),
     })
 }
 
@@ -205,6 +232,7 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
     st.encoder_start = None;
     let _ = device.poll(wgpu::PollType::Poll);
     let period = st.period_ns;
+    let debug_on = live_debug_enabled();
     for slot in st.slots.iter_mut() {
         if slot.state.load(Ordering::Acquire) != MAPPED {
             continue;
@@ -215,6 +243,7 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
                 profile_slot(slot, &ts, period);
             }
             let mut total = 0.0;
+            let mut debug_frame: Vec<(&'static str, f64)> = Vec::new();
             for (a, b, label) in &slot.spans {
                 let ms = ts[*b as usize].wrapping_sub(ts[*a as usize]) as f64 * period / 1e6;
                 // (a counter that went backwards or a bogus value: dropped)
@@ -222,6 +251,12 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
                     continue;
                 }
                 total += ms;
+                if debug_on {
+                    match debug_frame.iter_mut().find(|span| span.0 == *label) {
+                        Some(span) => span.1 += ms,
+                        None => debug_frame.push((*label, ms)),
+                    }
+                }
                 if benchmark_enabled() {
                     match st.results.iter_mut().find(|e| e.0 == *label) {
                         Some(e) => e.1 += ms,
@@ -239,6 +274,10 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
             }
             if benchmark_enabled() {
                 st.totals.push(total);
+            }
+            if debug_on {
+                // Atomic-frame handoff without stalling to wait for the GPU.
+                st.last_debug = debug_frame;
             }
         }
         slot.read.unmap();
