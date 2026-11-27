@@ -1,12 +1,7 @@
-//! View > GPU Driver: which graphics adapter and driver this run draws
-//! with, whether weak-GPU mode is on (gpu_caps.rs), and, on Android, the
-//! switch for the Mesa Vulkan driver the APK ships for the device — Turnip
-//! on Snapdragon, PanVK on Mali (src/android/turnip.rs) — with Turnip's
-//! debug switches. The 3D view's quality itself (Automatic or manual
-//! quality, 3D resolution, shading detail, shadows, ambient occlusion,
-//! bloom, the frame limit) is File > Studio Settings > rustudio >
-//! Performance (crates/rustudio-core/src/rustudio_settings.rs). Built for
-//! a thumb: check boxes and buttons, nothing to drag.
+//! Luavexa Debug: lightweight performance readings and a reversible
+//! GPU transparency comparison, plus the existing driver diagnostics.
+//! Use File > Studio Settings > Luavexa > Performance for quality controls.
+//! This screen does not alter project files or GPU driver state by itself.
 
 use egui::RichText;
 
@@ -20,12 +15,12 @@ impl Editor {
         }
         let mut open = true;
         let screen = ctx.content_rect();
-        egui::Window::new("GPU Driver")
-            .id(egui::Id::new("graphics_settings_window"))
+        egui::Window::new("Luavexa Debug")
+            .id(egui::Id::new("luavexa_debug_window"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(380.0)
+            .default_width(440.0)
             .default_pos(screen.center() - egui::vec2(200.0, (screen.height() * 0.45).min(320.0)))
             // (a phone's screen is shorter than the rows: the rest scrolls)
             .vscroll(true)
@@ -34,7 +29,62 @@ impl Editor {
     }
 
     fn graphics_settings_body(&mut self, ui: &mut egui::Ui) {
-        ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(28.0);
+        ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(36.0);
+        use rustudio_core::rustudio_settings as settings;
+
+        ui.label(RichText::new("LUAVEXA / PERFORMANCE").strong());
+        let fps = self.fps.max(0.0);
+        let frame_ms = if fps > 0.1 { format!("{:.1} ms", 1000.0 / fps) } else { "measuring...".into() };
+        let mode = if self.game.is_playing() { "Play" } else { "Edit" };
+        ui.label(format!("{} · {:.0} FPS · {}", mode, fps, frame_ms));
+        let view = self.game.viewport_rect;
+        ui.label(format!("Viewport: {:.0} × {:.0} logical points", view.width().max(0.0), view.height().max(0.0)));
+        ui.label(format!(
+            "3D resolution: {}% · Graphics: {} · Detail: {}",
+            settings::performance_value("resolution"),
+            settings::performance_value("quality"),
+            settings::performance_value("detail")
+        ));
+        ui.label(format!(
+            "SSAO: {} · Shadows: {} · Bloom: {}",
+            settings::performance_value("ssao"),
+            settings::performance_value("shadows"),
+            settings::performance_value("bloom")
+        ));
+        ui.small(RichText::new("These are session readings and configured values, not GPU pass timings. Keep the same camera, quality and view size when comparing FPS.").weak());
+        ui.separator();
+
+        ui.label(RichText::new("TRANSPARENCY A/B TEST").strong());
+        let mut fast = rustudio_render::render::fast_transparency_enabled();
+        if ui.checkbox(&mut fast, "Use fast linear transparency (experimental)").changed() {
+            rustudio_render::render::set_fast_transparency(fast);
+        }
+        ui.small(RichText::new("OFF: original encoded SeeThrough passes. ON: direct linear blending. Colors and transparent edges may look different. Session-only; automatically resets at restart. This test does not prove that blending is the only bottleneck.").weak());
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Reset transparency").clicked() {
+                rustudio_render::render::set_fast_transparency(false);
+            }
+            if ui.button("Copy FPS summary").clicked() {
+                ui.ctx().copy_text(format!(
+                    "Luavexa debug | {mode} | {fps:.0} FPS | {frame_ms} | viewport {:.0}x{:.0} logical | resolution {}% | quality {} | detail {} | linear transparency {}",
+                    view.width().max(0.0),
+                    view.height().max(0.0),
+                    settings::performance_value("resolution"),
+                    settings::performance_value("quality"),
+                    settings::performance_value("detail"),
+                    rustudio_render::render::fast_transparency_enabled(),
+                ));
+            }
+        });
+        #[cfg(target_os = "android")]
+        if ui.button("Export crash & session logs to Download").clicked() {
+            match crate::android::logs::export("Luavexa Debug") {
+                Ok(path) => self.info(format!("Luavexa debug logs saved to {path}")),
+                Err(e) => self.error(format!("Couldn't export debug logs: {e}")),
+            }
+        }
+        ui.separator();
+        ui.label(RichText::new("GPU / DRIVER").strong());
         match self.game.render_state.as_ref() {
             Some(rs) => {
                 let i = rs.adapter.get_info();
@@ -49,7 +99,7 @@ impl Editor {
         if rustudio_core::rustudio_settings::weak_gpu() {
             ui.small("Weak-GPU mode: Automatic quality starts at its lowest level and climbs as frame times allow (RUSTUDIO_LOWEND=0 turns it off).");
         }
-        ui.small(RichText::new("Graphics quality, 3D resolution, shading detail, shadows and the frame limit: File > Studio Settings > rustudio > Performance.").weak());
+        ui.small(RichText::new("Graphics quality, 3D resolution, shading detail, shadows and the frame limit: File > Studio Settings > Luavexa > Performance.").weak());
         #[cfg(target_os = "android")]
         gpu_driver_section(ui);
     }
