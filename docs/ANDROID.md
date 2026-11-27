@@ -1,4 +1,6 @@
-# rustudio on Android
+# Luavexa on Android (Rustudio-based)
+
+> **Luavexa Aurora 0.1.1 candidate:** The Android app ID is `dev.luavexa.studio` (legacy/upstream APKs used `dev.rustudio.studio`). The new app installs separately; back up/export private projects and keep the old installation until verified. Logs copied to shared storage now appear in `Download/Luavexa/`. This long upstream-derived guide contains historical examples referring to the older package ID, filenames and logcat tags; read them as context, not as the current Luavexa APK's identity. See [Aurora diagnostics and migration](LUAVEXA-0.1.1-DIAGNOSTICS.md).
 
 The Android app is the same editor as the desktop one — the `rustudio`
 library (src/lib.rs) — inside a `NativeActivity`. What differs is in
@@ -17,14 +19,7 @@ Targets:
 
 ## Building
 
-CI (`.github/workflows/android.yml`) builds four APKs on every push / PR
-that touches Rust sources — arm64 and x64, debug and release — and uploads
-them as artifacts (`rustudio-<arch>-<profile>.apk`). A `v*` tag builds the
-two release APKs and adds them to the tag's GitHub release beside the
-desktop downloads (`rustudio-android-arm64-v8a.apk`,
-`rustudio-android-x86_64.apk`, `SHA256SUMS-android`); the editor's update
-notice (src/update.rs) stays off on Android, where the system installs
-APKs. Locally:
+Luavexa CI (`.github/workflows/android.yml`) defaults to **one ARM64 Release** APK on every push / PR touching the editor, uploaded as `luavexa-arm64-release.apk`. Manual **Run workflow** supports x64, debug, or both; optional Mesa drivers are not fetched by ordinary PR builds. A `v*` release tag builds both ARM64 and x64 release APKs and uploads `luavexa-android-arm64-v8a.apk`, `luavexa-android-x86_64.apk` and `SHA256SUMS-android`. The editor's update notice (src/update.rs) stays off on Android. Internally xbuild still produces `rustudio-android.apk` due to the native Rust crate's unchanged name. Locally:
 
 ```sh
 # once
