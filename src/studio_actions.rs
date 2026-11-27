@@ -669,7 +669,7 @@ impl Editor {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                self.pending_user_shot = Some(dir.join(format!("rustudio-{secs}.png")));
+                self.pending_user_shot = Some(dir.join(format!("luavexa-{secs}.png")));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
             "mute" => {
@@ -925,7 +925,7 @@ impl Editor {
                     }
                     None => String::new(),
                 };
-                let r = ui.label(RichText::new(format!("{}{dirty}{cloud} - rustudio", self.game.doc.title)).color(theme::TEXT_DIM));
+                let r = ui.label(RichText::new(format!("{}{dirty}{cloud} - Luavexa", self.game.doc.title)).color(theme::TEXT_DIM));
                 if let Some((_, s)) = self.cloud.status.as_ref().filter(|_| self.game.doc.cloud.is_some()) {
                     r.on_hover_text(s.describe());
                 }
@@ -1023,13 +1023,13 @@ impl Editor {
             return;
         }
         let mut open = true;
-        egui::Window::new("About rustudio")
+        egui::Window::new("About Luavexa")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
                 crate::icons::logo(ui, 32.0);
-                ui.label(RichText::new(format!("rustudio {}", env!("CARGO_PKG_VERSION"))).strong());
+                ui.label(RichText::new(format!("Luavexa {}", env!("CARGO_PKG_VERSION"))).strong());
                 ui.label("A native editor for Roblox places. Not made by Roblox.");
                 ui.label("Icons: Tabler Icons (MIT). See CREDITS.md.");
             });
