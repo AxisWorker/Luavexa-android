@@ -304,7 +304,7 @@ pub fn run(app: AndroidApp) {
         Ok(Err(e)) => {
             // (eframe gave up: a surface or device it couldn't make)
             log::error!("eframe: {e}");
-            log::error!("rustudio: the editor's loop ended with an error, leaving the process");
+            log::error!("Luavexa: the editor's loop ended with an error, leaving the process");
             logcat::sync_session();
             std::process::exit(2);
         }
@@ -314,9 +314,9 @@ pub fn run(app: AndroidApp) {
                 .map(|s| s.to_string())
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "<non-string panic payload>".into());
-            log::error!("rustudio: panic on the editor's thread: {msg}");
+            log::error!("Luavexa: panic on the editor's thread: {msg}");
             if let Some(p) = rustudio_core::crash::last_report() {
-                log::error!("rustudio: crash report {} (echoed to Output and logcat at the next start)", p.display());
+                log::error!("Luavexa: crash report {} (echoed to Output and logcat at the next start)", p.display());
             }
             logcat::sync_session();
             std::process::exit(101);
@@ -326,7 +326,7 @@ pub fn run(app: AndroidApp) {
     // statics (APP, the folders, the destroy hook's context) belong to this
     // activity, and android-activity may run android_main again in the same
     // process otherwise.
-    log::info!("rustudio: editor closed, leaving the process");
+    log::info!("Luavexa: editor closed, leaving the process");
     std::process::exit(0);
 }
 
@@ -355,7 +355,7 @@ pub fn install_gpu_error_handler(device: &egui_wgpu::wgpu::Device) {
             GPU_OOM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if n <= GPU_ERRORS_LOGGED {
-            log::error!("rustudio: wgpu error {n} (the frame goes on): {e}");
+            log::error!("Luavexa: wgpu error {n} (the frame goes on): {e}");
             rustudio_core::crash::note(format!("wgpu error {n}: {e}"));
         } else if n == GPU_ERRORS_LOGGED + 1 {
             log::error!("rustudio: wgpu error {n}: {e} — further ones are counted, not logged");
@@ -366,7 +366,7 @@ pub fn install_gpu_error_handler(device: &egui_wgpu::wgpu::Device) {
     // every call on this device fails from here on. wgpu says so only here.
     device.set_device_lost_callback(|reason, message| {
         let line = format!(
-            "rustudio: the GPU device is lost ({reason:?}: {message}); nothing more can be drawn with it — the open place is saved to the recovery folder and rustudio restarts"
+            "Luavexa: the GPU device is lost ({reason:?}: {message}); nothing more can be drawn with it — the open place is saved to the recovery folder and rustudio restarts"
         );
         log::error!("{line}");
         rustudio_core::crash::note(line);
@@ -462,13 +462,13 @@ pub fn gpu_watch(ed: &mut crate::app::Editor) -> bool {
     } else {
         "No place was open".to_string()
     };
-    let line = format!("rustudio: {why}; nothing more can be drawn. {saved}. rustudio restarts; open the saved copy from Recent or the recovery folder.");
+    let line = format!("Luavexa: {why}; nothing more can be drawn. {saved}. rustudio restarts; open the saved copy from Recent or the recovery folder.");
     log::error!("{line}");
     eprintln!("{line}");
     logcat::sync_session();
     let _ = rustudio_core::crash::write_event(&why, &line);
     if let Err(e) = jni::relaunch() {
-        log::error!("rustudio: relaunch: {e}");
+        log::error!("Luavexa: relaunch: {e}");
     }
     // (the report and the save are on disk; the relaunch intent is queued)
     std::thread::sleep(std::time::Duration::from_millis(300));
