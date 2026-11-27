@@ -559,7 +559,7 @@ impl RustudioApp {
             switch_to_viewport: false,
         };
         ed.info(format!(
-            "rustudio {} ready. Reflection database has {} classes.",
+            "Luavexa {} ready. Reflection database has {} classes.",
             env!("CARGO_PKG_VERSION"),
             doc::db().classes.len()
         ));
@@ -590,7 +590,7 @@ impl RustudioApp {
         #[cfg(target_os = "android")]
         if !reports.is_empty() && ed.harness.run.log_out.is_none() {
             match crate::android::logs::export("after a crash") {
-                Ok(path) => ed.error(format!("The crash report and the logs were copied to {path} (a Files app: Download > rustudio); please send that file with a bug report")),
+                Ok(path) => ed.error(format!("The crash report and the logs were copied to {path} (a Files app: Download > Luavexa); please send that file with a bug report")),
                 Err(e) => ed.error(format!("The logs couldn't be copied to Download: {e}")),
             }
         }
@@ -1780,12 +1780,12 @@ impl Editor {
             && self.terrain_ed.tool.is_some_and(crate::terrain_editor::Tool::is_region)
         {
             if self.terrain_ed.clipboard.is_some() && self.harness.selftest.is_none() {
-                ctx.copy_text("rustudio: terrain region copied".to_string());
+                ctx.copy_text("Luavexa: terrain region copied".to_string());
             }
             return;
         }
         if self.clipboard.is_some() && self.harness.selftest.is_none() {
-            ctx.copy_text(format!("rustudio: {} object(s) copied", self.game.doc.selection.len()));
+            ctx.copy_text(format!("Luavexa: {} object(s) copied", self.game.doc.selection.len()));
         }
     }
 
@@ -3248,6 +3248,15 @@ impl RustudioApp {
                 stop = ed.play_stop_button(ui);
                 dock = ed.play_full_button(ui, true);
             });
+        // Keep performance diagnostics reachable when Play fills the screen.
+        // Outside the viewport's game GUI so games cannot intercept the button.
+        egui::Area::new(egui::Id::new("luavexa_play_debug_button"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-112.0, 10.0))
+            .show(ctx, |ui| {
+                if ui.add_sized([80.0, 48.0], egui::Button::new("Debug")).clicked() {
+                    ed.ui.graphics_settings = !ed.ui.graphics_settings;
+                }
+            });
         if stop {
             ed.stop_play();
         } else if dock {
@@ -3261,6 +3270,7 @@ impl RustudioApp {
         ed.confirm_ui(ctx);
         ed.account_window(ctx);
         ed.cloud_windows(ctx);
+        ed.graphics_settings_ui(ctx);
         self.watchdog.stage("3D view", "harness and screenshot readback");
         self.finish_frame(ctx, frame_start, dt);
         // The soft keyboard over a game's TextBox (the chat), as in `frame`.
