@@ -1,12 +1,12 @@
-//! Rustudio logo, bundled primitive artwork, and Tabler class glyphs.
+//! Luavexa logo, bundled primitive artwork, and Tabler class glyphs.
 
 use egui::{Painter, Rect, Sense, Vec2};
 
 /// The same embedded artwork is used in the chrome and native window icon.
-const LOGO_PNG: &[u8] = include_bytes!("../assets/icons/rustudio-256.png");
+const LOGO_PNG: &[u8] = include_bytes!("../assets/icons/luavexa-256.png");
 
 pub fn paint_logo(p: &Painter, r: Rect) {
-    let id = egui::Id::new("rustudio-app-icon");
+    let id = egui::Id::new("luavexa-app-icon");
     let texture = p
         .ctx()
         .data_mut(|data| data.get_temp::<egui::TextureHandle>(id))
@@ -15,7 +15,7 @@ pub fn paint_logo(p: &Painter, r: Rect) {
             let image = egui::ColorImage::from_rgba_unmultiplied([64, 64], &rgba);
             let texture =
                 p.ctx()
-                    .load_texture("rustudio-app-icon", image, egui::TextureOptions::LINEAR);
+                    .load_texture("luavexa-app-icon", image, egui::TextureOptions::LINEAR);
             p.ctx()
                 .data_mut(|data| data.insert_temp(id, texture.clone()));
             texture
@@ -36,7 +36,7 @@ pub fn logo(ui: &mut egui::Ui, size: f32) {
 /// RGBA pixels of the logo for the window icon.
 pub fn logo_rgba(size: u32) -> Vec<u8> {
     let image = image::load_from_memory(LOGO_PNG)
-        .expect("embedded Rustudio icon must be a valid PNG")
+        .expect("embedded Luavexa icon must be a valid PNG")
         .to_rgba8();
     image::imageops::resize(&image, size, size, image::imageops::FilterType::Lanczos3).into_raw()
 }
