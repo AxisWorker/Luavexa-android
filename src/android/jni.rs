@@ -877,7 +877,7 @@ fn write_clipboard(text: &str) -> Result<()> {
         if cm.is_null() {
             return Err(jni::errors::Error::NullPtr("ClipboardManager"));
         }
-        let label = env.new_string("rustudio")?;
+        let label = env.new_string("Luavexa")?;
         let jtext = env.new_string(text)?;
         let clip = env
             .call_static_method(
@@ -1033,7 +1033,7 @@ pub fn move_task_to_back() -> Result<()> {
     )?
 }
 
-/// Writes a file into the shared Download folder, `Download/rustudio/<name>`,
+/// Writes a file into the shared Download folder, `Download/Luavexa/<name>`,
 /// where a Files app shows it — the app's own folders under `Android/data`
 /// are closed to them since Android 11, so a crash report there was out of
 /// a user's reach. API 29+: a `MediaStore.Downloads` row the app inserts
@@ -1041,9 +1041,9 @@ pub fn move_task_to_back() -> Result<()> {
 /// written straight into the public Download folder (which needs the
 /// storage permission). Returns the path as the Files app shows it.
 pub fn export_download(name: &str, mime: &str, bytes: &[u8]) -> Result<String> {
-    let rel = format!("Download/rustudio/{name}");
+    let rel = format!("Download/Luavexa/{name}");
     if sdk_int() < 29 {
-        let dir = std::path::Path::new("/storage/emulated/0/Download/rustudio");
+        let dir = std::path::Path::new("/storage/emulated/0/Download/Luavexa");
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         std::fs::write(dir.join(name), bytes).map_err(|e| format!("{rel}: {e}"))?;
         return Ok(rel);
@@ -1053,7 +1053,7 @@ pub fn export_download(name: &str, mime: &str, bytes: &[u8]) -> Result<String> {
             .call_method(activity, jni_str!("getContentResolver"), jni_sig!("()Landroid/content/ContentResolver;"), &[])?
             .l()?;
         let values = env.new_object(jni_str!("android/content/ContentValues"), jni_sig!("()V"), &[])?;
-        for (key, value) in [("_display_name", name), ("mime_type", mime), ("relative_path", "Download/rustudio")] {
+        for (key, value) in [("_display_name", name), ("mime_type", mime), ("relative_path", "Download/Luavexa")] {
             let k = env.new_string(key)?;
             let v = env.new_string(value)?;
             env.call_method(&values, jni_str!("put"), jni_sig!("(Ljava/lang/String;Ljava/lang/String;)V"), &[JValue::Object(&k), JValue::Object(&v)])?;
