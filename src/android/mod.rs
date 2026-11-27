@@ -485,8 +485,9 @@ pub fn gpu_watch(ed: &mut crate::app::Editor) -> bool {
 /// points across for the editor's ribbon and panels, and a big tablet's
 /// into controls smaller than a fingertip. The first run's zoom (of the
 /// density) is the one that gives the window about [`touch::FIT_POINTS`]
-/// points across, within [`touch::ZOOM_RANGE`]: a 1080p phone lands near
-/// 0.8, a 10" tablet near 1.2.
+/// points across, within [`touch::ZOOM_RANGE`]. The effective Android UI
+/// zoom varies by screen density; users can reset it via View > Fit
+/// Workspace Zoom instead of changing system DPI.
 pub mod touch {
     /// The window width (points) the first-run zoom aims for: a small
     /// laptop's worth of editor.
