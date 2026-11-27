@@ -1,4 +1,4 @@
-name: Android
+name: Luavexa Android
 
 # APKs for aarch64 (arm64-v8a) and x86_64 (the emulator), debug and release,
 # built with xbuild (https://github.com/rust-mobile/xbuild): `x build
@@ -40,10 +40,16 @@ on:
       - ".github/workflows/android.yml"
   workflow_dispatch:
     inputs:
+      arch:
+        description: "APK architecture (arm64 phones, x64 emulators, or both)"
+        required: false
+        default: "arm64"
+        type: choice
+        options: [arm64, x64, both]
       profile:
         description: "Build profile (debug, release, or both)"
         required: false
-        default: "both"
+        default: "release"
         type: choice
         options: [debug, release, both]
       turnip:
@@ -111,11 +117,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [arm64, x64]
-        # push / pull_request build both profiles; a manual run can narrow
-        # it to one (github.event.inputs is empty outside workflow_dispatch);
-        # a v* tag builds the release only.
-        profile: ${{ fromJSON(startsWith(github.ref, 'refs/tags/v') && '["release"]' || github.event.inputs.profile == 'debug' && '["debug"]' || github.event.inputs.profile == 'release' && '["release"]' || '["debug", "release"]') }}
+        # Fast Alpha CI: one arm64 release APK for pushes / PRs by default.
+        # Manual runs can request x64/debug; tagged releases include both ABIs.
+        arch: ${{ fromJSON(startsWith(github.ref, 'refs/tags/v') && '["arm64","x64"]' || github.event.inputs.arch == 'both' && '["arm64","x64"]' || github.event.inputs.arch == 'x64' && '["x64"]' || '["arm64"]') }}
+        profile: ${{ fromJSON(startsWith(github.ref, 'refs/tags/v') && '["release"]' || github.event.inputs.profile == 'debug' && '["debug"]' || github.event.inputs.profile == 'both' && '["debug","release"]' || '["release"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -222,12 +227,12 @@ jobs:
           apk="target/x/${{ matrix.profile }}/android/rustudio-android.apk"
           test -f "$apk"
           mkdir -p dist
-          cp "$apk" "dist/rustudio-${{ matrix.arch }}-${{ matrix.profile }}.apk"
+          cp "$apk" "dist/luavexa-${{ matrix.arch }}-${{ matrix.profile }}.apk"
           ls -l dist
 
       - name: APK contents
         run: |
-          apk="dist/rustudio-${{ matrix.arch }}-${{ matrix.profile }}.apk"
+          apk="dist/luavexa-${{ matrix.arch }}-${{ matrix.profile }}.apk"
           unzip -l "$apk" | grep -E "lib/|assets/|AndroidManifest" || true
           # The drivers the arm64 build fetched must have made it in.
           if [ "${{ matrix.arch }}" = "arm64" ] && [ "${{ github.event.inputs.turnip }}" != "false" ]; then
@@ -242,8 +247,8 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: rustudio-${{ matrix.arch }}-${{ matrix.profile }}.apk
-          path: dist/rustudio-${{ matrix.arch }}-${{ matrix.profile }}.apk
+          name: luavexa-${{ matrix.arch }}-${{ matrix.profile }}.apk
+          path: dist/luavexa-${{ matrix.arch }}-${{ matrix.profile }}.apk
           if-no-files-found: error
           retention-days: 14
 
@@ -266,8 +271,8 @@ jobs:
       - name: Name the downloads
         run: |
           mkdir -p dist
-          cp apks/rustudio-arm64-release.apk dist/rustudio-android-arm64-v8a.apk
-          cp apks/rustudio-x64-release.apk dist/rustudio-android-x86_64.apk
+          cp apks/luavexa-arm64-release.apk dist/luavexa-android-arm64-v8a.apk
+          cp apks/luavexa-x64-release.apk dist/luavexa-android-x86_64.apk
           cd dist && sha256sum * | tee SHA256SUMS-android
       - name: Publish
         env:
@@ -278,7 +283,7 @@ jobs:
           # again if both tried to create it at once).
           for try in 1 2 3; do
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber && exit 0
-            gh release create "$GITHUB_REF_NAME" dist/* --title "rustudio $GITHUB_REF_NAME" --notes-file - <<'NOTES' && exit 0
+            gh release create "$GITHUB_REF_NAME" dist/* --title "Luavexa $GITHUB_REF_NAME" --notes-file - <<'NOTES' && exit 0
           Android (arm64-v8a phones and tablets; x86_64 for the emulator): install the APK with `adb install` or by opening it on the device. SHA256SUMS-android lists each file's checksum.
           NOTES
             sleep 15
