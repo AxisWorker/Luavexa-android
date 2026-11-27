@@ -281,6 +281,7 @@ pub const EDIT: &[M] = &[
 pub const VIEW: &[M] = &[
     I("Zoom In", "Ctrl+=", "zoom_in"),
     I("Zoom Out", "Ctrl+-", "zoom_out"),
+    I("Fit Workspace Zoom", "", "fit_workspace_zoom"),
     I("Full Screen", "F11", "full_screen"),
     I("Play Fills the Screen", "", "play_full"),
     // Which adapter and driver draw the 3D view; on Android the Mesa
