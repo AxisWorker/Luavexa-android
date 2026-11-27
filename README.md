@@ -166,4 +166,4 @@ first launch.
 ## License
 
 MIT OR Apache-2.0, at your option. Vendored crates in `vendor/` keep their
-own licences.
+own licenses.
