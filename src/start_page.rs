@@ -884,7 +884,7 @@ impl Editor {
         });
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.label(
-                RichText::new(format!("Luavexa · {}", env!("CARGO_PKG_VERSION")))
+                RichText::new(format!("Luavexa Aurora 0.1.1 Alpha · engine {}", env!("CARGO_PKG_VERSION")))
                     .small()
                     .color(theme::TEXT_DIM),
             );
