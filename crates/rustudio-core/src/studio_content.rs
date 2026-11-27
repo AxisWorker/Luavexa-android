@@ -128,12 +128,12 @@ pub fn spawn_background_install_if_missing() {
             // "latest"): replace it with the pinned one.
             let _ = std::thread::Builder::new().name("studio-content".into()).spawn(move || {
                 post(false, format!(
-                    "Studio content is {}, not the Studio {} rustudio targets: downloading {pinned} (about 60 MB)…",
+                    "Studio content is {}, not the Studio {} Luavexa targets: downloading {pinned} (about 60 MB)…",
                     found.as_deref().unwrap_or("an unknown version"),
                     crate::studio_target::VERSION,
                 ));
                 match install_retrying(&background_step) {
-                    Ok(v) => post(false, format!("Studio content {v} installed. Restart rustudio to use it everywhere.")),
+                    Ok(v) => post(false, format!("Studio content {v} installed. Restart Luavexa to use it everywhere.")),
                     Err(e) => post(true, format!(
                         "Couldn't download Studio content {pinned}: {e}. It continues where it stopped at the next start; `rustudio --install-studio-content` retries now."
                     )),
@@ -143,7 +143,7 @@ pub fn spawn_background_install_if_missing() {
         }
         if root != install_dir() && found.as_deref() != Some(pinned) {
             post(true, format!(
-                "Studio content at {} is {}, not the Studio {} ({pinned}) rustudio targets: scripts and metadata may not match its API. Unset RUSTUDIO_STUDIO_DIR to use rustudio's pinned download.",
+                "Studio content at {} is {}, not the Studio {} ({pinned}) Luavexa targets: scripts and metadata may not match its API. Unset RUSTUDIO_STUDIO_DIR to use Luavexa's pinned download.",
                 root.display(),
                 found.as_deref().unwrap_or("an unknown version"),
                 crate::studio_target::VERSION,
@@ -154,7 +154,7 @@ pub fn spawn_background_install_if_missing() {
                 let a = agent();
                 if !packages.is_empty() {
                     let names: Vec<&str> = packages.iter().map(|(p, _)| *p).collect();
-                    post(false, format!("Studio content: downloading {} (new in this version of rustudio)…", names.join(", ")));
+                    post(false, format!("Studio content: downloading {} (new in this Luavexa version)…", names.join(", ")));
                     match install_missing_packages(&a, &root, &|_| {}) {
                         Ok(()) => post(false, "Studio content: downloaded".into()),
                         Err(e) => post(true, format!("Couldn't download Studio content: {e}")),
@@ -183,7 +183,7 @@ pub fn spawn_background_install_if_missing() {
         post(false, "No Roblox Studio install found: downloading Studio's built-in content (default character, player scripts, fonts, textures, sounds, the CoreScripts' icon font; about 70 MB) from Roblox's CDN…".into());
         match install_retrying(&background_step) {
             Ok(v) => post(false, format!(
-                "Studio content {v} installed in {}. Play now uses Roblox's default character and player scripts; restart rustudio to use Studio's fonts everywhere.",
+                "Studio content {v} installed in {}. Play now uses Roblox's default character and player scripts; restart Luavexa to use Studio's fonts everywhere.",
                 install_dir().display()
             )),
             Err(e) => post(true, format!(
