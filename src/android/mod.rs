@@ -485,12 +485,17 @@ pub fn gpu_watch(ed: &mut crate::app::Editor) -> bool {
 /// points across for the editor's ribbon and panels, and a big tablet's
 /// into controls smaller than a fingertip. The first run's zoom (of the
 /// density) is the one that gives the window about [`touch::FIT_POINTS`]
-/// points across, within [`touch::ZOOM_RANGE`]: a 1080p phone lands near
-/// 0.8, a 10" tablet near 1.2.
+/// points across, within [`touch::ZOOM_RANGE`]. The effective Android UI
+/// zoom varies by screen density; users can reset it via View > Fit
+/// Workspace Zoom instead of changing system DPI.
 pub mod touch {
     /// The window width (points) the first-run zoom aims for: a small
     /// laptop's worth of editor.
-    pub const FIT_POINTS: f32 = 1100.0;
+    // Keep desktop-like workspace space on landscape phones while retaining
+    // at least ~48dp effective touch targets at typical Android densities.
+    // Previous 1100-point target chose 1.30x on a Galaxy S9 (2220px, 1.54x),
+    // leaving the ribbon and viewport unnecessarily cramped.
+    pub const FIT_POINTS: f32 = 1280.0;
     pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.8..=1.6;
 
     /// (The 3D view's first-run quality is Automatic from the lowest
@@ -520,22 +525,29 @@ pub mod touch {
         });
     }
 
-    /// The first frame with a window: the zoom that fits [`FIT_POINTS`]
-    /// across the longer side of the screen (landscape), once per fresh
-    /// layout.
-    pub fn auto_zoom(ed: &mut crate::app::Editor, ctx: &egui::Context) {
-        if !ed.auto_zoom {
-            return;
-        }
+    /// Fit the editor's logical width to the target in either orientation.
+    /// Returns None until the Android surface has a usable size.
+    pub fn fit_zoom(ctx: &egui::Context) -> Option<f32> {
         let rect = ctx.content_rect();
         if !rect.is_positive() {
-            return;
+            return None;
         }
         let native = ctx.native_pixels_per_point().unwrap_or(1.0).max(0.5);
         let longer_px = rect.width().max(rect.height()) * ctx.pixels_per_point();
         let zoom = (longer_px / (native * FIT_POINTS)).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
-        let zoom = (zoom * 20.0).round() / 20.0;
-        log::info!("first run: {longer_px:.0} px across at density {native:.2}: zoom {zoom:.2}");
+        Some((zoom * 20.0).round() / 20.0)
+    }
+
+    /// The first frame with a window. Existing saved layouts are left alone;
+    /// View > Fit Workspace Zoom can update them explicitly without touching
+    /// files, device DPI, or Android system settings.
+    pub fn auto_zoom(ed: &mut crate::app::Editor, ctx: &egui::Context) {
+        if !ed.auto_zoom {
+            return;
+        }
+        let Some(zoom) = fit_zoom(ctx) else { return };
+        let native = ctx.native_pixels_per_point().unwrap_or(1.0).max(0.5);
+        log::info!("first run: density {native:.2}: Luavexa workspace zoom {zoom:.2}");
         ed.ui.zoom = zoom;
         ed.auto_zoom = false;
     }

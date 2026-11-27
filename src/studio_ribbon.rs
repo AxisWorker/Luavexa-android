@@ -230,7 +230,11 @@ impl Editor {
             self.plugins_tab_hidden();
         }
         let a = &mut act;
-        ui.horizontal(|ui| {
+        // A landscape phone cannot display every Studio ribbon tool at once.
+        // Scroll horizontally on Android so clipped tools remain reachable
+        // without shrinking touch targets or changing desktop toolbar layout.
+        let mut draw_ribbon = |ui: &mut egui::Ui| {
+            ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
             match self.ui.tab {
                 RibbonTab::Home => {
@@ -348,7 +352,15 @@ impl Editor {
                 // Plugins Folder are in the Plugins menu): src/plugin_host/ui_ribbon.rs.
                 RibbonTab::Plugins => self.plugins_ribbon(ui),
             }
-        });
+            });
+        };
+        #[cfg(target_os = "android")]
+        egui::ScrollArea::horizontal()
+            .id_salt("luavexa_mobile_ribbon")
+            .auto_shrink([false, true])
+            .show(ui, &mut draw_ribbon);
+        #[cfg(not(target_os = "android"))]
+        draw_ribbon(ui);
         self.ribbon_color_popup(&ctx);
         if let Some(a) = act {
             self.ui_action(&ctx, &a);

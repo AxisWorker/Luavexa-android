@@ -272,6 +272,16 @@ impl Touch {
             && ctx.layer_id_at(pos).is_none_or(|l| l.order == egui::Order::Background)
     }
 
+    /// The Luavexa Debug title is special: an immediate drag moves its
+    /// window instead of scrolling the contents. The precise title-response
+    /// rectangle excludes the close button.
+    fn on_luavexa_debug_title(ctx: &egui::Context, pos: Pos2) -> bool {
+        let window = egui::Id::new("luavexa_debug_window");
+        ctx.layer_id_at(pos).is_some_and(|layer| layer.id == window)
+            && ctx.read_response(window.with("__title_click"))
+                .is_some_and(|response| response.rect.contains(pos))
+    }
+
     /// Rewrites the frame's raw input (see the module doc). `frame_no` is
     /// the editor's frame counter, to tell fresh zones from stale ones.
     pub fn filter(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput, frame_no: u64) {
@@ -443,6 +453,11 @@ impl Touch {
                                 out.push(button(p.start, PointerButton::Secondary, true));
                                 out.push(Event::PointerMoved(pos));
                                 p.mode = Mode::Look;
+                            } else if Self::on_luavexa_debug_title(ctx, p.start) {
+                                out.push(Event::PointerMoved(p.start));
+                                out.push(button(p.start, PointerButton::Primary, true));
+                                out.push(Event::PointerMoved(pos));
+                                p.mode = Mode::Press;
                             } else if now.duration_since(p.since) >= HOLD {
                                 // Held, then moved: a drag from where it landed.
                                 out.push(Event::PointerMoved(p.start));

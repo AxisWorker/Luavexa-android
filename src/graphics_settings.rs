@@ -8,24 +8,32 @@ use egui::RichText;
 use crate::app::Editor;
 
 impl Editor {
-    /// The window, while View > GPU Driver has it open.
+    /// Touch-friendly floating diagnostics. Drag the title to move the
+    /// window; swipe the body to scroll through long GPU-driver details.
     pub fn graphics_settings_ui(&mut self, ctx: &egui::Context) {
         if !self.ui.graphics_settings {
+            rustudio_render::gpu_timing::set_live_debug(false);
             return;
         }
         let mut open = true;
         let screen = ctx.content_rect();
+        let width = (screen.width() - 16.0).clamp(180.0, 440.0);
         egui::Window::new("Luavexa Debug")
             .id(egui::Id::new("luavexa_debug_window"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(440.0)
-            .default_pos(screen.center() - egui::vec2(200.0, (screen.height() * 0.45).min(320.0)))
-            // (a phone's screen is shorter than the rows: the rest scrolls)
+            .movable(true)
+            .drag_area(egui::WindowDrag::TitleBar)
+            .constrain_to(screen)
+            .default_width(width)
+            .default_pos(screen.center() - egui::vec2(width * 0.5, (screen.height() * 0.45).min(320.0)))
             .vscroll(true)
             .show(ctx, |ui| self.graphics_settings_body(ui));
         self.ui.graphics_settings = open;
+        if !open {
+            rustudio_render::gpu_timing::set_live_debug(false);
+        }
     }
 
     fn graphics_settings_body(&mut self, ui: &mut egui::Ui) {
@@ -33,6 +41,7 @@ impl Editor {
         use rustudio_core::rustudio_settings as settings;
 
         ui.label(RichText::new("LUAVEXA / PERFORMANCE").strong());
+        ui.small(RichText::new("Drag the title bar to move this window; swipe the details below to scroll.").weak());
         let fps = self.fps.max(0.0);
         let frame_ms = if fps > 0.1 { format!("{:.1} ms", 1000.0 / fps) } else { "measuring...".into() };
         let mode = if self.game.is_playing() { "Play" } else { "Edit" };
@@ -51,7 +60,45 @@ impl Editor {
             settings::performance_value("shadows"),
             settings::performance_value("bloom")
         ));
-        ui.small(RichText::new("These are session readings and configured values, not GPU pass timings. Keep the same camera, quality and view size when comparing FPS.").weak());
+        ui.small(RichText::new("Keep the same camera, graphics preset, and view size when comparing FPS.").weak());
+        ui.separator();
+
+        ui.label(RichText::new("GPU PASS TIMINGS").strong());
+        let mut timing = rustudio_render::gpu_timing::live_debug_enabled();
+        if ui.checkbox(&mut timing, "Measure individual GPU passes (experimental)").changed() {
+            rustudio_render::gpu_timing::set_live_debug(timing);
+        }
+        ui.small(RichText::new("Off by default. Uses asynchronous GPU timestamp queries where supported; enabling measurement has a small cost. Values may lag a few frames.").weak());
+        if timing {
+            match self.game.render_state.as_ref() {
+                Some(rs) if rustudio_render::gpu_timing::supported(&rs.device) => {
+                    let mut spans = rustudio_render::gpu_timing::live_debug_snapshot();
+                    spans.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    if spans.is_empty() {
+                        ui.small("Collecting GPU timings...");
+                    } else {
+                        for (label, ms) in spans.iter().take(12) {
+                            ui.monospace(format!("{label}: {ms:.2} ms"));
+                        }
+                        ui.small("Shown: largest measured GPU spans; not an end-to-end frame total.");
+                        if ui.button("Copy GPU timings").clicked() {
+                            let mut text = String::from("Luavexa GPU timing (ms; most recent resolved frame)\n");
+                            for (label, ms) in spans {
+                                use std::fmt::Write as _;
+                                let _ = writeln!(&mut text, "{label}: {ms:.3}");
+                            }
+                            ui.ctx().copy_text(text);
+                        }
+                    }
+                }
+                Some(_) => {
+                    ui.small("This driver does not expose the timestamp queries needed for GPU pass measurements. FPS and device details remain available.");
+                }
+                None => {
+                    ui.small("Renderer not ready yet.");
+                }
+            }
+        }
         ui.separator();
 
         ui.label(RichText::new("TRANSPARENCY A/B TEST").strong());
