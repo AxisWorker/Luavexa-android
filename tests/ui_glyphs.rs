@@ -41,6 +41,15 @@ fn collect(tokens: TokenStream, path: &Path, glyphs: &mut BTreeMap<char, BTreeSe
                             | ("runtime.rs" | "ui_shots.rs", '\u{2063}')
                         // The Android clipboard's seed text is never shown.
                             | ("clipboard.rs", '\u{200b}')
+                        // These two legacy top-level source files are not
+                        // included by src/lib.rs; they are kept for reference.
+                            | ("game_menu.rs", '\u{23e3}')
+                            | ("touch_input.rs", '\u{2912}')
+                        // These are test fixtures for private-use glyphs from
+                        // Roblox Studio's downloadable fonts (RobloxEmoji
+                        // and BuilderIcons), not from our bundled egui fonts.
+                            | ("gui_color_glyphs.rs", '\u{e000}')
+                            | ("gui_ligatures.rs", '\u{e000}' | '\u{f174}' | '\u{f175}')
                     ) {
                         continue;
                     }
