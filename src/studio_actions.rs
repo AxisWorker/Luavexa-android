@@ -147,7 +147,7 @@ impl Editor {
                 (edit && any, Some(any && self.selected_parts_all(prop)))
             }
             "unlock_all" | "select_all" => (edit, None),
-            "zoom_in" | "zoom_out" => (true, None),
+            "zoom_in" | "zoom_out" | "fit_workspace_zoom" => (true, None),
             "full_screen" => (true, Some(self.game.fullscreen)),
             "view_selector" => {
                 if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::ViewSelector) {
@@ -584,6 +584,16 @@ impl Editor {
             }
             "zoom_in" => self.ui.zoom = (self.ui.zoom + 0.1).min(2.0),
             "zoom_out" => self.ui.zoom = (self.ui.zoom - 0.1).max(0.5),
+            "fit_workspace_zoom" => {
+                #[cfg(target_os = "android")]
+                if let Some(zoom) = crate::android::touch::fit_zoom(ctx) {
+                    self.ui.zoom = zoom;
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    self.ui.zoom = 1.0;
+                }
+            },
             "graphics_settings" => self.ui.graphics_settings = !self.ui.graphics_settings,
             "full_screen" => {
                 self.game.fullscreen = !self.game.fullscreen;
