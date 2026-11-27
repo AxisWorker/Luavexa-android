@@ -46,6 +46,13 @@ impl Editor {
         let frame_ms = if fps > 0.1 { format!("{:.1} ms", 1000.0 / fps) } else { "measuring...".into() };
         let mode = if self.game.is_playing() { "Play" } else { "Edit" };
         ui.label(format!("{} · {:.0} FPS · {}", mode, fps, frame_ms));
+        // This measures Editor::finish_frame's update and UI work, *before*
+        // eframe's draw submission, egui GPU compositing and window present.
+        // Readings are from the preceding frame; frame_ms is a smoothed
+        // wall-clock interval. They are intentionally not added together.
+        let cpu_ms = self.last_work_ms.max(0.0);
+        ui.label(format!("CPU update + UI: {cpu_ms:.1} ms (previous frame)"));
+        ui.small(RichText::new("CPU excludes eframe GPU submission and display present; FPS represents a smoothed full-frame interval. Compare stable camera views, not one snapshot.").weak());
         let view = self.game.viewport_rect;
         ui.label(format!("Viewport: {:.0} × {:.0} logical points", view.width().max(0.0), view.height().max(0.0)));
         ui.label(format!(
@@ -68,7 +75,7 @@ impl Editor {
         if ui.checkbox(&mut timing, "Measure individual GPU passes (experimental)").changed() {
             rustudio_render::gpu_timing::set_live_debug(timing);
         }
-        ui.small(RichText::new("Off by default. Uses asynchronous GPU timestamp queries where supported; enabling measurement has a small cost. Values may lag a few frames.").weak());
+        ui.small(RichText::new("Off by default. Timestamp queries may lag a few frames. Timed scene passes exclude egui compositing, GPU queue waits and presentation; enabling adds some overhead.").weak());
         if timing {
             match self.game.render_state.as_ref() {
                 Some(rs) if rustudio_render::gpu_timing::supported(&rs.device) => {
@@ -80,9 +87,11 @@ impl Editor {
                         for (label, ms) in spans.iter().take(12) {
                             ui.monospace(format!("{label}: {ms:.2} ms"));
                         }
-                        ui.small("Shown: largest measured GPU spans; not an end-to-end frame total.");
+                        ui.small("Shown: latest resolved GPU scene spans, not a complete frame. If FPS is low but all spans are short, investigate CPU update/UI, egui rendering, pacing, waits and presentation.");
                         if ui.button("Copy GPU timings").clicked() {
-                            let mut text = String::from("Luavexa GPU timing (ms; most recent resolved frame)\n");
+                            let mut text = format!(
+                                "Luavexa GPU timing (ms; most recent resolved frame)\nMode: {mode} | FPS (smoothed): {fps:.1} | frame interval: {frame_ms}\nCPU update + UI (previous frame): {cpu_ms:.3} ms\nGPU spans omit egui composition and present; not an end-to-end frame time.\n"
+                            );
                             for (label, ms) in spans {
                                 use std::fmt::Write as _;
                                 let _ = writeln!(&mut text, "{label}: {ms:.3}");
@@ -113,7 +122,7 @@ impl Editor {
             }
             if ui.button("Copy FPS summary").clicked() {
                 ui.ctx().copy_text(format!(
-                    "Luavexa debug | {mode} | {fps:.0} FPS | {frame_ms} | viewport {:.0}x{:.0} logical | resolution {}% | quality {} | detail {} | linear transparency {}",
+                    "Luavexa debug | {mode} | {fps:.0} FPS | {frame_ms} | CPU update+UI (prior): {cpu_ms:.1}ms | viewport {:.0}x{:.0} logical | resolution {}% | quality {} | detail {} | linear transparency {}",
                     view.width().max(0.0),
                     view.height().max(0.0),
                     settings::performance_value("resolution"),
