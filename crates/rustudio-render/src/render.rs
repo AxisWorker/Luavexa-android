@@ -12,6 +12,20 @@ pub mod vf;
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Session-only comparison mode for low-end GPUs. The default keeps Roblox-accurate
+/// encoded transparency blending; the debug panel can compare direct linear blending
+/// without creating new pipelines or changing a project file.
+static FAST_TRANSPARENCY: AtomicBool = AtomicBool::new(false);
+
+pub fn fast_transparency_enabled() -> bool {
+    FAST_TRANSPARENCY.load(Ordering::Relaxed)
+}
+
+pub fn set_fast_transparency(on: bool) {
+    FAST_TRANSPARENCY.store(on, Ordering::Relaxed);
+}
 
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::wgpu;
@@ -6193,7 +6207,7 @@ impl Renderer {
         let has_cutout = !cutout_runs.is_empty()
             || static_ranges.iter().any(|r| r.0 == Pass::Cutout);
         let has_pre_split_see = !surface_decal_runs.is_empty() || has_cutout;
-        let encoded = !viewport.see.linear
+        let encoded = !viewport.see.linear && !fast_transparency_enabled()
             && (has_pre_split_see
                 || !decal_runs.is_empty()
                 || !blend_runs.is_empty()

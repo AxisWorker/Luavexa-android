@@ -8,7 +8,7 @@ icon: ../../assets/icons/luavexa-512.png
 
 android:
   manifest:
-    package: dev.rustudio.studio
+    package: dev.luavexa.studio
     sdk:
       # API 26: VibrationEffect (HapticService); 28: DisplayCutout
       # (ScreenGui.ScreenInsets); 30: WindowInsets.Type.ime (the keyboard's
@@ -23,13 +23,13 @@ android:
       # HapticService:SetMotor / HapticEffect:Play through Vibrator.
       - name: android.permission.VIBRATE
       # ActivityManager.moveTaskToFront: a place opened from a file manager
-      # while the editor runs brings the editor's task to the front
+      # while Luavexa runs brings its task to the front
       # (src/android/intent.rs). A normal permission, granted at install.
       - name: android.permission.REORDER_TASKS
       # The in-app file picker (src/android/storage.rs) listing shared
       # storage (Download, Documents, …) for places and models. NativeActivity
       # gets no onActivityResult, so the system document picker (Storage
-      # Access Framework) can't hand a choice back; "Open with rustudio"
+      # Access Framework) can't hand a choice back; "Open with Luavexa"
       # from a Files app (the VIEW intent filter below, a content: URI copied
       # in) works without any of these. API 30+: "All files access", asked
       # for with a settings page the picker opens; API 26–29: the runtime

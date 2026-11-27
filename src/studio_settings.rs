@@ -121,7 +121,7 @@ pub const PAGES: &[&str] = &["Studio", "Selection", "Script Editor", "Diagnostic
 
 /// The page after Studio's: rustudio's own options (crates/rustudio-core/src/rustudio_settings.rs).
 pub const RUSTUDIO_PAGE: usize = PAGES.len();
-const RUSTUDIO_PAGE_NAME: &str = "rustudio";
+const RUSTUDIO_PAGE_NAME: &str = "Luavexa";
 
 fn page_name(i: usize) -> &'static str {
     PAGES.get(i).copied().unwrap_or(RUSTUDIO_PAGE_NAME)
@@ -501,7 +501,7 @@ pub fn live(prop: &str) -> Option<i64> {
 }
 
 pub fn version() -> String {
-    format!("{} (rustudio)", env!("CARGO_PKG_VERSION"))
+    format!("{} (Luavexa)", env!("CARGO_PKG_VERSION"))
 }
 
 /// What a row shows in its value column.
@@ -862,7 +862,7 @@ impl Dialog {
             let r = Rect::from_min_size(top, Vec2::new(w, ROW_H - 1.0));
             ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha(110));
             ui.interact(r, egui::Id::new(("studio_settings_noeffect", i)), Sense::hover())
-                .on_hover_text("No effect in rustudio yet (scripts can still read it through settings())");
+                .on_hover_text("No effect in Luavexa yet (scripts can still read it through settings())");
         }
     }
 

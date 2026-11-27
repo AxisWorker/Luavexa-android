@@ -4,8 +4,8 @@
 //! Files app can't open since Android 11 and `adb` isn't at hand on most
 //! phones, so a crash — a publish that took the process down — left
 //! nothing a user could send. [`export`] gathers what there is into one
-//! text file in the shared Download folder (`Download/rustudio/
-//! rustudio-logs-<stamp>.txt`, [`super::jni::export_download`]): the
+//! text file in the shared Download folder (`Download/Luavexa/
+//! luavexa-logs-<stamp>.txt`, [`super::jni::export_download`]): the
 //! build and device, the crash reports (newest first, three at most),
 //! the end of the session logs (logcat.rs: this run's and the previous
 //! runs' — the one that crashed among them, when the export follows a
@@ -31,7 +31,7 @@ pub fn export(reason: &str) -> Result<String, String> {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "rustudio {} ({}) on Android API {}, {} — logs exported {stamp} ({reason})",
+        "Luavexa {} ({}) on Android API {}, {} — logs exported {stamp} ({reason})",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::ARCH,
         super::jni::sdk_int(),
@@ -100,7 +100,7 @@ pub fn export(reason: &str) -> Result<String, String> {
         }
     }
 
-    let name = format!("rustudio-logs-{stamp}.txt");
+    let name = format!("luavexa-logs-{stamp}.txt");
     let path = super::jni::export_download(&name, "text/plain", out.as_bytes())?;
     log::info!("logs: {} bytes written to {path} ({reason})", out.len());
     Ok(path)

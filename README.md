@@ -75,10 +75,10 @@ The Android application uses the native Rust workspace and `xbuild`. See the ups
 x build -p rustudio-android --platform android --arch arm64 --format apk --release
 ```
 
-The existing [Android GitHub Actions workflow](.github/workflows/android.yml) also builds APK artifacts when enabled. Look under **Actions → Android → Artifacts** after a successful run. **Do not treat an untested build as a production release.**
+The existing [Android GitHub Actions workflow](.github/workflows/android.yml) also builds APK artifacts when enabled. Look under **Actions → Luavexa Android → Artifacts** after a successful run. The default Alpha artifact is `luavexa-arm64-release.apk`. **Do not treat an untested build as a production release.**
 
 > [!CAUTION]
-> This fork retains the upstream Android package ID (`dev.rustudio.studio`) for now, so it may conflict with other rustudio installations and signatures. Back up your projects before replacing an installation. Never share Roblox session cookies, MCP bearer tokens, or AI API keys.
+> **Aurora 0.1.1 candidate:** the Android package ID is `dev.luavexa.studio`, separate from the older `dev.rustudio.studio`. The new installation does **not** automatically migrate previous app data, project files, settings or sessions. Export/back up projects and keep the old app until they are verified. Never share Roblox session cookies, MCP bearer tokens, or AI API keys. See the [debug and migration guide](docs/LUAVEXA-0.1.1-DIAGNOSTICS.md).
 
 ## 🎨 Brand identity
 

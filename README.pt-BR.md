@@ -56,7 +56,7 @@ x build -p rustudio-android --platform android --arch arm64 --format apk --relea
 O workflow [Android no GitHub Actions](.github/workflows/android.yml) também pode gerar um APK de teste quando estiver habilitado. **A compilação e os testes devem ser concluídos antes de recomendar a instalação.**
 
 > [!CAUTION]
-> O identificador Android ainda é `dev.rustudio.studio`, portanto pode existir conflito de assinatura com outra instalação. Faça backup dos projetos antes de testar. Não compartilhe cookies de sessão Roblox, tokens MCP ou chaves de API.
+> **Alpha Aurora 0.1.1:** o identificador do novo app passa a ser `dev.luavexa.studio`, diferente do anterior (`dev.rustudio.studio`). A instalação nova **não migra automaticamente** projetos, configurações nem sessões. Exporte seus projetos e mantenha o app antigo até confirmar que seus arquivos estão seguros. Consulte o [guia de debug e migração](docs/LUAVEXA-0.1.1-DIAGNOSTICS.md). Não compartilhe cookies, tokens MCP nem chaves de API.
 
 ## 🎨 Identidade visual
 

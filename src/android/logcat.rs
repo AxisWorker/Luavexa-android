@@ -1,10 +1,10 @@
-//! Logging on Android: `log` records go to logcat under the tag `rustudio`
+//! Logging on Android: `log` records go to logcat under the tag `Luavexa`
 //! (eframe's, wgpu's and winit's lines included), and a panic's message is
 //! logged before the crash report is written. stdout and stderr are already
 //! forwarded to logcat by android-activity (tag `RustStdoutStderr`), so
 //! `println!` / `eprintln!` in the desktop code show up too.
 //!
-//! `adb logcat -s rustudio RustStdoutStderr` follows the app.
+//! `adb logcat -s Luavexa RustStdoutStderr` follows the app.
 //!
 //! The same records also go to a file, the session log
 //! (`<cache>/rustudio/logs/session.log`; [`open_session`]), because
@@ -108,7 +108,7 @@ pub fn install() {
         // Info; a place with a few sounds fills logcat with them: Warn.
         // (a module prefix: every symphonia_* crate)
         let filter = android_logger::FilterBuilder::new().filter_level(level).filter_module("symphonia", log::LevelFilter::Warn).build();
-        let config = android_logger::Config::default().with_max_level(level).with_filter(filter).with_tag("rustudio");
+        let config = android_logger::Config::default().with_max_level(level).with_filter(filter).with_tag("Luavexa");
         let tee = TEE.get_or_init(|| Tee {
             android: android_logger::AndroidLogger::new(config),
             session: Mutex::new(None),

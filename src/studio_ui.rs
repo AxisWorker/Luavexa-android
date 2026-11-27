@@ -241,8 +241,8 @@ pub const FILE: &[M] = &[
     S,
     I("Open Auto Saves", "", "auto_saves"),
     S,
-    I("About rustudio", "", "about"),
-    I("Restart rustudio", "", "restart"),
+    I("About Luavexa", "", "about"),
+    I("Restart Luavexa", "", "restart"),
     S,
     I("Exit", "", "exit"),
 ];
@@ -285,8 +285,8 @@ pub const VIEW: &[M] = &[
     I("Play Fills the Screen", "", "play_full"),
     // Which adapter and driver draw the 3D view; on Android the Mesa
     // driver switch (src/graphics_settings.rs). The quality settings are
-    // File > Studio Settings > rustudio > Performance.
-    I("GPU Driver...", "", "graphics_settings"),
+    // File > Studio Settings > Luavexa > Performance.
+    I("Luavexa Debug / GPU...", "", "graphics_settings"),
     S,
     I("Show View Selector", "", "view_selector"),
     I("Show Wind Direction", "", "wind_direction"),
