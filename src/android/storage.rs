@@ -42,7 +42,7 @@ fn shared_storage() -> PathBuf {
 }
 
 fn roots(storage_access: bool) -> Vec<Root> {
-    let mut v = vec![Root { label: "rustudio", path: super::data_dir() }];
+    let mut v = vec![Root { label: "Luavexa", path: super::data_dir() }];
     if super::data_dir() != super::files_dir() {
         v.push(Root { label: "App data", path: super::files_dir() });
     }
@@ -209,7 +209,7 @@ impl Picker {
                                 self.error = Some(format!("Could not open the permission page: {e}"));
                             }
                         }
-                        ui.label(egui::RichText::new("Or open the file from a Files app with rustudio.").weak().size(12.0));
+                        ui.label(egui::RichText::new("Or open the file from a Files app with Luavexa.").weak().size(12.0));
                     });
                 }
                 ui.horizontal(|ui| {
@@ -281,7 +281,7 @@ impl Picker {
                     }
                     if self.listing.folders.is_empty() && self.listing.files.is_empty() {
                         ui.add_space(12.0);
-                        ui.weak("Nothing here. Files put in this folder with a file manager, or opened\nfrom one with rustudio, show up in this list.");
+                        ui.weak("Nothing here. Files put in this folder with a file manager, or opened\nfrom one with Luavexa, show up in this list.");
                     }
                     if let Some(d) = enter {
                         self.go(&d);
