@@ -53,6 +53,8 @@ enum Msg {
 
 pub struct StartPage {
     pub visible: bool,
+    /// Disable optional Aurora transitions during this editor session.
+    pub reduced_motion: bool,
     /// The document that was open when the page came up: another one means
     /// something was opened, so the page goes away.
     pub doc_id: u64,
@@ -123,6 +125,7 @@ impl Default for StartPage {
         let (tx, rx) = channel();
         StartPage {
             visible: false,
+            reduced_motion: false,
             doc_id: 0,
             collapsed: HashSet::new(),
             expanded: HashSet::new(),
@@ -628,17 +631,43 @@ impl Editor {
             });
         }
 
+        // Fixed 220-point navigation overwhelms phone-sized screens.
+        // Switch to large, touch-friendly action buttons at compact widths.
+        let compact = ui.available_width() < 760.0;
         egui::Panel::top("start_top")
-            .exact_size(48.0)
-            .frame(egui::Frame::new().fill(theme::MENU_BAR).inner_margin(egui::Margin::symmetric(16, 0)))
+            .exact_size(56.0)
+            .frame(egui::Frame::new().fill(theme::MENU_BAR).inner_margin(egui::Margin::symmetric(12, 0)))
             .show(ui, |ui| self.start_top(ui, &mut todo));
-        egui::Panel::left("start_nav")
-            .exact_size(220.0)
-            .resizable(false)
-            .frame(egui::Frame::new().fill(theme::PANEL_DARK).inner_margin(egui::Margin::symmetric(10, 14)))
-            .show(ui, |ui| self.start_nav(ui, &mut todo));
+        if compact {
+            egui::Panel::top("aurora_mobile_actions")
+                .exact_size(60.0)
+                .frame(egui::Frame::new().fill(theme::PANEL_DARK).inner_margin(egui::Margin::symmetric(8, 6)))
+                .show(ui, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        if ui.add_sized([110.0, 48.0], egui::Button::new("+ New").fill(theme::ACCENT)).clicked() {
+                            todo.push(Do::Template(self.start.default_template()));
+                        }
+                        if ui.add_sized([104.0, 48.0], egui::Button::new("Open file")).clicked() {
+                            todo.push(Do::OpenFile(None));
+                        }
+                        if ui.add_sized([104.0, 48.0], egui::Button::new("Folder")).clicked() {
+                            todo.push(Do::OpenFolder);
+                        }
+                    });
+                });
+        } else {
+            egui::Panel::left("start_nav")
+                .exact_size(220.0)
+                .resizable(false)
+                .frame(egui::Frame::new().fill(theme::PANEL_DARK).inner_margin(egui::Margin::symmetric(10, 14)))
+                .show(ui, |ui| self.start_nav(ui, &mut todo));
+        }
+        let body_margin = if compact { 12 } else { 28 };
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin { left: 28, right: 20, top: 20, bottom: 12 }))
+            .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin {
+                left: body_margin, right: if compact { 12 } else { 20 }, top: 16, bottom: 12,
+            }))
             .show(ui, |ui| self.start_body(ui, &mut todo));
 
         for d in todo {
@@ -732,7 +761,10 @@ impl Editor {
         ui.horizontal_centered(|ui| {
             crate::icons::logo(ui, 26.0);
             ui.add_space(4.0);
-            ui.label(RichText::new("rustudio").size(16.0).strong().color(theme::TEXT));
+            ui.label(RichText::new("LUAVEXA").size(16.0).strong().color(theme::TEXT));
+            if ui.available_width() > 430.0 {
+                ui.label(RichText::new("AURORA").size(10.0).strong().color(theme::SELECT));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let label = if self.game.account.signed_in() {
                     self.game.account.status_short().trim_start_matches("Roblox: ").to_string()
@@ -747,11 +779,13 @@ impl Editor {
                     todo.push(Do::Account);
                 }
                 ui.add_space(8.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.start.search)
-                        .hint_text("🔍  Search")
-                        .desired_width(240.0),
-                );
+                if ui.available_width() > 470.0 {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.start.search)
+                            .hint_text("Search projects and templates")
+                            .desired_width(220.0),
+                    );
+                }
             });
         });
     }
@@ -844,7 +878,7 @@ impl Editor {
         });
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.label(
-                RichText::new(format!("rustudio {}", env!("CARGO_PKG_VERSION")))
+                RichText::new(format!("Luavexa · {}", env!("CARGO_PKG_VERSION")))
                     .small()
                     .color(theme::TEXT_DIM),
             );
@@ -872,6 +906,15 @@ impl Editor {
                 }
             });
         });
+        // Search remains available when the desktop sidebar collapses.
+        if ui.available_width() < 650.0 {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.start.search)
+                    .hint_text("Search projects and templates")
+                    .desired_width(ui.available_width()),
+            );
+            ui.add_space(8.0);
+        }
         if let Some(e) = self.cloud.open_error.clone().or(self.start.url_error.clone()) {
             ui.label(RichText::new(e).color(theme::WARN));
         }
@@ -965,8 +1008,46 @@ impl Editor {
         q.is_empty() || text.to_lowercase().contains(&q)
     }
 
+    /// Aurora Home: solid panels instead of costly GPU blur effects.
+    fn start_aurora_hero(&mut self, ui: &mut egui::Ui, todo: &mut Vec<Do>) {
+        let compact = ui.available_width() < 550.0;
+        let reveal = if self.start.reduced_motion {
+            1.0
+        } else {
+            ui.ctx().animate_bool_with_time(ui.id().with("aurora_hero"), true, 0.24)
+        };
+        egui::Frame::new()
+            .fill(theme::PANEL_DARK)
+            .stroke(Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.4 + reveal * 0.35)))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(egui::Margin::symmetric(18, 18))
+            .show(ui, |ui| {
+                ui.label(RichText::new("LUAVEXA  /  AURORA FOUNDATION").size(11.0).strong().color(theme::SELECT));
+                ui.add_space(5.0);
+                ui.label(RichText::new("Build beyond limits.").size(if compact { 23.0 } else { 29.0 }).strong().color(theme::TEXT));
+                ui.add_space(3.0);
+                ui.label(RichText::new("Create worlds, edit Luau, and bring your ideas to life on Android.").color(theme::TEXT_DIM));
+                ui.add_space(12.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                    if ui.add_sized([135.0, 48.0], egui::Button::new("+ New project").fill(theme::ACCENT)).clicked() {
+                        todo.push(Do::Template(self.start.default_template()));
+                    }
+                    if ui.add_sized([118.0, 48.0], egui::Button::new("Open project")).clicked() {
+                        todo.push(Do::OpenFile(None));
+                    }
+                });
+                ui.add_space(8.0);
+                ui.checkbox(&mut self.start.reduced_motion, "Reduce motion");
+            });
+        ui.add_space(14.0);
+    }
+
     fn start_home(&mut self, ui: &mut egui::Ui, todo: &mut Vec<Do>) {
         let searching = !self.start.search.trim().is_empty();
+        if !searching {
+            self.start_aurora_hero(ui, todo);
+        }
         self.start_templates_section(ui, searching, todo);
 
         // Recently opened from Roblox (the download cache's list).
