@@ -55,6 +55,8 @@ pub struct StartPage {
     pub visible: bool,
     /// Disable optional Aurora transitions during this editor session.
     pub reduced_motion: bool,
+    /// Whether the Home is rendered in touch-first compact layout.
+    pub compact: bool,
     /// The document that was open when the page came up: another one means
     /// something was opened, so the page goes away.
     pub doc_id: u64,
@@ -126,6 +128,7 @@ impl Default for StartPage {
         StartPage {
             visible: false,
             reduced_motion: false,
+            compact: false,
             doc_id: 0,
             collapsed: HashSet::new(),
             expanded: HashSet::new(),
@@ -634,6 +637,7 @@ impl Editor {
         // Fixed 220-point navigation overwhelms phone-sized screens.
         // Switch to large, touch-friendly action buttons at compact widths.
         let compact = ui.available_width() < 760.0;
+        self.start.compact = compact;
         egui::Panel::top("start_top")
             .exact_size(56.0)
             .frame(egui::Frame::new().fill(theme::MENU_BAR).inner_margin(egui::Margin::symmetric(12, 0)))
@@ -645,13 +649,14 @@ impl Editor {
                 .show(ui, |ui| {
                     ui.horizontal_centered(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        if ui.add_sized([110.0, 48.0], egui::Button::new("+ New").fill(theme::ACCENT)).clicked() {
+                        let button_w = ((ui.available_width() - 12.0) / 3.0).max(72.0);
+                        if ui.add_sized([button_w, 48.0], egui::Button::new("+ New").fill(theme::ACCENT)).clicked() {
                             todo.push(Do::Template(self.start.default_template()));
                         }
-                        if ui.add_sized([104.0, 48.0], egui::Button::new("Open file")).clicked() {
+                        if ui.add_sized([button_w, 48.0], egui::Button::new("Open file")).clicked() {
                             todo.push(Do::OpenFile(None));
                         }
-                        if ui.add_sized([104.0, 48.0], egui::Button::new("Folder")).clicked() {
+                        if ui.add_sized([button_w, 48.0], egui::Button::new("Folder")).clicked() {
                             todo.push(Do::OpenFolder);
                         }
                     });
@@ -779,11 +784,12 @@ impl Editor {
                     todo.push(Do::Account);
                 }
                 ui.add_space(8.0);
-                if ui.available_width() > 470.0 {
+                if !self.start.compact && ui.available_width() > 150.0 {
+                    let search_w = (ui.available_width() - 12.0).min(220.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut self.start.search)
                             .hint_text("Search projects and templates")
-                            .desired_width(220.0),
+                            .desired_width(search_w),
                     );
                 }
             });
@@ -907,7 +913,7 @@ impl Editor {
             });
         });
         // Search remains available when the desktop sidebar collapses.
-        if ui.available_width() < 650.0 {
+        if self.start.compact {
             ui.add(
                 egui::TextEdit::singleline(&mut self.start.search)
                     .hint_text("Search projects and templates")
