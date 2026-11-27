@@ -1,169 +1,104 @@
-<p align="center">
-  <img src="assets/icons/rustudio-256.png" width="128" alt="rustudio icon">
-</p>
+<div align="center">
+  <img src="assets/branding/luavexa-hero.webp" alt="Luavexa Android — coding, creativity and AI-assisted development" width="100%" />
 
-<h1 align="center">rustudio</h1>
+  <h1>Luavexa Android</h1>
+  <p><strong>Build worlds. Write Luau. Bring your ideas to life — anywhere.</strong></p>
+  <p>Native Roblox-compatible editing on Android, with an AI-first development experience in progress.</p>
 
-<p align="center">
-  <a href="https://discord.gg/pdVZpADpWr"><img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white" alt="Join the rustudio Discord"></a>
-</p>
+  <p>
+    <img src="https://img.shields.io/badge/STATUS-EARLY%20DEVELOPMENT-9059FF?style=for-the-badge" alt="Early development" />
+    <img src="https://img.shields.io/badge/PLATFORM-ANDROID-00C8DF?style=for-the-badge&logo=android&logoColor=white" alt="Android" />
+    <img src="https://img.shields.io/badge/BUILT%20WITH-RUST-5B64CF?style=for-the-badge&logo=rust&logoColor=white" alt="Rust" />
+    <img src="https://img.shields.io/badge/LICENSE-MIT%20OR%20APACHE--2.0-18223B?style=for-the-badge" alt="License" />
+  </p>
 
-**A native Linux/Windows/macOS/Android Roblox Studio, written in Rust.** Open, edit and save
-Roblox places, press Play and run them with real Luau, physics, characters
-and GUIs, without Wine — on a desktop, or on a phone or tablet with a touch
-screen, where Studio has never run.
+  [**Explore features**](#-the-editor) · [**AI roadmap**](#-the-luavexa-vision) · [**Android build**](#-build-on-android) · [**Português**](README.pt-BR.md)
+</div>
 
-![Editing a place in rustudio](docs/images/editor.png)
+---
 
-![Playing a test place in rustudio](docs/images/play-mode.png)
+## ✨ Make something extraordinary
 
-![The rustudio home screen](docs/images/home.png)
+**Luavexa** is an independent, Android-focused project built on top of the open-source [rustudio](https://github.com/rippelz/rustudio) editor and the [rustudio Android fork](https://github.com/TouseefX/rustudio-android).
 
-> This project is still early, so please please help!! Contributions are super welcome. Come hang out, ask for help or report bugs on the [Discord](https://discord.gg/pdVZpADpWr).
+Our goal is a **mobile development environment where an AI assistant can understand your place, consult trusted Roblox/Luau documentation, and eventually make reviewable changes through MCP tools**. You should be able to design, script, inspect, and test a project without having to switch to a desktop.
 
-## Features
+> [!IMPORTANT]
+> **Development status:** The underlying editor and its MCP server come from upstream. Luavexa's dedicated AI chat, skill routing, reference retrieval, and agent actions are **planned/in prototyping**, not finished features of the APK in this repository. No production AI integration is being claimed here.
 
-- **Editor:** Explorer, Properties, Output, script tabs, move/scale/rotate
-  tools, terrain brushes, pop-out panels, undo/redo, and Studio's menus and
-  shortcuts.
-- **Files:** `.rbxl` / `.rbxlx` places, `.rbxm` / `.rbxmx` models, and
-  Rojo/Argon-style project folders (File > Save as Project Folder…).
-- **File Sync:** attach a Rojo or Argon project to any open place, live Team
-  Create sessions included.
-- **Play / Run:** separate server and client, remotes, physics that follows
-  Studio's solver, R15/R6 characters, sounds, tweens, 2D and 3D GUIs, and
-  teleports between places of the same experience.
-- **Luau:** the real Luau VM with most of the engine API real games use
-  ([what's missing](docs/ENGINE-GAPS.md)).
-- **Rendering:** wgpu, with lighting, shadows, sky, atmosphere, materials,
-  meshes and terrain tuned against Studio, plus FBX import.
-- **Plugins and Toolbox:** Studio plugins run in the editor (local or from
-  the Creator Store), and the Toolbox searches the Creator Store and your
-  inventory.
-- **Roblox account:** open, save and publish your places, load assets and
-  avatars, use DataStores, and join Team Create.
-- **MCP server:** AI agents can read and edit an open place, run Luau, press
-  Play and send input (`rustudio mcp`).
-- **Profiler:** a MicroProfiler window (Ctrl+F6) and command-line captures
-  ([docs/PROFILING.md](docs/PROFILING.md)).
+## 🛠️ The editor
 
-## Install
+The fork currently inherits these capabilities from its upstream codebase. Some games and APIs are not yet fully compatible; see [engine gaps](docs/ENGINE-GAPS.md).
 
-Download the latest build from the
-[releases page](https://github.com/rippelz/rustudio/releases):
+| Workspace | What you can work with |
+| :-- | :-- |
+| 🧱 **World editor** | Explorer, Properties, transforms, terrain, models and assets |
+| 💻 **Luau scripts** | Script tabs and the native Luau runtime |
+| 🎮 **Play mode** | Client/server test sessions, input, physics and GUIs |
+| 📁 **Projects** | `.rbxl`, `.rbxlx`, `.rbxm`, `.rbxmx` and Rojo-style folders |
+| 🔌 **Tooling** | Studio plugins, file synchronization, profiler and output |
+| 🧩 **MCP foundation** | The upstream server exposes project inspection, editing and test tools |
 
-- **Linux (x86_64):** extract the archive and run `./install.sh`. It installs
-  into `~/.local` and adds rustudio to your app launcher. Run it again from a
-  newer archive to upgrade; `./install.sh --uninstall` removes it.
-- **Windows (x64):** extract the ZIP and double-click `install.cmd` (no admin
-  rights needed), or run `rustudio.exe` directly as a portable copy.
-  `uninstall.cmd` in the install folder removes it.
-- **macOS 11+ (Apple Silicon and Intel):** unzip, move `rustudio.app` to
-  Applications, and the first time right-click it > **Open** (it isn't
-  notarized).
+<div align="center">
+  <img src="docs/images/editor.png" alt="Editor screenshot from the upstream rustudio project" width="86%" />
+  <br />
+  <sub>Editor screenshot from the upstream project. Luavexa's branded UI and AI panel are in development.</sub>
+</div>
 
-Uninstalling keeps your projects, settings, sign-in and downloaded content.
-Downloaded copies check for updates on start (verified against the release's
-`SHA256SUMS`); set `RUSTUDIO_NO_UPDATE_CHECK=1` to turn that off.
+## 🧠 The Luavexa vision
 
-### Build from source
+<div align="center">
+  <strong>Understand → Plan → Edit → Test → Review</strong>
+</div>
 
-You need Rust 1.95 or newer and a GPU with Vulkan or OpenGL (Metal on macOS).
+| Component | What it will do | Status |
+| :-- | :-- | :-- |
+| **MCP bridge** | Connect the assistant to the existing editor tools | 🟠 Read-only integration prototype |
+| **Specialized skills** | Luau, mobile UI, gameplay, debugging, security and VFX workflows | 🟠 Prototype |
+| **Reference library** | Retrieve relevant, current documentation instead of guessing APIs | 🔵 Planned |
+| **Agent chat** | Turn natural-language requests into safe, explainable operations | 🔵 Planned |
+| **Project-aware context** | Read only the relevant scripts and objects, with project-specific notes | 🔵 Planned |
+| **Review & rollback** | Preview writes, require approval and make it easy to undo | 🔵 Planned |
 
-An Android APK (`rustudio-android-arm64-v8a.apk`; `x86_64` for the emulator)
-is on the releases page as well: install it with `adb install` or by opening
-it on the device. See [docs/ANDROID.md](docs/ANDROID.md).
+### A future workflow
 
-```sh
-git clone https://github.com/rippelz/rustudio
-cd rustudio
-cargo build --release
-./target/release/rustudio --demo           # sample scene
-./target/release/rustudio my_place.rbxl    # open a place
+> “Build a mobile-friendly stamina HUD, create the supporting Luau scripts and check the Output for errors.”
+
+The intended flow is to select relevant skills, inspect the open place through MCP, propose an implementation, request approval for changes, and verify the result. **This is a design target, not a feature available today.**
+
+## 📱 Build on Android
+
+The Android application uses the native Rust workspace and `xbuild`. See the upstream [Android build guide](docs/ANDROID.md) for prerequisites, Android SDK/NDK, graphics drivers and device troubleshooting.
+
+```bash
+# From a checkout of this repository, with the Android toolchain configured:
+x build -p rustudio-android --platform android --arch arm64 --format apk --release
 ```
 
-On Linux, `./install.sh` builds and installs it for your user
-(`--no-build` installs an existing `target/release/rustudio`; `--help` for
-more). On macOS, `tools/macos/bundle.sh` builds the `.app`. The standalone
-player isn't in the downloads; build it with `cargo build -p rustudio-player`.
+The existing [Android GitHub Actions workflow](.github/workflows/android.yml) also builds APK artifacts when enabled. Look under **Actions → Android → Artifacts** after a successful run. **Do not treat an untested build as a production release.**
 
-### Studio content
+> [!CAUTION]
+> This fork retains the upstream Android package ID (`dev.rustudio.studio`) for now, so it may conflict with other rustudio installations and signatures. Back up your projects before replacing an installation. Never share Roblox session cookies, MCP bearer tokens, or AI API keys.
 
-On first launch rustudio downloads Roblox Studio's built-in content (default
-characters, player scripts, fonts, textures, sounds; about 60 MB) from
-Roblox's CDN. Run `rustudio --install-studio-content` to fetch or update it
-ahead of time. If you already have Studio installed (e.g. through
-[Vinegar](https://vinegarhq.org), or `RobloxStudio.app` on a Mac), rustudio
-can use that instead:
+## 🎨 Brand identity
 
-```sh
-export RUSTUDIO_STUDIO_DIR=~/.var/app/org.vinegarhq.Vinegar/data/vinegar/versions/version-XXXX
-```
+The new Luavexa emblem and artwork are located in [`assets/branding/`](assets/branding/); the Android icon is in [`assets/icons/luavexa-512.png`](assets/icons/luavexa-512.png). Explore the [brand guide](docs/BRAND_GUIDE.md) for color tokens, asset usage and credits.
 
-## Platforms
+## 🧭 Development principles
 
-| Platform | Status |
-|---|---|
-| Linux x86_64 (Wayland or X11) | Supported |
-| Linux ARM64 | Should build; untested |
-| macOS 11+ (Apple Silicon and Intel) | Builds and runs (tested on Apple Silicon) |
-| Windows x86_64 (MSVC) | Builds and runs (tested on Windows 11) |
-| Android 7+ (arm64-v8a; x86_64 for the emulator) | Builds and runs (tested on Samsung Galaxy phones, Android 13); see [docs/ANDROID.md](docs/ANDROID.md) |
+1. **Mobile-first:** touch-friendly UX and reasonable memory and performance targets.
+2. **Grounded AI:** use documented APIs and acknowledge editor/engine limitations.
+3. **User control:** show diffs and ask before writes, publishing or live Team Create edits.
+4. **Respect the project:** preserve source licenses, honor creators, and never expose account credentials.
 
-CI builds and tests on Linux, Windows and macOS (ARM and Intel), and builds
-the Android APKs.
+## 🤝 Credits and licensing
 
-- **Windows:** data and caches live in `%LOCALAPPDATA%\rustudio`, settings
-  in `%APPDATA%\rustudio`. Video playback is off, and native crashes don't
-  write a crash report (panics do).
-- **macOS:** data and settings live in `~/Library/Application Support/rustudio`,
-  caches in `~/Library/Caches/rustudio`. Shortcuts follow Studio for Mac.
-  Video playback needs `brew install libvpx opus`.
-- **Android:** the same editor inside a `NativeActivity`: the whole Studio
-  — Explorer, Properties, script editor, terrain, Play with the game's own
-  touch controls — driven by fingers (tap, hold-to-drag, two-finger camera,
-  long press for menus), with the soft keyboard typing through its own
-  input connection and a Cut / Copy / Paste bar above it. Places open from
-  the app's folder in shared storage (`Android/data/dev.rustudio.studio/
-  files`), from any Files app ("Open with"), or from Roblox when signed in;
-  Studio's content (the default character, the PlayerModule) is downloaded
-  at the first Play. Phones get the Automatic graphics quality and a Mesa
-  Turnip / PanVK driver switch for Snapdragon and Mali GPUs. Crash reports
-  and logs are copied to `Download/rustudio/` (Help > Copy Logs to
-  Download). Install the APK from the releases page with `adb install` or
-  by opening it on the device.
+Luavexa is based on [rustudio by rippelz and contributors](https://github.com/rippelz/rustudio) and [TouseefX's Android fork](https://github.com/TouseefX/rustudio-android). We appreciate the tremendous work behind the editor, its engine, and Android support.
 
-## Signing in
+The code retains the repository's dual **[MIT](LICENSE-MIT) / [Apache-2.0](LICENSE-APACHE)** licensing, subject to third-party components' own licenses. New Luavexa artwork was prepared for this fork; see [brand guide](docs/BRAND_GUIDE.md).
 
-Everything above works signed out. To open your own places or private
-assets, use the account button at the top right and choose **Sign in with
-your browser**, or paste your `.ROBLOSECURITY` cookie. rustudio keeps the
-session in your system keyring (the Keychain on macOS). See
-[docs/AUTH.md](docs/AUTH.md).
+Luavexa is an **independent community project**, not affiliated with or endorsed by Roblox Corporation. Roblox and Roblox Studio are trademarks of Roblox Corporation.
 
-## Docs
-
-- [DEVELOPING.md](docs/DEVELOPING.md): workspace layout, command-line options and tests
-- [ANDROID.md](docs/ANDROID.md): the Android app — building the APK, touch input, the soft keyboard, graphics on a phone, device-run notes
-- [MECHANICS.md](docs/MECHANICS.md): every tuning number and where it comes from
-- [ENGINE-GAPS.md](docs/ENGINE-GAPS.md): engine API that's still missing
-- [TEAMCREATE.md](docs/TEAMCREATE.md): Team Create
-- [PROFILING.md](docs/PROFILING.md): profiler captures and the CLI that reads them
-- [MATERIALS.md](docs/MATERIALS.md): where material textures come from
-- [STUDIO-PANELS.md](docs/STUDIO-PANELS.md): panels and pop-out windows
-- [UI-PARITY.md](docs/UI-PARITY.md): how the UI was matched to Studio
-
-## Not affiliated with Roblox
-
-rustudio is an independent project. It is not made, endorsed or supported
-by Roblox Corporation. "Roblox" and "Roblox Studio" are trademarks of Roblox
-Corporation.
-
-This repository doesn't redistribute Roblox Studio or its content. Studio's
-built-in content is downloaded from Roblox's own CDN onto your machine on
-first launch.
-
-## License
-
-MIT OR Apache-2.0, at your option. Vendored crates in `vendor/` keep their
-own licenses.
+<div align="center">
+  <sub>Made for creators who don't want their ideas limited by a screen size.</sub>
+</div>

@@ -4,7 +4,7 @@
 # the NativeActivity with android.app.lib_name = rustudio_android, the
 # config_changes list that keeps the activity alive across rotation, locale
 # and density changes, minSdkVersion 21 / targetSdkVersion 33).
-icon: ../../assets/icons/rustudio-512.png
+icon: ../../assets/icons/luavexa-512.png
 
 android:
   manifest:
@@ -65,7 +65,7 @@ android:
       - name: android.hardware.sensor.gyroscope
         required: false
     application:
-      label: rustudio
+      label: Luavexa
       theme: "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
       activities:
         - # The editor is a landscape tool; a place's
