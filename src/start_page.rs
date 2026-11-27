@@ -53,6 +53,10 @@ enum Msg {
 
 pub struct StartPage {
     pub visible: bool,
+    /// Disable optional Aurora transitions during this editor session.
+    pub reduced_motion: bool,
+    /// Whether the Home is rendered in touch-first compact layout.
+    pub compact: bool,
     /// The document that was open when the page came up: another one means
     /// something was opened, so the page goes away.
     pub doc_id: u64,
@@ -123,6 +127,8 @@ impl Default for StartPage {
         let (tx, rx) = channel();
         StartPage {
             visible: false,
+            reduced_motion: false,
+            compact: false,
             doc_id: 0,
             collapsed: HashSet::new(),
             expanded: HashSet::new(),
@@ -628,17 +634,45 @@ impl Editor {
             });
         }
 
+        // Fixed 220-point navigation overwhelms phone-sized screens.
+        // Switch to large, touch-friendly action buttons at compact widths.
+        let compact = ui.available_width() < 760.0;
+        self.start.compact = compact;
         egui::Panel::top("start_top")
-            .exact_size(48.0)
-            .frame(egui::Frame::new().fill(theme::MENU_BAR).inner_margin(egui::Margin::symmetric(16, 0)))
+            .exact_size(56.0)
+            .frame(egui::Frame::new().fill(theme::MENU_BAR).inner_margin(egui::Margin::symmetric(12, 0)))
             .show(ui, |ui| self.start_top(ui, &mut todo));
-        egui::Panel::left("start_nav")
-            .exact_size(220.0)
-            .resizable(false)
-            .frame(egui::Frame::new().fill(theme::PANEL_DARK).inner_margin(egui::Margin::symmetric(10, 14)))
-            .show(ui, |ui| self.start_nav(ui, &mut todo));
+        if compact {
+            egui::Panel::top("aurora_mobile_actions")
+                .exact_size(60.0)
+                .frame(egui::Frame::new().fill(theme::PANEL_DARK).inner_margin(egui::Margin::symmetric(8, 6)))
+                .show(ui, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let button_w = ((ui.available_width() - 12.0) / 3.0).max(72.0);
+                        if ui.add_sized([button_w, 48.0], egui::Button::new("+ New").fill(theme::ACCENT)).clicked() {
+                            todo.push(Do::Template(self.start.default_template()));
+                        }
+                        if ui.add_sized([button_w, 48.0], egui::Button::new("Open file")).clicked() {
+                            todo.push(Do::OpenFile(None));
+                        }
+                        if ui.add_sized([button_w, 48.0], egui::Button::new("Folder")).clicked() {
+                            todo.push(Do::OpenFolder);
+                        }
+                    });
+                });
+        } else {
+            egui::Panel::left("start_nav")
+                .exact_size(220.0)
+                .resizable(false)
+                .frame(egui::Frame::new().fill(theme::PANEL_DARK).inner_margin(egui::Margin::symmetric(10, 14)))
+                .show(ui, |ui| self.start_nav(ui, &mut todo));
+        }
+        let body_margin = if compact { 12 } else { 28 };
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin { left: 28, right: 20, top: 20, bottom: 12 }))
+            .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin {
+                left: body_margin, right: if compact { 12 } else { 20 }, top: 16, bottom: 12,
+            }))
             .show(ui, |ui| self.start_body(ui, &mut todo));
 
         for d in todo {
@@ -732,7 +766,10 @@ impl Editor {
         ui.horizontal_centered(|ui| {
             crate::icons::logo(ui, 26.0);
             ui.add_space(4.0);
-            ui.label(RichText::new("rustudio").size(16.0).strong().color(theme::TEXT));
+            ui.label(RichText::new("LUAVEXA").size(16.0).strong().color(theme::TEXT));
+            if ui.available_width() > 430.0 {
+                ui.label(RichText::new("AURORA").size(10.0).strong().color(theme::SELECT));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let label = if self.game.account.signed_in() {
                     self.game.account.status_short().trim_start_matches("Roblox: ").to_string()
@@ -747,11 +784,14 @@ impl Editor {
                     todo.push(Do::Account);
                 }
                 ui.add_space(8.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.start.search)
-                        .hint_text("🔍  Search")
-                        .desired_width(240.0),
-                );
+                if !self.start.compact && ui.available_width() > 150.0 {
+                    let search_w = (ui.available_width() - 12.0).min(220.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.start.search)
+                            .hint_text("Search projects and templates")
+                            .desired_width(search_w),
+                    );
+                }
             });
         });
     }
@@ -844,7 +884,7 @@ impl Editor {
         });
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.label(
-                RichText::new(format!("rustudio {}", env!("CARGO_PKG_VERSION")))
+                RichText::new(format!("Luavexa · {}", env!("CARGO_PKG_VERSION")))
                     .small()
                     .color(theme::TEXT_DIM),
             );
@@ -872,6 +912,15 @@ impl Editor {
                 }
             });
         });
+        // Search remains available when the desktop sidebar collapses.
+        if self.start.compact {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.start.search)
+                    .hint_text("Search projects and templates")
+                    .desired_width(ui.available_width()),
+            );
+            ui.add_space(8.0);
+        }
         if let Some(e) = self.cloud.open_error.clone().or(self.start.url_error.clone()) {
             ui.label(RichText::new(e).color(theme::WARN));
         }
@@ -965,8 +1014,46 @@ impl Editor {
         q.is_empty() || text.to_lowercase().contains(&q)
     }
 
+    /// Aurora Home: solid panels instead of costly GPU blur effects.
+    fn start_aurora_hero(&mut self, ui: &mut egui::Ui, todo: &mut Vec<Do>) {
+        let compact = ui.available_width() < 550.0;
+        let reveal = if self.start.reduced_motion {
+            1.0
+        } else {
+            ui.ctx().animate_bool_with_time(ui.id().with("aurora_hero"), true, 0.24)
+        };
+        egui::Frame::new()
+            .fill(theme::PANEL_DARK)
+            .stroke(Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.4 + reveal * 0.35)))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(egui::Margin::symmetric(18, 18))
+            .show(ui, |ui| {
+                ui.label(RichText::new("LUAVEXA  /  AURORA FOUNDATION").size(11.0).strong().color(theme::SELECT));
+                ui.add_space(5.0);
+                ui.label(RichText::new("Build beyond limits.").size(if compact { 23.0 } else { 29.0 }).strong().color(theme::TEXT));
+                ui.add_space(3.0);
+                ui.label(RichText::new("Create worlds, edit Luau, and bring your ideas to life on Android.").color(theme::TEXT_DIM));
+                ui.add_space(12.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                    if ui.add_sized([135.0, 48.0], egui::Button::new("+ New project").fill(theme::ACCENT)).clicked() {
+                        todo.push(Do::Template(self.start.default_template()));
+                    }
+                    if ui.add_sized([118.0, 48.0], egui::Button::new("Open project")).clicked() {
+                        todo.push(Do::OpenFile(None));
+                    }
+                });
+                ui.add_space(8.0);
+                ui.checkbox(&mut self.start.reduced_motion, "Reduce motion");
+            });
+        ui.add_space(14.0);
+    }
+
     fn start_home(&mut self, ui: &mut egui::Ui, todo: &mut Vec<Do>) {
         let searching = !self.start.search.trim().is_empty();
+        if !searching {
+            self.start_aurora_hero(ui, todo);
+        }
         self.start_templates_section(ui, searching, todo);
 
         // Recently opened from Roblox (the download cache's list).
@@ -997,7 +1084,7 @@ impl Editor {
                     let o = &recent[i].origin;
                     let sub = format!("Opened {}", ago(now, recent[i].opened_at));
                     let icon = self.start.icons.get(&o.universe_id).map(|t| t.id());
-                    let r = card(ui, &o.name, &sub, |p, rect| icon_thumb(p, rect, icon, &o.name));
+                    let r = card(ui, self.start.reduced_motion, &o.name, &sub, |p, rect| icon_thumb(p, rect, icon, &o.name));
                     let r = r.on_hover_text(format!(
                         "{} by {}\nplace {} · universe {}",
                         o.experience,
@@ -1235,7 +1322,12 @@ impl Editor {
         let carrying = egui::DragAndDrop::has_any_payload(ui.ctx());
         let hov = ui.rect_contains_pointer(r) && !dragging && !carrying;
         let title = if renaming { "" } else { e.name() };
-        paint_card(ui, r, hov, title, &sub, |p, tr| match e {
+        let hover = if self.start.reduced_motion {
+            if hov { 1.0 } else { 0.0 }
+        } else {
+            ui.ctx().animate_bool_with_time(resp.id.with("aurora_template_hover"), hov, 0.16)
+        };
+        paint_card(ui, r, hover, title, &sub, |p, tr| match e {
             Entry::Roblox(t) => icon_thumb(p, tr, thumb, &t.name),
             Entry::Custom(c) => custom_thumb(p, tr, thumb, c.thumb.is_none() && c.preview.is_some(), &c.name),
         });
@@ -1558,7 +1650,7 @@ impl Editor {
                 format!("Updated {}", e.updated.get(..10).unwrap_or(&e.updated))
             };
             let icon = self.start.icons.get(&e.id).map(|t| t.id());
-            let r = card(ui, &e.name, &sub, |p, rect| {
+            let r = card(ui, self.start.reduced_motion, &e.name, &sub, |p, rect| {
                 icon_thumb(p, rect, icon, &e.name);
                 if e.team_create == Some(true) {
                     let b = Rect::from_min_size(rect.min + Vec2::new(6.0, 6.0), Vec2::new(86.0, 18.0));
@@ -1655,19 +1747,24 @@ fn grid(ui: &mut egui::Ui, n: usize, mut each: impl FnMut(&mut egui::Ui, usize))
 }
 
 /// A card: thumbnail (drawn by `thumb`), title and one dim line.
-fn card(ui: &mut egui::Ui, title: &str, sub: &str, thumb: impl FnOnce(&egui::Painter, Rect)) -> egui::Response {
+fn card(ui: &mut egui::Ui, reduced_motion: bool, title: &str, sub: &str, thumb: impl FnOnce(&egui::Painter, Rect)) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(Vec2::new(CARD_W, CARD_H), Sense::click());
-    paint_card(ui, r, resp.hovered(), title, sub, thumb);
+    let hover = if reduced_motion {
+        if resp.hovered() { 1.0 } else { 0.0 }
+    } else {
+        ui.ctx().animate_bool_with_time(resp.id.with("aurora_card_hover"), resp.hovered(), 0.16)
+    };
+    paint_card(ui, r, hover, title, sub, thumb);
     resp
 }
 
-fn paint_card(ui: &egui::Ui, r: Rect, hov: bool, title: &str, sub: &str, thumb: impl FnOnce(&egui::Painter, Rect)) {
+fn paint_card(ui: &egui::Ui, r: Rect, hover: f32, title: &str, sub: &str, thumb: impl FnOnce(&egui::Painter, Rect)) {
     let p = ui.painter().with_clip_rect(r);
-    p.rect_filled(r, CornerRadius::same(6), if hov { theme::ACTIVE_TAB } else { theme::PANEL_DARK });
+    p.rect_filled(r, CornerRadius::same(10), if hover > 0.5 { theme::ACTIVE_TAB } else { theme::PANEL_DARK });
     let tr = Rect::from_min_size(r.min, Vec2::new(CARD_W, THUMB_H));
     thumb(&p.with_clip_rect(tr), tr);
-    if hov {
-        p.rect_stroke(r, CornerRadius::same(6), Stroke::new(1.5, theme::SELECT), egui::StrokeKind::Inside);
+    if hover > 0.0 {
+        p.rect_stroke(r, CornerRadius::same(10), Stroke::new(1.0 + hover * 0.6, theme::SELECT.gamma_multiply(hover)), egui::StrokeKind::Inside);
     }
     let font = egui::FontId::proportional(13.5);
     let title = elide(&p, title, &font, CARD_W - 20.0);
@@ -1675,7 +1772,7 @@ fn paint_card(ui: &egui::Ui, r: Rect, hov: bool, title: &str, sub: &str, thumb: 
     let small = egui::FontId::proportional(11.5);
     let sub = elide(&p, sub, &small, CARD_W - 20.0);
     p.text(Pos2::new(r.min.x + 10.0, tr.max.y + 35.0), egui::Align2::LEFT_CENTER, sub, small, theme::TEXT_DIM);
-    if hov {
+    if hover > 0.5 {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 }

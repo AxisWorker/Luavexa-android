@@ -1,31 +1,29 @@
-//! The editor's colours: Roblox Studio's dark theme, sampled from a
-//! screenshot of Studio (offline Studio) — panel #191a1f, headers #202227, menu bar
-//! #272930, fields #2c2d33, active tab #33343a, dividers #353741, accent
-//! #335fff (the Play button) — and Studio's "Select Color" (0.1, 0.6, 1) /
-//! "Hover Over Color" (0.7, 0.9, 1) settings. rustudio's name and icons stay
-//! its own.
+//! Aurora Foundation: Luavexa's Android-first dark visual system.
+//! A low-cost navy surface palette with purple actions and cyan selection,
+//! designed without GPU blur or expensive continuously animated backgrounds.
+//! Keep theme changes independent of editor and engine logic.
 
 use egui::{Color32, CornerRadius, Stroke};
 
-pub const BG: Color32 = Color32::from_rgb(25, 26, 31);
-pub const PANEL: Color32 = Color32::from_rgb(25, 26, 31);
-pub const PANEL_ALT: Color32 = Color32::from_rgb(44, 45, 51);
-pub const PANEL_DARK: Color32 = Color32::from_rgb(32, 34, 39);
+pub const BG: Color32 = Color32::from_rgb(11, 16, 37);
+pub const PANEL: Color32 = Color32::from_rgb(18, 25, 49);
+pub const PANEL_ALT: Color32 = Color32::from_rgb(33, 43, 75);
+pub const PANEL_DARK: Color32 = Color32::from_rgb(21, 27, 62);
 /// The menu bar.
-pub const MENU_BAR: Color32 = Color32::from_rgb(39, 41, 48);
+pub const MENU_BAR: Color32 = Color32::from_rgb(17, 24, 50);
 /// The selected ribbon tab / toggled tool.
-pub const ACTIVE_TAB: Color32 = Color32::from_rgb(51, 52, 58);
-pub const DIVIDER: Color32 = Color32::from_rgb(53, 55, 65);
-pub const TEXT: Color32 = Color32::from_rgb(222, 223, 226);
-pub const TEXT_DIM: Color32 = Color32::from_rgb(125, 127, 132);
-pub const ACCENT: Color32 = Color32::from_rgb(51, 95, 255);
-pub const SELECT: Color32 = Color32::from_rgb(25, 153, 255);
-pub const SELECT_BG: Color32 = Color32::from_rgb(38, 62, 120);
-pub const HOVER_BG: Color32 = Color32::from_rgb(44, 45, 51);
+pub const ACTIVE_TAB: Color32 = Color32::from_rgb(36, 48, 88);
+pub const DIVIDER: Color32 = Color32::from_rgb(54, 67, 97);
+pub const TEXT: Color32 = Color32::from_rgb(232, 237, 255);
+pub const TEXT_DIM: Color32 = Color32::from_rgb(169, 181, 210);
+pub const ACCENT: Color32 = Color32::from_rgb(138, 73, 247);
+pub const SELECT: Color32 = Color32::from_rgb(0, 217, 245);
+pub const SELECT_BG: Color32 = Color32::from_rgb(37, 59, 98);
+pub const HOVER_BG: Color32 = Color32::from_rgb(40, 54, 92);
 /// 3D hover outline (Studio's "Hover Over Color").
-pub const HOVER_3D: Color32 = Color32::from_rgb(179, 230, 255);
-pub const WARN: Color32 = Color32::from_rgb(240, 200, 90);
-pub const ERROR: Color32 = Color32::from_rgb(240, 96, 86);
+pub const HOVER_3D: Color32 = Color32::from_rgb(131, 231, 255);
+pub const WARN: Color32 = Color32::from_rgb(255, 199, 119);
+pub const ERROR: Color32 = Color32::from_rgb(255, 122, 136);
 
 pub fn apply(ctx: &egui::Context) {
     // eframe can report the system theme after app creation. Select our
@@ -37,13 +35,13 @@ pub fn apply(ctx: &egui::Context) {
     v.panel_fill = PANEL;
     v.window_fill = PANEL;
     v.extreme_bg_color = PANEL_DARK;
-    v.faint_bg_color = Color32::from_rgb(30, 31, 37);
+    v.faint_bg_color = Color32::from_rgb(16, 22, 45);
     v.override_text_color = Some(TEXT);
     v.selection.bg_fill = SELECT_BG;
     v.selection.stroke = Stroke::new(1.0, SELECT);
     v.hyperlink_color = ACCENT;
-    v.window_corner_radius = CornerRadius::same(3);
-    v.menu_corner_radius = CornerRadius::same(3);
+    v.window_corner_radius = CornerRadius::same(9);
+    v.menu_corner_radius = CornerRadius::same(8);
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, DIVIDER);
     v.widgets.inactive.weak_bg_fill = PANEL_ALT;
     v.widgets.inactive.bg_fill = PANEL_ALT;
@@ -56,12 +54,12 @@ pub fn apply(ctx: &egui::Context) {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.corner_radius = CornerRadius::same(2);
+        w.corner_radius = CornerRadius::same(6);
     }
-    style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-    // Studio's menus and panels appear at once (no fades).
+    style.spacing.item_spacing = egui::vec2(7.0, 5.0);
+    // Do not animate every editor widget. Aurora Home uses explicit short transitions.
     style.animation_time = 0.0;
-    style.spacing.button_padding = egui::vec2(6.0, 2.0);
+    style.spacing.button_padding = egui::vec2(9.0, 5.0);
     // Studio's scroll bars take their own strip beside the content (Qt);
     // egui's default floats them over it, covering the right edge of rows
     // (values, checkboxes, buttons) so they can't be clicked.
@@ -73,7 +71,7 @@ pub fn dock_style(style: &egui::Style) -> egui_dock::Style {
     let mut s = egui_dock::Style::from_egui(style);
     s.tab_bar.bg_fill = PANEL_DARK;
     s.tab_bar.hline_color = DIVIDER;
-    s.tab_bar.height = 24.0;
+    s.tab_bar.height = 28.0;
     // Studio's panels have a full-width title bar with the name centred.
     s.tab_bar.fill_tab_bar = true;
     s.tab.active.bg_fill = PANEL_DARK;
@@ -98,7 +96,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn studio_style_survives_system_theme_changes() {
+    fn aurora_style_survives_system_theme_changes() {
         let ctx = egui::Context::default();
         apply(&ctx);
 
