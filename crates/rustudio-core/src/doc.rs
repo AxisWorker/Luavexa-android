@@ -1192,9 +1192,14 @@ impl Document {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<WeakDom, String> {
-        let xml = bytes.starts_with(b"<roblox") && !bytes.starts_with(b"<roblox!");
+        let start = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes).trim_ascii_start();
+        // Roblox XML files may start with the optional XML declaration.
+        // Do not misclassify them as binary just because the first bytes
+        // are `<?xml` rather than `<roblox` (Android file imports, etc.).
+        let xml = start.starts_with(b"<?xml")
+            || (start.starts_with(b"<roblox") && !start.starts_with(b"<roblox!"));
         if xml {
-            rbx_xml::from_reader_default(Cursor::new(bytes)).map_err(|e| e.to_string())
+            rbx_xml::from_reader_default(Cursor::new(start)).map_err(|e| e.to_string())
         } else {
             // RUSTUDIO_KEEP_DEFAULTS=1 stores every value the file has, to
             // rule the leaving-out (implied_default) in or out of a bug.
@@ -2257,6 +2262,22 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_rbxlx_with_optional_preamble() {
+        let xml = br#"<roblox version="4"><Item class="Workspace" referent="RBX1"><Properties><string name="Name">Workspace</string></Properties></Item></roblox>"#;
+        for prefix in [
+            b"".as_slice(),
+            b" \n\t",
+            b"\xEF\xBB\xBF",
+            b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
+            b"\xEF\xBB\xBF \n<?xml version=\"1.0\"?>\n",
+        ] {
+            let dom = Document::decode(&[prefix, xml].concat()).unwrap();
+            let workspace = dom.get_by_ref(dom.root().children()[0]).unwrap();
+            assert_eq!(workspace.class.as_str(), "Workspace");
+        }
+    }
 
     #[test]
     fn idle_queries_keep_spatial_marks_through_unrelated_journal_churn() {
