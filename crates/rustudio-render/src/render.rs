@@ -32,6 +32,18 @@ pub fn set_fast_transparency(on: bool) {
 /// Applied ONLY to TexMode::Decal in the encoded see-through path.
 static DECAL_SHADER_PROBE: AtomicU8 = AtomicU8::new(0);
 
+/// Optional in-session A/B test of the accurate, specialized Low-detail decal
+/// shader. Off by default until visual and timing results are verified.
+static DECAL_LOW_FAST_PATH: AtomicBool = AtomicBool::new(false);
+
+pub fn decal_low_fast_path_enabled() -> bool {
+    DECAL_LOW_FAST_PATH.load(Ordering::Relaxed)
+}
+
+pub fn set_decal_low_fast_path(enabled: bool) {
+    DECAL_LOW_FAST_PATH.store(enabled, Ordering::Relaxed);
+}
+
 pub fn decal_shader_probe_mode() -> u8 {
     DECAL_SHADER_PROBE.load(Ordering::Relaxed).min(2)
 }
@@ -2222,6 +2234,7 @@ struct ViewportPipelines {
     // its original shader. Two culling variants: [two-sided, cull back].
     decal_probe_solid: [wgpu::RenderPipeline; 2],
     decal_probe_texonly: [wgpu::RenderPipeline; 2],
+    decal_low_fast: [wgpu::RenderPipeline; 2],
     see: SeeThrough,
 }
 
@@ -2510,6 +2523,13 @@ impl ViewportPipelines {
             "decal-probe-texture-enc", "vs_part", "fs_part_enc_decal_texture_only",
             &parts, T::TriangleList, cull, false, C::GreaterEqual, pm,
         ));
+        // A/B optimization experiment: unlike the two diagnostic probes,
+        // this fragment path preserves the original encoded colour, alpha
+        // and Low-detail lighting. The non-Decal paths stay unchanged.
+        let decal_low_fast = [None, Some(wgpu::Face::Back)].map(|cull| make(
+            "decal-low-specialized-enc", "vs_part", "fs_part_enc_decal_low",
+            &parts, T::TriangleList, cull, false, C::GreaterEqual, pm,
+        ));
         let see = SeeThrough::new(device, &shader, &bgl, ms);
         let water = crate::water::WaterPass::new(
             device,
@@ -2705,6 +2725,7 @@ impl ViewportPipelines {
             see_pipes,
             decal_probe_solid,
             decal_probe_texonly,
+            decal_low_fast,
             see,
         }
     }
@@ -6264,19 +6285,34 @@ impl Renderer {
         } else {
             None
         };
-        let decal_pipeline = |cull_back: bool| -> &wgpu::RenderPipeline {
-            match decal_probe {
-                Some(p) => &p[usize::from(cull_back)],
-                None if cull_back => &pipes.transparent_culled,
-                None => &pipes.transparent,
+        // Select the fast path only for encoded Decal/Texture batches whose
+        // original fragment would take part_shade_low. Leave all other scene
+        // content and both diagnostic modes unchanged.
+        let low_decal_enabled = encoded
+            && decal_low_fast_path_enabled()
+            && decal_probe.is_none()
+            && globals.perf[0] < 0.5
+            && globals.perf[1] <= 0.5
+            && globals.lamp1[3] <= 1.5;
+        let decal_pipeline = |cull_back: bool, instances: &[InstanceRaw]| -> &wgpu::RenderPipeline {
+            if let Some(p) = decal_probe {
+                return &p[usize::from(cull_back)];
+            }
+            if low_decal_enabled && low_decal_batch(instances) {
+                return &viewport.decal_low_fast[usize::from(cull_back)];
+            }
+            if cull_back {
+                &pipes.transparent_culled
+            } else {
+                &pipes.transparent
             }
         };
         let surface_decals = |pass: &mut wgpu::RenderPass, calls: &mut usize| {
             if !surface_decal_runs.is_empty() {
                 unbind();
-                pass.set_pipeline(decal_pipeline(false));
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                 for r in &surface_decal_runs {
+                    pass.set_pipeline(decal_pipeline(false, &raw[r.1 as usize..r.2 as usize]));
                     draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
                 }
                 pass.set_bind_group(1, &self.textures[0], &[]);
@@ -6314,13 +6350,14 @@ impl Renderer {
         let see_through = |pass: &mut wgpu::RenderPass, calls: &mut usize| {
             unbind();
             pass.set_bind_group(2, &target.glass_bg, &[]);
-            pass.set_pipeline(decal_pipeline(false));
             pass.set_vertex_buffer(1, self.static_buf.slice(..));
             for r in static_ranges.iter().filter(|r| r.0 == Pass::Decal) {
+                pass.set_pipeline(decal_pipeline(false, &self.st.raw[r.2 as usize..r.3 as usize]));
                 draw(pass, r.1, r.2..r.3, r.4, calls);
             }
             pass.set_vertex_buffer(1, self.instance_buf.slice(..));
             for r in &decal_runs {
+                pass.set_pipeline(decal_pipeline(false, &raw[r.1 as usize..r.2 as usize]));
                 draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
             }
             for r in &blend_runs {
@@ -6329,7 +6366,7 @@ impl Renderer {
                 pass.set_pipeline(if r.1 < glass_end {
                     if self.culls_back(r.0 .0) { &pipes.glass_culled } else { &pipes.glass }
                 } else if is_decal {
-                    decal_pipeline(self.culls_back(r.0 .0))
+                    decal_pipeline(self.culls_back(r.0 .0), &raw[r.1 as usize..r.2 as usize])
                 } else if self.culls_back(r.0 .0) {
                     &pipes.transparent_culled
                 } else {
@@ -7271,6 +7308,43 @@ fn draw_key(p: &PartDraw) -> (usize, usize) {
 
 const DECAL_TEX_MODE: f32 = 2.0;
 const CUTOUT_TEX_MODE: f32 = 4.0;
+
+// Low encoded-decal optimization must not capture transparent parts, glasses,
+// ForceFields, cutouts, SurfaceAppearance or mixed-kind texture batches.
+fn low_decal_batch(instances: &[InstanceRaw]) -> bool {
+    !instances.is_empty()
+        && instances.iter().all(|p| {
+            p.extra[3] == DECAL_TEX_MODE && (p.extra[0] as u32 & 7) < 3
+        })
+}
+
+#[cfg(test)]
+mod low_decal_fast_tests {
+    use super::{low_decal_batch, InstanceRaw, DECAL_TEX_MODE};
+    use bytemuck::Zeroable;
+
+    #[test]
+    fn only_ordinary_decal_texture_batches_use_specialized_low_shader() {
+        let mut decal = InstanceRaw::zeroed();
+        decal.extra[3] = DECAL_TEX_MODE;
+        assert!(!low_decal_batch(&[]));
+        for kind in [0.0, 1.0, 2.0, 8.0, 16.0] {
+            decal.extra[0] = kind;
+            assert!(low_decal_batch(&[decal]));
+        }
+        for kind in [3.0, 5.0, 6.0] {
+            decal.extra[0] = kind;
+            assert!(!low_decal_batch(&[decal]));
+        }
+        decal.extra[0] = 0.0;
+        let mut other = decal;
+        other.extra[3] = 1.0; // SurfaceAppearance / overlay, not a Decal
+        assert!(!low_decal_batch(&[decal, other]));
+        other.extra[3] = 4.0; // AlphaMode=Transparency cutout
+        assert!(!low_decal_batch(&[decal, other]));
+    }
+}
+
 
 fn tex_mode(p: &PartDraw) -> f32 {
     match (p.tex_mode, p.texture) {
