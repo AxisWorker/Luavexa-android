@@ -358,7 +358,7 @@ pub fn install_gpu_error_handler(device: &egui_wgpu::wgpu::Device) {
             log::error!("Luavexa: wgpu error {n} (the frame goes on): {e}");
             rustudio_core::crash::note(format!("wgpu error {n}: {e}"));
         } else if n == GPU_ERRORS_LOGGED + 1 {
-            log::error!("rustudio: wgpu error {n}: {e} — further ones are counted, not logged");
+            log::error!("Luavexa: wgpu error {n}: {e} — further ones are counted, not logged");
             rustudio_core::crash::note(format!("wgpu error {n}: {e} (further ones counted)"));
         }
     }));
@@ -366,7 +366,7 @@ pub fn install_gpu_error_handler(device: &egui_wgpu::wgpu::Device) {
     // every call on this device fails from here on. wgpu says so only here.
     device.set_device_lost_callback(|reason, message| {
         let line = format!(
-            "Luavexa: the GPU device is lost ({reason:?}: {message}); nothing more can be drawn with it — the open place is saved to the recovery folder and rustudio restarts"
+            "Luavexa: the GPU device is lost ({reason:?}: {message}); nothing more can be drawn with it — the open place is saved to the recovery folder and Luavexa restarts"
         );
         log::error!("{line}");
         rustudio_core::crash::note(line);
@@ -462,7 +462,7 @@ pub fn gpu_watch(ed: &mut crate::app::Editor) -> bool {
     } else {
         "No place was open".to_string()
     };
-    let line = format!("Luavexa: {why}; nothing more can be drawn. {saved}. rustudio restarts; open the saved copy from Recent or the recovery folder.");
+    let line = format!("Luavexa: {why}; nothing more can be drawn. {saved}. Luavexa restarts; open the saved copy from Recent or the recovery folder.");
     log::error!("{line}");
     eprintln!("{line}");
     logcat::sync_session();

@@ -62,7 +62,7 @@ fn args_line() -> String {
 
 fn header(kind: &str) -> String {
     format!(
-        "rustudio {} ({}) crashed: {kind}\npid {}\nargs: {}\n\n",
+        "Luavexa {} ({}) crashed: {kind}\npid {}\nargs: {}\n\n",
         env!("CARGO_PKG_VERSION"),
         option_env!("RUSTUDIO_GIT").unwrap_or("unknown commit"),
         std::process::id(),
@@ -162,7 +162,7 @@ pub fn install() {
                 notes_block()
             );
             if let Some(p) = write_report(&body) {
-                eprintln!("rustudio: crash report written to {}", p.display());
+                eprintln!("Luavexa: crash report written to {}", p.display());
             }
         }
         default_hook(info);
@@ -246,7 +246,7 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
                     let w = |b: &[u8]| {
                         libc::write(fd, b.as_ptr().cast(), b.len());
                     };
-                    w(b"rustudio crashed: fatal signal ");
+                    w(b"Luavexa crashed: fatal signal ");
                     w(sig_name(sig));
                     w(b"\n\n");
                     // On Android the backtrace is debuggerd's: the handler
@@ -326,9 +326,9 @@ pub fn unseen_reports() -> Vec<String> {
         // The first line after the header that says what happened.
         let what = text
             .lines()
-            .find(|l| l.starts_with("panic in thread") || l.starts_with("rustudio crashed: fatal"))
+            .find(|l| l.starts_with("panic in thread") || l.starts_with("Luavexa crashed: fatal") || l.starts_with("rustudio crashed: fatal"))
             .unwrap_or("crash")
-            .to_string();
+            .replace("rustudio crashed", "Luavexa crashed");
         let msg = text
             .lines()
             .skip_while(|l| !l.starts_with("panic in thread"))
@@ -336,7 +336,7 @@ pub fn unseen_reports() -> Vec<String> {
             .map(|m| format!(" — {m}"))
             .unwrap_or_default();
         lines.push(format!(
-            "rustudio crashed last time: {what}{msg}. Report: {}",
+            "Luavexa crashed last time: {what}{msg}. Report: {}",
             p.display()
         ));
         if let Some(n) = p.file_name().and_then(|n| n.to_str()) {

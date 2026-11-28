@@ -575,7 +575,7 @@ impl<'a> Reader<'a> {
             let inside = self.inside(&full);
             if !inside {
                 self.warnings
-                    .push(format!("{}: $path {} is outside the project's repository (Studio Settings > rustudio > Projects allows it)", project.display(), full.display()));
+                    .push(format!("{}: $path {} is outside the project's repository (Studio Settings > Luavexa > Projects allows it)", project.display(), full.display()));
             }
             match inside.then(|| self.snapshot(&full)).flatten() {
                 Some(mut ps) => {
