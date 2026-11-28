@@ -889,11 +889,11 @@ impl Editor {
         // the prerequisite rather than entering an apparently broken Play.
         #[cfg(target_os = "android")]
         if matches!(t, RunType::Test | RunType::TestHere)
-            && rustudio_core::studio_content::installed().is_none()
+            && rustudio_core::default_scripts::studio_dir().is_none()
         {
             self.ui.run_type = t;
             self.ui.play_setup_notice = true;
-            self.warn("Luavexa Play is not ready: Roblox Studio's character and player scripts are still downloading. Keep the app open, wait for 'Studio content ... installed' in Output, then retry Play.");
+            self.warn("Luavexa Play needs Roblox Studio's character content and player scripts. Check Output for setup progress or errors.");
             return;
         }
         self.ui.run_type = t;
@@ -927,8 +927,7 @@ impl Editor {
         if !self.ui.play_setup_notice {
             return;
         }
-        let ready = rustudio_core::studio_content::installed().is_some()
-            && rustudio_core::default_scripts::studio_dir().is_some();
+        let ready = rustudio_core::default_scripts::studio_dir().is_some();
         let mut open = true;
         let mut close_clicked = false;
         let mut play_clicked = false;
@@ -937,7 +936,7 @@ impl Editor {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(385.0)
+            .default_width((ctx.content_rect().width() - 32.0).clamp(1.0, 385.0))
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label("The first installation needs Roblox Studio's built-in content (about 70 MB).");
@@ -949,11 +948,8 @@ impl Editor {
                         play_clicked = true;
                     }
                 } else {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Downloading Studio content in the background...");
-                    });
-                    ui.small("Keep Luavexa open and connected. Look in Output for 'Studio content ... installed'. If an error appears, reopen the app to retry the remaining packages.");
+                    ui.label("Studio's player scripts are unavailable.");
+                    ui.small("Check Output for download progress or errors. If the download failed, reopen Luavexa to retry.");
                 }
                 if ui.button("Close").clicked() {
                     close_clicked = true;
