@@ -1169,6 +1169,32 @@ fn fs_part_enc(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) 
     return part_shade(in, front);
 }
 
+// Diagnostic-only: identical decal geometry, depth test and encoded blending,
+// but no image fetch, lighting, fog or material work.  Comparing its GPU time
+// against fs_part_enc isolates raster/overdraw/blend/encoded-output overhead.
+// Only selected for TexMode::Decal in the editor's Luavexa Debug UI.
+@fragment
+fn fs_part_enc_decal_solid(in: PartOut) -> @location(0) vec4<f32> {
+    ENC_OUT = true;
+    let alpha = clamp(in.color.a * in.vtint.a, 0.0, 1.0);
+    return see_out(vec3<f32>(0.25, 0.25, 0.25), alpha, alpha);
+}
+
+// Diagnostic-only: one image sample using the same decal UVs and clamp
+// policy as part_shade, but no lighting, fog, conversion back to gamma,
+// material maps or per-pixel surface derivatives.  This is NOT a visual
+// approximation of the normal renderer; use GPU timings, not its colors.
+@fragment
+fn fs_part_enc_decal_texture_only(in: PartOut) -> @location(0) vec4<f32> {
+    ENC_OUT = true;
+    let decal_clamp = all(abs(in.mscale - vec4<f32>(1.0, 1.0, 0.0, 0.0)) < vec4<f32>(1e-4));
+    let edge_px = 0.5 / vec2<f32>(textureDimensions(tex));
+    let uv = select(in.uv, clamp(in.uv, edge_px, vec2<f32>(1.0) - edge_px), decal_clamp);
+    let sample = textureSample(tex, tex_sampler, uv);
+    let alpha = clamp(in.color.a * in.vtint.a * sample.a, 0.0, 1.0);
+    return see_out(sample.rgb, alpha, alpha);
+}
+
 @fragment
 fn fs_part_cutout(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     CUTOUT_OUT = 1u;

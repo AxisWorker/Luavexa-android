@@ -12,7 +12,7 @@ pub mod vf;
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// Session-only comparison mode for low-end GPUs. The default keeps Roblox-accurate
 /// encoded transparency blending; the debug panel can compare direct linear blending
@@ -25,6 +25,27 @@ pub fn fast_transparency_enabled() -> bool {
 
 pub fn set_fast_transparency(on: bool) {
     FAST_TRANSPARENCY.store(on, Ordering::Relaxed);
+}
+
+/// Session-only diagnostic. 0 = normal fragment shader, 1 = solid colour
+/// (raster/blending/encoding), 2 = sample decal texture without full shading.
+/// Applied ONLY to TexMode::Decal in the encoded see-through path.
+static DECAL_SHADER_PROBE: AtomicU8 = AtomicU8::new(0);
+
+pub fn decal_shader_probe_mode() -> u8 {
+    DECAL_SHADER_PROBE.load(Ordering::Relaxed).min(2)
+}
+
+pub fn set_decal_shader_probe_mode(mode: u8) {
+    DECAL_SHADER_PROBE.store(mode.min(2), Ordering::Relaxed);
+}
+
+pub fn decal_shader_probe_label() -> &'static str {
+    match decal_shader_probe_mode() {
+        1 => "Solid (no texture/shading)",
+        2 => "Texture only (no lighting)",
+        _ => "Original",
+    }
 }
 
 use bytemuck::{Pod, Zeroable};
@@ -2197,6 +2218,10 @@ struct ViewportPipelines {
     terrain_low: Option<wgpu::RenderPipeline>,
     overlay: wgpu::RenderPipeline,
     see_pipes: SeePipes,
+    // Dedicated encoded decal pipelines: all other transparent content keeps
+    // its original shader. Two culling variants: [two-sided, cull back].
+    decal_probe_solid: [wgpu::RenderPipeline; 2],
+    decal_probe_texonly: [wgpu::RenderPipeline; 2],
     see: SeeThrough,
 }
 
@@ -2473,6 +2498,18 @@ impl ViewportPipelines {
             glass_culled: make("glass-composite-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None),
             overlay: make("parts-overlay-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
         };
+        // Separate fragment entry points so the driver's shader compiler can
+        // eliminate texture fetches and lighting entirely in the solid test.
+        // Keep vertex input, depth, raster state, sample count and blending
+        // identical to the ordinary encoded transparent pipeline.
+        let decal_probe_solid = [None, Some(wgpu::Face::Back)].map(|cull| make(
+            "decal-probe-solid-enc", "vs_part", "fs_part_enc_decal_solid",
+            &parts, T::TriangleList, cull, false, C::GreaterEqual, pm,
+        ));
+        let decal_probe_texonly = [None, Some(wgpu::Face::Back)].map(|cull| make(
+            "decal-probe-texture-enc", "vs_part", "fs_part_enc_decal_texture_only",
+            &parts, T::TriangleList, cull, false, C::GreaterEqual, pm,
+        ));
         let see = SeeThrough::new(device, &shader, &bgl, ms);
         let water = crate::water::WaterPass::new(
             device,
@@ -2666,6 +2703,8 @@ impl ViewportPipelines {
             terrain_low,
             overlay,
             see_pipes,
+            decal_probe_solid,
+            decal_probe_texonly,
             see,
         }
     }
@@ -6214,10 +6253,28 @@ impl Renderer {
                 || !overlay_runs.is_empty()
                 || static_ranges.iter().any(|r| r.0 == Pass::Decal));
         let pipes = if encoded { &viewport.see_pipes } else { &linear_pipes };
+        // Only the main encoded see-through pass can use these probes.
+        // No project data, lighting, world GUI, cutout or glass is modified.
+        let decal_probe: Option<&[wgpu::RenderPipeline; 2]> = if encoded {
+            match decal_shader_probe_mode() {
+                1 => Some(&viewport.decal_probe_solid),
+                2 => Some(&viewport.decal_probe_texonly),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let decal_pipeline = |cull_back: bool| -> &wgpu::RenderPipeline {
+            match decal_probe {
+                Some(p) => &p[usize::from(cull_back)],
+                None if cull_back => &pipes.transparent_culled,
+                None => &pipes.transparent,
+            }
+        };
         let surface_decals = |pass: &mut wgpu::RenderPass, calls: &mut usize| {
             if !surface_decal_runs.is_empty() {
                 unbind();
-                pass.set_pipeline(&pipes.transparent);
+                pass.set_pipeline(decal_pipeline(false));
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                 for r in &surface_decal_runs {
                     draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
@@ -6257,7 +6314,7 @@ impl Renderer {
         let see_through = |pass: &mut wgpu::RenderPass, calls: &mut usize| {
             unbind();
             pass.set_bind_group(2, &target.glass_bg, &[]);
-            pass.set_pipeline(&pipes.transparent);
+            pass.set_pipeline(decal_pipeline(false));
             pass.set_vertex_buffer(1, self.static_buf.slice(..));
             for r in static_ranges.iter().filter(|r| r.0 == Pass::Decal) {
                 draw(pass, r.1, r.2..r.3, r.4, calls);
@@ -6267,8 +6324,12 @@ impl Renderer {
                 draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
             }
             for r in &blend_runs {
+                let is_decal = raw[r.1 as usize..r.2 as usize]
+                    .iter().all(|part| part.extra[3] == DECAL_TEX_MODE);
                 pass.set_pipeline(if r.1 < glass_end {
                     if self.culls_back(r.0 .0) { &pipes.glass_culled } else { &pipes.glass }
+                } else if is_decal {
+                    decal_pipeline(self.culls_back(r.0 .0))
                 } else if self.culls_back(r.0 .0) {
                     &pipes.transparent_culled
                 } else {

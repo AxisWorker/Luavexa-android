@@ -46,6 +46,13 @@ impl Editor {
         let frame_ms = if fps > 0.1 { format!("{:.1} ms", 1000.0 / fps) } else { "measuring...".into() };
         let mode = if self.game.is_playing() { "Play" } else { "Edit" };
         ui.label(format!("{} · {:.0} FPS · {}", mode, fps, frame_ms));
+        // This measures Editor::finish_frame's update and UI work, *before*
+        // eframe's draw submission, egui GPU compositing and window present.
+        // Readings are from the preceding frame; frame_ms is a smoothed
+        // wall-clock interval. They are intentionally not added together.
+        let cpu_ms = self.last_work_ms.max(0.0);
+        ui.label(format!("CPU update + UI: {cpu_ms:.1} ms (previous frame)"));
+        ui.small(RichText::new("CPU excludes eframe GPU submission and display present; FPS represents a smoothed full-frame interval. Compare stable camera views, not one snapshot.").weak());
         let view = self.game.viewport_rect;
         ui.label(format!("Viewport: {:.0} × {:.0} logical points", view.width().max(0.0), view.height().max(0.0)));
         ui.label(format!(
@@ -68,7 +75,7 @@ impl Editor {
         if ui.checkbox(&mut timing, "Measure individual GPU passes (experimental)").changed() {
             rustudio_render::gpu_timing::set_live_debug(timing);
         }
-        ui.small(RichText::new("Off by default. Uses asynchronous GPU timestamp queries where supported; enabling measurement has a small cost. Values may lag a few frames.").weak());
+        ui.small(RichText::new("Off by default. Timestamp queries may lag a few frames. Timed scene passes exclude egui compositing, GPU queue waits and presentation; enabling adds some overhead.").weak());
         if timing {
             match self.game.render_state.as_ref() {
                 Some(rs) if rustudio_render::gpu_timing::supported(&rs.device) => {
@@ -80,9 +87,17 @@ impl Editor {
                         for (label, ms) in spans.iter().take(12) {
                             ui.monospace(format!("{label}: {ms:.2} ms"));
                         }
-                        ui.small("Shown: largest measured GPU spans; not an end-to-end frame total.");
+                        ui.small("Shown: latest resolved GPU scene spans, not a complete frame. If FPS is low but all spans are short, investigate CPU update/UI, egui rendering, pacing, waits and presentation.");
                         if ui.button("Copy GPU timings").clicked() {
-                            let mut text = String::from("Luavexa GPU timing (ms; most recent resolved frame)\n");
+                            let mut text = format!(
+                                "Luavexa GPU timing (ms; most recent resolved frame)\nMode: {mode} | FPS (smoothed): {fps:.1} | frame interval: {frame_ms}\nCPU update + UI (previous frame): {cpu_ms:.3} ms\nGPU spans omit egui composition and present; not an end-to-end frame time.\n"
+                            );
+                            use rustudio_render::render;
+                            text.push_str(&format!(
+                                "Decal shader probe: {} | fast linear transparency: {}\n",
+                                render::decal_shader_probe_label(),
+                                render::fast_transparency_enabled(),
+                            ));
                             for (label, ms) in spans {
                                 use std::fmt::Write as _;
                                 let _ = writeln!(&mut text, "{label}: {ms:.3}");
@@ -101,6 +116,31 @@ impl Editor {
         }
         ui.separator();
 
+        ui.label(RichText::new("DECAL SHADER ISOLATION").strong());
+        let mut decal_mode = rustudio_render::render::decal_shader_probe_mode();
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut decal_mode, 0, "Original");
+            ui.selectable_value(&mut decal_mode, 1, "Cor sólida");
+            ui.selectable_value(&mut decal_mode, 2, "Só textura");
+        });
+        if decal_mode != rustudio_render::render::decal_shader_probe_mode() {
+            rustudio_render::render::set_decal_shader_probe_mode(decal_mode);
+            if decal_mode != 0 {
+                // The probe pipelines target the original encoded pass only.
+                rustudio_render::render::set_fast_transparency(false);
+            }
+        }
+        ui.small(RichText::new(
+            "Somente Texture/Decal no passe see-through encoded. Cor sólida mantém geometria, profundidade e blend, mas remove textura/iluminação. Só textura mantém uma amostra, sem iluminação. As cores dos dois modos de teste NÃO são as cores finais. Reiniciar o app restaura Original."
+        ).weak());
+        if decal_mode != 0 && rustudio_render::render::fast_transparency_enabled() {
+            ui.colored_label(egui::Color32::YELLOW, "O teste de shader fica inativo enquanto Fast Linear Transparency estiver ligado. Desative-o abaixo.");
+        }
+        if ui.button("Restaurar shader original").clicked() {
+            rustudio_render::render::set_decal_shader_probe_mode(0);
+        }
+        ui.separator();
+
         ui.label(RichText::new("TRANSPARENCY A/B TEST").strong());
         let mut fast = rustudio_render::render::fast_transparency_enabled();
         if ui.checkbox(&mut fast, "Use fast linear transparency (experimental)").changed() {
@@ -113,13 +153,14 @@ impl Editor {
             }
             if ui.button("Copy FPS summary").clicked() {
                 ui.ctx().copy_text(format!(
-                    "Luavexa debug | {mode} | {fps:.0} FPS | {frame_ms} | viewport {:.0}x{:.0} logical | resolution {}% | quality {} | detail {} | linear transparency {}",
+                    "Luavexa debug | {mode} | {fps:.0} FPS | {frame_ms} | CPU update+UI (prior): {cpu_ms:.1}ms | viewport {:.0}x{:.0} logical | resolution {}% | quality {} | detail {} | linear transparency {} | decal shader {}",
                     view.width().max(0.0),
                     view.height().max(0.0),
                     settings::performance_value("resolution"),
                     settings::performance_value("quality"),
                     settings::performance_value("detail"),
                     rustudio_render::render::fast_transparency_enabled(),
+                    rustudio_render::render::decal_shader_probe_label(),
                 ));
             }
         });
