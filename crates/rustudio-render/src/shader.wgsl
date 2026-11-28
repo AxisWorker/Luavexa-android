@@ -1128,6 +1128,48 @@ fn fs_part_enc(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) 
     return part_shade(in, front);
 }
 
+// Adreno 630 experiment: a dedicated, visually equivalent Low-quality
+// Texture/Decal fragment path. The ordinary part_shade shader performs
+// material-atlas, surface-map and derivative work before reaching the
+// part_shade_low branch, even for a simple Decal that never uses those maps.
+// Only selected for TexMode::Decal, ordinary materials (kind 0..2), Low
+// detail, encoded transparency and a non-ViewportFrame camera.
+// IMPORTANT: preserve the original sRGB->Studio-colour conversion and alpha
+// behaviour exactly; this is NOT the diagnostic "texture only" shader.
+@fragment
+fn fs_part_enc_decal_low(in: PartOut) -> @location(0) vec4<f32> {
+    ENC_OUT = true;
+    let kind = f32(u32(in.extra.x + 0.5) & 7u);
+    let clamp_decal_uv = all(abs(in.mscale - vec4<f32>(1.0, 1.0, 0.0, 0.0)) < vec4<f32>(1e-4));
+    let edge_px = 0.5 / vec2<f32>(textureDimensions(tex));
+    let uv = select(in.uv, clamp(in.uv, edge_px, vec2<f32>(1.0) - edge_px), clamp_decal_uv);
+    let sample = textureSample(tex, tex_sampler, uv);
+    // Match part_shade's sRGB sampled texel -> original sRGB bytes -> squared
+    // Studio colours. Omitting this (as the texture-only probe does) changes
+    // visible colours.
+    let raw = select(
+        1.055 * pow(max(sample.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
+        12.92 * sample.rgb,
+        sample.rgb <= vec3<f32>(0.0031308),
+    );
+    var base = in.color.rgb * sq(in.vtint.rgb) * (raw * raw);
+    let original_alpha = in.color.a;
+    var alpha = original_alpha * sample.a;
+    if (original_alpha < 0.999) {
+        alpha *= in.vtint.a;
+    }
+    let packed = u32(in.extra.y + 0.5);
+    let faces = (packed >> 1u) & 0x3FFFFu;
+    if (faces != 0u) {
+        base *= surface_shade(faces, in.objn, in.local, in.half, dpdx(in.local), dpdy(in.local));
+    }
+    if ((packed & 1u) == 1u) {
+        let k = fract((in.world.x + in.world.y + in.world.z) * 0.25);
+        base = mix(base, base * 0.6 + vec3<f32>(0.18, 0.12, 0.3), step(0.5, k) * 0.6);
+    }
+    return part_shade_low(in, base, alpha, kind);
+}
+
 // Diagnostic-only: identical decal geometry, depth test and encoded blending,
 // but no image fetch, lighting, fog or material work.  Comparing its GPU time
 // against fs_part_enc isolates raster/overdraw/blend/encoded-output overhead.
