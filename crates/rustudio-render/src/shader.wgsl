@@ -1125,6 +1125,47 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
 @fragment
 fn fs_part_enc(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     ENC_OUT = true;
+    // Experimental mobile Low path for ordinary Decal/Texture overlays.
+    // On Adreno 630 these fragments were measured at ~63 ms versus ~9 ms
+    // with the Baseplate overlay removed. The generic part_shade computes
+    // unused material/surface derivatives and samples before reaching
+    // part_shade_low; this path keeps its colour, alpha, fog and lighting
+    // maths, but skips work that cannot affect a simple decal.
+    //
+    // Fall back for cutout/ForceField/glass, debug flat, complex surface
+    // modifiers, Studio ViewportFrames, and any non-Low quality settings.
+    let code = u32(in.extra.x + 0.5);
+    let kind = f32(code & 7u);
+    let mode = u32(in.extra.w + 0.5);
+    let packed = u32(in.extra.y + 0.5);
+    let has_surface = (packed & 1u) != 0u || ((packed >> 1u) & 0x3ffffu) != 0u;
+    if (mode == 2u
+        && kind < 2.5
+        && !has_surface
+        && g.perf.y <= 0.5
+        && spec_pred(1u, g.perf.x < 0.5)
+        && !spec_pred(8u, g.lamp1.w > 1.5)) {
+        // Same untiled Decal edge clamp as part_shade. Tiled Texture
+        // instances use the original coordinates and sampler repetition.
+        let clamp_decal = all(abs(in.mscale - vec4<f32>(1.0, 1.0, 0.0, 0.0)) < vec4<f32>(1e-4));
+        let edge_px = 0.5 / vec2<f32>(textureDimensions(tex));
+        let suv = select(in.uv, clamp(in.uv, edge_px, vec2<f32>(1.0) - edge_px), clamp_decal);
+        let texel = textureSample(tex, tex_sampler, suv);
+        // Retain Studio's existing sRGB -> byte -> square conversion.
+        // This is intentionally NOT a cheaper approximation of gamma.
+        let raw = select(
+            1.055 * pow(max(texel.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
+            12.92 * texel.rgb,
+            texel.rgb <= vec3<f32>(0.0031308)
+        );
+        let base = (raw * raw) * in.color.rgb * sq(in.vtint.rgb);
+        var alpha = in.color.a;
+        if (alpha < 0.999) {
+            alpha *= in.vtint.a;
+        }
+        alpha *= texel.a;
+        return part_shade_low(in, base, alpha, kind);
+    }
     return part_shade(in, front);
 }
 
