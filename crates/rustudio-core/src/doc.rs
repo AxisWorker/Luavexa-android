@@ -2275,6 +2275,12 @@ mod tests {
             let start = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head).trim_ascii_start();
             assert!(start.starts_with(b"<?xml") || (start.starts_with(b"<roblox") && !start.starts_with(b"<roblox!")));
         }
+        // Exercise the actual decoder (not just its header detection):
+        // this real Roblox XML shape must work with an XML declaration.
+        let xml = b"<roblox version=\"4\"><Item class=\"Workspace\" referent=\"RBX1\"><Properties><string name=\"Name\">Workspace</string></Properties></Item></roblox>";
+        let declared = [b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n".as_slice(), xml.as_slice()].concat();
+        assert!(Document::decode(xml).is_ok(), "bare rbxlx failed");
+        assert!(Document::decode(&declared).is_ok(), "rbxlx with XML declaration failed");
     }
 
     #[test]
