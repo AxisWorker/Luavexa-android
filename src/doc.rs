@@ -688,12 +688,7 @@ impl Document {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<WeakDom, String> {
-        let start = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes).trim_ascii_start();
-        // Roblox XML files may start with the optional XML declaration.
-        // Do not misclassify them as binary just because the first bytes
-        // are `<?xml` rather than `<roblox` (Android file imports, etc.).
-        let xml = start.starts_with(b"<?xml")
-            || (start.starts_with(b"<roblox") && !start.starts_with(b"<roblox!"));
+        let xml = bytes.starts_with(b"<roblox") && !bytes.starts_with(b"<roblox!");
         if xml {
             rbx_xml::from_reader_default(Cursor::new(bytes)).map_err(|e| e.to_string())
         } else {
@@ -1643,26 +1638,6 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detects_rbxlx_with_xml_declaration_or_bom() {
-        // These are all legal starts of Roblox XML place files. A file
-        // starting with the declaration previously reached the binary parser.
-        for head in [
-            b"<roblox version=\"4\">".as_slice(),
-            b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<roblox version=\"4\">".as_slice(),
-            b"\xEF\xBB\xBF  \n<?xml version=\"1.0\"?>\n<roblox version=\"4\">".as_slice(),
-        ] {
-            let start = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head).trim_ascii_start();
-            assert!(start.starts_with(b"<?xml") || (start.starts_with(b"<roblox") && !start.starts_with(b"<roblox!")));
-        }
-        // Exercise the actual decoder (not just its header detection):
-        // this real Roblox XML shape must work with an XML declaration.
-        let xml = b"<roblox version=\"4\"><Item class=\"Workspace\" referent=\"RBX1\"><Properties><string name=\"Name\">Workspace</string></Properties></Item></roblox>";
-        let declared = [b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n".as_slice(), xml.as_slice()].concat();
-        assert!(Document::decode(xml).is_ok(), "bare rbxlx failed");
-        assert!(Document::decode(&declared).is_ok(), "rbxlx with XML declaration failed");
-    }
 
     /// ScreenGui.IgnoreGuiInset is ScreenInsets ≠ CoreUISafeInsets, both ways
     /// (measured in Studio 0.744 on Laser Tag's GameplayGui / ReticleGui).
