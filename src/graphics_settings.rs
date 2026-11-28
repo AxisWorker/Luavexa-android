@@ -94,8 +94,9 @@ impl Editor {
                             );
                             use rustudio_render::render;
                             text.push_str(&format!(
-                                "Decal shader probe: {} | fast linear transparency: {}\n",
+                                "Decal shader probe: {} | Low decal fast path: {} | fast linear transparency: {}\n",
                                 render::decal_shader_probe_label(),
+                                render::decal_low_fast_path_enabled(),
                                 render::fast_transparency_enabled(),
                             ));
                             for (label, ms) in spans {
@@ -116,6 +117,20 @@ impl Editor {
         }
         ui.separator();
 
+        ui.label(RichText::new("LOW DETAIL · DECAL OPTIMIZATION A/B").strong());
+        let mut low_decal_fast = rustudio_render::render::decal_low_fast_path_enabled();
+        if ui.checkbox(&mut low_decal_fast, "Optimize Texture/Decal in Low (experimental)").changed() {
+            rustudio_render::render::set_decal_low_fast_path(low_decal_fast);
+            if low_decal_fast {
+                rustudio_render::render::set_decal_shader_probe_mode(0);
+                rustudio_render::render::set_fast_transparency(false);
+            }
+        }
+        ui.small(RichText::new(
+            "OFF = original. ON = specialized shader with the same sRGB conversion, alpha and Low lighting. Applies only to eligible Texture/Decal batches in encoded transparency, Shading Detail Low. Session-only; resets on restart. Compare FPS and colors in the same camera view."
+        ).weak());
+        ui.separator();
+
         ui.label(RichText::new("DECAL SHADER ISOLATION").strong());
         let mut decal_mode = rustudio_render::render::decal_shader_probe_mode();
         ui.horizontal_wrapped(|ui| {
@@ -128,6 +143,7 @@ impl Editor {
             if decal_mode != 0 {
                 // The probe pipelines target the original encoded pass only.
                 rustudio_render::render::set_fast_transparency(false);
+                rustudio_render::render::set_decal_low_fast_path(false);
             }
         }
         ui.small(RichText::new(
@@ -138,6 +154,7 @@ impl Editor {
         }
         if ui.button("Restaurar shader original").clicked() {
             rustudio_render::render::set_decal_shader_probe_mode(0);
+            rustudio_render::render::set_decal_low_fast_path(false);
         }
         ui.separator();
 
@@ -153,7 +170,7 @@ impl Editor {
             }
             if ui.button("Copy FPS summary").clicked() {
                 ui.ctx().copy_text(format!(
-                    "Luavexa debug | {mode} | {fps:.0} FPS | {frame_ms} | CPU update+UI (prior): {cpu_ms:.1}ms | viewport {:.0}x{:.0} logical | resolution {}% | quality {} | detail {} | linear transparency {} | decal shader {}",
+                    "Luavexa debug | {mode} | {fps:.0} FPS | {frame_ms} | CPU update+UI (prior): {cpu_ms:.1}ms | viewport {:.0}x{:.0} logical | resolution {}% | quality {} | detail {} | linear transparency {} | decal shader {} | Low decal fast path {}",
                     view.width().max(0.0),
                     view.height().max(0.0),
                     settings::performance_value("resolution"),
@@ -161,6 +178,7 @@ impl Editor {
                     settings::performance_value("detail"),
                     rustudio_render::render::fast_transparency_enabled(),
                     rustudio_render::render::decal_shader_probe_label(),
+                    rustudio_render::render::decal_low_fast_path_enabled(),
                 ));
             }
         });
