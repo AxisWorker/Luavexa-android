@@ -83,6 +83,15 @@ impl Editor {
                         ui.small("Shown: largest measured GPU spans; not an end-to-end frame total.");
                         if ui.button("Copy GPU timings").clicked() {
                             let mut text = String::from("Luavexa GPU timing (ms; most recent resolved frame)\n");
+                            if let Some(rs) = self.game.render_state.as_ref() {
+                                let info = rs.adapter.get_info();
+                                let eligible = rustudio_render::render::adreno630_low_decal_supported(&info.name, info.backend);
+                                use std::fmt::Write as _;
+                                let _ = writeln!(
+                                    &mut text,
+                                    "Adreno 630 Low Texture/Decal optimization available: {eligible} (automatic with Low + encoded transparency)"
+                                );
+                            }
                             for (label, ms) in spans {
                                 use std::fmt::Write as _;
                                 let _ = writeln!(&mut text, "{label}: {ms:.3}");
@@ -138,6 +147,9 @@ impl Editor {
                 ui.label(RichText::new(&i.name).strong());
                 ui.small(format!("{:?}, {:?}; driver {} {}", i.backend, i.device_type, i.driver, i.driver_info).trim_end().to_string());
                 ui.small(format!("Surface {:?}", rs.target_format));
+                if rustudio_render::render::adreno630_low_decal_supported(&i.name, i.backend) {
+                    ui.small("Adreno 630: optimized Texture/Decal shader is automatic for eligible Low-quality surfaces (encoded transparency). No debug switch required.");
+                }
             }
             None => {
                 ui.label(RichText::new("No GPU renderer").strong());

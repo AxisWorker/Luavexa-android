@@ -2197,7 +2197,22 @@ struct ViewportPipelines {
     terrain_low: Option<wgpu::RenderPipeline>,
     overlay: wgpu::RenderPipeline,
     see_pipes: SeePipes,
+    // Created only for Vulkan Adreno 630. Other GPUs always use the
+    // unmodified general-purpose fragment shader.
+    decal_low_fast: Option<[wgpu::RenderPipeline; 2]>,
     see: SeeThrough,
+}
+
+/// Only activate the specialized shader on the GPU/driver combination
+/// actually validated on hardware; keep the original elsewhere.
+pub fn adreno630_low_decal_supported(name: &str, backend: wgpu::Backend) -> bool {
+    if backend != wgpu::Backend::Vulkan {
+        return false;
+    }
+    let name = name.to_ascii_lowercase();
+    name.contains("adreno (tm) 630")
+        || name.contains("adreno 630")
+        || name.contains("adreno630")
 }
 
 // Some OpenGL drivers lack the color-buffer-float extension that wgpu
@@ -2473,6 +2488,16 @@ impl ViewportPipelines {
             glass_culled: make("glass-composite-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None),
             overlay: make("parts-overlay-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
         };
+        // Create the optimized shader only on Adreno 630 Vulkan. This is the
+        // same fragment entry point proven fast on Galaxy S9 (PR #12), not
+        // the inaccurate diagnostic "texture only" path.
+        let info = device.adapter_info();
+        let decal_low_fast = adreno630_low_decal_supported(&info.name, info.backend).then(|| {
+            [None, Some(wgpu::Face::Back)].map(|cull| make(
+                "decal-low-specialized-enc", "vs_part", "fs_part_enc_decal_low",
+                &parts, T::TriangleList, cull, false, C::GreaterEqual, pm,
+            ))
+        });
         let see = SeeThrough::new(device, &shader, &bgl, ms);
         let water = crate::water::WaterPass::new(
             device,
@@ -2666,6 +2691,7 @@ impl ViewportPipelines {
             terrain_low,
             overlay,
             see_pipes,
+            decal_low_fast,
             see,
         }
     }
@@ -6214,12 +6240,27 @@ impl Renderer {
                 || !overlay_runs.is_empty()
                 || static_ranges.iter().any(|r| r.0 == Pass::Decal));
         let pipes = if encoded { &viewport.see_pipes } else { &linear_pipes };
+        // Fast path is automatic in Low only. Other quality modes, render
+        // backends, transparency modes and special materials use the original.
+        let optimized_decals = viewport.decal_low_fast.as_ref().filter(|_| {
+            encoded && globals.perf[0] < 0.5 && globals.perf[1] <= 0.5 && globals.lamp1[3] <= 1.5
+        });
+        let decal_pipeline = |cull_back: bool, instances: &[InstanceRaw]| -> &wgpu::RenderPipeline {
+            if let Some(pipelines) = optimized_decals.filter(|_| low_decal_batch(instances)) {
+                return &pipelines[usize::from(cull_back)];
+            }
+            if cull_back {
+                &pipes.transparent_culled
+            } else {
+                &pipes.transparent
+            }
+        };
         let surface_decals = |pass: &mut wgpu::RenderPass, calls: &mut usize| {
             if !surface_decal_runs.is_empty() {
                 unbind();
-                pass.set_pipeline(&pipes.transparent);
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                 for r in &surface_decal_runs {
+                    pass.set_pipeline(decal_pipeline(false, &raw[r.1 as usize..r.2 as usize]));
                     draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
                 }
                 pass.set_bind_group(1, &self.textures[0], &[]);
@@ -6257,22 +6298,22 @@ impl Renderer {
         let see_through = |pass: &mut wgpu::RenderPass, calls: &mut usize| {
             unbind();
             pass.set_bind_group(2, &target.glass_bg, &[]);
-            pass.set_pipeline(&pipes.transparent);
             pass.set_vertex_buffer(1, self.static_buf.slice(..));
             for r in static_ranges.iter().filter(|r| r.0 == Pass::Decal) {
+                pass.set_pipeline(decal_pipeline(false, &self.st.raw[r.2 as usize..r.3 as usize]));
                 draw(pass, r.1, r.2..r.3, r.4, calls);
             }
             pass.set_vertex_buffer(1, self.instance_buf.slice(..));
             for r in &decal_runs {
+                pass.set_pipeline(decal_pipeline(false, &raw[r.1 as usize..r.2 as usize]));
                 draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
             }
             for r in &blend_runs {
+                let cull_back = self.culls_back(r.0 .0);
                 pass.set_pipeline(if r.1 < glass_end {
-                    if self.culls_back(r.0 .0) { &pipes.glass_culled } else { &pipes.glass }
-                } else if self.culls_back(r.0 .0) {
-                    &pipes.transparent_culled
+                    if cull_back { &pipes.glass_culled } else { &pipes.glass }
                 } else {
-                    &pipes.transparent
+                    decal_pipeline(cull_back, &raw[r.1 as usize..r.2 as usize])
                 });
                 draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
             }
@@ -7210,6 +7251,52 @@ fn draw_key(p: &PartDraw) -> (usize, usize) {
 
 const DECAL_TEX_MODE: f32 = 2.0;
 const CUTOUT_TEX_MODE: f32 = 4.0;
+
+/// Only ordinary Decal/Texture batches can safely use the simpler Low
+/// fragment path. Mixed modes and other shaders retain the original.
+fn low_decal_batch(instances: &[InstanceRaw]) -> bool {
+    !instances.is_empty()
+        && instances.iter().all(|p| {
+            p.extra[3] == DECAL_TEX_MODE && (p.extra[0] as u32 & 7) < 3
+        })
+}
+
+#[cfg(test)]
+mod optimized_low_decal_tests {
+    use super::{adreno630_low_decal_supported, low_decal_batch, InstanceRaw, DECAL_TEX_MODE};
+    use bytemuck::Zeroable;
+    use egui_wgpu::wgpu;
+
+    #[test]
+    fn only_verified_adreno_630_vulkan_uses_low_shader() {
+        assert!(adreno630_low_decal_supported("Adreno (TM) 630", wgpu::Backend::Vulkan));
+        assert!(adreno630_low_decal_supported("Adreno630v2", wgpu::Backend::Vulkan));
+        assert!(!adreno630_low_decal_supported("Adreno (TM) 630", wgpu::Backend::Gl));
+        assert!(!adreno630_low_decal_supported("Adreno (TM) 650", wgpu::Backend::Vulkan));
+        assert!(!adreno630_low_decal_supported("Mali-G76", wgpu::Backend::Vulkan));
+    }
+
+    #[test]
+    fn special_or_mixed_materials_use_the_original_path() {
+        let mut decal = InstanceRaw::zeroed();
+        decal.extra[3] = DECAL_TEX_MODE;
+        assert!(!low_decal_batch(&[]));
+        for kind in [0.0, 1.0, 2.0, 8.0, 16.0] {
+            decal.extra[0] = kind;
+            assert!(low_decal_batch(&[decal]));
+        }
+        for kind in [3.0, 5.0, 6.0] {
+            decal.extra[0] = kind;
+            assert!(!low_decal_batch(&[decal]));
+        }
+        decal.extra[0] = 0.0;
+        let mut overlay = decal;
+        overlay.extra[3] = 1.0;
+        assert!(!low_decal_batch(&[decal, overlay]));
+        overlay.extra[3] = 4.0;
+        assert!(!low_decal_batch(&[decal, overlay]));
+    }
+}
 
 fn tex_mode(p: &PartDraw) -> f32 {
     match (p.tex_mode, p.texture) {

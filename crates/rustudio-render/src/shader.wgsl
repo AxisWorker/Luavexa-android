@@ -1125,48 +1125,53 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
 @fragment
 fn fs_part_enc(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     ENC_OUT = true;
-    // Experimental mobile Low path for ordinary Decal/Texture overlays.
-    // On Adreno 630 these fragments were measured at ~63 ms versus ~9 ms
-    // with the Baseplate overlay removed. The generic part_shade computes
-    // unused material/surface derivatives and samples before reaching
-    // part_shade_low; this path keeps its colour, alpha, fog and lighting
-    // maths, but skips work that cannot affect a simple decal.
-    //
-    // Fall back for cutout/ForceField/glass, debug flat, complex surface
-    // modifiers, Studio ViewportFrames, and any non-Low quality settings.
-    let code = u32(in.extra.x + 0.5);
-    let kind = f32(code & 7u);
-    let mode = u32(in.extra.w + 0.5);
-    let packed = u32(in.extra.y + 0.5);
-    let has_surface = (packed & 1u) != 0u || ((packed >> 1u) & 0x3ffffu) != 0u;
-    if (mode == 2u
-        && kind < 2.5
-        && !has_surface
-        && g.perf.y <= 0.5
-        && spec_pred(1u, g.perf.x < 0.5)
-        && !spec_pred(8u, g.lamp1.w > 1.5)) {
-        // Same untiled Decal edge clamp as part_shade. Tiled Texture
-        // instances use the original coordinates and sampler repetition.
-        let clamp_decal = all(abs(in.mscale - vec4<f32>(1.0, 1.0, 0.0, 0.0)) < vec4<f32>(1e-4));
-        let edge_px = 0.5 / vec2<f32>(textureDimensions(tex));
-        let suv = select(in.uv, clamp(in.uv, edge_px, vec2<f32>(1.0) - edge_px), clamp_decal);
-        let texel = textureSample(tex, tex_sampler, suv);
-        // Retain Studio's existing sRGB -> byte -> square conversion.
-        // This is intentionally NOT a cheaper approximation of gamma.
-        let raw = select(
-            1.055 * pow(max(texel.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
-            12.92 * texel.rgb,
-            texel.rgb <= vec3<f32>(0.0031308)
-        );
-        let base = (raw * raw) * in.color.rgb * sq(in.vtint.rgb);
-        var alpha = in.color.a;
-        if (alpha < 0.999) {
-            alpha *= in.vtint.a;
-        }
-        alpha *= texel.a;
-        return part_shade_low(in, base, alpha, kind);
-    }
     return part_shade(in, front);
+}
+
+// Adreno 630: a dedicated, visually equivalent Low-quality
+// Texture/Decal fragment path. The ordinary part_shade shader performs
+// material-atlas, surface-map and derivative work before reaching the
+// part_shade_low branch, even for a simple Decal that never uses those maps.
+// Only selected for TexMode::Decal, ordinary materials (kind 0..2), Low
+// detail, encoded transparency and a non-ViewportFrame camera.
+// Preserve the original sRGB-to-Studio colour conversion and alpha exactly.
+// Scope: ordinary decal and Texture faces, not other material modes.
+@fragment
+fn fs_part_enc_decal_low(in: PartOut) -> @location(0) vec4<f32> {
+    ENC_OUT = true;
+    let kind = f32(u32(in.extra.x + 0.5) & 7u);
+    let clamp_decal_uv = all(abs(in.mscale - vec4<f32>(1.0, 1.0, 0.0, 0.0)) < vec4<f32>(1e-4));
+    let edge_px = 0.5 / vec2<f32>(textureDimensions(tex));
+    let uv = select(in.uv, clamp(in.uv, edge_px, vec2<f32>(1.0) - edge_px), clamp_decal_uv);
+    let sample = textureSample(tex, tex_sampler, uv);
+    // Match part_shade's sRGB sampled texel -> original sRGB bytes -> squared
+    // Studio colours. Omitting this (as the texture-only probe does) changes
+    // visible colours.
+    let raw = select(
+        1.055 * pow(max(sample.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
+        12.92 * sample.rgb,
+        sample.rgb <= vec3<f32>(0.0031308),
+    );
+    var base = in.color.rgb * sq(in.vtint.rgb) * (raw * raw);
+    let original_alpha = in.color.a;
+    var alpha = original_alpha * sample.a;
+    if (original_alpha < 0.999) {
+        alpha *= in.vtint.a;
+    }
+    let packed = u32(in.extra.y + 0.5);
+    // Fragment derivatives must run in uniform control flow (WGSL rule);
+    // calculate them before checking per-instance legacy face flags.
+    let ddx = dpdx(in.local);
+    let ddy = dpdy(in.local);
+    let faces = (packed >> 1u) & 0x3FFFFu;
+    if (faces != 0u) {
+        base *= surface_shade(faces, in.objn, in.local, in.half, ddx, ddy);
+    }
+    if ((packed & 1u) == 1u) {
+        let k = fract((in.world.x + in.world.y + in.world.z) * 0.25);
+        base = mix(base, base * 0.6 + vec3<f32>(0.18, 0.12, 0.3), step(0.5, k) * 0.6);
+    }
+    return part_shade_low(in, base, alpha, kind);
 }
 
 @fragment
