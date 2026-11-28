@@ -126,7 +126,7 @@ impl Editor {
             if mode.is_none() && resp.clicked() {
                 self.start_run(self.ui.run_type);
             }
-            let resp = top_icon(ui, "player-pause-filled", theme::TEXT, false).on_hover_text("Pause: not in rustudio yet");
+            let resp = top_icon(ui, "player-pause-filled", theme::TEXT, false).on_hover_text("Pause: unavailable in Luavexa");
             self.ui_rects.insert("test.pause", resp.rect);
             let resp = top_icon(ui, "player-stop-filled", Color32::from_rgb(200, 60, 60), mode.is_some())
                 .on_hover_text("Stop (Shift+F5)");
@@ -134,7 +134,7 @@ impl Editor {
             if mode.is_some() && resp.clicked() {
                 self.stop_play();
             }
-            top_icon(ui, "device-mobile", theme::TEXT, false).on_hover_text("Device Simulator: not in rustudio yet");
+            top_icon(ui, "device-mobile", theme::TEXT, false).on_hover_text("Device Simulator: unavailable in Luavexa");
 
             // The tabs, centred like Studio's.
             let tab_w = 80.0;
@@ -164,7 +164,7 @@ impl Editor {
             let font = egui::FontId::proportional(15.0);
             ui.painter().text(plus.center(), egui::Align2::CENTER_CENTER, "+", font, theme::TEXT_DIM);
             ui.interact(plus, egui::Id::new("ribbon_tab_add"), Sense::hover())
-                .on_hover_text("Custom tabs: not in rustudio yet");
+                .on_hover_text("Custom tabs: unavailable in Luavexa");
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
@@ -180,13 +180,13 @@ impl Editor {
                     self.game.account.open = !self.game.account.open;
                     self.game.account.adding = false;
                 }
-                top_icon(ui, "bell", theme::TEXT, false).on_hover_text("Notifications: not in rustudio yet");
+                top_icon(ui, "bell", theme::TEXT, false).on_hover_text("Notifications: unavailable in Luavexa");
                 let tc = match (&self.game.doc.cloud, &self.cloud.status) {
                     (Some(o), Some((u, s))) if *u == o.universe_id => s.describe(),
                     _ => "Open a Team Create place to see its live collaborators".into(),
                 };
                 if top_icon(ui, "users-group", theme::TEXT, false).on_hover_text(tc).clicked() {self.cloud.live_collaborators_open=true;}
-                top_icon(ui, "share", theme::TEXT, false).on_hover_text("Share: not in rustudio yet");
+                top_icon(ui, "share", theme::TEXT, false).on_hover_text("Share: unavailable in Luavexa");
                 if ui.button("Collaborate").clicked() {self.cloud.live_collaborators_open=true;}
                 // (right to left: the MCP button sits left of Collaborate)
                 self.mcp_top_button(ui);
@@ -474,7 +474,7 @@ impl Editor {
                 {
                     format!("{label}: Roblox's built-in plugin is unavailable")
                 }
-                _ => format!("{label}: not in rustudio yet"),
+                _ => format!("{label}: unavailable in Luavexa"),
             };
             resp.on_hover_text(tip);
         }

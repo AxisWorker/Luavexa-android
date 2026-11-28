@@ -822,7 +822,7 @@ impl Editor {
         }
         // The window title, as Studio's: the place's name.
         let dirty = if self.game.doc.dirty() { " •" } else { "" };
-        let title = format!("{}{dirty} - rustudio", if self.game.doc.title.is_empty() { "Untitled" } else { &self.game.doc.title });
+        let title = format!("{}{dirty} - Luavexa", if self.game.doc.title.is_empty() { "Untitled" } else { &self.game.doc.title });
         if title != self.cloud.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.cloud.window_title = title;
@@ -1085,7 +1085,7 @@ impl Editor {
         for (id, first, second) in live.model.take_conflicts() {
             let (a, b) = (crate::live_sync::path(&self.game.doc, first), crate::live_sync::path(&self.game.doc, second));
             log::warn!("Team Create (place={}): referent {id:#x} is used by both {a} and {b}", live.place);
-            self.error(format!("Team Create: the server holds two instances under one referent ({a} and {b}); rustudio will not edit or delete either. Change them in Roblox Studio"));
+            self.error(format!("Team Create: the server holds two instances under one referent ({a} and {b}); Luavexa will leave both unchanged. Change them in Roblox Studio"));
         }
     }
 
