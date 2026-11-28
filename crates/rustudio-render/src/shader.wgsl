@@ -1159,9 +1159,13 @@ fn fs_part_enc_decal_low(in: PartOut) -> @location(0) vec4<f32> {
         alpha *= in.vtint.a;
     }
     let packed = u32(in.extra.y + 0.5);
+    // Fragment derivatives must run in uniform control flow (WGSL rule);
+    // calculate them before checking per-instance legacy face flags.
+    let ddx = dpdx(in.local);
+    let ddy = dpdy(in.local);
     let faces = (packed >> 1u) & 0x3FFFFu;
     if (faces != 0u) {
-        base *= surface_shade(faces, in.objn, in.local, in.half, dpdx(in.local), dpdy(in.local));
+        base *= surface_shade(faces, in.objn, in.local, in.half, ddx, ddy);
     }
     if ((packed & 1u) == 1u) {
         let k = fract((in.world.x + in.world.y + in.world.z) * 0.25);
