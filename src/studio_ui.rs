@@ -118,6 +118,8 @@ pub struct UiState {
     pub about: bool,
     /// View > GPU Driver (src/graphics_settings.rs).
     pub graphics_settings: bool,
+    /// First-run Android Play setup notice while Roblox Studio scripts download.
+    pub play_setup_notice: bool,
     /// File > Studio Settings (src/studio_settings.rs).
     pub studio_settings: crate::studio_settings::Dialog,
     pub insert_popup: Option<InsertPopup>,
@@ -150,6 +152,7 @@ impl Default for UiState {
             grid_size: rustudio_core::mech::GRID_SPACING,
             about: false,
             graphics_settings: false,
+            play_setup_notice: false,
             studio_settings: Default::default(),
             insert_popup: None,
             recent: load_recent(),

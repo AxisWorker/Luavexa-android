@@ -883,6 +883,19 @@ impl Editor {
         if self.game.play.is_some() || !t.available() {
             return;
         }
+        // The first Android install downloads ~70 MB of Roblox Studio content.
+        // Starting character Play too early gives a placeholder R15 avatar
+        // with neither PlayerModule (camera/controls) nor Animate. Explain
+        // the prerequisite rather than entering an apparently broken Play.
+        #[cfg(target_os = "android")]
+        if matches!(t, RunType::Test | RunType::TestHere)
+            && rustudio_core::default_scripts::studio_dir().is_none()
+        {
+            self.ui.run_type = t;
+            self.ui.play_setup_notice = true;
+            self.warn("Luavexa Play needs Roblox Studio's character content and player scripts. Check Output for setup progress or errors.");
+            return;
+        }
         self.ui.run_type = t;
         match t {
             RunType::Test => {
@@ -904,6 +917,51 @@ impl Editor {
         // switch window to main viewport when playtesting
         // (the dock lives on RustudioApp, which consumes this flag in ui())
         self.switch_to_viewport = true;
+    }
+
+    /// Explain why first-run Android Play cannot yet move a character.
+    /// Unlike a silent disabled Play button, this notice describes what is
+    /// missing and updates itself once the CDN content finishes installing.
+    #[cfg(target_os = "android")]
+    pub fn play_setup_notice_ui(&mut self, ctx: &egui::Context) {
+        if !self.ui.play_setup_notice {
+            return;
+        }
+        let ready = rustudio_core::default_scripts::studio_dir().is_some();
+        let mut open = true;
+        let mut close_clicked = false;
+        let mut play_clicked = false;
+        egui::Window::new("Luavexa / Preparing Play")
+            .id(egui::Id::new("luavexa_play_setup_notice"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width((ctx.content_rect().width() - 32.0).clamp(1.0, 385.0))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("The first installation needs Roblox Studio's built-in content (about 70 MB).");
+                ui.label("Until it finishes, the placeholder character has no default camera, movement, or animation scripts.");
+                ui.add_space(10.0);
+                if ready {
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, "Content ready. You can start Play now.");
+                    if ui.button("Start Play").clicked() {
+                        play_clicked = true;
+                    }
+                } else {
+                    ui.label("Studio's player scripts are unavailable.");
+                    ui.small("Check Output for download progress or errors. If the download failed, reopen Luavexa to retry.");
+                }
+                if ui.button("Close").clicked() {
+                    close_clicked = true;
+                }
+            });
+        self.ui.play_setup_notice = open && !close_clicked && !play_clicked;
+        if !ready {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        if play_clicked {
+            self.start_run(self.ui.run_type);
+        }
     }
 
     /// The menu bar: Studio's menus in Studio's order.

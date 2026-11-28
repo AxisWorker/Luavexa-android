@@ -3096,6 +3096,8 @@ impl RustudioApp {
         ed.about_ui(&ctx);
         ed.plugins_ui(&ctx);
         ed.graphics_settings_ui(&ctx);
+        #[cfg(target_os = "android")]
+        ed.play_setup_notice_ui(&ctx);
         ed.studio_settings_ui(&ctx);
         ed.user_screenshot_tick(&ctx);
         rustudio_engine::runtime::domains::assets_cloud::capture::frame_tick(&ctx, ed.game.viewport_rect);
