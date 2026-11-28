@@ -92,6 +92,12 @@ impl Editor {
                             let mut text = format!(
                                 "Luavexa GPU timing (ms; most recent resolved frame)\nMode: {mode} | FPS (smoothed): {fps:.1} | frame interval: {frame_ms}\nCPU update + UI (previous frame): {cpu_ms:.3} ms\nGPU spans omit egui composition and present; not an end-to-end frame time.\n"
                             );
+                            use rustudio_render::render;
+                            text.push_str(&format!(
+                                "Decal shader probe: {} | fast linear transparency: {}\n",
+                                render::decal_shader_probe_label(),
+                                render::fast_transparency_enabled(),
+                            ));
                             for (label, ms) in spans {
                                 use std::fmt::Write as _;
                                 let _ = writeln!(&mut text, "{label}: {ms:.3}");
@@ -110,6 +116,31 @@ impl Editor {
         }
         ui.separator();
 
+        ui.label(RichText::new("DECAL SHADER ISOLATION").strong());
+        let mut decal_mode = rustudio_render::render::decal_shader_probe_mode();
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut decal_mode, 0, "Original");
+            ui.selectable_value(&mut decal_mode, 1, "Cor sólida");
+            ui.selectable_value(&mut decal_mode, 2, "Só textura");
+        });
+        if decal_mode != rustudio_render::render::decal_shader_probe_mode() {
+            rustudio_render::render::set_decal_shader_probe_mode(decal_mode);
+            if decal_mode != 0 {
+                // The probe pipelines target the original encoded pass only.
+                rustudio_render::render::set_fast_transparency(false);
+            }
+        }
+        ui.small(RichText::new(
+            "Somente Texture/Decal no passe see-through encoded. Cor sólida mantém geometria, profundidade e blend, mas remove textura/iluminação. Só textura mantém uma amostra, sem iluminação. As cores dos dois modos de teste NÃO são as cores finais. Reiniciar o app restaura Original."
+        ).weak());
+        if decal_mode != 0 && rustudio_render::render::fast_transparency_enabled() {
+            ui.colored_label(egui::Color32::YELLOW, "O teste de shader fica inativo enquanto Fast Linear Transparency estiver ligado. Desative-o abaixo.");
+        }
+        if ui.button("Restaurar shader original").clicked() {
+            rustudio_render::render::set_decal_shader_probe_mode(0);
+        }
+        ui.separator();
+
         ui.label(RichText::new("TRANSPARENCY A/B TEST").strong());
         let mut fast = rustudio_render::render::fast_transparency_enabled();
         if ui.checkbox(&mut fast, "Use fast linear transparency (experimental)").changed() {
@@ -122,13 +153,14 @@ impl Editor {
             }
             if ui.button("Copy FPS summary").clicked() {
                 ui.ctx().copy_text(format!(
-                    "Luavexa debug | {mode} | {fps:.0} FPS | {frame_ms} | CPU update+UI (prior): {cpu_ms:.1}ms | viewport {:.0}x{:.0} logical | resolution {}% | quality {} | detail {} | linear transparency {}",
+                    "Luavexa debug | {mode} | {fps:.0} FPS | {frame_ms} | CPU update+UI (prior): {cpu_ms:.1}ms | viewport {:.0}x{:.0} logical | resolution {}% | quality {} | detail {} | linear transparency {} | decal shader {}",
                     view.width().max(0.0),
                     view.height().max(0.0),
                     settings::performance_value("resolution"),
                     settings::performance_value("quality"),
                     settings::performance_value("detail"),
                     rustudio_render::render::fast_transparency_enabled(),
+                    rustudio_render::render::decal_shader_probe_label(),
                 ));
             }
         });
