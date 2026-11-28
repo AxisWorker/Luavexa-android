@@ -6242,15 +6242,12 @@ impl Renderer {
         let pipes = if encoded { &viewport.see_pipes } else { &linear_pipes };
         // Fast path is automatic in Low only. Other quality modes, render
         // backends, transparency modes and special materials use the original.
-        let optimized_decal_low = encoded
-            && globals.perf[0] < 0.5
-            && globals.perf[1] <= 0.5
-            && globals.lamp1[3] <= 1.5;
+        let optimized_decals = viewport.decal_low_fast.as_ref().filter(|_| {
+            encoded && globals.perf[0] < 0.5 && globals.perf[1] <= 0.5 && globals.lamp1[3] <= 1.5
+        });
         let decal_pipeline = |cull_back: bool, instances: &[InstanceRaw]| -> &wgpu::RenderPipeline {
-            if optimized_decal_low && low_decal_batch(instances) {
-                if let Some(pipelines) = &viewport.decal_low_fast {
-                    return &pipelines[usize::from(cull_back)];
-                }
+            if let Some(pipelines) = optimized_decals.filter(|_| low_decal_batch(instances)) {
+                return &pipelines[usize::from(cull_back)];
             }
             if cull_back {
                 &pipes.transparent_culled
@@ -6312,16 +6309,11 @@ impl Renderer {
                 draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
             }
             for r in &blend_runs {
-                let is_decal = raw[r.1 as usize..r.2 as usize]
-                    .iter().all(|part| part.extra[3] == DECAL_TEX_MODE);
+                let cull_back = self.culls_back(r.0 .0);
                 pass.set_pipeline(if r.1 < glass_end {
-                    if self.culls_back(r.0 .0) { &pipes.glass_culled } else { &pipes.glass }
-                } else if is_decal {
-                    decal_pipeline(self.culls_back(r.0 .0), &raw[r.1 as usize..r.2 as usize])
-                } else if self.culls_back(r.0 .0) {
-                    &pipes.transparent_culled
+                    if cull_back { &pipes.glass_culled } else { &pipes.glass }
                 } else {
-                    &pipes.transparent
+                    decal_pipeline(cull_back, &raw[r.1 as usize..r.2 as usize])
                 });
                 draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
             }
