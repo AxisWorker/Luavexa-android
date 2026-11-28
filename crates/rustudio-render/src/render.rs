@@ -6298,11 +6298,7 @@ impl Renderer {
             if let Some(p) = decal_probe {
                 return &p[usize::from(cull_back)];
             }
-            if low_decal_enabled && !instances.is_empty()
-                && instances.iter().all(|p| {
-                    p.extra[3] == DECAL_TEX_MODE && (p.extra[0] as u32 & 7) < 3
-                })
-            {
+            if low_decal_enabled && low_decal_batch(instances) {
                 return &viewport.decal_low_fast[usize::from(cull_back)];
             }
             if cull_back {
@@ -7312,6 +7308,43 @@ fn draw_key(p: &PartDraw) -> (usize, usize) {
 
 const DECAL_TEX_MODE: f32 = 2.0;
 const CUTOUT_TEX_MODE: f32 = 4.0;
+
+// Low encoded-decal optimization must not capture transparent parts, glasses,
+// ForceFields, cutouts, SurfaceAppearance or mixed-kind texture batches.
+fn low_decal_batch(instances: &[InstanceRaw]) -> bool {
+    !instances.is_empty()
+        && instances.iter().all(|p| {
+            p.extra[3] == DECAL_TEX_MODE && (p.extra[0] as u32 & 7) < 3
+        })
+}
+
+#[cfg(test)]
+mod low_decal_fast_tests {
+    use super::{low_decal_batch, InstanceRaw, DECAL_TEX_MODE};
+    use bytemuck::Zeroable;
+
+    #[test]
+    fn only_ordinary_decal_texture_batches_use_specialized_low_shader() {
+        let mut decal = InstanceRaw::zeroed();
+        decal.extra[3] = DECAL_TEX_MODE;
+        assert!(!low_decal_batch(&[]));
+        for kind in [0.0, 1.0, 2.0, 8.0, 16.0] {
+            decal.extra[0] = kind;
+            assert!(low_decal_batch(&[decal]));
+        }
+        for kind in [3.0, 5.0, 6.0] {
+            decal.extra[0] = kind;
+            assert!(!low_decal_batch(&[decal]));
+        }
+        decal.extra[0] = 0.0;
+        let mut other = decal;
+        other.extra[3] = 1.0; // SurfaceAppearance / overlay, not a Decal
+        assert!(!low_decal_batch(&[decal, other]));
+        other.extra[3] = 4.0; // AlphaMode=Transparency cutout
+        assert!(!low_decal_batch(&[decal, other]));
+    }
+}
+
 
 fn tex_mode(p: &PartDraw) -> f32 {
     match (p.tex_mode, p.texture) {
